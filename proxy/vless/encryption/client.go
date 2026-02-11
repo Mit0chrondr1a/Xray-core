@@ -201,6 +201,9 @@ func (i *ClientInstance) Handshake(conn net.Conn) (*CommonConn, error) {
 		return nil, err
 	}
 	length := DecodeLength(encryptedLength[:2])
+	if length > MaxPaddingLength {
+		return nil, errors.New("padding length exceeds maximum: ", length)
+	}
 	c.PeerPadding = make([]byte, length) // important: allows server sends padding slowly, eliminating 1-RTT's traffic pattern
 
 	if i.XorMode == 2 {

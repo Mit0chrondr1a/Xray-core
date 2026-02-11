@@ -313,7 +313,11 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 	if _, err := nfsAEAD.Open(encryptedLength[:0], nil, encryptedLength, nil); err != nil {
 		return nil, err
 	}
-	encryptedPadding := make([]byte, DecodeLength(encryptedLength[:2]))
+	paddingLen := DecodeLength(encryptedLength[:2])
+	if paddingLen > MaxPaddingLength {
+		return nil, errors.New("padding length exceeds maximum: ", paddingLen)
+	}
+	encryptedPadding := make([]byte, paddingLen)
 	if _, err := io.ReadFull(conn, encryptedPadding); err != nil {
 		return nil, err
 	}

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -154,15 +155,17 @@ type AEAD struct {
 	Nonce [12]byte
 }
 
+const MaxPaddingLength = 20000
+
 func NewAEAD(ctx, key []byte, useAES bool) *AEAD {
 	k := make([]byte, 32)
 	blake3.DeriveKey(k, string(ctx), key)
 	var aead cipher.AEAD
 	if useAES {
-		block, _ := aes.NewCipher(k)
-		aead, _ = cipher.NewGCM(block)
+		block := common.Must2(aes.NewCipher(k))
+		aead = common.Must2(cipher.NewGCM(block))
 	} else {
-		aead, _ = chacha20poly1305.New(k)
+		aead = common.Must2(chacha20poly1305.New(k))
 	}
 	return &AEAD{AEAD: aead}
 }
