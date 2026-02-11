@@ -80,7 +80,11 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 	hub.udpConn, _ = hub.conn.(*net.UDPConn)
 	hub.cache = make(chan *udp.Packet, hub.capacity)
 
-	go hub.start()
+	if hub.udpConn != nil && canUseBatchRead() {
+		go hub.startBatch()
+	} else {
+		go hub.start()
+	}
 	return hub, nil
 }
 
