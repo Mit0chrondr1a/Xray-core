@@ -1,6 +1,8 @@
 package http
 
 import (
+	"crypto/subtle"
+
 	"google.golang.org/protobuf/proto"
 
 	"github.com/xtls/xray-core/common/protocol"
@@ -28,7 +30,8 @@ func (sc *ServerConfig) HasAccount(username, password string) bool {
 
 	p, found := sc.Accounts[username]
 	if !found {
+		subtle.ConstantTimeCompare([]byte(password), []byte(password))
 		return false
 	}
-	return p == password
+	return subtle.ConstantTimeCompare([]byte(p), []byte(password)) == 1
 }
