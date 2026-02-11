@@ -224,7 +224,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "trojan"
-	inbound.CanSpliceCopy = 3
+	inbound.CanSpliceCopy = 2
 	inbound.User = user
 	sessionPolicy = s.policyManager.ForLevel(user.Level)
 
@@ -333,6 +333,10 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 	link, err := dispatcher.Dispatch(ctx, destination)
 	if err != nil {
 		return errors.New("failed to dispatch request to ", destination).Base(err)
+	}
+
+	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.CanSpliceCopy == 2 {
+		inbound.CanSpliceCopy = 1
 	}
 
 	requestDone := func() error {

@@ -52,7 +52,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		return errors.New("target not specified")
 	}
 	ob.Name = "trojan"
-	ob.CanSpliceCopy = 3
+	ob.CanSpliceCopy = 2
 	destination := ob.Target
 	network := destination.Network
 
@@ -145,6 +145,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 				Reader: conn,
 			}
 		} else {
+			ob.CanSpliceCopy = 1
 			reader = buf.NewReader(conn)
 		}
 		return buf.Copy(reader, link.Writer, buf.UpdateActivity(timer))
