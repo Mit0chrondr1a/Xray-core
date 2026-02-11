@@ -28,6 +28,7 @@ import (
 	"github.com/xtls/xray-core/proxy/vless/encryption"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/ebpf"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -730,6 +731,39 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 		}
 		if splice {
+			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
+			if mgr := ebpf.GlobalSockmapManager(); mgr != nil && ebpf.CanUseZeroCopy(readerConn, writerConn) {
+				if err := mgr.RegisterPair(readerConn, writerConn); err == nil {
+					errors.LogDebug(ctx, "CopyRawConn sockmap")
+					statWriter, _ := writer.(*dispatcher.SizeStatWriter)
+					timer.SetTimeout(24 * time.Hour)
+					if inTimer != nil {
+						inTimer.SetTimeout(24 * time.Hour)
+					}
+					// Sockmap handles forwarding in kernel. Block until one side closes
+					// by attempting a zero-byte read that will return on EOF/error.
+					waitBuf := make([]byte, 1)
+					_, err := readerConn.Read(waitBuf)
+					mgr.UnregisterPair(readerConn, writerConn)
+					if readCounter != nil {
+						if pair, ok := mgr.GetStats(readerConn, writerConn); ok {
+							readCounter.Add(int64(pair.BytesForwarded))
+						}
+					}
+					if writeCounter != nil {
+						if pair, ok := mgr.GetStats(readerConn, writerConn); ok {
+							writeCounter.Add(int64(pair.BytesForwarded))
+						}
+					}
+					_ = statWriter
+					if err != nil && errors.Cause(err) != io.EOF {
+						return err
+					}
+					return nil
+				}
+				// Fall through to splice on sockmap failure
+			}
+
 			errors.LogDebug(ctx, "CopyRawConn splice")
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
 			//runtime.Gosched() // necessary
