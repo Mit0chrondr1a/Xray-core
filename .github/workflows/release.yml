@@ -168,6 +168,7 @@ jobs:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
       GOARM: ${{ matrix.goarm }}
+      GOAMD64: ${{ matrix.goarch == 'amd64' && 'v3' || '' }}
       CGO_ENABLED: 0
     steps:
       - name: Checkout codebase

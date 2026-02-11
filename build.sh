@@ -24,16 +24,18 @@ OUTNAME="xray"
 GOARCH="${1:-amd64}"
 GOOS="linux"
 
-LDFLAGS="-s -w"
-BUILDFLAGS="-trimpath"
+COMMID=$(git describe --always --dirty 2>/dev/null || echo "dev")
+LDFLAGS="-s -w -buildid= -X github.com/xtls/xray-core/core.build=${COMMID}"
+BUILDFLAGS="-trimpath -buildvcs=false"
+GCFLAGS="all=-l=4"
 
 if [ "$GOARCH" = "amd64" ]; then
     export GOAMD64=v3  # AVX2, BMI1/2, FMA — requires Haswell+ or Zen+
 fi
 
-echo "Building Xray-core for ${GOOS}/${GOARCH}..."
+echo "Building Xray-core for ${GOOS}/${GOARCH} (${COMMID})..."
 CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-    "$GO" build -o "$OUTNAME" $BUILDFLAGS -ldflags="$LDFLAGS" ./main/
+    "$GO" build -o "$OUTNAME" $BUILDFLAGS -gcflags="$GCFLAGS" -ldflags="$LDFLAGS" ./main/
 
 echo "Done: $(ls -lh $OUTNAME | awk '{print $5}') static binary"
 file "$OUTNAME"

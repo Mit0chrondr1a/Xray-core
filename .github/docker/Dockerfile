@@ -6,7 +6,9 @@ WORKDIR /src
 COPY . .
 ARG TARGETOS
 ARG TARGETARCH
-RUN GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags "-s -w -buildid=" ./main
+RUN GOAMD64=$( [ "$TARGETARCH" = "amd64" ] && echo "v3" || echo "" ) \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 \
+    go build -o xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags "-s -w -buildid=" ./main
 
 # Download geodat into a staging directory
 ADD https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat /tmp/geodat/geoip.dat
