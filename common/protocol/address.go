@@ -206,6 +206,9 @@ func (p *addressParser) readAddress(b *buf.Buffer, reader io.Reader) (net.Addres
 			return nil, err
 		}
 		domainLength := int32(b.Byte(b.Len() - 1))
+		if domainLength == 0 {
+			return nil, errors.New("zero-length domain")
+		}
 		if _, err := b.ReadFullFrom(reader, domainLength); err != nil {
 			return nil, err
 		}
