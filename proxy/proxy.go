@@ -8,9 +8,8 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"io"
-	"math/big"
+	"math/rand/v2"
 	"runtime"
 	"strconv"
 	"time"
@@ -47,6 +46,7 @@ var (
 		0x1305: "TLS_AES_128_CCM_8_SHA256",
 	}
 )
+
 
 const (
 	TlsHandshakeTypeClientHello byte = 0x01
@@ -269,9 +269,9 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		w.rawInput = nil
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
-			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
-			// 	inbound.CanSpliceCopy = 1
-			// }
+			if w.isUplink && inbound.CanSpliceCopy == 2 {
+				inbound.CanSpliceCopy = 1
+			}
 			if !w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // ob need to be passed in due to context can have more than one ob
 				w.ob.CanSpliceCopy = 1
 			}
@@ -334,9 +334,9 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			if !w.isUplink && inbound.CanSpliceCopy == 2 {
 				inbound.CanSpliceCopy = 1
 			}
-			// if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // TODO: enable uplink splice
-			// 	w.ob.CanSpliceCopy = 1
-			// }
+			if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 {
+				w.ob.CanSpliceCopy = 1
+			}
 		}
 		rawConn, _, writerCounter := UnwrapRawConn(w.conn)
 		w.Writer = buf.NewWriter(rawConn)
@@ -394,57 +394,54 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 // IsCompleteRecord Is complete tls data record
+// Iterates over MultiBuffer segments directly without copying to a flat []byte.
 func IsCompleteRecord(buffer buf.MultiBuffer) bool {
-	b := make([]byte, buffer.Len())
-	if buffer.Copy(b) != int(buffer.Len()) {
-		panic("impossible bytes allocation")
-	}
 	var headerLen int = 5
 	var recordLen int
 
-	totalLen := len(b)
-	i := 0
-	for i < totalLen {
-		// record header: 0x17 0x3 0x3 + 2 bytes length
-		if headerLen > 0 {
-			data := b[i]
-			i++
-			switch headerLen {
-			case 5:
-				if data != 0x17 {
-					return false
+	for _, seg := range buffer {
+		data := seg.Bytes()
+		pos := 0
+		segLen := len(data)
+		for pos < segLen {
+			if headerLen > 0 {
+				b := data[pos]
+				pos++
+				switch headerLen {
+				case 5:
+					if b != 0x17 {
+						return false
+					}
+				case 4:
+					if b != 0x03 {
+						return false
+					}
+				case 3:
+					if b != 0x03 {
+						return false
+					}
+				case 2:
+					recordLen = int(b) << 8
+				case 1:
+					recordLen = recordLen | int(b)
 				}
-			case 4:
-				if data != 0x03 {
-					return false
+				headerLen--
+			} else if recordLen > 0 {
+				remaining := segLen - pos
+				if remaining >= recordLen {
+					pos += recordLen
+					recordLen = 0
+					headerLen = 5
+				} else {
+					recordLen -= remaining
+					pos = segLen // move to next segment
 				}
-			case 3:
-				if data != 0x03 {
-					return false
-				}
-			case 2:
-				recordLen = int(data) << 8
-			case 1:
-				recordLen = recordLen | int(data)
-			}
-			headerLen--
-		} else if recordLen > 0 {
-			remaining := totalLen - i
-			if remaining < recordLen {
-				return false
 			} else {
-				i += recordLen
-				recordLen = 0
-				headerLen = 5
+				return false
 			}
-		} else {
-			return false
 		}
 	}
-	if headerLen == 5 && recordLen == 0 {
-		return true
-	}
-	return false
+	return headerLen == 5 && recordLen == 0
 }
 
 // ReshapeMultiBuffer prepare multi buffer for padding structure (max 21 bytes)
@@ -490,17 +487,9 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 		contentLen = b.Len()
 	}
 	if contentLen < int32(testseed[0]) && longPadding {
-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[1])))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
-		}
-		paddingLen = int32(l.Int64()) + int32(testseed[2]) - contentLen
+		paddingLen = int32(rand.IntN(int(testseed[1]))) + int32(testseed[2]) - contentLen
 	} else {
-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[3])))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
-		}
-		paddingLen = int32(l.Int64())
+		paddingLen = int32(rand.IntN(int(testseed[3])))
 	}
 	if paddingLen > buf.Size-21-contentLen {
 		paddingLen = buf.Size - 21 - contentLen
