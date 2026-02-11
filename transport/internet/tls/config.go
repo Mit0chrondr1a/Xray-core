@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,16 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 )
 
-var globalSessionCache = tls.NewLRUClientSessionCache(128)
+var globalSessionCache = tls.NewLRUClientSessionCache(getTLSCacheSize())
+
+func getTLSCacheSize() int {
+	if s := os.Getenv("XRAY_TLS_CACHE_SIZE"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 512
+}
 
 // ParseCertificate converts a cert.Certificate to Certificate.
 func ParseCertificate(c *cert.Certificate) *Certificate {
