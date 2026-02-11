@@ -112,7 +112,13 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
 		}, writer, writer, l.config)
 		var netConn stat.Connection = conn
 		if l.tlsConfig != nil {
-			netConn = tls.Server(conn, l.tlsConfig)
+			tlsConn := tls.Server(conn, l.tlsConfig)
+			if err := tlsConn.(*tls.Conn).HandshakeAndEnableKTLS(context.Background()); err != nil {
+				errors.LogWarningInner(context.Background(), err, "failed TLS handshake on KCP connection")
+				conn.Terminate()
+				return
+			}
+			netConn = tlsConn
 		}
 
 		l.addConn(netConn)

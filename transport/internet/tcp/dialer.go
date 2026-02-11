@@ -73,7 +73,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			}
 		} else {
 			conn = tls.Client(conn, tlsConfig)
-			err = conn.(*tls.Conn).HandshakeContext(ctx)
+			err = conn.(*tls.Conn).HandshakeAndEnableKTLS(ctx)
 		}
 		if err != nil {
 			if isFromMitmVerify {

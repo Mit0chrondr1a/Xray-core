@@ -111,6 +111,11 @@ func (v *Listener) keepAccepting() {
 		go func() {
 			if v.tlsConfig != nil {
 				conn = tls.Server(conn, v.tlsConfig)
+				if err := conn.(*tls.Conn).HandshakeAndEnableKTLS(context.Background()); err != nil {
+					errors.LogWarningInner(context.Background(), err, "failed TLS handshake on accepted connection")
+					conn.Close()
+					return
+				}
 			} else if v.realityConfig != nil {
 				if conn, err = reality.Server(conn, v.realityConfig); err != nil {
 					errors.LogInfo(context.Background(), err.Error())

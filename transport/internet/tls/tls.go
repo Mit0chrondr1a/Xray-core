@@ -25,6 +25,7 @@ var _ Interface = (*Conn)(nil)
 
 type Conn struct {
 	*tls.Conn
+	ktls KTLSState
 }
 
 const tlsCloseTimeout = 250 * time.Millisecond
@@ -54,6 +55,21 @@ func (c *Conn) HandshakeContextServerName(ctx context.Context) string {
 func (c *Conn) NegotiatedProtocol() string {
 	state := c.ConnectionState()
 	return state.NegotiatedProtocol
+}
+
+// HandshakeAndEnableKTLS performs the TLS handshake and attempts to enable
+// kernel TLS offload. kTLS failure is not an error — it degrades gracefully.
+func (c *Conn) HandshakeAndEnableKTLS(ctx context.Context) error {
+	if err := c.HandshakeContext(ctx); err != nil {
+		return err
+	}
+	c.ktls = TryEnableKTLS(c)
+	return nil
+}
+
+// KTLSEnabled returns the kTLS state for this connection.
+func (c *Conn) KTLSEnabled() KTLSState {
+	return c.ktls
 }
 
 // Client initiates a TLS client handshake on the given connection.
