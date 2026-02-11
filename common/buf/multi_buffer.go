@@ -2,11 +2,37 @@ package buf
 
 import (
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/serial"
 )
+
+var multiBufferPool = sync.Pool{
+	New: func() interface{} {
+		mb := make(MultiBuffer, 0, 16)
+		return &mb
+	},
+}
+
+// GetMultiBuffer returns a MultiBuffer from the pool.
+func GetMultiBuffer() MultiBuffer {
+	p := multiBufferPool.Get().(*MultiBuffer)
+	mb := *p
+	mb = mb[:0]
+	return mb
+}
+
+// PutMultiBuffer returns a MultiBuffer to the pool.
+// The caller must ensure all Buffer pointers have been nil'd or released.
+func PutMultiBuffer(mb MultiBuffer) {
+	if cap(mb) < 4 || cap(mb) > 128 {
+		return // Don't pool unusual sizes
+	}
+	mb = mb[:0]
+	multiBufferPool.Put(&mb)
+}
 
 // ReadAllToBytes reads all content from the reader into a byte array, until EOF.
 func ReadAllToBytes(reader io.Reader) ([]byte, error) {
@@ -53,13 +79,14 @@ func MergeBytes(dest MultiBuffer, src []byte) MultiBuffer {
 	return dest
 }
 
-// ReleaseMulti releases all content of the MultiBuffer, and returns an empty MultiBuffer.
+// ReleaseMulti releases all content of the MultiBuffer, and returns nil.
 func ReleaseMulti(mb MultiBuffer) MultiBuffer {
 	for i := range mb {
 		mb[i].Release()
 		mb[i] = nil
 	}
-	return mb[:0]
+	PutMultiBuffer(mb)
+	return nil
 }
 
 // Copy copied the beginning part of the MultiBuffer into the given byte array.
@@ -77,7 +104,7 @@ func (mb MultiBuffer) Copy(b []byte) int {
 
 // ReadFrom reads all content from reader until EOF.
 func ReadFrom(reader io.Reader) (MultiBuffer, error) {
-	mb := make(MultiBuffer, 0, 16)
+	mb := GetMultiBuffer()
 	for {
 		b := New()
 		_, err := b.ReadFullFrom(reader, Size)
@@ -139,7 +166,7 @@ func Compact(mb MultiBuffer) MultiBuffer {
 		return mb
 	}
 
-	mb2 := make(MultiBuffer, 0, len(mb))
+	mb2 := GetMultiBuffer()
 	last := mb[0]
 
 	for i := 1; i < len(mb); i++ {
@@ -205,7 +232,7 @@ func SplitSize(mb MultiBuffer, size int32) (MultiBuffer, MultiBuffer) {
 
 // SplitMulti splits the beginning of the MultiBuffer into first one, the index i and after into second one
 func SplitMulti(mb MultiBuffer, i int) (MultiBuffer, MultiBuffer) {
-	mb2 := make(MultiBuffer, 0, len(mb))
+	mb2 := GetMultiBuffer()
 	if i < len(mb) && i >= 0 {
 		mb2 = append(mb2, mb[i:]...)
 		for j := i; j < len(mb); j++ {
