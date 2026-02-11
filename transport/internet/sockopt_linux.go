@@ -88,6 +88,9 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 			}
 		}
 
+		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); err != nil {
+			return errors.New("failed to set TCP_NODELAY").Base(err)
+		}
 	}
 
 	if len(config.CustomSockopt) > 0 {
@@ -196,6 +199,11 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 				return errors.New("failed to set TCP_MAXSEG", err)
 			}
 		}
+
+		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); err != nil {
+			return errors.New("failed to set TCP_NODELAY").Base(err)
+		}
+
 		if len(config.CustomSockopt) > 0 {
 			for _, custom := range config.CustomSockopt {
 				if custom.System != "" && custom.System != runtime.GOOS {
