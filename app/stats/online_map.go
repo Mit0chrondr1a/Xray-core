@@ -55,7 +55,7 @@ func (c *OnlineMap) GetKeys() []string {
 	c.access.RLock()
 	defer c.access.RUnlock()
 
-	keys := []string{}
+	keys := make([]string, 0, len(c.ipList))
 	for k := range c.ipList {
 		keys = append(keys, k)
 	}
