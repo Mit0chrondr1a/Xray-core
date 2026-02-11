@@ -6,34 +6,34 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Build the static library for CGO linking
-    const lib = b.addStaticLibrary(.{
-        .name = "xray_zig",
+    const lib_mod = b.createModule(.{
         .root_source_file = b.path("src/ffi.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // Enable SIMD optimizations
-    lib.root_module.addCMacro("ZIG_ENABLE_SIMD", "1");
-
-    // For release builds, enable all optimizations
     if (optimize != .Debug) {
-        lib.root_module.strip = true;
+        lib_mod.strip = true;
     }
+
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "xray_zig",
+        .root_module = lib_mod,
+    });
 
     // Install the library
     b.installArtifact(lib);
 
-    // Generate C header for FFI
-    const header = lib.getEmittedH();
-    const install_header = b.addInstallFile(header, "include/xray_zig.h");
-    b.getInstallStep().dependOn(&install_header.step);
-
     // Unit tests
-    const unit_tests = b.addTest(.{
+    const test_mod = b.createModule(.{
         .root_source_file = b.path("src/ffi.zig"),
         .target = target,
         .optimize = optimize,
+    });
+
+    const unit_tests = b.addTest(.{
+        .root_module = test_mod,
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -41,11 +41,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     // Benchmarks
-    const bench = b.addExecutable(.{
-        .name = "bench",
+    const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+    });
+
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
     });
     b.installArtifact(bench);
 

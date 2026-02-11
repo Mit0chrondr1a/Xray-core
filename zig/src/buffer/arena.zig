@@ -34,7 +34,7 @@ pub const Arena = struct {
             .buffer = buffer,
             .offset = 0,
             .capacity = actual_size,
-            .overflow = std.ArrayList([]u8).init(allocator),
+            .overflow = .empty,
             .total_allocated = 0,
             .allocator = allocator,
         };
@@ -46,7 +46,7 @@ pub const Arena = struct {
         for (self.overflow.items) |chunk| {
             self.allocator.free(chunk);
         }
-        self.overflow.deinit();
+        self.overflow.deinit(self.allocator);
 
         // Free main buffer
         self.allocator.free(self.buffer);
@@ -71,7 +71,7 @@ pub const Arena = struct {
         // Slow path: allocate overflow chunk
         const chunk_size = @max(aligned_size, 4096);
         const chunk = try self.allocator.alloc(u8, chunk_size);
-        try self.overflow.append(chunk);
+        try self.overflow.append(self.allocator, chunk);
         self.total_allocated += size;
         return chunk[0..size];
     }

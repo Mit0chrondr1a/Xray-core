@@ -3,8 +3,6 @@ const ring = @import("buffer/ring.zig");
 const arena = @import("buffer/arena.zig");
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
-
     // Benchmark ring buffer
     {
         var rb = try ring.RingBuffer.init(65536);
@@ -22,7 +20,7 @@ pub fn main() !void {
         }
         const elapsed = timer.read();
         const ns_per_op = elapsed / iterations;
-        try stdout.print("Ring buffer write+read (1KB): {} ns/op\n", .{ns_per_op});
+        std.debug.print("Ring buffer write+read (1KB): {} ns/op\n", .{ns_per_op});
     }
 
     // Benchmark arena allocator
@@ -40,6 +38,6 @@ pub fn main() !void {
         }
         const elapsed = timer.read();
         const ns_per_op = elapsed / iterations;
-        try stdout.print("Arena alloc (256B): {} ns/op\n", .{ns_per_op});
+        std.debug.print("Arena alloc (256B): {} ns/op\n", .{ns_per_op});
     }
 }
