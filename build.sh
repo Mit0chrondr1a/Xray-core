@@ -19,7 +19,7 @@ set -euo pipefail
 #   ./build.sh amd64        # Build for amd64 (GOAMD64=v3, AVX2 required)
 #   ./build.sh arm64        # Build for arm64
 
-GO="${GO:-/usr/local/go/bin/go}"
+GO="${GO:-go}"
 OUTNAME="xray"
 GOARCH="${1:-amd64}"
 GOOS="linux"
