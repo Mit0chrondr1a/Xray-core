@@ -13,6 +13,7 @@ type dataHandler func(MultiBuffer)
 
 type copyHandler struct {
 	onData []dataHandler
+	onExit []func()
 }
 
 // SizeCounter is for counting bytes copied by Copy().
@@ -41,12 +42,23 @@ func CountSize(sc *SizeCounter) CopyOption {
 	}
 }
 
-// AddToStatCounter a CopyOption add to stat counter
+// AddToStatCounter a CopyOption add to stat counter.
+// Updates are batched to reduce atomic operations on the counter.
 func AddToStatCounter(sc stats.Counter) CopyOption {
 	return func(handler *copyHandler) {
+		var accumulated int64
 		handler.onData = append(handler.onData, func(b MultiBuffer) {
-			if sc != nil {
-				sc.Add(int64(b.Len()))
+			accumulated += int64(b.Len())
+			if accumulated >= 65536 { // Flush every 64KB
+				if sc != nil {
+					sc.Add(accumulated)
+				}
+				accumulated = 0
+			}
+		})
+		handler.onExit = append(handler.onExit, func() {
+			if sc != nil && accumulated > 0 {
+				sc.Add(accumulated)
 			}
 		})
 	}
@@ -89,6 +101,11 @@ func IsWriteError(err error) bool {
 }
 
 func copyInternal(reader Reader, writer Writer, handler *copyHandler) error {
+	defer func() {
+		for _, fn := range handler.onExit {
+			fn()
+		}
+	}()
 	for {
 		buffer, err := reader.ReadMultiBuffer()
 		if !buffer.IsEmpty() {
