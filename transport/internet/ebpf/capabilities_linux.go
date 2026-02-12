@@ -35,11 +35,11 @@ func probeCapabilities() Capabilities {
 	}
 
 	// Sockmap support: kernel 4.17+
-	// Improved sk_msg: kernel 5.4+
+	// Full sk_skb stream parser/verdict: kernel 5.4+
 	if caps.KernelVersion.AtLeast(4, 17, 0) {
 		caps.SockmapSupported = probeSockmapSupport()
 		if caps.KernelVersion.AtLeast(5, 4, 0) {
-			caps.SockmapSKMsgSupported = caps.SockmapSupported
+			caps.SockmapSKSkbSupported = caps.SockmapSupported
 		}
 	}
 
@@ -128,16 +128,21 @@ func checkBPFSyscall() bool {
 	license := []byte("GPL\x00")
 	attr.license = uint64(uintptr(unsafe.Pointer(&license[0])))
 
-	_, _, errno := syscall.Syscall(
+	fd, _, errno := syscall.Syscall(
 		unix.SYS_BPF,
 		5, // BPF_PROG_LOAD
 		uintptr(unsafe.Pointer(&attr)),
 		unsafe.Sizeof(attr),
 	)
 
+	if errno == 0 {
+		syscall.Close(int(fd))
+		return true
+	}
+
 	// EPERM means we don't have permission but BPF syscall exists
 	// EINVAL might mean bad parameters but BPF exists
-	return errno == 0 || errno == syscall.EPERM || errno == syscall.EINVAL
+	return errno == syscall.EPERM || errno == syscall.EINVAL
 }
 
 // probXDPSupport checks if XDP is available.
@@ -174,7 +179,7 @@ func probXDPSupport() bool {
 		unsafe.Sizeof(attr),
 	)
 
-	if errno == 0 && fd > 0 {
+	if errno == 0 {
 		syscall.Close(int(fd))
 		return true
 	}
@@ -183,9 +188,11 @@ func probXDPSupport() bool {
 }
 
 // probeSockmapSupport checks if sockmap is available.
+// Probes both SOCKMAP creation and SK_SKB program loading, since the
+// implementation requires sk_skb (stream parser + verdict) programs.
 func probeSockmapSupport() bool {
 	// Try to create a SOCKMAP
-	attr := struct {
+	mapAttr := struct {
 		mapType    uint32
 		keySize    uint32
 		valueSize  uint32
@@ -197,14 +204,58 @@ func probeSockmapSupport() bool {
 		maxEntries: 1,
 	}
 
-	fd, _, errno := syscall.Syscall(
+	mapFD, _, errno := syscall.Syscall(
 		unix.SYS_BPF,
 		0, // BPF_MAP_CREATE
+		uintptr(unsafe.Pointer(&mapAttr)),
+		unsafe.Sizeof(mapAttr),
+	)
+
+	if errno != 0 {
+		return false
+	}
+	syscall.Close(int(mapFD))
+
+	// Also verify we can load BPF_PROG_TYPE_SK_SKB (type 23).
+	// A kernel that supports SOCKMAP but not sk_skb programs would
+	// fail at setup time; detect this early to avoid noisy fallback logs.
+	return probeSKSkbSupport()
+}
+
+// probeSKSkbSupport checks if BPF_PROG_TYPE_SK_SKB programs can be loaded.
+func probeSKSkbSupport() bool {
+	// Minimal sk_skb program: r0 = 1 (SK_PASS); exit
+	insns := []uint64{
+		0x00000001000000b7, // mov r0, 1
+		0x0000000000000095, // exit
+	}
+
+	license := []byte("GPL\x00")
+
+	attr := struct {
+		progType    uint32
+		insnCnt     uint32
+		insns       uint64
+		license     uint64
+		logLevel    uint32
+		logSize     uint32
+		logBuf      uint64
+		kernVersion uint32
+	}{
+		progType: 23, // BPF_PROG_TYPE_SK_SKB
+		insnCnt:  uint32(len(insns)),
+		insns:    uint64(uintptr(unsafe.Pointer(&insns[0]))),
+		license:  uint64(uintptr(unsafe.Pointer(&license[0]))),
+	}
+
+	fd, _, errno := syscall.Syscall(
+		unix.SYS_BPF,
+		5, // BPF_PROG_LOAD
 		uintptr(unsafe.Pointer(&attr)),
 		unsafe.Sizeof(attr),
 	)
 
-	if errno == 0 && fd > 0 {
+	if errno == 0 {
 		syscall.Close(int(fd))
 		return true
 	}
@@ -246,7 +297,7 @@ func probeTCBPFSupport() bool {
 		unsafe.Sizeof(attr),
 	)
 
-	if errno == 0 && fd > 0 {
+	if errno == 0 {
 		syscall.Close(int(fd))
 		return true
 	}
@@ -288,7 +339,7 @@ func probeReuseportBPFSupport() bool {
 		unsafe.Sizeof(attr),
 	)
 
-	if errno == 0 && fd > 0 {
+	if errno == 0 {
 		syscall.Close(int(fd))
 		return true
 	}
@@ -321,4 +372,3 @@ func checkCgroupBPF() bool {
 
 	return false
 }
-

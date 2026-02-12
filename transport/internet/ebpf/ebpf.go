@@ -7,6 +7,7 @@
 package ebpf
 
 import (
+	"strconv"
 	"sync"
 )
 
@@ -20,13 +21,13 @@ type Capabilities struct {
 	// Requires kernel 5.3+.
 	XDPRedirectSupported bool
 
-	// SockmapSupported indicates sockmap/sk_msg is available for zero-copy TCP.
-	// Requires kernel 4.17+, with improved sk_msg requiring 5.4+.
+	// SockmapSupported indicates sockmap/sk_skb is available for zero-copy TCP.
+	// Requires kernel 4.17+, with full sk_skb stream verdict requiring 5.4+.
 	SockmapSupported bool
 
-	// SockmapSKMsgSupported indicates improved sk_msg support.
-	// Requires kernel 5.4+.
-	SockmapSKMsgSupported bool
+	// SockmapSKSkbSupported indicates kernel 5.4+ sk_skb support with
+	// improved stream parser/verdict handling.
+	SockmapSKSkbSupported bool
 
 	// TCBPFSupported indicates TC BPF classifier is available.
 	// Used for routing cache acceleration.
@@ -62,9 +63,9 @@ func (v KernelVersion) AtLeast(major, minor, patch int) bool {
 	return v.Patch >= patch
 }
 
-// String returns the version as a string.
+// String returns the version as "Major.Minor.Patch".
 func (v KernelVersion) String() string {
-	return ""
+	return strconv.Itoa(v.Major) + "." + strconv.Itoa(v.Minor) + "." + strconv.Itoa(v.Patch)
 }
 
 var (

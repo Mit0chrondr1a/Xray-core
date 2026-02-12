@@ -120,6 +120,7 @@ const (
 	bpfFuncKtimeGetNs       = 5
 	bpfFuncGetSocketCookie  = 46
 	bpfFuncMsgRedirectHash  = 71
+	bpfFuncSKRedirectHash   = 72
 	bpfFuncXdpAdjustHead    = 44
 )
 

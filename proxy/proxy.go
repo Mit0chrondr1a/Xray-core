@@ -9,10 +9,10 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"math/rand/v2"
+	"crypto/rand"
+	"math/big"
 	"runtime"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -233,7 +233,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	if *withinPaddingBuffers || w.trafficState.NumberOfPacketToFilter > 0 {
-		mb2 := make(buf.MultiBuffer, 0, len(buffer))
+		mb2 := buf.GetMultiBuffer()
 		for _, b := range buffer {
 			newbuffer := XtlsUnpadding(b, w.trafficState, w.isUplink, w.ctx)
 			if newbuffer.Len() > 0 {
@@ -270,9 +270,9 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		w.rawInput = nil
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
-			if w.isUplink && inbound.CanSpliceCopy == 2 {
-				inbound.CanSpliceCopy = 1
-			}
+			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
+			// 	inbound.CanSpliceCopy = 1
+			// }
 			if !w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // ob need to be passed in due to context can have more than one ob
 				w.ob.CanSpliceCopy = 1
 			}
@@ -335,9 +335,9 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			if !w.isUplink && inbound.CanSpliceCopy == 2 {
 				inbound.CanSpliceCopy = 1
 			}
-			if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 {
-				w.ob.CanSpliceCopy = 1
-			}
+			// if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // TODO: enable uplink splice
+			// 	w.ob.CanSpliceCopy = 1
+			// }
 		}
 		rawConn, _, writerCounter := UnwrapRawConn(w.conn)
 		w.Writer = buf.NewWriter(rawConn)
@@ -395,54 +395,57 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 // IsCompleteRecord Is complete tls data record
-// Iterates over MultiBuffer segments directly without copying to a flat []byte.
 func IsCompleteRecord(buffer buf.MultiBuffer) bool {
+	b := make([]byte, buffer.Len())
+	if buffer.Copy(b) != int(buffer.Len()) {
+		panic("impossible bytes allocation")
+	}
 	var headerLen int = 5
 	var recordLen int
 
-	for _, seg := range buffer {
-		data := seg.Bytes()
-		pos := 0
-		segLen := len(data)
-		for pos < segLen {
-			if headerLen > 0 {
-				b := data[pos]
-				pos++
-				switch headerLen {
-				case 5:
-					if b != 0x17 {
-						return false
-					}
-				case 4:
-					if b != 0x03 {
-						return false
-					}
-				case 3:
-					if b != 0x03 {
-						return false
-					}
-				case 2:
-					recordLen = int(b) << 8
-				case 1:
-					recordLen = recordLen | int(b)
+	totalLen := len(b)
+	i := 0
+	for i < totalLen {
+		// record header: 0x17 0x3 0x3 + 2 bytes length
+		if headerLen > 0 {
+			data := b[i]
+			i++
+			switch headerLen {
+			case 5:
+				if data != 0x17 {
+					return false
 				}
-				headerLen--
-			} else if recordLen > 0 {
-				remaining := segLen - pos
-				if remaining >= recordLen {
-					pos += recordLen
-					recordLen = 0
-					headerLen = 5
-				} else {
-					recordLen -= remaining
-					pos = segLen // move to next segment
+			case 4:
+				if data != 0x03 {
+					return false
 				}
-			} else {
-				return false
+			case 3:
+				if data != 0x03 {
+					return false
+				}
+			case 2:
+				recordLen = int(data) << 8
+			case 1:
+				recordLen = recordLen | int(data)
 			}
+			headerLen--
+		} else if recordLen > 0 {
+			remaining := totalLen - i
+			if remaining < recordLen {
+				return false
+			} else {
+				i += recordLen
+				recordLen = 0
+				headerLen = 5
+			}
+		} else {
+			return false
 		}
 	}
-	return headerLen == 5 && recordLen == 0
+	if headerLen == 5 && recordLen == 0 {
+		return true
+	}
+	return false
 }
 
 // ReshapeMultiBuffer prepare multi buffer for padding structure (max 21 bytes)
@@ -456,8 +459,7 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 	if needReshape == 0 {
 		return buffer
 	}
-	mb2 := make(buf.MultiBuffer, 0, len(buffer)+needReshape)
-	var sb strings.Builder
+	mb2 := buf.GetMultiBuffer()
 	for i, buffer1 := range buffer {
 		if buffer1.Len() >= buf.Size-21 {
 			index := int32(bytes.LastIndex(buffer1.Bytes(), TlsApplicationDataStart))
@@ -468,19 +470,12 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 			buffer2.Write(buffer1.BytesFrom(index))
 			buffer1.Resize(0, index)
 			mb2 = append(mb2, buffer1, buffer2)
-			sb.WriteByte(' ')
-			sb.WriteString(strconv.Itoa(int(buffer1.Len())))
-			sb.WriteByte(' ')
-			sb.WriteString(strconv.Itoa(int(buffer2.Len())))
 		} else {
 			mb2 = append(mb2, buffer1)
-			sb.WriteByte(' ')
-			sb.WriteString(strconv.Itoa(int(buffer1.Len())))
 		}
 		buffer[i] = nil
 	}
 	buffer = buffer[:0]
-	errors.LogDebug(ctx, "ReshapeMultiBuffer ", sb.String())
 	return mb2
 }
 
@@ -492,9 +487,17 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 		contentLen = b.Len()
 	}
 	if contentLen < int32(testseed[0]) && longPadding {
-		paddingLen = int32(rand.IntN(int(testseed[1]))) + int32(testseed[2]) - contentLen
+		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[1])))
+		if err != nil {
+			errors.LogDebugInner(ctx, err, "failed to generate padding")
+		}
+		paddingLen = int32(l.Int64()) + int32(testseed[2]) - contentLen
 	} else {
-		paddingLen = int32(rand.IntN(int(testseed[3])))
+		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[3])))
+		if err != nil {
+			errors.LogDebugInner(ctx, err, "failed to generate padding")
+		}
+		paddingLen = int32(l.Int64())
 	}
 	if paddingLen > buf.Size-21-contentLen {
 		paddingLen = buf.Size - 21 - contentLen
@@ -504,7 +507,8 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 		newbuffer.Write(*userUUID)
 		*userUUID = nil
 	}
-	newbuffer.Write([]byte{command, byte(contentLen >> 8), byte(contentLen), byte(paddingLen >> 8), byte(paddingLen)})
+	hdr := [5]byte{command, byte(contentLen >> 8), byte(contentLen), byte(paddingLen >> 8), byte(paddingLen)}
+	newbuffer.Write(hdr[:])
 	if b != nil {
 		newbuffer.Write(b.Bytes())
 		b.Release()
@@ -721,8 +725,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 
 	for {
-		inbound := session.InboundFromContext(ctx)
-		outbounds := session.OutboundsFromContext(ctx)
 		var splice = inbound.CanSpliceCopy == 1
 		for _, ob := range outbounds {
 			if ob.CanSpliceCopy != 1 {
@@ -734,33 +736,21 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if mgr := ebpf.GlobalSockmapManager(); mgr != nil && ebpf.CanUseZeroCopy(readerConn, writerConn) {
 				if err := mgr.RegisterPair(readerConn, writerConn); err == nil {
 					errors.LogDebug(ctx, "CopyRawConn sockmap")
-					statWriter, _ := writer.(*dispatcher.SizeStatWriter)
 					timer.SetTimeout(24 * time.Hour)
 					if inTimer != nil {
 						inTimer.SetTimeout(24 * time.Hour)
 					}
-					// Sockmap handles forwarding in kernel. Block until one side closes
-					// by attempting a zero-byte read that will return on EOF/error.
-					waitBuf := make([]byte, 1)
-					_, err := readerConn.Read(waitBuf)
-					var forwarded uint64
-					if pair, ok := mgr.GetStats(readerConn, writerConn); ok {
-						forwarded = pair.BytesForwarded
+					fallbackToSplice, waitErr := waitForSockmapForwarding(readerConn, writerConn)
+					if err := mgr.UnregisterPair(readerConn, writerConn); err != nil {
+						errors.LogDebugInner(ctx, err, "CopyRawConn sockmap unregister failed")
 					}
-					mgr.UnregisterPair(readerConn, writerConn)
-					if readCounter != nil {
-						readCounter.Add(int64(forwarded))
+					if waitErr != nil {
+						errors.LogDebugInner(ctx, waitErr, "CopyRawConn sockmap wait failed, falling back to splice")
+					} else if !fallbackToSplice {
+						return nil
+					} else {
+						errors.LogDebug(ctx, "CopyRawConn sockmap inactive, falling back to splice")
 					}
-					if writeCounter != nil {
-						writeCounter.Add(int64(forwarded))
-					}
-					if statWriter != nil {
-						statWriter.Counter.Add(int64(forwarded))
-					}
-					if err != nil && errors.Cause(err) != io.EOF {
-						return err
-					}
-					return nil
 				} else {
 					errors.LogDebugInner(ctx, err, "CopyRawConn sockmap register failed, falling back to splice")
 				}

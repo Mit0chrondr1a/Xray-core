@@ -27,8 +27,18 @@ func removeFromSockmapImpl(fd int) error {
 }
 
 // setupForwardingImpl is a no-op on non-Linux systems.
-func setupForwardingImpl(inboundFD, outboundFD int) error {
+func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
 	return ErrSockmapNotSupported
+}
+
+// removeForwardingImpl is a no-op on non-Linux systems.
+func removeForwardingImpl(inboundCookie, outboundCookie uint64) error {
+	return nil
+}
+
+// getSocketCookie returns an error on non-Linux systems.
+func getSocketCookie(fd int) (uint64, error) {
+	return 0, ErrSockmapNotSupported
 }
 
 // getConnFDImpl returns an error on non-Linux systems.

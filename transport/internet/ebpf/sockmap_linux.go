@@ -5,7 +5,7 @@ package ebpf
 import (
 	"fmt"
 	"net"
-	"reflect"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -13,43 +13,70 @@ import (
 )
 
 var (
-	sockmapFD      int = -1
-	sockhashFD     int = -1
-	skMsgProgFD    int = -1
-	skMsgLinkFD    int = -1
+	sockmapFD         int = -1
+	sockhashFD        int = -1
+	skSkbParserFD     int = -1
+	skSkbVerdictFD    int = -1
+	sockmapMaxEntries uint32
+
+	sockmapSlotMu sync.Mutex
+	sockmapSlots  map[int]uint32
+	sockmapFree   []uint32
+	sockmapNext   uint32
 )
 
-// buildSKMsgProgram generates the sk_msg BPF program bytecode.
-// The program gets the socket cookie of the current message, looks it up
-// in the sockhash map, and redirects to the paired socket if found.
+// buildSKSkbParserProgram generates a minimal sk_skb stream parser that
+// accepts all available data by returning skb->len.
+//
+// Context: struct __sk_buff * (R1)
+// Return:  message length to process
+func buildSKSkbParserProgram() []bpfInsn {
+	return []bpfInsn{
+		// r0 = skb->len (__sk_buff.len is at offset 0)
+		bpfLoadMem(bpfW, bpfRegR0, bpfRegR1, 0),
+		bpfExitInsn(),
+	}
+}
+
+// buildSKSkbVerdictProgram generates the sk_skb stream verdict BPF program.
+// When data arrives on a socket in the SOCKMAP, this program fires:
+//  1. Gets the receiving socket's cookie via bpf_get_socket_cookie
+//  2. Looks up the cookie in the SOCKHASH to find the paired socket
+//  3. Redirects the data to the paired socket's egress (send) path
+//
+// This achieves true zero-copy TCP proxying — data arriving from the
+// network on one socket is forwarded directly to the paired socket
+// without ever entering userspace.
+//
+// Context: struct __sk_buff * (R1)
+// Return:  SK_PASS (1) always — on redirect failure, data proceeds normally
 //
 // Stack layout:
 //
-//	[R10-4 .. R10-1]: key (uint32 socket cookie, truncated)
-func buildSKMsgProgram() []bpfInsn {
+//	[R10-8 .. R10-1]: key (uint64 socket cookie)
+func buildSKSkbVerdictProgram() []bpfInsn {
 	const (
-		skPass = 1
-		// Stack offset for the lookup key
-		stackKey = -4
+		skPass   = 1
+		stackKey = -8
 	)
 
 	insns := []bpfInsn{
-		// r6 = ctx (sk_msg_md)
+		// r6 = skb (callee-saved)
 		bpfMovReg(bpfRegR6, bpfRegR1),
 
 		// Zero the key area on the stack
-		bpfStoreImm(bpfW, bpfRegR10, int16(stackKey), 0),
+		bpfStoreImm(bpfDW, bpfRegR10, int16(stackKey), 0),
 
-		// r1 = ctx for bpf_get_socket_cookie
+		// r1 = skb for bpf_get_socket_cookie
 		bpfMovReg(bpfRegR1, bpfRegR6),
-		// r0 = bpf_get_socket_cookie(ctx) -- helper #46
+		// r0 = bpf_get_socket_cookie(skb) — helper #46
 		bpfCallHelper(bpfFuncGetSocketCookie),
 
-		// Store lower 32 bits of cookie as key (map uses uint32 keys)
-		bpfStoreMem(bpfW, bpfRegR10, bpfRegR0, int16(stackKey)),
+		// Store full 64-bit cookie as key (map uses uint64 keys)
+		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR0, int16(stackKey)),
 
-		// Set up args for bpf_msg_redirect_hash(ctx, map, key, flags)
-		// r1 = ctx
+		// Set up args for bpf_sk_redirect_hash(skb, map, key, flags)
+		// r1 = skb
 		bpfMovReg(bpfRegR1, bpfRegR6),
 	}
 
@@ -61,15 +88,16 @@ func buildSKMsgProgram() []bpfInsn {
 		// r3 = &key (pointer to stack)
 		bpfMovReg(bpfRegR3, bpfRegR10),
 		bpfAddImm(bpfRegR3, int32(stackKey)),
-		// r4 = flags (0 = send to egress path of target socket)
+		// r4 = flags (0 = redirect to egress path of target socket)
 		bpfMovImm(bpfRegR4, 0),
-		// call bpf_msg_redirect_hash -- helper #71
-		bpfCallHelper(bpfFuncMsgRedirectHash),
+		// call bpf_sk_redirect_hash — helper #72
+		bpfCallHelper(bpfFuncSKRedirectHash),
 
 		// Always return SK_PASS.
-		// If redirect succeeded (r0 == SK_PASS), the message was forwarded.
-		// If redirect failed (r0 == SK_DROP), we still return SK_PASS to
-		// let the message proceed through the normal path.
+		// If redirect succeeded (r0 == SK_PASS), the data was forwarded
+		// to the paired socket's egress (send) path.
+		// If redirect failed (r0 == SK_DROP), we return SK_PASS so the
+		// data proceeds to the original socket (userspace fallback).
 		bpfMovImm(bpfRegR0, skPass),
 		bpfExitInsn(),
 	)
@@ -77,24 +105,24 @@ func buildSKMsgProgram() []bpfInsn {
 	return insns
 }
 
-// skMsgMapFDPlaceholder is the map fd value in the bytecode that gets replaced.
-const skMsgMapFDPlaceholder = 0
+// skSkbMapFDPlaceholder is the map fd value in the bytecode that gets replaced.
+const skSkbMapFDPlaceholder = 0
 
-// setupSockmapImpl creates the sockmap and sk_msg program.
+// setupSockmapImpl creates the sockmap, sockhash, and sk_skb programs.
 func setupSockmapImpl(config SockmapConfig) error {
-	// Create SOCKHASH map for socket lookup
+	// Create SOCKHASH map for socket cookie → socket lookup (used by verdict program)
 	hashFD, err := createBPFMap(
 		18, // BPF_MAP_TYPE_SOCKHASH
-		4,  // key size (socket cookie or similar)
-		4,  // value size (socket fd)
+		8,  // key size (uint64 cookie)
+		4,  // value size (socket fd, resolved to socket by kernel)
 		config.MaxEntries,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create sockhash map: %w", err)
 	}
-	sockhashFD = hashFD
 
-	// Create SOCKMAP for storing sockets
+	// Create SOCKMAP for storing sockets (sk_skb programs attach here;
+	// incoming data on any socket in this map triggers the programs)
 	mapFD, err := createBPFMap(
 		15, // BPF_MAP_TYPE_SOCKMAP
 		4,
@@ -105,39 +133,64 @@ func setupSockmapImpl(config SockmapConfig) error {
 		syscall.Close(hashFD)
 		return fmt.Errorf("failed to create sockmap: %w", err)
 	}
-	sockmapFD = mapFD
 
-	// Build and load sk_msg program
-	skMsgInsns := buildSKMsgProgram()
-	skMsgBytecode := encodeBPFInsns(skMsgInsns)
-	progFD, err := loadSKMsgProgram(skMsgBytecode, hashFD)
+	// Build and load sk_skb stream parser
+	parserInsns := buildSKSkbParserProgram()
+	parserBytecode := encodeBPFInsns(parserInsns)
+	parserFD, err := loadSKSkbProgram(parserBytecode, 0, "xray_skb_parse")
 	if err != nil {
 		syscall.Close(hashFD)
 		syscall.Close(mapFD)
-		return fmt.Errorf("failed to load sk_msg program: %w", err)
+		return fmt.Errorf("failed to load sk_skb parser: %w", err)
 	}
-	skMsgProgFD = progFD
 
-	// Attach sk_msg program to sockmap
-	if err := attachSKMsgToSockmap(progFD, mapFD); err != nil {
-		syscall.Close(progFD)
+	// Build and load sk_skb stream verdict
+	verdictInsns := buildSKSkbVerdictProgram()
+	verdictBytecode := encodeBPFInsns(verdictInsns)
+	verdictFD, err := loadSKSkbProgram(verdictBytecode, hashFD, "xray_skb_vrdt")
+	if err != nil {
+		syscall.Close(parserFD)
 		syscall.Close(hashFD)
 		syscall.Close(mapFD)
-		return fmt.Errorf("failed to attach sk_msg program: %w", err)
+		return fmt.Errorf("failed to load sk_skb verdict: %w", err)
 	}
+
+	// Attach both programs to sockmap
+	if err := attachSKSkbToSockmap(parserFD, verdictFD, mapFD); err != nil {
+		syscall.Close(verdictFD)
+		syscall.Close(parserFD)
+		syscall.Close(hashFD)
+		syscall.Close(mapFD)
+		return fmt.Errorf("failed to attach sk_skb programs: %w", err)
+	}
+
+	// Commit to global state only after all operations succeed.
+	// This prevents double-close if teardownSockmapImpl runs after a
+	// partial setup failure that already closed the local FDs above.
+	sockhashFD = hashFD
+	sockmapFD = mapFD
+	skSkbParserFD = parserFD
+	skSkbVerdictFD = verdictFD
+	sockmapSlotMu.Lock()
+	sockmapMaxEntries = config.MaxEntries
+	sockmapSlots = make(map[int]uint32)
+	sockmapFree = nil
+	sockmapNext = 0
+	sockmapSlotMu.Unlock()
 
 	return nil
 }
 
 // teardownSockmapImpl cleans up sockmap resources.
+// Closing the SOCKMAP fd implicitly detaches all attached programs.
 func teardownSockmapImpl() error {
-	if skMsgLinkFD >= 0 {
-		syscall.Close(skMsgLinkFD)
-		skMsgLinkFD = -1
+	if skSkbVerdictFD >= 0 {
+		syscall.Close(skSkbVerdictFD)
+		skSkbVerdictFD = -1
 	}
-	if skMsgProgFD >= 0 {
-		syscall.Close(skMsgProgFD)
-		skMsgProgFD = -1
+	if skSkbParserFD >= 0 {
+		syscall.Close(skSkbParserFD)
+		skSkbParserFD = -1
 	}
 	if sockhashFD >= 0 {
 		syscall.Close(sockhashFD)
@@ -147,6 +200,12 @@ func teardownSockmapImpl() error {
 		syscall.Close(sockmapFD)
 		sockmapFD = -1
 	}
+	sockmapSlotMu.Lock()
+	sockmapMaxEntries = 0
+	sockmapSlots = nil
+	sockmapFree = nil
+	sockmapNext = 0
+	sockmapSlotMu.Unlock()
 	return nil
 }
 
@@ -156,16 +215,22 @@ func addToSockmapImpl(fd int) error {
 		return ErrSockmapNotEnabled
 	}
 
-	// Use socket cookie as key
-	cookie, err := getSocketCookie(fd)
+	slot, created, err := assignSockmapSlot(fd)
 	if err != nil {
-		return fmt.Errorf("failed to get socket cookie: %w", err)
+		return err
 	}
 
-	key := uint32(cookie)
+	key := slot
 	value := uint32(fd)
 
-	return bpfMapUpdate(sockmapFD, unsafe.Pointer(&key), unsafe.Pointer(&value))
+	if err := bpfMapUpdate(sockmapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+		if created {
+			releaseSockmapSlot(fd)
+		}
+		return err
+	}
+
+	return nil
 }
 
 // removeFromSockmapImpl removes a socket from the sockmap.
@@ -174,52 +239,105 @@ func removeFromSockmapImpl(fd int) error {
 		return nil
 	}
 
-	cookie, err := getSocketCookie(fd)
-	if err != nil {
-		return nil // Socket may already be closed
+	key, ok := releaseSockmapSlot(fd)
+	if !ok {
+		return nil
 	}
 
-	key := uint32(cookie)
 	return bpfMapDelete(sockmapFD, unsafe.Pointer(&key))
 }
 
 // setupForwardingImpl configures bidirectional forwarding between sockets.
-func setupForwardingImpl(inboundFD, outboundFD int) error {
+// Cookies are passed from the caller to avoid redundant getsockopt(SO_COOKIE) calls.
+func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
 	if sockhashFD < 0 {
 		return ErrSockmapNotEnabled
 	}
 
-	// Add forwarding entries in sockhash
-	// inbound -> outbound
-	inboundCookie, err := getSocketCookie(inboundFD)
-	if err != nil {
-		return err
-	}
-	outboundCookie, err := getSocketCookie(outboundFD)
-	if err != nil {
-		return err
-	}
-
-	// Map inbound socket to outbound
-	key := uint32(inboundCookie)
+	// Map inbound socket to outbound using full SO_COOKIE keys.
+	inboundKey := inboundCookie
+	key := inboundKey
 	value := uint32(outboundFD)
 	if err := bpfMapUpdate(sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
 		return err
 	}
 
 	// Map outbound socket to inbound
-	key = uint32(outboundCookie)
+	key = outboundCookie
 	value = uint32(inboundFD)
-	return bpfMapUpdate(sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value))
+	if err := bpfMapUpdate(sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+		_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+		return err
+	}
+
+	return nil
 }
 
-// loadSKMsgProgram loads an sk_msg BPF program with map fd relocation.
-func loadSKMsgProgram(insns []uint64, sockhashMapFD int) (int, error) {
-	// Patch map fd placeholder with actual sockhash map fd
-	patchMapFD(insns, skMsgMapFDPlaceholder, int32(sockhashMapFD))
+// removeForwardingImpl removes bidirectional forwarding entries from sockhash.
+func removeForwardingImpl(inboundCookie, outboundCookie uint64) error {
+	if sockhashFD < 0 {
+		return nil
+	}
+
+	var firstErr error
+	key := inboundCookie
+	if err := bpfMapDelete(sockhashFD, unsafe.Pointer(&key)); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	key = outboundCookie
+	if err := bpfMapDelete(sockhashFD, unsafe.Pointer(&key)); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
+	return firstErr
+}
+
+func assignSockmapSlot(fd int) (slot uint32, created bool, err error) {
+	sockmapSlotMu.Lock()
+	defer sockmapSlotMu.Unlock()
+
+	if sockmapSlots == nil {
+		sockmapSlots = make(map[int]uint32)
+	}
+	if existing, ok := sockmapSlots[fd]; ok {
+		return existing, false, nil
+	}
+
+	if len(sockmapFree) > 0 {
+		i := len(sockmapFree) - 1
+		slot = sockmapFree[i]
+		sockmapFree = sockmapFree[:i]
+	} else {
+		if sockmapNext >= sockmapMaxEntries {
+			return 0, false, fmt.Errorf("sockmap is full (max entries %d)", sockmapMaxEntries)
+		}
+		slot = sockmapNext
+		sockmapNext++
+	}
+
+	sockmapSlots[fd] = slot
+	return slot, true, nil
+}
+
+func releaseSockmapSlot(fd int) (uint32, bool) {
+	sockmapSlotMu.Lock()
+	defer sockmapSlotMu.Unlock()
+
+	slot, ok := sockmapSlots[fd]
+	if !ok {
+		return 0, false
+	}
+	delete(sockmapSlots, fd)
+	sockmapFree = append(sockmapFree, slot)
+	return slot, true
+}
+
+// loadSKSkbProgram loads an sk_skb BPF program with optional map fd relocation.
+func loadSKSkbProgram(insns []uint64, sockhashMapFD int, name string) (int, error) {
+	// Patch map fd placeholder with actual sockhash map fd (no-op if no LD_IMM64 in insns)
+	patchMapFD(insns, skSkbMapFDPlaceholder, int32(sockhashMapFD))
 
 	license := []byte("GPL\x00")
-	logBuf := make([]byte, 65536)
 
 	attr := struct {
 		progType    uint32
@@ -233,17 +351,15 @@ func loadSKMsgProgram(insns []uint64, sockhashMapFD int) (int, error) {
 		progFlags   uint32
 		progName    [16]byte
 	}{
-		progType: 25, // BPF_PROG_TYPE_SK_MSG
+		progType: 23, // BPF_PROG_TYPE_SK_SKB
 		insnCnt:  uint32(len(insns)),
 		insns:    uint64(uintptr(unsafe.Pointer(&insns[0]))),
 		license:  uint64(uintptr(unsafe.Pointer(&license[0]))),
-		logLevel: 1,
-		logSize:  uint32(len(logBuf)),
-		logBuf:   uint64(uintptr(unsafe.Pointer(&logBuf[0]))),
 	}
 
-	copy(attr.progName[:], "xray_sk_msg")
+	copy(attr.progName[:], name)
 
+	// Fast path: try without log buffer to avoid 64KB allocation.
 	fd, _, errno := syscall.Syscall(
 		unix.SYS_BPF,
 		5, // BPF_PROG_LOAD
@@ -251,27 +367,48 @@ func loadSKMsgProgram(insns []uint64, sockhashMapFD int) (int, error) {
 		unsafe.Sizeof(attr),
 	)
 
+	if errno == 0 {
+		return int(fd), nil
+	}
+
+	// Retry with log buffer for diagnostic info on verifier rejection.
+	logBuf := make([]byte, 65536)
+	attr.logLevel = 1
+	attr.logSize = uint32(len(logBuf))
+	attr.logBuf = uint64(uintptr(unsafe.Pointer(&logBuf[0])))
+
+	fd, _, errno = syscall.Syscall(
+		unix.SYS_BPF,
+		5,
+		uintptr(unsafe.Pointer(&attr)),
+		unsafe.Sizeof(attr),
+	)
 	if errno != 0 {
-		// Try again without log buffer
-		attr.logLevel = 0
-		attr.logSize = 0
-		attr.logBuf = 0
-		fd, _, errno = syscall.Syscall(
-			unix.SYS_BPF,
-			5,
-			uintptr(unsafe.Pointer(&attr)),
-			unsafe.Sizeof(attr),
-		)
-		if errno != 0 {
-			return -1, fmt.Errorf("BPF_PROG_LOAD sk_msg: %w", errno)
-		}
+		return -1, fmt.Errorf("BPF_PROG_LOAD %s: %w", name, errno)
 	}
 
 	return int(fd), nil
 }
 
-// attachSKMsgToSockmap attaches an sk_msg program to a sockmap.
-func attachSKMsgToSockmap(progFD, mapFD int) error {
+// attachSKSkbToSockmap attaches sk_skb stream parser and verdict to a sockmap.
+func attachSKSkbToSockmap(parserFD, verdictFD, mapFD int) error {
+	// Attach parser (BPF_SK_SKB_STREAM_PARSER = 4)
+	if err := attachBPFProgToMap(mapFD, parserFD, 4); err != nil {
+		return fmt.Errorf("parser: %w", err)
+	}
+
+	// Attach verdict (BPF_SK_SKB_STREAM_VERDICT = 5)
+	if err := attachBPFProgToMap(mapFD, verdictFD, 5); err != nil {
+		// Detach parser on partial failure to leave sockmap in clean state.
+		detachBPFProgFromMap(mapFD, parserFD, 4)
+		return fmt.Errorf("verdict: %w", err)
+	}
+
+	return nil
+}
+
+// detachBPFProgFromMap detaches a BPF program from a map. Best-effort.
+func detachBPFProgFromMap(mapFD, progFD int, attachType uint32) {
 	attr := struct {
 		targetFD    uint32
 		attachBPFFD uint32
@@ -280,7 +417,28 @@ func attachSKMsgToSockmap(progFD, mapFD int) error {
 	}{
 		targetFD:    uint32(mapFD),
 		attachBPFFD: uint32(progFD),
-		attachType:  6, // BPF_SK_MSG_VERDICT
+		attachType:  attachType,
+	}
+
+	syscall.Syscall(
+		unix.SYS_BPF,
+		9, // BPF_PROG_DETACH
+		uintptr(unsafe.Pointer(&attr)),
+		unsafe.Sizeof(attr),
+	)
+}
+
+// attachBPFProgToMap attaches a BPF program to a map with the given attach type.
+func attachBPFProgToMap(mapFD, progFD int, attachType uint32) error {
+	attr := struct {
+		targetFD    uint32
+		attachBPFFD uint32
+		attachType  uint32
+		attachFlags uint32
+	}{
+		targetFD:    uint32(mapFD),
+		attachBPFFD: uint32(progFD),
+		attachType:  attachType,
 	}
 
 	_, _, errno := syscall.Syscall(
@@ -343,35 +501,9 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	if fd < 0 {
+		return -1, fmt.Errorf("invalid socket fd: %d", fd)
+	}
 
 	return fd, nil
-}
-
-// getConnFDReflect gets fd using reflection as a fallback.
-func getConnFDReflect(conn net.Conn) (int, error) {
-	// Use reflection to access private fields
-	v := reflect.ValueOf(conn)
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
-	}
-
-	// Look for "conn" or "fd" field
-	for _, name := range []string{"conn", "fd", "netFD"} {
-		f := v.FieldByName(name)
-		if f.IsValid() {
-			if f.Kind() == reflect.Ptr {
-				f = f.Elem()
-			}
-			// Look for pfd or sysfd
-			pfd := f.FieldByName("pfd")
-			if pfd.IsValid() {
-				sysfd := pfd.FieldByName("Sysfd")
-				if sysfd.IsValid() && sysfd.CanInt() {
-					return int(sysfd.Int()), nil
-				}
-			}
-		}
-	}
-
-	return -1, fmt.Errorf("could not extract file descriptor from connection")
 }

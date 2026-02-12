@@ -27,6 +27,10 @@ type SockPair struct {
 	InboundConn net.Conn
 	// OutboundConn is the outbound connection (server side).
 	OutboundConn net.Conn
+	// InboundCookie is the stable socket cookie used for sockhash cleanup.
+	InboundCookie uint64
+	// OutboundCookie is the stable socket cookie used for sockhash cleanup.
+	OutboundCookie uint64
 	// BytesForwarded is the total bytes forwarded.
 	BytesForwarded uint64
 	// Active indicates if the pair is actively proxying.
@@ -106,10 +110,13 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 		OutboundFD: outboundFD,
 	}
 
-	pair := &SockPair{
-		InboundConn:  inbound,
-		OutboundConn: outbound,
-		Active:       true,
+	inboundCookie, err := getSocketCookie(inboundFD)
+	if err != nil {
+		return err
+	}
+	outboundCookie, err := getSocketCookie(outboundFD)
+	if err != nil {
+		return err
 	}
 
 	// Add both sockets to sockmap
@@ -121,11 +128,20 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 		return err
 	}
 
-	// Setup sk_msg program to forward data
-	if err := m.setupForwarding(inboundFD, outboundFD); err != nil {
+	// Setup sk_skb verdict program to forward data.
+	// Pass cookies already obtained above to avoid redundant getsockopt(SO_COOKIE).
+	if err := m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie); err != nil {
 		m.removeFromSockmap(inboundFD)
 		m.removeFromSockmap(outboundFD)
 		return err
+	}
+
+	pair := &SockPair{
+		InboundConn:    inbound,
+		OutboundConn:   outbound,
+		InboundCookie:  inboundCookie,
+		OutboundCookie: outboundCookie,
+		Active:         true,
 	}
 
 	m.pairs[key] = pair
@@ -162,27 +178,36 @@ func (m *SockmapManager) unregisterPairLocked(key SockPairKey) error {
 		return nil
 	}
 
+	var firstErr error
 	pair.Active = false
-	m.removeFromSockmap(key.InboundFD)
-	m.removeFromSockmap(key.OutboundFD)
+	if err := m.removeForwarding(pair.InboundCookie, pair.OutboundCookie); err != nil {
+		firstErr = err
+	}
+	if err := m.removeFromSockmap(key.InboundFD); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := m.removeFromSockmap(key.OutboundFD); err != nil && firstErr == nil {
+		firstErr = err
+	}
 
 	delete(m.pairs, key)
-	return nil
+	return firstErr
 }
 
-// GetStats returns statistics for a socket pair.
-func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (*SockPair, bool) {
+// GetStats returns a snapshot of statistics for a socket pair.
+// The returned SockPair is a copy; callers cannot mutate internal state.
+func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (SockPair, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	inboundFD, err := getConnFD(inbound)
 	if err != nil {
-		return nil, false
+		return SockPair{}, false
 	}
 
 	outboundFD, err := getConnFD(outbound)
 	if err != nil {
-		return nil, false
+		return SockPair{}, false
 	}
 
 	key := SockPairKey{
@@ -191,7 +216,10 @@ func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (*SockPair, bool) 
 	}
 
 	pair, ok := m.pairs[key]
-	return pair, ok
+	if !ok {
+		return SockPair{}, false
+	}
+	return *pair, true
 }
 
 // IsEnabled returns true if sockmap proxying is active.
@@ -232,6 +260,10 @@ func (m *SockmapManager) removeFromSockmap(fd int) error {
 	return removeFromSockmapImpl(fd)
 }
 
-func (m *SockmapManager) setupForwarding(inboundFD, outboundFD int) error {
-	return setupForwardingImpl(inboundFD, outboundFD)
+func (m *SockmapManager) setupForwarding(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
+	return setupForwardingImpl(inboundFD, outboundFD, inboundCookie, outboundCookie)
+}
+
+func (m *SockmapManager) removeForwarding(inboundCookie, outboundCookie uint64) error {
+	return removeForwardingImpl(inboundCookie, outboundCookie)
 }
