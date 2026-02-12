@@ -56,6 +56,13 @@ type cryptoInfoChaCha20Poly1305 struct {
 	RecSeq     [8]byte
 }
 
+// Compile-time assertions: verify struct sizes match kernel ABI.
+var (
+	_ [40]byte = [unsafe.Sizeof(cryptoInfoAESGCM128{})]byte{}
+	_ [56]byte = [unsafe.Sizeof(cryptoInfoAESGCM256{})]byte{}
+	_ [56]byte = [unsafe.Sizeof(cryptoInfoChaCha20Poly1305{})]byte{}
+)
+
 // KTLSState tracks the kTLS state for a connection.
 type KTLSState struct {
 	Enabled bool
@@ -110,9 +117,11 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 
 	// Set TCP_ULP to "tls"
 	var ulpErr error
-	rawConn.Control(func(fd uintptr) {
+	if err := rawConn.Control(func(fd uintptr) {
 		ulpErr = syscall.SetsockoptString(int(fd), syscall.SOL_TCP, unix.TCP_ULP, "tls")
-	})
+	}); err != nil {
+		return state
+	}
 	if ulpErr != nil {
 		return state
 	}
@@ -120,18 +129,22 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 	state.Enabled = true
 
 	// Configure TX (send direction)
-	rawConn.Control(func(fd uintptr) {
+	if err := rawConn.Control(func(fd uintptr) {
 		if err := setKTLSCryptoInfo(int(fd), TLS_TX, tlsVersion, cs.CipherSuite, keys.txKey, keys.txIV, keys.txSeq); err == nil {
 			state.TxReady = true
 		}
-	})
+	}); err != nil {
+		return state
+	}
 
 	// Configure RX (receive direction)
-	rawConn.Control(func(fd uintptr) {
+	if err := rawConn.Control(func(fd uintptr) {
 		if err := setKTLSCryptoInfo(int(fd), TLS_RX, tlsVersion, cs.CipherSuite, keys.rxKey, keys.rxIV, keys.rxSeq); err == nil {
 			state.RxReady = true
 		}
-	})
+	}); err != nil {
+		return state
+	}
 
 	return state
 }
@@ -268,6 +281,23 @@ func fieldToBytes(v reflect.Value) []byte {
 	return nil
 }
 
+// setKTLSSockopt performs the setsockopt syscall for kTLS crypto info.
+func setKTLSSockopt(fd int, direction int, info unsafe.Pointer, size uintptr) error {
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_SETSOCKOPT,
+		uintptr(fd),
+		uintptr(SOL_TLS),
+		uintptr(direction),
+		uintptr(info),
+		size,
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 // setKTLSCryptoInfo configures kTLS for one direction (TX or RX).
 func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16, key, iv, seq []byte) error {
 	switch cipherSuite {
@@ -291,19 +321,7 @@ func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16
 		if seq != nil {
 			copy(info.RecSeq[:], seq)
 		}
-		_, _, errno := syscall.Syscall6(
-			syscall.SYS_SETSOCKOPT,
-			uintptr(fd),
-			uintptr(SOL_TLS),
-			uintptr(direction),
-			uintptr(unsafe.Pointer(&info)),
-			unsafe.Sizeof(info),
-			0,
-		)
-		if errno != 0 {
-			return errno
-		}
-		return nil
+		return setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
 
 	case tls.TLS_AES_256_GCM_SHA384,
 		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
@@ -323,19 +341,7 @@ func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16
 		if seq != nil {
 			copy(info.RecSeq[:], seq)
 		}
-		_, _, errno := syscall.Syscall6(
-			syscall.SYS_SETSOCKOPT,
-			uintptr(fd),
-			uintptr(SOL_TLS),
-			uintptr(direction),
-			uintptr(unsafe.Pointer(&info)),
-			unsafe.Sizeof(info),
-			0,
-		)
-		if errno != 0 {
-			return errno
-		}
-		return nil
+		return setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
 
 	case tls.TLS_CHACHA20_POLY1305_SHA256,
 		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
@@ -354,19 +360,7 @@ func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16
 		if seq != nil {
 			copy(info.RecSeq[:], seq)
 		}
-		_, _, errno := syscall.Syscall6(
-			syscall.SYS_SETSOCKOPT,
-			uintptr(fd),
-			uintptr(SOL_TLS),
-			uintptr(direction),
-			uintptr(unsafe.Pointer(&info)),
-			unsafe.Sizeof(info),
-			0,
-		)
-		if errno != 0 {
-			return errno
-		}
-		return nil
+		return setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
 
 	default:
 		return fmt.Errorf("unsupported cipher suite for kTLS: 0x%04x", cipherSuite)

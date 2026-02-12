@@ -170,19 +170,24 @@ func (h *Hub) startBatch() {
 }
 
 // sockaddrToUDPAddr converts a raw sockaddr to *net.UDPAddr.
+// The IP bytes are copied because the sockaddr buffer is reused across batches.
 func sockaddrToUDPAddr(sa *unix.RawSockaddrInet6) *net.UDPAddr {
 	// Check if it's IPv4 (family == AF_INET)
 	if sa.Family == unix.AF_INET {
 		sa4 := (*unix.RawSockaddrInet4)(unsafe.Pointer(sa))
+		ip := make(net.IP, net.IPv4len)
+		copy(ip, sa4.Addr[:])
 		return &net.UDPAddr{
-			IP:   net.IP(sa4.Addr[:]),
+			IP:   ip,
 			Port: int(sa4.Port>>8) | int(sa4.Port&0xff)<<8, // network byte order
 		}
 	}
 	// IPv6
 	if sa.Family == unix.AF_INET6 {
+		ip := make(net.IP, net.IPv6len)
+		copy(ip, sa.Addr[:])
 		return &net.UDPAddr{
-			IP:   net.IP(sa.Addr[:]),
+			IP:   ip,
 			Port: int(sa.Port>>8) | int(sa.Port&0xff)<<8, // network byte order
 		}
 	}
