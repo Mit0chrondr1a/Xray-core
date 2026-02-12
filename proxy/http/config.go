@@ -1,6 +1,7 @@
 package http
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 
 	"google.golang.org/protobuf/proto"
@@ -30,8 +31,15 @@ func (sc *ServerConfig) HasAccount(username, password string) bool {
 
 	p, found := sc.Accounts[username]
 	if !found {
-		subtle.ConstantTimeCompare([]byte(password), []byte(password))
-		return false
+		p = password // dummy: prevent username enumeration timing
 	}
-	return subtle.ConstantTimeCompare([]byte(p), []byte(password)) == 1
+
+	// Hash both to fixed-length to prevent length-based timing leaks.
+	// subtle.ConstantTimeCompare returns 0 immediately for different-length
+	// inputs, so raw comparison would leak stored password length.
+	storedHash := sha256.Sum256([]byte(p))
+	inputHash := sha256.Sum256([]byte(password))
+
+	passwordMatch := subtle.ConstantTimeCompare(storedHash[:], inputHash[:]) == 1
+	return passwordMatch && found
 }

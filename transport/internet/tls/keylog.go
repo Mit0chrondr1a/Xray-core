@@ -44,3 +44,14 @@ func MasterKeyLogWriter(path string) io.Writer {
 	masterKeyLogWriters.writers[path] = writer
 	return writer
 }
+
+// CloseMasterKeyLogWriters closes all cached key log file handles.
+// Should be called during process shutdown.
+func CloseMasterKeyLogWriters() {
+	masterKeyLogWriters.Lock()
+	defer masterKeyLogWriters.Unlock()
+	for path, writer := range masterKeyLogWriters.writers {
+		writer.Close()
+		delete(masterKeyLogWriters.writers, path)
+	}
+}
