@@ -117,7 +117,14 @@ func (r *ReadVReader) readMulti() (MultiBuffer, error) {
 		bs[i] = nil
 	}
 
-	return MultiBuffer(bs[:nBuf]), nil
+	// Return an owned slice so callers can retain/release it safely.
+	// bs points to r.bufs backing array, which is reused on next read.
+	mb := make(MultiBuffer, nBuf)
+	copy(mb, bs[:nBuf])
+	for i := 0; i < nBuf; i++ {
+		bs[i] = nil
+	}
+	return mb, nil
 }
 
 // ReadMultiBuffer implements Reader.
