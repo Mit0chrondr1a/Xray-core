@@ -54,13 +54,20 @@ func (h *SessionHistory) Close() error {
 }
 
 func (h *SessionHistory) addIfNotExits(session sessionID) bool {
-	h.Lock()
+	// Fast path: check under read lock (common case — no replay).
+	h.RLock()
+	if expire, found := h.cache[session]; found && expire.After(time.Now()) {
+		h.RUnlock()
+		return false
+	}
+	h.RUnlock()
 
+	// Slow path: insert under write lock.
+	h.Lock()
 	if expire, found := h.cache[session]; found && expire.After(time.Now()) {
 		h.Unlock()
 		return false
 	}
-
 	h.cache[session] = time.Now().Add(time.Minute * 3)
 	h.Unlock()
 	common.Must(h.task.Start())

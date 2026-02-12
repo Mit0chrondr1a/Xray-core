@@ -278,9 +278,20 @@ type udpWorker struct {
 }
 
 func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
+	// Fast path: check existing connection under read lock.
+	w.RLock()
+	if conn, found := w.activeConn[id]; found && !conn.done.Done() {
+		conn.updateActivity()
+		w.RUnlock()
+		return conn, true
+	}
+	w.RUnlock()
+
+	// Slow path: create new connection under write lock.
 	w.Lock()
 	defer w.Unlock()
 
+	// Double-check after acquiring write lock.
 	if conn, found := w.activeConn[id]; found && !conn.done.Done() {
 		conn.updateActivity()
 		return conn, true
