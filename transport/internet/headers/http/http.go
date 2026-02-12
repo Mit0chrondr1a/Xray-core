@@ -57,6 +57,51 @@ type HeaderReader struct {
 	expectedHeader *RequestConfig
 }
 
+func matchRequestHeader(req *http.Request, expected *Header) bool {
+	var actualValues []string
+	if strings.EqualFold(expected.GetName(), "host") {
+		if req.Host != "" {
+			actualValues = []string{req.Host}
+		}
+	} else {
+		actualValues = req.Header.Values(expected.GetName())
+	}
+	if len(actualValues) == 0 {
+		return false
+	}
+	if len(expected.GetValue()) == 0 {
+		return true
+	}
+	allowed := make(map[string]struct{}, len(expected.GetValue()))
+	for _, rawExpected := range expected.GetValue() {
+		allowed[strings.TrimSpace(rawExpected)] = struct{}{}
+	}
+	for _, rawActual := range actualValues {
+		for _, candidate := range strings.Split(rawActual, ",") {
+			if _, ok := allowed[strings.TrimSpace(candidate)]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isStrictMatchMarker(expected *Header) bool {
+	if !strings.EqualFold(expected.GetName(), StrictMatchMarkerHeaderName) {
+		return false
+	}
+	values := expected.GetValue()
+	if len(values) == 0 {
+		return true
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == StrictMatchMarkerHeaderValue {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *HeaderReader) ExpectThisRequest(expectedHeader *RequestConfig) *HeaderReader {
 	h.expectedHeader = expectedHeader
 	return h
@@ -126,6 +171,26 @@ func (h *HeaderReader) Read(reader io.Reader) (*buf.Buffer, error) {
 
 	if !hasThisURI {
 		return nil, ErrHeaderMisMatch
+	}
+	strictMatch := false
+	for _, expected := range h.expectedHeader.GetHeader() {
+		if isStrictMatchMarker(expected) {
+			strictMatch = true
+			break
+		}
+	}
+	if strictMatch {
+		if method := h.expectedHeader.GetMethod(); method != nil && !strings.EqualFold(h.req.Method, method.GetValue()) {
+			return nil, ErrHeaderMisMatch
+		}
+		for _, expected := range h.expectedHeader.GetHeader() {
+			if isStrictMatchMarker(expected) {
+				continue
+			}
+			if !matchRequestHeader(h.req, expected) {
+				return nil, ErrHeaderMisMatch
+			}
+		}
 	}
 
 	if buffer.IsEmpty() {

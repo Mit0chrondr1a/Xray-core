@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -29,6 +30,7 @@ const (
 
 type SocksServerConfig struct {
 	AuthMethod string          `json:"auth"`
+	StrictAuth bool            `json:"strictAuth"`
 	Accounts   []*SocksAccount `json:"accounts"`
 	UDP        bool            `json:"udp"`
 	Host       *Address        `json:"ip"`
@@ -38,12 +40,15 @@ type SocksServerConfig struct {
 func (v *SocksServerConfig) Build() (proto.Message, error) {
 	config := new(socks.ServerConfig)
 	switch v.AuthMethod {
-	case AuthMethodNoAuth:
+	case "", AuthMethodNoAuth:
 		config.AuthType = socks.AuthType_NO_AUTH
 	case AuthMethodUserPass:
 		config.AuthType = socks.AuthType_PASSWORD
 	default:
-		// errors.New("unknown socks auth method: ", v.AuthMethod, ". Default to noauth.").AtWarning().WriteToLog()
+		if v.StrictAuth {
+			return nil, errors.New("unknown socks auth method: ", v.AuthMethod, ". Allowed values are ", AuthMethodNoAuth, " and ", AuthMethodUserPass).AtError()
+		}
+		errors.LogWarning(context.Background(), "unknown socks auth method: ", v.AuthMethod, ". Default to ", AuthMethodNoAuth)
 		config.AuthType = socks.AuthType_NO_AUTH
 	}
 

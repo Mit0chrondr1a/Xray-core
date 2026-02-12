@@ -58,6 +58,26 @@ func TestRequestHeader(t *testing.T) {
 	}
 }
 
+func TestRequestHeaderSkipsStrictMarker(t *testing.T) {
+	auth, err := NewAuthenticator(context.Background(), &Config{
+		Request: &RequestConfig{
+			Uri: []string{"/"},
+			Header: []*Header{
+				{Name: StrictMatchMarkerHeaderName, Value: []string{StrictMatchMarkerHeaderValue}},
+			},
+		},
+	})
+	common.Must(err)
+
+	cache := buf.New()
+	err = auth.GetClientWriter().Write(cache)
+	common.Must(err)
+
+	if strings.Contains(cache.String(), StrictMatchMarkerHeaderName) {
+		t.Fatalf("strict marker must not be sent to remote peer: %q", cache.String())
+	}
+}
+
 func TestLongRequestHeader(t *testing.T) {
 	payload := make([]byte, buf.Size+2)
 	common.Must2(rand.Read(payload[:buf.Size-2]))
@@ -301,5 +321,50 @@ func TestConnectionInvReq(t *testing.T) {
 	common.Must(err)
 	if !strings.HasPrefix(string(l), "HTTP/1.1 400 Bad Request") {
 		t.Error("Resp to non http conn", string(l))
+	}
+}
+
+func TestHeaderReaderStrictMatchDisabled(t *testing.T) {
+	reader := new(HeaderReader).ExpectThisRequest(&RequestConfig{
+		Method: &Method{Value: "POST"},
+		Uri:    []string{"/strict"},
+		Header: []*Header{{Name: "Host", Value: []string{"expected.example"}}},
+	})
+
+	buffer, err := reader.Read(bytes.NewBufferString("GET /strict HTTP/1.1\r\nHost: other.example\r\n\r\npayload"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := buffer.String(); got != "payload" {
+		t.Fatalf("unexpected payload: %q", got)
+	}
+	buffer.Release()
+}
+
+func TestHeaderReaderStrictMatchEnabled(t *testing.T) {
+	config := &RequestConfig{
+		Method: &Method{Value: "POST"},
+		Uri:    []string{"/strict"},
+		Header: []*Header{
+			{Name: "Host", Value: []string{"expected.example"}},
+			{Name: "User-Agent", Value: []string{"Strict-UA"}},
+			{Name: StrictMatchMarkerHeaderName, Value: []string{StrictMatchMarkerHeaderValue}},
+		},
+	}
+
+	reader := new(HeaderReader).ExpectThisRequest(config)
+	buffer, err := reader.Read(bytes.NewBufferString("POST /strict HTTP/1.1\r\nHost: expected.example\r\nUser-Agent: Strict-UA\r\n\r\npayload"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := buffer.String(); got != "payload" {
+		t.Fatalf("unexpected payload: %q", got)
+	}
+	buffer.Release()
+
+	reader = new(HeaderReader).ExpectThisRequest(config)
+	_, err = reader.Read(bytes.NewBufferString("POST /strict HTTP/1.1\r\nHost: wrong.example\r\nUser-Agent: Strict-UA\r\n\r\npayload"))
+	if err != ErrHeaderMisMatch {
+		t.Fatalf("expected %v, got %v", ErrHeaderMisMatch, err)
 	}
 }

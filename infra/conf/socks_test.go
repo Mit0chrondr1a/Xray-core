@@ -18,9 +18,22 @@ func TestSocksInboundConfig(t *testing.T) {
 	runMultiTestCase(t, []TestCase{
 		{
 			Input: `{
-				"auth": "password",
-				"accounts": [
-					{
+					"auth": "invalid",
+					"udp": true,
+					"userLevel": 2
+				}`,
+			Parser: loadJSON(creator),
+			Output: &socks.ServerConfig{
+				AuthType:   socks.AuthType_NO_AUTH,
+				UdpEnabled: true,
+				UserLevel:  2,
+			},
+		},
+		{
+			Input: `{
+					"auth": "password",
+					"accounts": [
+						{
 						"user": "my-username",
 						"pass": "my-password"
 					}
@@ -45,6 +58,21 @@ func TestSocksInboundConfig(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestSocksInboundConfigStrictAuthRejectsUnknown(t *testing.T) {
+	creator := func() Buildable {
+		return new(SocksServerConfig)
+	}
+
+	parser := loadJSON(creator)
+	_, err := parser(`{
+		"auth": "invalid",
+		"strictAuth": true
+	}`)
+	if err == nil {
+		t.Fatal("expected strictAuth to reject unknown auth value")
+	}
 }
 
 func TestSocksOutboundConfig(t *testing.T) {

@@ -6,6 +6,11 @@ import (
 	"github.com/xtls/xray-core/common/dice"
 )
 
+const (
+	StrictMatchMarkerHeaderName  = "X-Xray-Internal-Strict-Match"
+	StrictMatchMarkerHeaderValue = "1"
+)
+
 func pickString(arr []string) string {
 	n := len(arr)
 	switch n {
@@ -30,10 +35,20 @@ func (v *RequestConfig) PickHeaders() []string {
 	headers := make([]string, n)
 	for idx, headerConfig := range v.Header {
 		headerName := headerConfig.Name
+		if strings.EqualFold(headerName, StrictMatchMarkerHeaderName) {
+			continue
+		}
 		headerValue := pickString(headerConfig.Value)
 		headers[idx] = headerName + ": " + headerValue
 	}
-	return headers
+	out := headers[:0]
+	for _, h := range headers {
+		if h == "" {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
 }
 
 func (v *RequestConfig) GetVersionValue() string {

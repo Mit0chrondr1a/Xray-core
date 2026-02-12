@@ -2,6 +2,7 @@ package conf
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/utils"
@@ -21,6 +22,7 @@ type AuthenticatorRequest struct {
 	Method  string                 `json:"method"`
 	Path    StringList             `json:"path"`
 	Headers map[string]*StringList `json:"headers"`
+	Strict  bool                   `json:"strict"`
 }
 
 func sortMapKeys(m map[string]*StringList) []string {
@@ -75,6 +77,9 @@ func (v *AuthenticatorRequest) Build() (*http.RequestConfig, error) {
 		config.Header = make([]*http.Header, 0, len(v.Headers))
 		headerNames := sortMapKeys(v.Headers)
 		for _, key := range headerNames {
+			if strings.EqualFold(key, http.StrictMatchMarkerHeaderName) {
+				return nil, errors.New("reserved HTTP header name: " + key).AtError()
+			}
 			value := v.Headers[key]
 			if value == nil {
 				return nil, errors.New("empty HTTP header value: " + key).AtError()
@@ -84,6 +89,12 @@ func (v *AuthenticatorRequest) Build() (*http.RequestConfig, error) {
 				Value: append([]string(nil), (*value)...),
 			})
 		}
+	}
+	if v.Strict {
+		config.Header = append(config.Header, &http.Header{
+			Name:  http.StrictMatchMarkerHeaderName,
+			Value: []string{http.StrictMatchMarkerHeaderValue},
+		})
 	}
 
 	return config, nil
