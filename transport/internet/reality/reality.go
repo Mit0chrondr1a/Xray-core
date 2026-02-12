@@ -24,6 +24,7 @@ import (
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/reality"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -36,6 +37,27 @@ import (
 
 type Conn struct {
 	*reality.Conn
+}
+
+var (
+	maxRealitySpiderResponseBytes int64 = 1 * 1024 * 1024
+	maxRealitySpiderPaths               = 4096
+)
+
+func readSpiderBody(reader io.Reader) ([]byte, error) {
+	return buf.ReadAllLimitedToBytes(reader, maxRealitySpiderResponseBytes)
+}
+
+func addSpiderPaths(paths map[string]struct{}, body []byte, prefix []byte) {
+	for _, m := range href.FindAllSubmatch(body, -1) {
+		if len(paths) >= maxRealitySpiderPaths {
+			return
+		}
+		m[1] = bytes.TrimPrefix(m[1], prefix)
+		if !bytes.Contains(m[1], dot) {
+			paths[string(m[1])] = struct{}{}
+		}
+	}
 }
 
 func (c *Conn) HandshakeAddress() net.Address {
@@ -241,16 +263,11 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					}
 					defer resp.Body.Close()
 					req.Header.Set("Referer", req.URL.String())
-					if body, err = io.ReadAll(resp.Body); err != nil {
+					if body, err = readSpiderBody(resp.Body); err != nil {
 						break
 					}
 					maps.Lock()
-					for _, m := range href.FindAllSubmatch(body, -1) {
-						m[1] = bytes.TrimPrefix(m[1], prefix)
-						if !bytes.Contains(m[1], dot) {
-							paths[string(m[1])] = struct{}{}
-						}
-					}
+					addSpiderPaths(paths, body, prefix)
 					req.URL.Path = getPathLocked(paths)
 					if config.Show {
 						fmt.Printf("REALITY localAddr: %v\treq.Referer(): %v\n", localAddr, req.Referer())

@@ -35,10 +35,11 @@ type ConfigBuilder func(files []*ConfigSource) (*Config, error)
 type ConfigsMerger func(files []*ConfigSource) (string, error)
 
 var (
-	configLoaderByName    = make(map[string]*ConfigFormat)
-	configLoaderByExt     = make(map[string]*ConfigFormat)
-	ConfigBuilderForFiles ConfigBuilder
-	ConfigMergedFormFiles ConfigsMerger
+	configLoaderByName     = make(map[string]*ConfigFormat)
+	configLoaderByExt      = make(map[string]*ConfigFormat)
+	ConfigBuilderForFiles  ConfigBuilder
+	ConfigMergedFormFiles  ConfigsMerger
+	maxProtobufConfigBytes int64 = 16 * 1024 * 1024
 )
 
 // RegisterConfigLoader add a new ConfigLoader.
@@ -175,13 +176,19 @@ func init() {
 			switch v := input.(type) {
 			case cmdarg.Arg:
 				r, err := confloader.LoadConfig(v[0])
-				common.Must(err)
-				data, err := buf.ReadAllToBytes(r)
-				common.Must(err)
+				if err != nil {
+					return nil, err
+				}
+				data, err := buf.ReadAllLimitedToBytes(r, maxProtobufConfigBytes)
+				if err != nil {
+					return nil, errors.New("protobuf config is too large, max bytes: ", maxProtobufConfigBytes).Base(err)
+				}
 				return loadProtobufConfig(data)
 			case io.Reader:
-				data, err := buf.ReadAllToBytes(v)
-				common.Must(err)
+				data, err := buf.ReadAllLimitedToBytes(v, maxProtobufConfigBytes)
+				if err != nil {
+					return nil, errors.New("protobuf config is too large, max bytes: ", maxProtobufConfigBytes).Base(err)
+				}
 				return loadProtobufConfig(data)
 			default:
 				return nil, errors.New("unknown type")

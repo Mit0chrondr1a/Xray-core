@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"io"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -124,6 +125,22 @@ func TestMultiBufferReadAllToByte(t *testing.T) {
 		if d := cmp.Diff(buf2, cnt); d != "" {
 			t.Error("fail to read from file: ", d)
 		}
+	}
+}
+
+func TestMultiBufferReadAllLimitedToBytes(t *testing.T) {
+	data, err := ReadAllLimitedToBytes(strings.NewReader("abcd"), 4)
+	common.Must(err)
+	if got := string(data); got != "abcd" {
+		t.Fatalf("unexpected data: %q", got)
+	}
+
+	if _, err := ReadAllLimitedToBytes(strings.NewReader("abcde"), 4); err == nil {
+		t.Fatal("expected limit error")
+	}
+
+	if _, err := ReadAllLimitedToBytes(strings.NewReader(""), 0); err == nil {
+		t.Fatal("expected invalid max bytes error")
 	}
 }
 

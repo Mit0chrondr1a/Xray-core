@@ -12,6 +12,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
@@ -35,6 +36,8 @@ type DoHNameServer struct {
 	dohURL          string
 	clientIP        net.IP
 }
+
+var maxDoHResponseBytes int64 = 1 * 1024 * 1024
 
 // NewDoHNameServer creates DOH/DOHL client object for remote/local resolving.
 func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) *DoHNameServer {
@@ -230,7 +233,7 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 		return nil, fmt.Errorf("DOH server returned code %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	return buf.ReadAllLimitedToBytes(resp.Body, maxDoHResponseBytes)
 }
 
 // QueryIP implements Server.

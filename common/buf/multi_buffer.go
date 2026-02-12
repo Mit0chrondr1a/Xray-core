@@ -49,6 +49,23 @@ func ReadAllToBytes(reader io.Reader) ([]byte, error) {
 	return b, nil
 }
 
+// ReadAllLimitedToBytes reads content from reader with an upper size bound.
+// It returns an error once the payload exceeds maxBytes.
+func ReadAllLimitedToBytes(reader io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, errors.New("invalid max bytes: ", maxBytes)
+	}
+
+	data, err := ReadAllToBytes(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errors.New("input too large, max bytes: ", maxBytes)
+	}
+	return data, nil
+}
+
 // MultiBuffer is a list of Buffers. The order of Buffer matters.
 type MultiBuffer []*Buffer
 

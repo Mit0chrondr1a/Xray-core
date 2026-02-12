@@ -7,11 +7,14 @@ import (
 
 	"github.com/ghodss/yaml"
 	"github.com/pelletier/go-toml"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf"
 	json_reader "github.com/xtls/xray-core/infra/conf/json"
 )
+
+var maxSerializedConfigBytes int64 = 16 * 1024 * 1024
 
 type offset struct {
 	line int
@@ -45,9 +48,13 @@ func findOffset(b []byte, o int) *offset {
 func DecodeJSONConfig(reader io.Reader) (*conf.Config, error) {
 	jsonConfig := &conf.Config{}
 
-	jsonContent := bytes.NewBuffer(make([]byte, 0, 10240))
+	rawJSON, err := buf.ReadAllLimitedToBytes(reader, maxSerializedConfigBytes)
+	if err != nil {
+		return nil, errors.New("failed to read config file").Base(err)
+	}
+	jsonContent := bytes.NewBuffer(make([]byte, 0, min(len(rawJSON), 10240)))
 	jsonReader := io.TeeReader(&json_reader.Reader{
-		Reader: reader,
+		Reader: bytes.NewReader(rawJSON),
 	}, jsonContent)
 	decoder := json.NewDecoder(jsonReader)
 
@@ -86,7 +93,7 @@ func LoadJSONConfig(reader io.Reader) (*core.Config, error) {
 // DecodeTOMLConfig reads from reader and decode the config into *conf.Config
 // using github.com/pelletier/go-toml and map to convert toml to json.
 func DecodeTOMLConfig(reader io.Reader) (*conf.Config, error) {
-	tomlFile, err := io.ReadAll(reader)
+	tomlFile, err := buf.ReadAllLimitedToBytes(reader, maxSerializedConfigBytes)
 	if err != nil {
 		return nil, errors.New("failed to read config file").Base(err)
 	}
@@ -121,7 +128,7 @@ func LoadTOMLConfig(reader io.Reader) (*core.Config, error) {
 // DecodeYAMLConfig reads from reader and decode the config into *conf.Config
 // using github.com/ghodss/yaml to convert yaml to json.
 func DecodeYAMLConfig(reader io.Reader) (*conf.Config, error) {
-	yamlFile, err := io.ReadAll(reader)
+	yamlFile, err := buf.ReadAllLimitedToBytes(reader, maxSerializedConfigBytes)
 	if err != nil {
 		return nil, errors.New("failed to read config file").Base(err)
 	}
