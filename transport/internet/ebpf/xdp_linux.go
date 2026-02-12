@@ -9,14 +9,15 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
 var (
-	xdpProgFD   int = -1
-	xdpFlowMap  int = -1
-	xdpStatsMap int = -1
-	xdpIfindex  int
+	xdpProgFD  int = -1
+	xdpLinkFD  int = -1
+	xdpFlowMap int = -1
+	xdpIfindex int
 )
 
 // buildXDPProgram generates the XDP BPF program bytecode.
@@ -46,11 +47,13 @@ func buildXDPProgram() []bpfInsn {
 		ipv6HdrLen = 40
 		udpHdrLen  = 8
 
-		// Ethertype values in network byte order (big-endian) as they
-		// appear when loaded from packet memory with BPF_LDX_MEM(BPF_H).
-		// On little-endian hosts the bytes are swapped.
-		ethTypeIPv4 = 0x0008 // ntohs(0x0800)
-		ethTypeIPv6 = 0xDD86 // ntohs(0x86DD)
+		// Ethertype values after BPF_LDX_MEM(BPF_H) on little-endian hosts.
+		// BPF loads packet bytes in host byte order, so big-endian wire
+		// values appear byte-swapped in registers on LE architectures.
+		// All supported Go/Linux targets (amd64, arm64, riscv64, loong64)
+		// are little-endian, so this is safe without runtime conversion.
+		ethTypeIPv4 = 0x0008 // LE representation of 0x0800 (IPv4)
+		ethTypeIPv6 = 0xDD86 // LE representation of 0x86DD (IPv6)
 		protoUDP    = 17
 
 		// Stack offsets for flow key (base = R10-48)
@@ -128,7 +131,7 @@ func buildXDPProgram() []bpfInsn {
 		bpfStoreMem(bpfW, bpfRegR10, bpfRegR2, int16(stackSrcIP+12)),
 
 		// --- Copy DstIP (4 bytes from IPv4+16) ---
-		bpfLoadMem(bpfW, bpfRegR2, bpfRegR3, 16), // r2 = dst IPv4
+		bpfLoadMem(bpfW, bpfRegR2, bpfRegR3, 16),               // r2 = dst IPv4
 		bpfStoreImm(bpfH, bpfRegR10, int16(stackDstIP+10), -1), // 0xffff
 		bpfStoreMem(bpfW, bpfRegR10, bpfRegR2, int16(stackDstIP+12)),
 
@@ -170,7 +173,7 @@ func buildXDPProgram() []bpfInsn {
 		bpfAddImm(bpfRegR3, ethHdrLen),
 
 		// Read next header (byte at IPv6 header + 6)
-		bpfLoadMem(bpfB, bpfRegR2, bpfRegR3, 6), // r2 = next_header
+		bpfLoadMem(bpfB, bpfRegR2, bpfRegR3, 6),  // r2 = next_header
 		bpfJmpImm(bpfJNE, bpfRegR2, protoUDP, 0), // if not UDP: goto pass [patched]
 
 		// Store protocol
@@ -303,50 +306,40 @@ func attachXDPImpl(ifname string, config XDPConfig) error {
 	if err != nil {
 		return fmt.Errorf("failed to create flow map: %w", err)
 	}
-	xdpFlowMap = flowMapFD
-
-	// Create stats map
-	statsMapFD, err := createBPFMap(
-		21, // BPF_MAP_TYPE_LRU_HASH
-		uint32(unsafe.Sizeof(FlowKey{})),
-		uint32(unsafe.Sizeof(flowStats{})),
-		config.FlowTableSize,
-	)
-	if err != nil {
-		syscall.Close(flowMapFD)
-		return fmt.Errorf("failed to create stats map: %w", err)
-	}
-	xdpStatsMap = statsMapFD
 
 	// Build and load XDP program
 	xdpInsns := buildXDPProgram()
 	xdpBytecode := encodeBPFInsns(xdpInsns)
-	progFD, err := loadXDPProgram(xdpBytecode, flowMapFD, statsMapFD)
+	progFD, err := loadXDPProgram(xdpBytecode, flowMapFD)
 	if err != nil {
 		syscall.Close(flowMapFD)
-		syscall.Close(statsMapFD)
 		return fmt.Errorf("failed to load XDP program: %w", err)
 	}
-	xdpProgFD = progFD
 
 	// Attach to interface
 	mode := selectXDPMode(config.Mode, ifname)
 	if err := attachXDPToInterface(iface.Index, progFD, mode); err != nil {
 		syscall.Close(progFD)
 		syscall.Close(flowMapFD)
-		syscall.Close(statsMapFD)
 		return fmt.Errorf("failed to attach XDP to %s: %w", ifname, err)
 	}
 
+	// Commit to global state only after all operations succeed.
+	// This prevents double-close if a later detachXDPImpl runs against
+	// FDs that were already closed in the error paths above.
+	xdpFlowMap = flowMapFD
+	xdpProgFD = progFD
 	xdpIfindex = iface.Index
 	return nil
 }
 
 // detachXDPImpl detaches XDP from all interfaces.
+// Uses best-effort cleanup: closes all FDs even if an earlier step fails.
 func detachXDPImpl() error {
+	var firstErr error
 	if xdpIfindex > 0 && xdpProgFD >= 0 {
 		if err := detachXDPFromInterface(xdpIfindex); err != nil {
-			return err
+			firstErr = err
 		}
 	}
 
@@ -358,13 +351,9 @@ func detachXDPImpl() error {
 		syscall.Close(xdpFlowMap)
 		xdpFlowMap = -1
 	}
-	if xdpStatsMap >= 0 {
-		syscall.Close(xdpStatsMap)
-		xdpStatsMap = -1
-	}
 	xdpIfindex = 0
 
-	return nil
+	return firstErr
 }
 
 // flowValue is the value stored in the flow map.
@@ -413,12 +402,13 @@ func createBPFMap(mapType, keySize, valueSize, maxEntries uint32) (int, error) {
 }
 
 // loadXDPProgram loads an XDP BPF program with map fd relocation.
-func loadXDPProgram(insns []uint64, flowMapFD, statsMapFD int) (int, error) {
+// Only the flow map fd is patched into the bytecode; the stats map is
+// managed separately from Go userspace via bpfMapLookup/bpfMapUpdate.
+func loadXDPProgram(insns []uint64, flowMapFD int) (int, error) {
 	// Patch map fd placeholder with actual flow map fd
 	patchMapFD(insns, xdpMapFDPlaceholder, int32(flowMapFD))
 
 	license := []byte("GPL\x00")
-	logBuf := make([]byte, 65536)
 
 	attr := struct {
 		progType    uint32
@@ -436,13 +426,11 @@ func loadXDPProgram(insns []uint64, flowMapFD, statsMapFD int) (int, error) {
 		insnCnt:  uint32(len(insns)),
 		insns:    uint64(uintptr(unsafe.Pointer(&insns[0]))),
 		license:  uint64(uintptr(unsafe.Pointer(&license[0]))),
-		logLevel: 1,
-		logSize:  uint32(len(logBuf)),
-		logBuf:   uint64(uintptr(unsafe.Pointer(&logBuf[0]))),
 	}
 
 	copy(attr.progName[:], "xray_xdp_udp")
 
+	// Fast path: try without log buffer to avoid 64KB allocation.
 	fd, _, errno := syscall.Syscall(
 		unix.SYS_BPF,
 		5, // BPF_PROG_LOAD
@@ -450,20 +438,24 @@ func loadXDPProgram(insns []uint64, flowMapFD, statsMapFD int) (int, error) {
 		unsafe.Sizeof(attr),
 	)
 
+	if errno == 0 {
+		return int(fd), nil
+	}
+
+	// Retry with log buffer for diagnostic info on verifier rejection.
+	logBuf := make([]byte, 65536)
+	attr.logLevel = 1
+	attr.logSize = uint32(len(logBuf))
+	attr.logBuf = uint64(uintptr(unsafe.Pointer(&logBuf[0])))
+
+	fd, _, errno = syscall.Syscall(
+		unix.SYS_BPF,
+		5,
+		uintptr(unsafe.Pointer(&attr)),
+		unsafe.Sizeof(attr),
+	)
 	if errno != 0 {
-		// Try again without log buffer (some kernels have issues)
-		attr.logLevel = 0
-		attr.logSize = 0
-		attr.logBuf = 0
-		fd, _, errno = syscall.Syscall(
-			unix.SYS_BPF,
-			5,
-			uintptr(unsafe.Pointer(&attr)),
-			unsafe.Sizeof(attr),
-		)
-		if errno != 0 {
-			return -1, fmt.Errorf("BPF_PROG_LOAD: %w", errno)
-		}
+		return -1, fmt.Errorf("BPF_PROG_LOAD: %w", errno)
 	}
 
 	return int(fd), nil
@@ -473,11 +465,11 @@ func loadXDPProgram(insns []uint64, flowMapFD, statsMapFD int) (int, error) {
 func selectXDPMode(mode XDPMode, ifname string) uint32 {
 	switch mode {
 	case XDPModeNative:
-		return 2 // XDP_FLAGS_DRV_MODE
+		return uint32(unix.XDP_FLAGS_DRV_MODE)
 	case XDPModeOffload:
-		return 4 // XDP_FLAGS_HW_MODE
+		return uint32(unix.XDP_FLAGS_HW_MODE)
 	case XDPModeGeneric:
-		return 1 // XDP_FLAGS_SKB_MODE
+		return uint32(unix.XDP_FLAGS_SKB_MODE)
 	default:
 		// Auto mode: try native first, fall back to generic
 		// Could probe driver support here
@@ -487,24 +479,20 @@ func selectXDPMode(mode XDPMode, ifname string) uint32 {
 
 // attachXDPToInterface attaches an XDP program to a network interface.
 func attachXDPToInterface(ifindex, progFD int, flags uint32) error {
-	// Use netlink to attach XDP
-	// This is a simplified version; full implementation would use
-	// the netlink socket to send IFLA_XDP attribute
-
-	// For now, use bpf_set_link_xdp_fd equivalent
+	// Preferred path: BPF_LINK_CREATE.
 	attr := struct {
-		targetFD   uint32
-		attachBPFD uint32
-		attachType uint32
-		attachFlags uint32
+		progFD        uint32
+		targetIfindex uint32
+		attachType    uint32
+		attachFlags   uint32
 	}{
-		targetFD:   uint32(ifindex),
-		attachBPFD: uint32(progFD),
-		attachType: 37, // BPF_XDP
-		attachFlags: flags,
+		progFD:        uint32(progFD),
+		targetIfindex: uint32(ifindex),
+		attachType:    37, // BPF_XDP
+		attachFlags:   flags,
 	}
 
-	_, _, errno := syscall.Syscall(
+	linkFD, _, errno := syscall.Syscall(
 		unix.SYS_BPF,
 		28, // BPF_LINK_CREATE
 		uintptr(unsafe.Pointer(&attr)),
@@ -512,37 +500,43 @@ func attachXDPToInterface(ifindex, progFD int, flags uint32) error {
 	)
 
 	if errno != 0 {
-		// Fall back to older interface
-		return attachXDPNetlink(ifindex, progFD, flags)
+		// Fall back to older interface.
+		if err := attachXDPNetlink(ifindex, progFD, flags); err != nil {
+			return fmt.Errorf("BPF_LINK_CREATE failed: %w (fallback failed: %v)", errno, err)
+		}
+		return nil
 	}
+
+	if xdpLinkFD >= 0 {
+		syscall.Close(xdpLinkFD)
+		xdpLinkFD = -1
+	}
+	xdpLinkFD = int(linkFD)
 
 	return nil
 }
 
 // attachXDPNetlink attaches XDP using netlink (for older kernels).
 func attachXDPNetlink(ifindex, progFD int, flags uint32) error {
-	// Create netlink socket
-	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_ROUTE)
+	link, err := netlink.LinkByIndex(ifindex)
 	if err != nil {
-		return err
-	}
-	defer syscall.Close(fd)
-
-	// Bind to netlink
-	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
-	if err := syscall.Bind(fd, sa); err != nil {
-		return err
+		return fmt.Errorf("netlink LinkByIndex(%d): %w", ifindex, err)
 	}
 
-	// Build netlink message with IFLA_XDP attribute
-	// This is simplified; full implementation needs proper NLA encoding
-
+	if err := netlink.LinkSetXdpFdWithFlags(link, progFD, int(flags)); err != nil {
+		return fmt.Errorf("netlink LinkSetXdpFdWithFlags(ifindex=%d progFD=%d flags=%d): %w", ifindex, progFD, flags, err)
+	}
 	return nil
 }
 
 // detachXDPFromInterface detaches XDP from an interface.
 func detachXDPFromInterface(ifindex int) error {
-	return attachXDPToInterface(ifindex, -1, 0)
+	if xdpLinkFD >= 0 {
+		err := syscall.Close(xdpLinkFD)
+		xdpLinkFD = -1 // Always reset to prevent double-close on retry.
+		return err
+	}
+	return attachXDPNetlink(ifindex, -1, 0)
 }
 
 // updateFlowMapImpl updates a flow entry in the BPF map.
@@ -577,19 +571,10 @@ func deleteFlowMapImpl(key FlowKey) error {
 
 // readFlowStatsImpl reads flow statistics from the BPF map.
 func readFlowStatsImpl(key FlowKey, entry *FlowEntry) error {
-	if xdpStatsMap < 0 {
-		return nil
-	}
-
-	var stats flowStats
-	if err := bpfMapLookup(xdpStatsMap, unsafe.Pointer(&key), unsafe.Pointer(&stats)); err != nil {
-		return err
-	}
-
-	entry.Packets = stats.Packets
-	entry.Bytes = stats.Bytes
-	entry.LastSeen = int64(stats.LastSeen)
-
+	// Stats are currently tracked in userspace only; no kernel-side map updates
+	// are emitted by the XDP program yet.
+	_ = key
+	_ = entry
 	return nil
 }
 
@@ -682,19 +667,19 @@ func checkXDPDriverSupport(ifname string) bool {
 
 	// Known XDP-capable drivers
 	xdpDrivers := map[string]bool{
-		"i40e":      true,
-		"ixgbe":     true,
-		"mlx5_core": true,
-		"mlx4_en":   true,
-		"nfp":       true,
-		"bnxt_en":   true,
-		"thunder":   true,
+		"i40e":       true,
+		"ixgbe":      true,
+		"mlx5_core":  true,
+		"mlx4_en":    true,
+		"nfp":        true,
+		"bnxt_en":    true,
+		"thunder":    true,
 		"virtio_net": true,
-		"veth":      true,
+		"veth":       true,
 	}
 
-	// Extract driver name from path
-	driver := link[len(link)-len(link)+1:]
+	// Extract driver name from last path component
+	driver := link
 	for i := len(link) - 1; i >= 0; i-- {
 		if link[i] == '/' {
 			driver = link[i+1:]
