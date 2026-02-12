@@ -3,6 +3,7 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -206,13 +207,8 @@ func TestKTLSDataIntegrity(t *testing.T) {
 	if received == nil {
 		t.Fatal("server received nil")
 	}
-	if len(received) != len(testData) {
-		t.Fatalf("data length mismatch: got %d, want %d", len(received), len(testData))
-	}
-	for i := range testData {
-		if received[i] != testData[i] {
-			t.Fatalf("data mismatch at byte %d", i)
-		}
+	if !bytes.Equal(received, testData) {
+		t.Fatalf("data mismatch: got %d bytes, want %d bytes", len(received), len(testData))
 	}
 }
 
@@ -250,6 +246,91 @@ func TestKTLSGracefulFallback(t *testing.T) {
 	t.Logf("graceful fallback: kTLS state=%+v", state)
 	conn.Close()
 	serverEnd.Close()
+}
+
+func TestExtractTLSKeysFromGoAEADWrappers(t *testing.T) {
+	cert := generateTestCert(t)
+
+	tests := []struct {
+		name         string
+		minVersion   uint16
+		maxVersion   uint16
+		cipherSuites []uint16
+	}{
+		{
+			name:       "tls12-aesgcm",
+			minVersion: gotls.VersionTLS12,
+			maxVersion: gotls.VersionTLS12,
+			cipherSuites: []uint16{
+				gotls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			},
+		},
+		{
+			name:       "tls13",
+			minVersion: gotls.VersionTLS13,
+			maxVersion: gotls.VersionTLS13,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			serverConfig := &gotls.Config{
+				Certificates: []gotls.Certificate{cert},
+				MinVersion:   tc.minVersion,
+				MaxVersion:   tc.maxVersion,
+				CipherSuites: tc.cipherSuites,
+			}
+			clientConfig := &gotls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tc.minVersion,
+				MaxVersion:         tc.maxVersion,
+				CipherSuites:       tc.cipherSuites,
+			}
+
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				raw, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				tlsRaw := gotls.Server(raw, serverConfig)
+				_ = tlsRaw.Handshake()
+				_, _ = io.Copy(io.Discard, tlsRaw)
+				_ = tlsRaw.Close()
+			}()
+
+			rawConn, err := net.Dial("tcp", listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			tlsRaw := gotls.Client(rawConn, clientConfig)
+			conn := &Conn{Conn: tlsRaw}
+			if err := conn.HandshakeContext(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			keys, err := extractTLSKeys(conn.Conn)
+			if err != nil {
+				t.Fatalf("extractTLSKeys failed: %v", err)
+			}
+			if len(keys.txKey) == 0 || len(keys.rxKey) == 0 {
+				t.Fatalf("missing TLS keys: tx=%d rx=%d", len(keys.txKey), len(keys.rxKey))
+			}
+			if len(keys.txIV) == 0 || len(keys.rxIV) == 0 {
+				t.Fatalf("missing TLS IVs: tx=%d rx=%d", len(keys.txIV), len(keys.rxIV))
+			}
+
+			_ = conn.Close()
+			<-serverDone
+		})
+	}
 }
 
 func BenchmarkKTLSSplice(b *testing.B) {

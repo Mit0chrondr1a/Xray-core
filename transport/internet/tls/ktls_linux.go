@@ -4,9 +4,11 @@ package tls
 
 import (
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"reflect"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -102,6 +104,12 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 	default:
 		return state
 	}
+	if !isKTLSCipherSuiteSupported(cs.CipherSuite) {
+		return state
+	}
+	if !kernelKTLSSupportedCached() {
+		return state
+	}
 
 	// Extract keys using reflection
 	keys, err := extractTLSKeys(conn.Conn)
@@ -115,38 +123,50 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 		return state
 	}
 
-	// Set TCP_ULP to "tls"
-	var ulpErr error
+	// Perform all kTLS setup in a single Control call to minimize
+	// runtime fd-lock acquisitions (3 → 1).
 	if err := rawConn.Control(func(fd uintptr) {
-		ulpErr = syscall.SetsockoptString(int(fd), syscall.SOL_TCP, unix.TCP_ULP, "tls")
-	}); err != nil {
-		return state
-	}
-	if ulpErr != nil {
-		return state
-	}
+		intFD := int(fd)
 
-	state.Enabled = true
+		// Set TCP_ULP to "tls"
+		if err := syscall.SetsockoptString(intFD, syscall.SOL_TCP, unix.TCP_ULP, "tls"); err != nil {
+			return
+		}
 
-	// Configure TX (send direction)
-	if err := rawConn.Control(func(fd uintptr) {
-		if err := setKTLSCryptoInfo(int(fd), TLS_TX, tlsVersion, cs.CipherSuite, keys.txKey, keys.txIV, keys.txSeq); err == nil {
+		state.Enabled = true
+
+		// Configure TX (send direction)
+		if err := setKTLSCryptoInfo(intFD, TLS_TX, tlsVersion, cs.CipherSuite, keys.txKey, keys.txIV, keys.txSeq); err == nil {
 			state.TxReady = true
 		}
-	}); err != nil {
-		return state
-	}
 
-	// Configure RX (receive direction)
-	if err := rawConn.Control(func(fd uintptr) {
-		if err := setKTLSCryptoInfo(int(fd), TLS_RX, tlsVersion, cs.CipherSuite, keys.rxKey, keys.rxIV, keys.rxSeq); err == nil {
+		// Configure RX (receive direction)
+		if err := setKTLSCryptoInfo(intFD, TLS_RX, tlsVersion, cs.CipherSuite, keys.rxKey, keys.rxIV, keys.rxSeq); err == nil {
 			state.RxReady = true
+		}
+
+		// Only report as enabled if at least one direction succeeded.
+		// ULP installation alone is a no-op without crypto info.
+		if !state.TxReady && !state.RxReady {
+			state.Enabled = false
 		}
 	}); err != nil {
 		return state
 	}
 
 	return state
+}
+
+var (
+	ktlsSupportOnce sync.Once
+	ktlsSupportOK   bool
+)
+
+func kernelKTLSSupportedCached() bool {
+	ktlsSupportOnce.Do(func() {
+		ktlsSupportOK = KTLSSupported()
+	})
+	return ktlsSupportOK
 }
 
 // tlsKeys contains the extracted TLS session keys.
@@ -212,7 +232,10 @@ func extractHalfConnKeys(halfConn reflect.Value) (key, iv, seq []byte, err error
 	// For TLS 1.3, it's a *tls.cipherSuiteTLS13 with an AEAD.
 	// For TLS 1.2, it's a crypto/cipher.AEAD directly.
 	// We need to dig into the implementation to find the key.
-	cipherVal := cipherField.Elem()
+	cipherVal := cipherField
+	if cipherVal.Kind() == reflect.Interface || cipherVal.Kind() == reflect.Ptr {
+		cipherVal = cipherVal.Elem()
+	}
 	if !cipherVal.IsValid() {
 		return nil, nil, nil, fmt.Errorf("cipher value not valid")
 	}
@@ -221,9 +244,15 @@ func extractHalfConnKeys(halfConn reflect.Value) (key, iv, seq []byte, err error
 	if keyField := findField(cipherVal, "key"); keyField.IsValid() {
 		key = fieldToBytes(keyField)
 	}
+	if key == nil {
+		// AES-GCM implementations often expose only expanded round keys.
+		key = extractExpandedAESKey(cipherVal)
+	}
 	if ivField := findField(cipherVal, "nonceMask"); ivField.IsValid() {
 		iv = fieldToBytes(ivField)
 	} else if ivField := findField(cipherVal, "fixedNonce"); ivField.IsValid() {
+		iv = fieldToBytes(ivField)
+	} else if ivField := findField(cipherVal, "nonce"); ivField.IsValid() {
 		iv = fieldToBytes(ivField)
 	}
 
@@ -236,11 +265,18 @@ func extractHalfConnKeys(halfConn reflect.Value) (key, iv, seq []byte, err error
 
 // findField recursively searches for a named field in a reflect.Value.
 func findField(v reflect.Value, name string) reflect.Value {
-	if v.Kind() == reflect.Ptr {
+	return findFieldRecursive(v, name, 0)
+}
+
+func findFieldRecursive(v reflect.Value, name string, depth int) reflect.Value {
+	if depth > 16 || !v.IsValid() {
+		return reflect.Value{}
+	}
+	if v.Kind() == reflect.Interface || v.Kind() == reflect.Ptr {
 		if v.IsNil() {
 			return reflect.Value{}
 		}
-		v = v.Elem()
+		return findFieldRecursive(v.Elem(), name, depth+1)
 	}
 	if v.Kind() != reflect.Struct {
 		return reflect.Value{}
@@ -251,13 +287,11 @@ func findField(v reflect.Value, name string) reflect.Value {
 		return f
 	}
 
-	// Search embedded fields
+	// Search nested fields
 	for i := 0; i < v.NumField(); i++ {
 		field := v.Field(i)
-		if field.Kind() == reflect.Struct || (field.Kind() == reflect.Ptr && !field.IsNil()) {
-			if result := findField(field, name); result.IsValid() {
-				return result
-			}
+		if result := findFieldRecursive(field, name, depth+1); result.IsValid() {
+			return result
 		}
 	}
 
@@ -269,7 +303,7 @@ func fieldToBytes(v reflect.Value) []byte {
 	switch v.Kind() {
 	case reflect.Slice:
 		if v.Type().Elem().Kind() == reflect.Uint8 {
-			return v.Bytes()
+			return append([]byte(nil), v.Bytes()...)
 		}
 	case reflect.Array:
 		bytes := make([]byte, v.Len())
@@ -278,6 +312,64 @@ func fieldToBytes(v reflect.Value) []byte {
 		}
 		return bytes
 	}
+	return nil
+}
+
+// extractExpandedAESKey extracts the original AES key from expanded round keys.
+func extractExpandedAESKey(v reflect.Value) []byte {
+	return extractExpandedAESKeyRecursive(v, 0)
+}
+
+func extractExpandedAESKeyRecursive(v reflect.Value, depth int) []byte {
+	if depth > 16 || !v.IsValid() {
+		return nil
+	}
+	if v.Kind() == reflect.Interface || v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return nil
+		}
+		return extractExpandedAESKeyRecursive(v.Elem(), depth+1)
+	}
+	if v.Kind() != reflect.Struct {
+		return nil
+	}
+
+	roundsField := v.FieldByName("rounds")
+	encField := v.FieldByName("enc")
+	if roundsField.IsValid() && encField.IsValid() {
+		rounds := -1
+		switch roundsField.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			rounds = int(roundsField.Int())
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			rounds = int(roundsField.Uint())
+		}
+		keyWords := 0
+		switch rounds {
+		case 10:
+			keyWords = 4 // AES-128
+		case 12:
+			keyWords = 6 // AES-192
+		case 14:
+			keyWords = 8 // AES-256
+		}
+		if keyWords > 0 && (encField.Kind() == reflect.Array || encField.Kind() == reflect.Slice) {
+			if encField.Type().Elem().Kind() == reflect.Uint32 && encField.Len() >= keyWords {
+				key := make([]byte, keyWords*4)
+				for i := 0; i < keyWords; i++ {
+					binary.BigEndian.PutUint32(key[i*4:], uint32(encField.Index(i).Uint()))
+				}
+				return key
+			}
+		}
+	}
+
+	for i := 0; i < v.NumField(); i++ {
+		if key := extractExpandedAESKeyRecursive(v.Field(i), depth+1); key != nil {
+			return key
+		}
+	}
+
 	return nil
 }
 
@@ -337,6 +429,8 @@ func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16
 		if len(iv) >= 12 {
 			copy(info.Salt[:], iv[:4])
 			copy(info.IV[:], iv[4:12])
+		} else if len(iv) >= 4 {
+			copy(info.Salt[:], iv[:4])
 		}
 		if seq != nil {
 			copy(info.RecSeq[:], seq)

@@ -30,7 +30,7 @@ func getTLSCacheSize() int {
 			return n
 		}
 	}
-	return 512
+	return 128
 }
 
 // ParseCertificate converts a cert.Certificate to Certificate.
