@@ -150,16 +150,29 @@ func BenchmarkCopyRawConn_KTLSSplice(b *testing.B) {
 		// Wrap reader side in TLS
 		tlsServer := gotls.Server(readerPeer, serverCfg)
 		tlsClient := tls.Client(readerRaw, clientCfg).(*tls.Conn)
-		tlsClient.HandshakeAndEnableKTLS(context.Background())
+		serverErr := make(chan error, 1)
+		go func() {
+			if err := tlsServer.Handshake(); err != nil {
+				serverErr <- err
+				return
+			}
+			if _, err := tlsServer.Write(payload); err != nil {
+				serverErr <- err
+				return
+			}
+			if err := tlsServer.Close(); err != nil {
+				serverErr <- err
+				return
+			}
+			serverErr <- nil
+		}()
+		if err := tlsClient.HandshakeAndEnableKTLS(context.Background()); err != nil {
+			b.Fatal(err)
+		}
 
 		ctx := makeSpliceCopyCtx()
 		timer := signal.CancelAfterInactivity(ctx, func() {}, 30*time.Second)
 
-		go func() {
-			tlsServer.Handshake()
-			tlsServer.Write(payload)
-			tlsServer.Close()
-		}()
 		go func() {
 			io.Copy(io.Discard, writerPeer)
 			writerPeer.Close()
@@ -167,8 +180,19 @@ func BenchmarkCopyRawConn_KTLSSplice(b *testing.B) {
 
 		// UnwrapRawConn will peel the TLS to get the raw TCP conn
 		b.StartTimer()
-		CopyRawConnIfExist(ctx, tlsClient, writer, buf.Discard, timer, nil)
+		err := CopyRawConnIfExist(ctx, tlsClient, writer, buf.Discard, timer, nil)
 		b.StopTimer()
+		if err != nil {
+			b.Fatal(err)
+		}
+		select {
+		case err := <-serverErr:
+			if err != nil {
+				b.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			b.Fatal("timeout waiting for TLS server benchmark goroutine")
+		}
 
 		readerRaw.Close()
 		writer.Close()
