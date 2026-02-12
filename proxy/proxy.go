@@ -8,11 +8,12 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"io"
 	"crypto/rand"
+	"io"
 	"math/big"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -460,6 +461,7 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 		return buffer
 	}
 	mb2 := buf.GetMultiBuffer()
+	var sb strings.Builder
 	for i, buffer1 := range buffer {
 		if buffer1.Len() >= buf.Size-21 {
 			index := int32(bytes.LastIndex(buffer1.Bytes(), TlsApplicationDataStart))
@@ -470,12 +472,19 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 			buffer2.Write(buffer1.BytesFrom(index))
 			buffer1.Resize(0, index)
 			mb2 = append(mb2, buffer1, buffer2)
+			sb.WriteByte(' ')
+			sb.WriteString(strconv.Itoa(int(buffer1.Len())))
+			sb.WriteByte(' ')
+			sb.WriteString(strconv.Itoa(int(buffer2.Len())))
 		} else {
 			mb2 = append(mb2, buffer1)
+			sb.WriteByte(' ')
+			sb.WriteString(strconv.Itoa(int(buffer1.Len())))
 		}
 		buffer[i] = nil
 	}
 	buffer = buffer[:0]
+	errors.LogDebug(ctx, "ReshapeMultiBuffer", sb.String())
 	return mb2
 }
 

@@ -13,7 +13,8 @@ Tracking a UDP connection may be a bit troublesome.
 Here is a simple solution.
 We create a filter, add remote IP to the pool when it try to establish a UDP connection with auth.
 And drop UDP packets from unauthorized IP.
-After discussion, we believe it is not necessary to add a timeout mechanism to this filter.
+Entries expire after a configurable TTL (default 10 minutes) with sliding expiration,
+so active sessions stay alive while stale entries are cleaned up periodically.
 */
 
 type UDPFilter struct {
