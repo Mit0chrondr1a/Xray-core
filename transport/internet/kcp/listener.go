@@ -4,6 +4,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -14,6 +15,8 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
+
+const kcpTLSHandshakeTimeout = 8 * time.Second
 
 type ConnectionID struct {
 	Remote net.Address
@@ -86,12 +89,11 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
 	}
 
 	l.Lock()
-	defer l.Unlock()
-
 	conn, found := l.sessions[id]
 
 	if !found {
 		if cmd == CommandTerminate {
+			l.Unlock()
 			return
 		}
 		writer := &Writer{
@@ -110,21 +112,41 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
 			RemoteAddr:   remoteAddr,
 			Conversation: conv,
 		}, writer, writer, l.config)
-		var netConn stat.Connection = conn
-		if l.tlsConfig != nil {
-			tlsConn := tls.Server(conn, l.tlsConfig)
-			if err := tlsConn.(*tls.Conn).HandshakeAndEnableKTLS(context.Background()); err != nil {
-				errors.LogWarningInner(context.Background(), err, "failed TLS handshake on KCP connection")
-				conn.Terminate()
-				return
-			}
-			netConn = tlsConn
-		}
-
-		l.addConn(netConn)
 		l.sessions[id] = conn
 	}
+	l.Unlock()
+
+	if !found {
+		if l.tlsConfig != nil {
+			go l.addTLSConn(conn, id)
+		} else {
+			l.addConn(stat.Connection(conn))
+		}
+	}
 	conn.Input(segments)
+}
+
+func (l *Listener) addTLSConn(conn *Connection, id ConnectionID) {
+	tlsConn := tls.Server(conn, l.tlsConfig)
+	if err := tlsConn.SetDeadline(time.Now().Add(kcpTLSHandshakeTimeout)); err != nil {
+		errors.LogWarningInner(context.Background(), err, "failed to set TLS handshake deadline on KCP connection")
+		conn.Terminate()
+		l.Remove(id)
+		return
+	}
+	hsCtx, cancel := context.WithTimeout(context.Background(), kcpTLSHandshakeTimeout)
+	hsErr := tlsConn.(*tls.Conn).HandshakeAndEnableKTLS(hsCtx)
+	cancel()
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		errors.LogWarningInner(context.Background(), err, "failed to clear TLS handshake deadline on KCP connection")
+	}
+	if hsErr != nil {
+		errors.LogWarningInner(context.Background(), hsErr, "failed TLS handshake on KCP connection")
+		conn.Terminate()
+		l.Remove(id)
+		return
+	}
+	l.addConn(stat.Connection(tlsConn))
 }
 
 func (l *Listener) Remove(id ConnectionID) {

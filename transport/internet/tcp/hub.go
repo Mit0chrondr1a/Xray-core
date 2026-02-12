@@ -26,6 +26,8 @@ type Listener struct {
 	addConn       internet.ConnHandler
 }
 
+const tlsHandshakeTimeout = 8 * time.Second
+
 // ListenTCP creates a new Listener based on configurations.
 func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
 	l := &Listener{
@@ -108,25 +110,41 @@ func (v *Listener) keepAccepting() {
 			}
 			continue
 		}
-		go func() {
+		go func(rawConn net.Conn) {
+			conn := rawConn
 			if v.tlsConfig != nil {
-				conn = tls.Server(conn, v.tlsConfig)
-				if err := conn.(*tls.Conn).HandshakeAndEnableKTLS(context.Background()); err != nil {
-					errors.LogWarningInner(context.Background(), err, "failed TLS handshake on accepted connection")
-					conn.Close()
+				tlsConn := tls.Server(conn, v.tlsConfig)
+				if err := tlsConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+					errors.LogWarningInner(context.Background(), err, "failed to set TLS handshake deadline on accepted connection")
+					_ = tlsConn.Close()
 					return
 				}
+				hsCtx, cancel := context.WithTimeout(context.Background(), tlsHandshakeTimeout)
+				hsErr := tlsConn.(*tls.Conn).HandshakeAndEnableKTLS(hsCtx)
+				cancel()
+				if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+					errors.LogWarningInner(context.Background(), err, "failed to clear TLS handshake deadline on accepted connection")
+				}
+				if hsErr != nil {
+					errors.LogWarningInner(context.Background(), hsErr, "failed TLS handshake on accepted connection")
+					_ = tlsConn.Close()
+					return
+				}
+				conn = tlsConn
 			} else if v.realityConfig != nil {
-				if conn, err = reality.Server(conn, v.realityConfig); err != nil {
-					errors.LogInfo(context.Background(), err.Error())
+				realityConn, serveErr := reality.Server(conn, v.realityConfig)
+				if serveErr != nil {
+					errors.LogInfo(context.Background(), serveErr.Error())
+					_ = conn.Close()
 					return
 				}
+				conn = realityConn
 			}
 			if v.authConfig != nil {
 				conn = v.authConfig.Server(conn)
 			}
 			v.addConn(stat.Connection(conn))
-		}()
+		}(conn)
 	}
 }
 
