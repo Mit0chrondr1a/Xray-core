@@ -102,8 +102,14 @@ func (h *Hub) WriteTo(payload []byte, dest net.Destination) (int, error) {
 }
 
 func (h *Hub) start() {
+	h.startSingle(true)
+}
+
+func (h *Hub) startSingle(closeCache bool) {
 	c := h.cache
-	defer close(c)
+	if closeCache {
+		defer close(c)
+	}
 
 	oobBytes := make([]byte, 256)
 

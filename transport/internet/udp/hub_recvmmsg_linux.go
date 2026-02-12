@@ -118,7 +118,8 @@ func (h *Hub) startBatch() {
 			for i := 0; i < batchSize; i++ {
 				buffers[i].Release()
 			}
-			break
+			h.startSingle(false)
+			return
 		}
 
 		// Process received packets
