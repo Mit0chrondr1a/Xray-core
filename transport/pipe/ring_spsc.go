@@ -19,9 +19,11 @@ type SPSCRingBuffer struct {
 	readPos  atomic.Uint64
 	_pad2    [56]byte // cache line padding
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	closed atomic.Bool
+	mu             sync.Mutex
+	cond           *sync.Cond
+	closed         atomic.Bool
+	readerWaiting  atomic.Bool
+	writerWaiting  atomic.Bool
 }
 
 // NewSPSCRingBuffer creates a new lock-free SPSC ring buffer with the given
@@ -118,20 +120,24 @@ func (r *SPSCRingBuffer) Write(data []byte) (int, error) {
 		written += n
 
 		if written < len(data) {
-			// Buffer full, wait for reader to drain
+			// Buffer full, wake reader and wait for drain.
 			r.mu.Lock()
-			r.cond.Signal() // wake reader
+			r.cond.Signal()
 			if !r.closed.Load() && r.AvailableWrite() == 0 {
+				r.writerWaiting.Store(true)
 				r.cond.Wait()
+				r.writerWaiting.Store(false)
 			}
 			r.mu.Unlock()
 		}
 	}
 
-	// Signal reader that data is available
-	r.mu.Lock()
-	r.cond.Signal()
-	r.mu.Unlock()
+	// Signal reader only if it is actually waiting.
+	if r.readerWaiting.Load() {
+		r.mu.Lock()
+		r.cond.Signal()
+		r.mu.Unlock()
+	}
 
 	return written, nil
 }
@@ -146,10 +152,12 @@ func (r *SPSCRingBuffer) Read(buf []byte) (int, error) {
 	for {
 		n := r.read(buf)
 		if n > 0 {
-			// Signal writer that space is available
-			r.mu.Lock()
-			r.cond.Signal()
-			r.mu.Unlock()
+			// Signal writer only if it is actually waiting.
+			if r.writerWaiting.Load() {
+				r.mu.Lock()
+				r.cond.Signal()
+				r.mu.Unlock()
+			}
 			return n, nil
 		}
 
@@ -157,10 +165,12 @@ func (r *SPSCRingBuffer) Read(buf []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		// No data, wait for writer
+		// No data, wait for writer.
 		r.mu.Lock()
 		if r.AvailableRead() == 0 && !r.closed.Load() {
+			r.readerWaiting.Store(true)
 			r.cond.Wait()
+			r.readerWaiting.Store(false)
 		}
 		r.mu.Unlock()
 	}

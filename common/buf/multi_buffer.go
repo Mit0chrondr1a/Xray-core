@@ -102,14 +102,13 @@ func MergeBytes(dest MultiBuffer, src []byte) MultiBuffer {
 	return dest
 }
 
-// ReleaseMulti releases all content of the MultiBuffer, and returns nil.
+// ReleaseMulti releases all content of the MultiBuffer, and returns an empty MultiBuffer.
 func ReleaseMulti(mb MultiBuffer) MultiBuffer {
 	for i := range mb {
 		mb[i].Release()
 		mb[i] = nil
 	}
-	PutMultiBuffer(mb)
-	return nil
+	return mb[:0]
 }
 
 // Copy copied the beginning part of the MultiBuffer into the given byte array.

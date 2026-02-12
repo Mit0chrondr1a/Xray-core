@@ -35,12 +35,12 @@ func (s *allocStrategy) Adjust(n uint32) {
 	}
 }
 
-func (s *allocStrategy) Alloc() []*Buffer {
-	bs := make([]*Buffer, s.current)
-	for i := range bs {
-		bs[i] = New()
+func (s *allocStrategy) Alloc(bufs *[8]*Buffer) []*Buffer {
+	n := s.current
+	for i := uint32(0); i < n; i++ {
+		bufs[i] = New()
 	}
-	return bs
+	return bufs[:n]
 }
 
 type multiReader interface {
@@ -56,6 +56,7 @@ type ReadVReader struct {
 	mr      multiReader
 	alloc   allocStrategy
 	counter stats.Counter
+	bufs    [8]*Buffer // pre-allocated array to avoid per-read slice allocation
 }
 
 // NewReadVReader creates a new ReadVReader.
@@ -72,7 +73,7 @@ func NewReadVReader(reader io.Reader, rawConn syscall.RawConn, counter stats.Cou
 }
 
 func (r *ReadVReader) readMulti() (MultiBuffer, error) {
-	bs := r.alloc.Alloc()
+	bs := r.alloc.Alloc(&r.bufs)
 
 	r.mr.Init(bs)
 	var nBytes int32
