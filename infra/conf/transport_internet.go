@@ -45,6 +45,8 @@ var (
 		"none": func() interface{} { return new(NoOpConnectionAuthenticator) },
 		"http": func() interface{} { return new(Authenticator) },
 	}, "type", "")
+	allowInsecureRemovalDate = time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	nowForTransportConfig    = time.Now
 )
 
 type KCPConfig struct {
@@ -749,7 +751,7 @@ func (c *TLSConfig) Build() (proto.Message, error) {
 	config.MasterKeyLog = c.MasterKeyLog
 
 	if c.AllowInsecure {
-		if time.Now().After(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)) {
+		if !nowForTransportConfig().Before(allowInsecureRemovalDate) {
 			return nil, errors.PrintRemovedFeatureError(`"allowInsecure"`, `"pinnedPeerCertSha256"`)
 		} else {
 			errors.LogWarning(context.Background(), `"allowInsecure" will be removed automatically after 2026-06-01, please use "pinnedPeerCertSha256"(pcs) and "verifyPeerCertByName"(vcn) instead, PLEASE CONTACT YOUR SERVICE PROVIDER (AIRPORT)`)

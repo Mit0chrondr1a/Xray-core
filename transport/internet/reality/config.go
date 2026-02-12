@@ -1,16 +1,14 @@
 package reality
 
 import (
-	"context"
 	"io"
 	"net"
-	"os"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/xtls/reality"
-	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet"
+	tls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 func (c *Config) GetREALITYConfig() *reality.Config {
@@ -59,16 +57,7 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 }
 
 func KeyLogWriterFromConfig(c *Config) io.Writer {
-	if len(c.MasterKeyLog) <= 0 || c.MasterKeyLog == "none" {
-		return nil
-	}
-
-	writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
-	if err != nil {
-		errors.LogErrorInner(context.Background(), err, "failed to open ", c.MasterKeyLog, " as master key log")
-	}
-
-	return writer
+	return tls.MasterKeyLogWriter(c.MasterKeyLog)
 }
 
 func ConfigFromStreamSettings(settings *internet.MemoryStreamConfig) *Config {

@@ -149,6 +149,8 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		}),
 	}
 
+	// TLS/REALITY is negotiated inside WithContextDialer, so gRPC itself must treat
+	// the returned net.Conn as already-secured transport.
 	dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 
 	authority := ""

@@ -46,7 +46,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	}
 	if config.AuthType == AuthType_PASSWORD {
 		httpConfig.Accounts = config.Accounts
-		s.udpFilter = new(UDPFilter) // We only use this when auth is enabled
+		s.udpFilter = NewUDPFilter(0) // We only use this when auth is enabled
 	}
 	s.httpServer, _ = http.NewServer(ctx, httpConfig)
 	return s, nil
