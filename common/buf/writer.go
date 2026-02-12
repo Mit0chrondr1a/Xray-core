@@ -4,7 +4,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -76,20 +75,19 @@ func (w *BufferToBytesWriter) ReadFrom(reader io.Reader) (int64, error) {
 // BufferedWriter is a Writer with internal buffer.
 type BufferedWriter struct {
 	sync.Mutex
-	writer     Writer
-	buffer     *Buffer
-	buffered   atomic.Bool
-	flushNext  bool
+	writer    Writer
+	buffer    *Buffer
+	buffered  bool
+	flushNext bool
 }
 
 // NewBufferedWriter creates a new BufferedWriter.
 func NewBufferedWriter(writer Writer) *BufferedWriter {
-	w := &BufferedWriter{
-		writer: writer,
-		buffer: New(),
+	return &BufferedWriter{
+		writer:   writer,
+		buffer:   New(),
+		buffered: true,
 	}
-	w.buffered.Store(true)
-	return w
 }
 
 // WriteByte implements io.ByteWriter.
@@ -103,15 +101,14 @@ func (w *BufferedWriter) Write(b []byte) (int, error) {
 		return 0, nil
 	}
 
-	// Fast path: unbuffered mode needs no lock (single-goroutine writer).
-	if !w.buffered.Load() {
+	w.Lock()
+	defer w.Unlock()
+
+	if !w.buffered {
 		if writer, ok := w.writer.(io.Writer); ok {
 			return writer.Write(b)
 		}
 	}
-
-	w.Lock()
-	defer w.Unlock()
 
 	totalBytes := 0
 	for len(b) > 0 {
@@ -124,7 +121,7 @@ func (w *BufferedWriter) Write(b []byte) (int, error) {
 		if err != nil {
 			return totalBytes, err
 		}
-		if !w.buffered.Load() || w.buffer.IsFull() {
+		if !w.buffered || w.buffer.IsFull() {
 			if err := w.flushInternal(); err != nil {
 				return totalBytes, err
 			}
@@ -141,13 +138,12 @@ func (w *BufferedWriter) WriteMultiBuffer(b MultiBuffer) error {
 		return nil
 	}
 
-	// Fast path: unbuffered mode needs no lock.
-	if !w.buffered.Load() {
-		return w.writer.WriteMultiBuffer(b)
-	}
-
 	w.Lock()
 	defer w.Unlock()
+
+	if !w.buffered {
+		return w.writer.WriteMultiBuffer(b)
+	}
 
 	reader := MultiBufferContainer{
 		MultiBuffer: b,
@@ -167,7 +163,7 @@ func (w *BufferedWriter) WriteMultiBuffer(b MultiBuffer) error {
 	}
 
 	if w.flushNext {
-		w.buffered.Store(false)
+		w.buffered = false
 		w.flushNext = false
 		return w.flushInternal()
 	}
@@ -205,7 +201,7 @@ func (w *BufferedWriter) SetBuffered(f bool) error {
 	w.Lock()
 	defer w.Unlock()
 
-	w.buffered.Store(f)
+	w.buffered = f
 	if !f {
 		return w.flushInternal()
 	}

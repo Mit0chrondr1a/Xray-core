@@ -2,42 +2,15 @@ package buf
 
 import (
 	"io"
-	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/serial"
 )
 
-var multiBufferPool = sync.Pool{
-	New: func() interface{} {
-		mb := make(MultiBuffer, 0, 16)
-		return &mb
-	},
-}
-
-// GetMultiBuffer returns a MultiBuffer from the pool.
+// GetMultiBuffer returns a fresh MultiBuffer with a reasonable default capacity.
 func GetMultiBuffer() MultiBuffer {
-	p := multiBufferPool.Get().(*MultiBuffer)
-	mb := *p
-	mb = mb[:0]
-	return mb
-}
-
-// PutMultiBuffer returns a MultiBuffer to the pool.
-// The caller must ensure all Buffer pointers have been released.
-func PutMultiBuffer(mb MultiBuffer) {
-	if cap(mb) < 4 || cap(mb) > 128 {
-		return // Don't pool unusual sizes
-	}
-	// Clear all slots to prevent stale Buffer pointer retention in the pool,
-	// which could keep freed buffers alive for GC.
-	all := mb[:cap(mb)]
-	for i := range all {
-		all[i] = nil
-	}
-	mb = mb[:0]
-	multiBufferPool.Put(&mb)
+	return make(MultiBuffer, 0, 16)
 }
 
 // ReadAllToBytes reads all content from the reader into a byte array, until EOF.
