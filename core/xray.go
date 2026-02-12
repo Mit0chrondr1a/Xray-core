@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet"
+	internettls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 // Server is an instance of Xray. At any time, there must be at most one Server instance running.
@@ -260,6 +261,8 @@ func (s *Instance) Close() error {
 	defer s.statusLock.Unlock()
 
 	s.running = false
+	// Ensure cached TLS keylog descriptors are released on all close paths.
+	defer internettls.CloseMasterKeyLogWriters()
 
 	var errs []interface{}
 	for _, f := range s.features {
