@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"math/big"
+	gonet "net"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 )
 
@@ -64,7 +66,51 @@ func (c *Conn) HandshakeAndEnableKTLS(ctx context.Context) error {
 		return err
 	}
 	c.ktls = TryEnableKTLS(c)
+	logCtx := ctx
+	if logCtx == nil {
+		logCtx = context.Background()
+	}
+	if c.ktls.Enabled {
+		if !c.ktls.TxReady || !c.ktls.RxReady {
+			errors.LogDebug(logCtx, "kTLS partially enabled: tx=", c.ktls.TxReady, " rx=", c.ktls.RxReady)
+		}
+		return nil
+	}
+
+	cs := c.ConnectionState()
+	switch {
+	case !isKTLSCipherSuiteSupported(cs.CipherSuite):
+		errors.LogDebug(logCtx, "kTLS not enabled: unsupported cipher suite ", cs.CipherSuite)
+	case cs.Version != tls.VersionTLS12 && cs.Version != tls.VersionTLS13:
+		errors.LogDebug(logCtx, "kTLS not enabled: unsupported TLS version ", cs.Version)
+	case !isUnderlyingTCPConn(c.Conn.NetConn()):
+		errors.LogDebug(logCtx, "kTLS not enabled: underlying transport is not TCP")
+	default:
+		errors.LogDebug(logCtx, "kTLS not enabled: kernel/permission/key extraction constraints")
+	}
 	return nil
+}
+
+func isUnderlyingTCPConn(conn gonet.Conn) bool {
+	_, ok := conn.(*gonet.TCPConn)
+	return ok
+}
+
+func isKTLSCipherSuiteSupported(cipherSuite uint16) bool {
+	switch cipherSuite {
+	case tls.TLS_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:
+		return true
+	default:
+		return false
+	}
 }
 
 // KTLSEnabled returns the kTLS state for this connection.

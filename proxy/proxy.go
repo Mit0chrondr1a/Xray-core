@@ -49,7 +49,6 @@ var (
 	}
 )
 
-
 const (
 	TlsHandshakeTypeClientHello byte = 0x01
 	TlsHandshakeTypeServerHello byte = 0x02
@@ -744,22 +743,26 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 					// by attempting a zero-byte read that will return on EOF/error.
 					waitBuf := make([]byte, 1)
 					_, err := readerConn.Read(waitBuf)
+					var forwarded uint64
+					if pair, ok := mgr.GetStats(readerConn, writerConn); ok {
+						forwarded = pair.BytesForwarded
+					}
 					mgr.UnregisterPair(readerConn, writerConn)
 					if readCounter != nil {
-						if pair, ok := mgr.GetStats(readerConn, writerConn); ok {
-							readCounter.Add(int64(pair.BytesForwarded))
-						}
+						readCounter.Add(int64(forwarded))
 					}
 					if writeCounter != nil {
-						if pair, ok := mgr.GetStats(readerConn, writerConn); ok {
-							writeCounter.Add(int64(pair.BytesForwarded))
-						}
+						writeCounter.Add(int64(forwarded))
 					}
-					_ = statWriter
+					if statWriter != nil {
+						statWriter.Counter.Add(int64(forwarded))
+					}
 					if err != nil && errors.Cause(err) != io.EOF {
 						return err
 					}
 					return nil
+				} else {
+					errors.LogDebugInner(ctx, err, "CopyRawConn sockmap register failed, falling back to splice")
 				}
 				// Fall through to splice on sockmap failure
 			}
