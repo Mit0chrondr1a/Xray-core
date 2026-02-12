@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -218,7 +217,13 @@ func DecodeHeader(h []byte) (l int, err error) {
 		l = 0
 	}
 	if l < 17 || l > 17000 { // TODO: TLSv1.3 max length
-		err = errors.New("invalid header: " + fmt.Sprintf("%v", h[:5])) // DO NOT CHANGE: relied by client's Read()
+		// DO NOT CHANGE format: relied by client's Read()
+		err = errors.New("invalid header: [" +
+			strconv.Itoa(int(h[0])) + " " +
+			strconv.Itoa(int(h[1])) + " " +
+			strconv.Itoa(int(h[2])) + " " +
+			strconv.Itoa(int(h[3])) + " " +
+			strconv.Itoa(int(h[4])) + "]")
 	}
 	return
 }
