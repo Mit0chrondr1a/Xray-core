@@ -320,6 +320,9 @@ func getSocketCookie(fd int) (uint64, error) {
 }
 
 // getConnFDImpl extracts the file descriptor from a net.Conn on Linux.
+// Safety: The returned FD is the runtime-managed FD and remains valid as long
+// as the caller holds the net.Conn reference (preventing GC finalization).
+// Callers must NOT close this FD or use it after the connection is closed.
 func getConnFDImpl(conn net.Conn) (int, error) {
 	// Try to get the underlying TCPConn
 	tcpConn, ok := conn.(*net.TCPConn)
@@ -334,15 +337,11 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 	}
 
 	var fd int
-	var fdErr error
 	err = rawConn.Control(func(f uintptr) {
 		fd = int(f)
 	})
 	if err != nil {
 		return -1, err
-	}
-	if fdErr != nil {
-		return -1, fdErr
 	}
 
 	return fd, nil

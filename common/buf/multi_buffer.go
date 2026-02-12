@@ -25,10 +25,16 @@ func GetMultiBuffer() MultiBuffer {
 }
 
 // PutMultiBuffer returns a MultiBuffer to the pool.
-// The caller must ensure all Buffer pointers have been nil'd or released.
+// The caller must ensure all Buffer pointers have been released.
 func PutMultiBuffer(mb MultiBuffer) {
 	if cap(mb) < 4 || cap(mb) > 128 {
 		return // Don't pool unusual sizes
+	}
+	// Clear all slots to prevent stale Buffer pointer retention in the pool,
+	// which could keep freed buffers alive for GC.
+	all := mb[:cap(mb)]
+	for i := range all {
+		all[i] = nil
 	}
 	mb = mb[:0]
 	multiBufferPool.Put(&mb)
