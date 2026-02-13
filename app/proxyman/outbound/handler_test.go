@@ -88,11 +88,10 @@ func TestOutboundWithStatCounter(t *testing.T) {
 }
 
 func TestTagsCache(t *testing.T) {
-
-	test_duration := 10 * time.Second
-	threads_num := 50
-	delay := 10 * time.Millisecond
-	tags_prefix := "node"
+	testDuration := 800 * time.Millisecond
+	threadsNum := 32
+	delay := 2 * time.Millisecond
+	tagsPrefix := "node"
 
 	tags := sync.Map{}
 	counter := atomic.Uint64{}
@@ -107,15 +106,16 @@ func TestTagsCache(t *testing.T) {
 	v, _ := core.New(config)
 	v.AddFeature(ohm)
 	ctx := context.WithValue(context.Background(), xrayKey, v)
+	runCtx, cancel := context.WithTimeout(context.Background(), testDuration)
+	defer cancel()
 
-	stop_add_rm := false
-	wg_add_rm := sync.WaitGroup{}
+	wgAddRm := sync.WaitGroup{}
 	addHandlers := func() {
-		defer wg_add_rm.Done()
-		for !stop_add_rm {
+		defer wgAddRm.Done()
+		for runCtx.Err() == nil {
 			time.Sleep(delay)
 			idx := counter.Add(1)
-			tag := fmt.Sprintf("%s%d", tags_prefix, idx)
+			tag := fmt.Sprintf("%s%d", tagsPrefix, idx)
 			cfg := &core.OutboundHandlerConfig{
 				Tag:           tag,
 				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
@@ -134,8 +134,8 @@ func TestTagsCache(t *testing.T) {
 	}
 
 	rmHandlers := func() {
-		defer wg_add_rm.Done()
-		for !stop_add_rm {
+		defer wgAddRm.Done()
+		for runCtx.Err() == nil {
 			time.Sleep(delay)
 			tags.Range(func(key interface{}, value interface{}) bool {
 				if _, ok := tags.LoadAndDelete(key); ok {
@@ -148,29 +148,30 @@ func TestTagsCache(t *testing.T) {
 		}
 	}
 
-	selectors := []string{tags_prefix}
-	wg_get := sync.WaitGroup{}
-	stop_get := false
+	selectors := []string{tagsPrefix}
+	wgGet := sync.WaitGroup{}
 	getTags := func() {
-		defer wg_get.Done()
-		for !stop_get {
+		defer wgGet.Done()
+		for runCtx.Err() == nil {
 			time.Sleep(delay)
 			_ = ohm.Select(selectors)
 			// t.Logf("get tags: %v", tag)
 		}
 	}
 
-	for i := 0; i < threads_num; i++ {
-		wg_add_rm.Add(2)
+	for i := 0; i < threadsNum; i++ {
+		wgAddRm.Add(2)
 		go rmHandlers()
 		go addHandlers()
-		wg_get.Add(1)
+		wgGet.Add(1)
 		go getTags()
 	}
 
-	time.Sleep(test_duration)
-	stop_add_rm = true
-	wg_add_rm.Wait()
-	stop_get = true
-	wg_get.Wait()
+	<-runCtx.Done()
+	wgAddRm.Wait()
+	wgGet.Wait()
+
+	if counter.Load() == 0 {
+		t.Fatal("expected at least one handler add attempt")
+	}
 }

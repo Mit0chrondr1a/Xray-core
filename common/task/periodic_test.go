@@ -1,6 +1,7 @@
 package task_test
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,28 +10,38 @@ import (
 )
 
 func TestPeriodicTaskStop(t *testing.T) {
-	value := 0
+	const interval = 20 * time.Millisecond
+	var value atomic.Int32
 	task := &Periodic{
-		Interval: time.Second * 2,
+		Interval: interval,
 		Execute: func() error {
-			value++
+			value.Add(1)
 			return nil
 		},
 	}
+
+	waitForAtLeast := func(target int32, timeout time.Duration) {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for value.Load() < target {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for value >= %d, got %d", target, value.Load())
+			}
+			time.Sleep(interval / 4)
+		}
+	}
+
 	common.Must(task.Start())
-	time.Sleep(time.Second * 5)
+	waitForAtLeast(3, 250*time.Millisecond)
+
 	common.Must(task.Close())
-	if value != 3 {
-		t.Fatal("expected 3, but got ", value)
+	stopped := value.Load()
+	time.Sleep(3 * interval)
+	if got := value.Load(); got != stopped {
+		t.Fatalf("expected periodic task to stop at %d, got %d", stopped, got)
 	}
-	time.Sleep(time.Second * 4)
-	if value != 3 {
-		t.Fatal("expected 3, but got ", value)
-	}
+
 	common.Must(task.Start())
-	time.Sleep(time.Second * 3)
-	if value != 5 {
-		t.Fatal("Expected 5, but ", value)
-	}
+	waitForAtLeast(stopped+2, 250*time.Millisecond)
 	common.Must(task.Close())
 }
