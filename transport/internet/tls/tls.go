@@ -6,11 +6,13 @@ import (
 	"crypto/tls"
 	"math/big"
 	gonet "net"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 )
 
@@ -27,7 +29,9 @@ var _ Interface = (*Conn)(nil)
 
 type Conn struct {
 	*tls.Conn
-	ktls KTLSState
+	ktls     KTLSState
+	isClient bool
+	capture  *keyCapture
 }
 
 const tlsCloseTimeout = 250 * time.Millisecond
@@ -158,14 +162,16 @@ func (c *Conn) KTLSEnabled() KTLSState {
 
 // Client initiates a TLS client handshake on the given connection.
 func Client(c net.Conn, config *tls.Config) net.Conn {
-	tlsConn := tls.Client(c, config)
-	return &Conn{Conn: tlsConn}
+	tlsConfig, capture := setupKeyCapture(config)
+	tlsConn := tls.Client(c, tlsConfig)
+	return &Conn{Conn: tlsConn, isClient: true, capture: capture}
 }
 
 // Server initiates a TLS server handshake on the given connection.
 func Server(c net.Conn, config *tls.Config) net.Conn {
-	tlsConn := tls.Server(c, config)
-	return &Conn{Conn: tlsConn}
+	tlsConfig, capture := setupKeyCapture(config)
+	tlsConn := tls.Server(c, tlsConfig)
+	return &Conn{Conn: tlsConn, isClient: false, capture: capture}
 }
 
 type UConn struct {
@@ -228,6 +234,301 @@ func UClient(c net.Conn, config *tls.Config, fingerprint *utls.ClientHelloID) ne
 
 func GeneraticUClient(c net.Conn, config *tls.Config) *utls.UConn {
 	return utls.UClient(c, copyConfig(config), utls.HelloChrome_Auto)
+}
+
+// RustConn wraps a raw TCP connection after Rust-side rustls handshake + kTLS setup.
+// The kernel handles TLS encryption/decryption via kTLS, so Read/Write go directly
+// to the underlying connection.
+type RustConn struct {
+	rawConn    net.Conn
+	state      *native.TlsStateHandle
+	ktls       KTLSState
+	alpn       string
+	version    uint16
+	cipher     uint16
+	serverName string
+}
+
+var _ Interface = (*RustConn)(nil)
+
+func (c *RustConn) Read(b []byte) (int, error) {
+	if c.ktls.RxReady {
+		n, err := c.rawConn.Read(b)
+		if err != nil && isKeyExpired(err) && c.state != nil {
+			if herr := native.TlsKeyUpdate(c.state); herr != nil {
+				return 0, herr
+			}
+			return c.rawConn.Read(b)
+		}
+		return n, err
+	}
+	return c.rawConn.Read(b)
+}
+
+func (c *RustConn) Write(b []byte) (int, error) {
+	return c.rawConn.Write(b)
+}
+
+func (c *RustConn) Close() error {
+	if c.state != nil {
+		native.TlsStateFree(c.state)
+		c.state = nil
+	}
+	return c.rawConn.Close()
+}
+
+func (c *RustConn) LocalAddr() gonet.Addr                      { return c.rawConn.LocalAddr() }
+func (c *RustConn) RemoteAddr() gonet.Addr                     { return c.rawConn.RemoteAddr() }
+func (c *RustConn) SetDeadline(t time.Time) error              { return c.rawConn.SetDeadline(t) }
+func (c *RustConn) SetReadDeadline(t time.Time) error          { return c.rawConn.SetReadDeadline(t) }
+func (c *RustConn) SetWriteDeadline(t time.Time) error         { return c.rawConn.SetWriteDeadline(t) }
+func (c *RustConn) HandshakeContext(ctx context.Context) error { return nil }
+func (c *RustConn) VerifyHostname(host string) error           { return nil }
+
+func (c *RustConn) HandshakeContextServerName(ctx context.Context) string {
+	return c.serverName
+}
+
+func (c *RustConn) NegotiatedProtocol() string {
+	return c.alpn
+}
+
+func (c *RustConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	mb = buf.Compact(mb)
+	mb, err := buf.WriteMultiBuffer(c, mb)
+	buf.ReleaseMulti(mb)
+	return err
+}
+
+func (c *RustConn) KTLSEnabled() KTLSState {
+	return c.ktls
+}
+
+// NewRustConn creates a RustConn from native handshake results.
+// Used by the REALITY package to construct a RustConn from Rust handshake output.
+func NewRustConn(rawConn net.Conn, result *native.TlsResult, serverName string) *RustConn {
+	rc := &RustConn{
+		rawConn:    rawConn,
+		state:      result.StateHandle,
+		alpn:       result.ALPN,
+		version:    result.Version,
+		cipher:     result.CipherSuite,
+		serverName: serverName,
+		ktls: KTLSState{
+			Enabled: result.KtlsTx || result.KtlsRx,
+			TxReady: result.KtlsTx,
+			RxReady: result.KtlsRx,
+		},
+	}
+	return rc
+}
+
+// configToNative translates an Xray TLS Config to a native Rust TLS config handle.
+func configToNative(config *Config, dest net.Destination, isServer bool) *native.TlsConfigHandle {
+	h := native.TlsConfigNew(isServer)
+	if h == nil {
+		return nil
+	}
+
+	// Server name (SNI)
+	serverName := config.ServerName
+	if serverName == "" && dest.Address.Family().IsDomain() {
+		serverName = dest.Address.Domain()
+	}
+	if serverName != "" {
+		native.TlsConfigSetServerName(h, serverName)
+	}
+
+	// Certificates
+	for _, entry := range config.Certificate {
+		if entry.Usage == Certificate_ENCIPHERMENT {
+			native.TlsConfigAddCertPEM(h, entry.Certificate, entry.Key)
+		} else if entry.Usage == Certificate_AUTHORITY_VERIFY {
+			native.TlsConfigAddRootCAPEM(h, entry.Certificate)
+		}
+	}
+
+	// Root CAs: use system roots unless custom CAs are provided
+	hasCustomCA := false
+	for _, entry := range config.Certificate {
+		if entry.Usage == Certificate_AUTHORITY_VERIFY {
+			hasCustomCA = true
+			break
+		}
+	}
+	if !hasCustomCA && !config.DisableSystemRoot {
+		native.TlsConfigUseSystemRoots(h)
+	}
+
+	// ALPN
+	if len(config.NextProtocol) > 0 {
+		var alpnBuf []byte
+		for _, proto := range config.NextProtocol {
+			alpnBuf = append(alpnBuf, byte(len(proto)))
+			alpnBuf = append(alpnBuf, proto...)
+		}
+		native.TlsConfigSetALPN(h, alpnBuf)
+	}
+
+	// TLS version constraints
+	minVer := uint16(tls.VersionTLS12)
+	maxVer := uint16(tls.VersionTLS13)
+	versionMap := map[string]uint16{
+		"1.0": tls.VersionTLS10,
+		"1.1": tls.VersionTLS11,
+		"1.2": tls.VersionTLS12,
+		"1.3": tls.VersionTLS13,
+	}
+	if v, ok := versionMap[config.MinVersion]; ok {
+		minVer = v
+	}
+	if v, ok := versionMap[config.MaxVersion]; ok {
+		maxVer = v
+	}
+	if config.MinVersion != "" || config.MaxVersion != "" {
+		native.TlsConfigSetVersions(h, minVer, maxVer)
+	}
+
+	// InsecureSkipVerify
+	if config.AllowInsecure {
+		native.TlsConfigSetInsecureSkipVerify(h, true)
+	}
+
+	// Pinned cert SHA256
+	for _, pin := range config.PinnedPeerCertSha256 {
+		native.TlsConfigPinCertSHA256(h, pin)
+	}
+
+	// Verify peer cert by name
+	for _, name := range config.VerifyPeerCertByName {
+		native.TlsConfigAddVerifyName(h, name)
+	}
+
+	// Key log file
+	if config.MasterKeyLog != "" && config.MasterKeyLog != "none" {
+		native.TlsConfigSetKeyLogPath(h, config.MasterKeyLog)
+	}
+
+	return h
+}
+
+// ExtractFd extracts the file descriptor from a net.Conn.
+// Returns -1 if the connection doesn't support SyscallConn.
+func ExtractFd(conn gonet.Conn) (int, error) {
+	type syscallConner interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	sc, ok := conn.(syscallConner)
+	if !ok {
+		return -1, errors.New("connection does not support SyscallConn")
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+	var fd int
+	if err := raw.Control(func(f uintptr) {
+		fd = int(f)
+	}); err != nil {
+		return -1, err
+	}
+	return fd, nil
+}
+
+func ensureNativeFullKTLS(result *native.TlsResult) error {
+	if result == nil {
+		return errors.New("native TLS handshake returned nil result")
+	}
+	if result.KtlsTx && result.KtlsRx {
+		return nil
+	}
+	if result.StateHandle != nil {
+		native.TlsStateFree(result.StateHandle)
+		result.StateHandle = nil
+	}
+	return errors.New("native TLS requires full kTLS offload (tx=", result.KtlsTx, ", rx=", result.KtlsRx, ")")
+}
+
+// RustClient performs a TLS client handshake using the Rust rustls library
+// and enables kTLS for kernel-accelerated encryption.
+func RustClient(c net.Conn, config *Config, dest net.Destination) (net.Conn, error) {
+	h := configToNative(config, dest, false)
+	if h == nil {
+		return nil, errors.New("failed to create native TLS config")
+	}
+	defer native.TlsConfigFree(h)
+
+	fd, err := ExtractFd(c)
+	if err != nil {
+		return nil, errors.New("failed to extract fd: ").Base(err)
+	}
+
+	result, err := native.TlsHandshake(fd, h, true)
+	if err != nil {
+		return nil, errors.New("native TLS client handshake failed: ").Base(err)
+	}
+	if err := ensureNativeFullKTLS(result); err != nil {
+		return nil, errors.New("native TLS client handshake failed: ").Base(err)
+	}
+
+	serverName := config.ServerName
+	if serverName == "" && dest.Address.Family().IsDomain() {
+		serverName = dest.Address.Domain()
+	}
+
+	rustConn := &RustConn{
+		rawConn:    c,
+		state:      result.StateHandle,
+		alpn:       result.ALPN,
+		version:    result.Version,
+		cipher:     result.CipherSuite,
+		serverName: serverName,
+		ktls: KTLSState{
+			Enabled: result.KtlsTx || result.KtlsRx,
+			TxReady: result.KtlsTx,
+			RxReady: result.KtlsRx,
+		},
+	}
+
+	return rustConn, nil
+}
+
+// RustServer performs a TLS server handshake using the Rust rustls library
+// and enables kTLS for kernel-accelerated encryption.
+func RustServer(c net.Conn, config *Config) (net.Conn, error) {
+	h := configToNative(config, net.Destination{}, true)
+	if h == nil {
+		return nil, errors.New("failed to create native TLS config")
+	}
+	defer native.TlsConfigFree(h)
+
+	fd, err := ExtractFd(c)
+	if err != nil {
+		return nil, errors.New("failed to extract fd: ").Base(err)
+	}
+
+	result, err := native.TlsHandshake(fd, h, false)
+	if err != nil {
+		return nil, errors.New("native TLS server handshake failed: ").Base(err)
+	}
+	if err := ensureNativeFullKTLS(result); err != nil {
+		return nil, errors.New("native TLS server handshake failed: ").Base(err)
+	}
+
+	rustConn := &RustConn{
+		rawConn: c,
+		state:   result.StateHandle,
+		alpn:    result.ALPN,
+		version: result.Version,
+		cipher:  result.CipherSuite,
+		ktls: KTLSState{
+			Enabled: result.KtlsTx || result.KtlsRx,
+			TxReady: result.KtlsTx,
+			RxReady: result.KtlsRx,
+		},
+	}
+
+	return rustConn, nil
 }
 
 func copyConfig(c *tls.Config) *utls.Config {

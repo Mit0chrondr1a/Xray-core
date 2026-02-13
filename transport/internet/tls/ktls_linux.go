@@ -3,11 +3,15 @@
 package tls
 
 import (
+	"crypto"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -65,6 +69,139 @@ var (
 	_ [56]byte = [unsafe.Sizeof(cryptoInfoChaCha20Poly1305{})]byte{}
 )
 
+// keyCapture implements io.Writer to capture TLS 1.3 traffic secrets
+// from the KeyLogWriter API (SSLKEYLOGFILE format).
+type keyCapture struct {
+	mu             sync.Mutex
+	clientSecret   []byte
+	serverSecret   []byte
+	originalWriter io.Writer // chain to original KeyLogWriter if set
+}
+
+func (kc *keyCapture) Write(p []byte) (n int, err error) {
+	kc.mu.Lock()
+	line := string(p)
+	if strings.HasPrefix(line, "CLIENT_TRAFFIC_SECRET_0 ") {
+		parts := strings.Fields(line)
+		if len(parts) >= 3 {
+			kc.clientSecret, _ = hex.DecodeString(parts[2])
+		}
+	} else if strings.HasPrefix(line, "SERVER_TRAFFIC_SECRET_0 ") {
+		parts := strings.Fields(line)
+		if len(parts) >= 3 {
+			kc.serverSecret, _ = hex.DecodeString(parts[2])
+		}
+	}
+	kc.mu.Unlock()
+	if kc.originalWriter != nil {
+		return kc.originalWriter.Write(p)
+	}
+	return len(p), nil
+}
+
+func (kc *keyCapture) secrets() (clientSecret, serverSecret []byte) {
+	kc.mu.Lock()
+	defer kc.mu.Unlock()
+	return kc.clientSecret, kc.serverSecret
+}
+
+// setupKeyCapture clones the TLS config and installs a KeyLogWriter on the
+// clone to capture traffic secrets for TLS 1.3 kTLS key derivation.
+// Cloning avoids mutating shared listener/client configs across connections.
+func setupKeyCapture(config *tls.Config) (*tls.Config, *keyCapture) {
+	if config == nil {
+		return nil, nil
+	}
+	cloned := config.Clone()
+	capture := &keyCapture{
+		originalWriter: cloned.KeyLogWriter,
+	}
+	cloned.KeyLogWriter = capture
+	return cloned, capture
+}
+
+// deriveKeysFromCapture derives kTLS keys from TLS 1.3 traffic secrets
+// captured via KeyLogWriter. This avoids the deep reflection needed by
+// extractTLSKeys for TLS 1.3 connections.
+func deriveKeysFromCapture(capture *keyCapture, cipherSuite uint16, isClient bool) (*tlsKeys, error) {
+	clientSecret, serverSecret := capture.secrets()
+	if len(clientSecret) == 0 || len(serverSecret) == 0 {
+		return nil, fmt.Errorf("traffic secrets not captured")
+	}
+
+	var hashFunc crypto.Hash
+	var keyLen int
+	switch cipherSuite {
+	case tls.TLS_AES_128_GCM_SHA256:
+		hashFunc = crypto.SHA256
+		keyLen = 16
+	case tls.TLS_AES_256_GCM_SHA384:
+		hashFunc = crypto.SHA384
+		keyLen = 32
+	case tls.TLS_CHACHA20_POLY1305_SHA256:
+		hashFunc = crypto.SHA256
+		keyLen = 32
+	default:
+		return nil, fmt.Errorf("unsupported TLS 1.3 cipher suite: 0x%04x", cipherSuite)
+	}
+
+	var txSecret, rxSecret []byte
+	if isClient {
+		txSecret = clientSecret
+		rxSecret = serverSecret
+	} else {
+		txSecret = serverSecret
+		rxSecret = clientSecret
+	}
+
+	txKey := expandLabel(hashFunc, txSecret, "key", nil, keyLen)
+	txIV := expandLabel(hashFunc, txSecret, "iv", nil, 12)
+	rxKey := expandLabel(hashFunc, rxSecret, "key", nil, keyLen)
+	rxIV := expandLabel(hashFunc, rxSecret, "iv", nil, 12)
+
+	return &tlsKeys{
+		txKey:    txKey,
+		txIV:     txIV,
+		txSeq:    make([]byte, 8),
+		rxKey:    rxKey,
+		rxIV:     rxIV,
+		rxSeq:    make([]byte, 8),
+		txSecret: txSecret,
+		rxSecret: rxSecret,
+	}, nil
+}
+
+// extractSeqOnly extracts only the sequence numbers from a tls.Conn using
+// minimal reflection. This is much more stable than full key extraction
+// because it only accesses the seq field (a simple [8]byte array) from
+// the out and in halfConn structures.
+func extractSeqOnly(conn *tls.Conn) (txSeq, rxSeq []byte, err error) {
+	connVal := reflect.ValueOf(conn).Elem()
+
+	outVal := connVal.FieldByName("out")
+	inVal := connVal.FieldByName("in")
+	if !outVal.IsValid() || !inVal.IsValid() {
+		return nil, nil, fmt.Errorf("cannot access tls.Conn out/in fields")
+	}
+
+	txSeqField := outVal.FieldByName("seq")
+	rxSeqField := inVal.FieldByName("seq")
+	if !txSeqField.IsValid() || !rxSeqField.IsValid() {
+		return nil, nil, fmt.Errorf("cannot access halfConn.seq fields")
+	}
+
+	txSeq = make([]byte, txSeqField.Len())
+	rxSeq = make([]byte, rxSeqField.Len())
+	for i := 0; i < txSeqField.Len(); i++ {
+		txSeq[i] = byte(txSeqField.Index(i).Uint())
+	}
+	for i := 0; i < rxSeqField.Len(); i++ {
+		rxSeq[i] = byte(rxSeqField.Index(i).Uint())
+	}
+
+	return txSeq, rxSeq, nil
+}
+
 // KTLSState tracks the kTLS state for a connection.
 type KTLSState struct {
 	Enabled          bool
@@ -112,10 +249,30 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 		return state
 	}
 
-	// Extract keys using reflection
-	keys, err := extractTLSKeys(conn.Conn)
-	if err != nil {
-		return state
+	var keys *tlsKeys
+	var err error
+
+	// For TLS 1.3: try KeyLogWriter capture path first (more stable)
+	if cs.Version == tls.VersionTLS13 && conn.capture != nil {
+		keys, err = deriveKeysFromCapture(conn.capture, cs.CipherSuite, conn.isClient)
+		if err == nil {
+			// Get actual sequence numbers via minimal reflection
+			txSeq, rxSeq, seqErr := extractSeqOnly(conn.Conn)
+			if seqErr == nil {
+				keys.txSeq = txSeq
+				keys.rxSeq = rxSeq
+			}
+			// If seq extraction fails, keys still have zero sequences
+			// which may work if called immediately after handshake
+		}
+	}
+
+	// Fallback: full reflection (always works for TLS 1.2, fallback for TLS 1.3)
+	if keys == nil {
+		keys, err = extractTLSKeys(conn.Conn)
+		if err != nil {
+			return state
+		}
 	}
 
 	// Get the file descriptor
