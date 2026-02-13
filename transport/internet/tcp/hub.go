@@ -9,6 +9,7 @@ import (
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -20,6 +21,7 @@ import (
 type Listener struct {
 	listener      net.Listener
 	tlsConfig     *gotls.Config
+	tlsXrayConfig *tls.Config
 	realityConfig *goreality.Config
 	authConfig    internet.ConnectionAuthenticator
 	config        *Config
@@ -74,6 +76,7 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 
 	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
 		l.tlsConfig = config.GetTLSConfig()
+		l.tlsXrayConfig = config
 	}
 	if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
 		l.realityConfig = config.GetREALITYConfig()
@@ -113,24 +116,42 @@ func (v *Listener) keepAccepting() {
 		go func(rawConn net.Conn) {
 			conn := rawConn
 			if v.tlsConfig != nil {
-				tlsConn := tls.Server(conn, v.tlsConfig)
-				if err := tlsConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
-					errors.LogWarningInner(context.Background(), err, "failed to set TLS handshake deadline on accepted connection")
-					_ = tlsConn.Close()
-					return
+				if native.Available() && v.tlsXrayConfig != nil {
+					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+						errors.LogWarningInner(context.Background(), err, "failed to set Rust TLS handshake deadline on accepted connection")
+						_ = conn.Close()
+						return
+					}
+					rustConn, tlsErr := tls.RustServer(conn, v.tlsXrayConfig)
+					if err := conn.SetDeadline(time.Time{}); err != nil {
+						errors.LogWarningInner(context.Background(), err, "failed to clear Rust TLS handshake deadline on accepted connection")
+					}
+					if tlsErr != nil {
+						errors.LogWarningInner(context.Background(), tlsErr, "failed Rust TLS handshake on accepted connection")
+						_ = conn.Close()
+						return
+					}
+					conn = rustConn
+				} else {
+					tlsConn := tls.Server(conn, v.tlsConfig)
+					if err := tlsConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+						errors.LogWarningInner(context.Background(), err, "failed to set TLS handshake deadline on accepted connection")
+						_ = tlsConn.Close()
+						return
+					}
+					hsCtx, cancel := context.WithTimeout(context.Background(), tlsHandshakeTimeout)
+					hsErr := tlsConn.(*tls.Conn).HandshakeAndEnableKTLS(hsCtx)
+					cancel()
+					if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+						errors.LogWarningInner(context.Background(), err, "failed to clear TLS handshake deadline on accepted connection")
+					}
+					if hsErr != nil {
+						errors.LogWarningInner(context.Background(), hsErr, "failed TLS handshake on accepted connection")
+						_ = tlsConn.Close()
+						return
+					}
+					conn = tlsConn
 				}
-				hsCtx, cancel := context.WithTimeout(context.Background(), tlsHandshakeTimeout)
-				hsErr := tlsConn.(*tls.Conn).HandshakeAndEnableKTLS(hsCtx)
-				cancel()
-				if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-					errors.LogWarningInner(context.Background(), err, "failed to clear TLS handshake deadline on accepted connection")
-				}
-				if hsErr != nil {
-					errors.LogWarningInner(context.Background(), hsErr, "failed TLS handshake on accepted connection")
-					_ = tlsConn.Close()
-					return
-				}
-				conn = tlsConn
 			} else if v.realityConfig != nil {
 				realityConn, serveErr := reality.Server(conn, v.realityConfig)
 				if serveErr != nil {

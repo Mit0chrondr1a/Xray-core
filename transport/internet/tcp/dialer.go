@@ -8,6 +8,7 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport/internet"
@@ -71,6 +72,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			} else {
 				err = conn.(*tls.UConn).HandshakeContext(ctx)
 			}
+		} else if native.Available() {
+			conn, err = tls.RustClient(conn, config, dest)
 		} else {
 			conn = tls.Client(conn, tlsConfig)
 			err = conn.(*tls.Conn).HandshakeAndEnableKTLS(ctx)

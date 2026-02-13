@@ -11,6 +11,7 @@ import (
 	gotls "crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
@@ -195,6 +197,42 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		}
 		aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
 		copy(hello.Raw[39:], hello.SessionId)
+	}
+	// Try Rust native path: performs the TLS handshake in Rust and sets up kTLS
+	if native.Available() {
+		ecdhe := uConn.HandshakeState.State13.KeyShareKeys.Ecdhe
+		if ecdhe == nil {
+			ecdhe = uConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
+		}
+		if ecdhe != nil {
+			fd, fdErr := tls.ExtractFd(c)
+			if fdErr == nil {
+				realityCfg := native.RealityConfigNew(true)
+				if realityCfg != nil {
+					native.RealityConfigSetServerPubkey(realityCfg, config.PublicKey)
+					native.RealityConfigSetShortId(realityCfg, config.ShortId)
+					native.RealityConfigSetVersion(realityCfg, core.Version_x, core.Version_y, core.Version_z)
+					if len(config.Mldsa65Verify) > 0 {
+						native.RealityConfigSetMldsa65Verify(realityCfg, config.Mldsa65Verify)
+					}
+					result, rustErr := native.RealityClientConnect(fd, uConn.HandshakeState.Hello.Raw, ecdhe.Bytes(), realityCfg)
+					native.RealityConfigFree(realityCfg)
+					if rustErr == nil {
+						if result != nil && result.KtlsTx && result.KtlsRx {
+							return tls.NewRustConn(c, result, uConn.ServerName), nil
+						}
+						if result != nil && result.StateHandle != nil {
+							native.TlsStateFree(result.StateHandle)
+						}
+						errors.LogDebug(ctx, "REALITY native handshake has no full kTLS data path, fallback to Go/uTLS")
+					}
+					if rustErr != nil && !stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
+						return nil, rustErr
+					}
+					// Auth failed — fall through to Go path
+				}
+			}
+		}
 	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		return nil, err
