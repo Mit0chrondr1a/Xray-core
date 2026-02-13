@@ -710,6 +710,9 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 			if xc, ok := conn.(*tls.Conn); ok {
 				handler = xc.KTLSKeyUpdateHandler()
 				conn = xc.NetConn()
+			} else if rc, ok := conn.(*tls.RustConn); ok {
+				// RustConn always has kTLS — KeyUpdate handled by Rust state
+				conn = rc.NetConn()
 			} else if utlsConn, ok := conn.(*tls.UConn); ok {
 				conn = utlsConn.NetConn()
 			} else if realityConn, ok := conn.(*reality.Conn); ok {
@@ -729,10 +732,83 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 	return conn, readCounter, writerCounter, handler
 }
 
+// DetermineSocketCryptoHint peels off connection wrappers and returns the
+// underlying raw connection plus a CryptoHint describing the TLS state.
+// This must be called BEFORE UnwrapRawConn because it inspects TLS wrappers.
+func DetermineSocketCryptoHint(conn net.Conn) (net.Conn, ebpf.CryptoHint) {
+	if conn == nil {
+		return nil, ebpf.CryptoNone
+	}
+
+	// Peel encryption wrappers
+	if commonConn, ok := conn.(*encryption.CommonConn); ok {
+		conn = commonConn.Conn
+	}
+	if _, ok := conn.(*encryption.XorConn); ok {
+		return nil, ebpf.CryptoUserspaceTLS // XorConn is not eligible
+	}
+
+	// Peel stats wrapper
+	if statConn, ok := conn.(*stat.CounterConnection); ok {
+		conn = statConn.Connection
+	}
+
+	// Check TLS type
+	if xc, ok := conn.(*tls.Conn); ok {
+		ktls := xc.KTLSEnabled()
+		raw := xc.NetConn()
+		if ktls.TxReady && ktls.RxReady {
+			return raw, ebpf.CryptoKTLSBoth
+		}
+		if ktls.TxReady {
+			return raw, ebpf.CryptoKTLSTxOnly
+		}
+		if ktls.RxReady {
+			return raw, ebpf.CryptoKTLSRxOnly
+		}
+		return raw, ebpf.CryptoUserspaceTLS
+	}
+
+	if rc, ok := conn.(*tls.RustConn); ok {
+		ktls := rc.KTLSEnabled()
+		raw := rc.NetConn()
+		if ktls.TxReady && ktls.RxReady {
+			return raw, ebpf.CryptoKTLSBoth
+		}
+		if ktls.TxReady {
+			return raw, ebpf.CryptoKTLSTxOnly
+		}
+		if ktls.RxReady {
+			return raw, ebpf.CryptoKTLSRxOnly
+		}
+		return raw, ebpf.CryptoUserspaceTLS
+	}
+
+	if _, ok := conn.(*tls.UConn); ok {
+		return nil, ebpf.CryptoUserspaceTLS
+	}
+	if _, ok := conn.(*reality.Conn); ok {
+		return nil, ebpf.CryptoUserspaceTLS
+	}
+	if _, ok := conn.(*reality.UConn); ok {
+		return nil, ebpf.CryptoUserspaceTLS
+	}
+
+	if _, ok := conn.(*net.TCPConn); ok {
+		return conn, ebpf.CryptoNone
+	}
+
+	return nil, ebpf.CryptoNone
+}
+
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
 func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
+	// Capture crypto state before unwrapping TLS wrappers.
+	_, readerCrypto := DetermineSocketCryptoHint(readerConn)
+	_, writerCrypto := DetermineSocketCryptoHint(writerConn)
+
 	readerConn, readCounter, _, readerHandler := UnwrapRawConn(readerConn)
 	writerConn, _, writeCounter, _ := UnwrapRawConn(writerConn)
 	var readerForBuf net.Conn = readerConn
@@ -770,9 +846,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		}
 		if splice {
 			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
-			if mgr := ebpf.GlobalSockmapManager(); mgr != nil && ebpf.CanUseZeroCopy(readerConn, writerConn) {
-				if err := mgr.RegisterPair(readerConn, writerConn); err == nil {
-					errors.LogDebug(ctx, "CopyRawConn sockmap")
+			if mgr := ebpf.GlobalSockmapManager(); mgr != nil && ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
+				if err := mgr.RegisterPairWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto); err == nil {
+					errors.LogDebug(ctx, "CopyRawConn sockmap (crypto: reader=", int(readerCrypto), " writer=", int(writerCrypto), ")")
 					timer.SetTimeout(24 * time.Hour)
 					if inTimer != nil {
 						inTimer.SetTimeout(24 * time.Hour)

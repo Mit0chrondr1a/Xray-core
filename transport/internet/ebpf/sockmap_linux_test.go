@@ -31,6 +31,41 @@ func TestSockmapManagerEnable(t *testing.T) {
 	}
 }
 
+func TestBuildSKSkbVerdictProgramDenyPolicyJumpsToSKPass(t *testing.T) {
+	insns := buildSKSkbVerdictProgram()
+	const (
+		denyJumpIdx     = 14
+		redirectCallIdx = 22
+		skPassIdx       = 23
+		skPassValue     = 1
+	)
+
+	if len(insns) <= skPassIdx+1 {
+		t.Fatalf("unexpected verdict program length: got %d, want at least %d", len(insns), skPassIdx+2)
+	}
+
+	denyJump := insns[denyJumpIdx]
+	if denyJump.code != (bpfClassJMP|bpfJEQ|bpfK) || denyJump.dst != bpfRegR0 || denyJump.imm != 0 {
+		t.Fatalf("unexpected deny-policy jump instruction at %d: %+v", denyJumpIdx, denyJump)
+	}
+
+	target := denyJumpIdx + 1 + int(denyJump.off)
+	if target != skPassIdx {
+		t.Fatalf("deny-policy jump target mismatch: got %d, want %d", target, skPassIdx)
+	}
+	if target == redirectCallIdx {
+		t.Fatalf("deny-policy jump incorrectly targets redirect helper at %d", redirectCallIdx)
+	}
+
+	skPassInsn := insns[skPassIdx]
+	if skPassInsn.code != (bpfALU64|bpfMov|bpfK) || skPassInsn.dst != bpfRegR0 || skPassInsn.imm != skPassValue {
+		t.Fatalf("unexpected SK_PASS instruction at %d: %+v", skPassIdx, skPassInsn)
+	}
+	if insns[skPassIdx+1].code != (bpfClassJMP | bpfExit) {
+		t.Fatalf("missing BPF exit after SK_PASS at %d", skPassIdx+1)
+	}
+}
+
 func TestSockmapRegisterPair(t *testing.T) {
 	caps := GetCapabilities()
 	if !caps.SockmapSupported {
@@ -757,6 +792,157 @@ func BenchmarkSockmapRegisterUnregister(b *testing.B) {
 		server.Close()
 		listener.Close()
 		b.StartTimer()
+	}
+}
+
+func TestComputeRedirectPolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		inbound  CryptoHint
+		outbound CryptoHint
+		wantAllow bool
+		wantKTLS  bool
+	}{
+		{"both raw TCP", CryptoNone, CryptoNone, true, false},
+		{"both kTLS full", CryptoKTLSBoth, CryptoKTLSBoth, true, true},
+		{"raw + kTLS", CryptoNone, CryptoKTLSBoth, false, false},
+		{"kTLS + raw", CryptoKTLSBoth, CryptoNone, false, false},
+		{"kTLS TX only + kTLS", CryptoKTLSTxOnly, CryptoKTLSBoth, false, false},
+		{"kTLS RX only + kTLS", CryptoKTLSRxOnly, CryptoKTLSBoth, false, false},
+		{"userspace + raw", CryptoUserspaceTLS, CryptoNone, false, false},
+		{"userspace + userspace", CryptoUserspaceTLS, CryptoUserspaceTLS, false, false},
+		{"kTLS TX only + kTLS TX only", CryptoKTLSTxOnly, CryptoKTLSTxOnly, false, false},
+		{"kTLS RX only + kTLS RX only", CryptoKTLSRxOnly, CryptoKTLSRxOnly, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := computeRedirectPolicy(tt.inbound, tt.outbound)
+			gotAllow := policy&PolicyAllowRedirect != 0
+			gotKTLS := policy&PolicyKTLSActive != 0
+			if gotAllow != tt.wantAllow {
+				t.Errorf("allow: got %v, want %v", gotAllow, tt.wantAllow)
+			}
+			if gotKTLS != tt.wantKTLS {
+				t.Errorf("kTLS: got %v, want %v", gotKTLS, tt.wantKTLS)
+			}
+		})
+	}
+}
+
+func TestPolicyMapLifecycle(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+
+	if policyMapFD < 0 {
+		t.Fatal("policyMapFD should be >= 0 after Enable")
+	}
+
+	if err := mgr.Disable(); err != nil {
+		t.Fatal(err)
+	}
+
+	if policyMapFD != -1 {
+		t.Fatal("policyMapFD should be -1 after Disable")
+	}
+}
+
+func TestRegisterPairWithCrypto(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan net.Conn, 1)
+	go func() {
+		conn, _ := listener.Accept()
+		serverDone <- conn
+	}()
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	server := <-serverDone
+	defer server.Close()
+
+	// Raw TCP pair should succeed
+	if err := mgr.RegisterPairWithCrypto(client, server, CryptoNone, CryptoNone); err != nil {
+		t.Fatalf("RegisterPairWithCrypto(None, None) failed: %v", err)
+	}
+
+	if err := mgr.UnregisterPair(client, server); err != nil {
+		t.Fatalf("UnregisterPair failed: %v", err)
+	}
+}
+
+func TestCanUseZeroCopyWithCrypto(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan net.Conn, 1)
+	go func() {
+		c, _ := listener.Accept()
+		serverDone <- c
+	}()
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-serverDone
+	defer server.Close()
+
+	// Raw TCP: allowed
+	if !CanUseZeroCopyWithCrypto(client, server, CryptoNone, CryptoNone) {
+		t.Error("expected true for CryptoNone+CryptoNone")
+	}
+
+	// Both kTLS: allowed
+	if !CanUseZeroCopyWithCrypto(client, server, CryptoKTLSBoth, CryptoKTLSBoth) {
+		t.Error("expected true for CryptoKTLSBoth+CryptoKTLSBoth")
+	}
+
+	// Asymmetric: denied
+	if CanUseZeroCopyWithCrypto(client, server, CryptoNone, CryptoKTLSBoth) {
+		t.Error("expected false for CryptoNone+CryptoKTLSBoth")
+	}
+
+	// Userspace: denied
+	if CanUseZeroCopyWithCrypto(client, server, CryptoUserspaceTLS, CryptoUserspaceTLS) {
+		t.Error("expected false for CryptoUserspaceTLS+CryptoUserspaceTLS")
+	}
+
+	// Non-TCP: denied regardless of crypto
+	pipeA, pipeB := net.Pipe()
+	defer pipeA.Close()
+	defer pipeB.Close()
+	if CanUseZeroCopyWithCrypto(pipeA, pipeB, CryptoNone, CryptoNone) {
+		t.Error("expected false for non-TCP connections")
 	}
 }
 

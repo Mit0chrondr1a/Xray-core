@@ -277,6 +277,7 @@ func (c *RustConn) Close() error {
 	return c.rawConn.Close()
 }
 
+func (c *RustConn) NetConn() gonet.Conn                        { return c.rawConn }
 func (c *RustConn) LocalAddr() gonet.Addr                      { return c.rawConn.LocalAddr() }
 func (c *RustConn) RemoteAddr() gonet.Addr                     { return c.rawConn.RemoteAddr() }
 func (c *RustConn) SetDeadline(t time.Time) error              { return c.rawConn.SetDeadline(t) }

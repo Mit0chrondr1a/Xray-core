@@ -46,6 +46,16 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 	return -1, ErrSockmapNotSupported
 }
 
+// setPolicyEntry is a no-op on non-Linux systems.
+func setPolicyEntry(cookie uint64, flags uint32) error {
+	return nil
+}
+
+// deletePolicyEntry is a no-op on non-Linux systems.
+func deletePolicyEntry(cookie uint64) error {
+	return nil
+}
+
 // isSocketAlive always returns false on non-Linux systems.
 func isSocketAlive(fd int) bool {
 	return false

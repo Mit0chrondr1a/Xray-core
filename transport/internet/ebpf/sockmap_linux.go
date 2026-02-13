@@ -16,6 +16,7 @@ import (
 var (
 	sockmapFD         int = -1
 	sockhashFD        int = -1
+	policyMapFD       int = -1
 	skSkbParserFD     int = -1
 	skSkbVerdictFD    int = -1
 	sockmapMaxEntries uint32
@@ -42,12 +43,15 @@ func buildSKSkbParserProgram() []bpfInsn {
 // buildSKSkbVerdictProgram generates the sk_skb stream verdict BPF program.
 // When data arrives on a socket in the SOCKMAP, this program fires:
 //  1. Gets the receiving socket's cookie via bpf_get_socket_cookie
-//  2. Looks up the cookie in the SOCKHASH to find the paired socket
-//  3. Redirects the data to the paired socket's egress (send) path
+//  2. Looks up the cookie in the policy map to check redirect permission
+//  3. If denied (flags & 1 == 0), returns SK_PASS (data to userspace)
+//  4. If allowed (or no policy entry), redirects via SOCKHASH
 //
 // This achieves true zero-copy TCP proxying — data arriving from the
 // network on one socket is forwarded directly to the paired socket
-// without ever entering userspace.
+// without ever entering userspace. The policy lookup enables kTLS-aware
+// sockmap: when both sockets have kTLS, the kernel handles encrypt/decrypt
+// transparently.
 //
 // Context: struct __sk_buff * (R1)
 // Return:  SK_PASS (1) always — on redirect failure, data proceeds normally
@@ -63,53 +67,84 @@ func buildSKSkbVerdictProgram() []bpfInsn {
 
 	insns := []bpfInsn{
 		// r6 = skb (callee-saved)
-		bpfMovReg(bpfRegR6, bpfRegR1),
+		bpfMovReg(bpfRegR6, bpfRegR1),                      // 0
 
 		// Zero the key area on the stack
-		bpfStoreImm(bpfDW, bpfRegR10, int16(stackKey), 0),
+		bpfStoreImm(bpfDW, bpfRegR10, int16(stackKey), 0),  // 1
 
 		// r1 = skb for bpf_get_socket_cookie
-		bpfMovReg(bpfRegR1, bpfRegR6),
+		bpfMovReg(bpfRegR1, bpfRegR6),                      // 2
 		// r0 = bpf_get_socket_cookie(skb) — helper #46
-		bpfCallHelper(bpfFuncGetSocketCookie),
+		bpfCallHelper(bpfFuncGetSocketCookie),               // 3
 
-		// Store full 64-bit cookie as key (map uses uint64 keys)
-		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR0, int16(stackKey)),
+		// r7 = cookie (callee-saved)
+		bpfMovReg(bpfRegR7, bpfRegR0),                      // 4
 
-		// Set up args for bpf_sk_redirect_hash(skb, map, key, flags)
-		// r1 = skb
-		bpfMovReg(bpfRegR1, bpfRegR6),
+		// Store cookie as key on stack
+		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR7, int16(stackKey)), // 5
 	}
 
-	// r2 = sockhash map fd (LD_IMM64, 2 instructions, patched at load time)
-	mapFDInsns := bpfLoadMapFD(bpfRegR2, 0) // placeholder fd=0
+	// --- Policy map lookup ---
+	// r1 = policy map fd (LD_IMM64, 2 instructions, patched at load time)
+	policyMapInsns := bpfLoadMapFD(bpfRegR1, skSkbPolicyFDPlaceholder) // 6, 7
 	insns = append(insns,
-		mapFDInsns[0],
-		mapFDInsns[1],
-		// r3 = &key (pointer to stack)
-		bpfMovReg(bpfRegR3, bpfRegR10),
-		bpfAddImm(bpfRegR3, int32(stackKey)),
-		// r4 = flags (0 = redirect to egress path of target socket)
-		bpfMovImm(bpfRegR4, 0),
-		// call bpf_sk_redirect_hash — helper #72
-		bpfCallHelper(bpfFuncSKRedirectHash),
+		policyMapInsns[0],
+		policyMapInsns[1],
+		// r2 = &key
+		bpfMovReg(bpfRegR2, bpfRegR10),                     // 8
+		bpfAddImm(bpfRegR2, int32(stackKey)),                // 9
+		// r0 = bpf_map_lookup_elem(policy_map, &key)
+		bpfCallHelper(bpfFuncMapLookupElem),                 // 10
 
-		// Always return SK_PASS.
-		// If redirect succeeded (r0 == SK_PASS), the data was forwarded
-		// to the paired socket's egress (send) path.
-		// If redirect failed (r0 == SK_DROP), we return SK_PASS so the
-		// data proceeds to the original socket (userspace fallback).
-		bpfMovImm(bpfRegR0, skPass),
-		bpfExitInsn(),
+		// If no policy entry (r0 == NULL), allow redirect (backward compat)
+		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 3),                  // 11: if NULL, skip to redirect section (+3)
+
+		// Policy entry found: load flags, check allow bit
+		bpfLoadMem(bpfW, bpfRegR0, bpfRegR0, 0),            // 12: r0 = *(u32*)(r0+0)
+		bpfAndImm32(bpfRegR0, int32(PolicyAllowRedirect)),   // 13: r0 &= 1
+		// Deny path must bypass redirect helper setup and jump to SK_PASS epilogue.
+		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 8),                  // 14: if zero → SK_PASS exit (+8 to insn 23)
+	)
+
+	// --- Redirect section ---
+	insns = append(insns,
+		// Restore cookie to stack key (may have been clobbered by helper)
+		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR7, int16(stackKey)), // 15
+
+		// r1 = skb
+		bpfMovReg(bpfRegR1, bpfRegR6),                      // 16
+	)
+
+	// r2 = sockhash map fd (LD_IMM64, 2 instructions, patched at load time)
+	sockhashInsns := bpfLoadMapFD(bpfRegR2, skSkbMapFDPlaceholder) // 17, 18
+	insns = append(insns,
+		sockhashInsns[0],
+		sockhashInsns[1],
+		// r3 = &key
+		bpfMovReg(bpfRegR3, bpfRegR10),                     // 19
+		bpfAddImm(bpfRegR3, int32(stackKey)),                // 20
+		// r4 = flags (0 = redirect to egress)
+		bpfMovImm(bpfRegR4, 0),                              // 21
+		// call bpf_sk_redirect_hash — helper #72
+		bpfCallHelper(bpfFuncSKRedirectHash),                // 22
+	)
+
+	// --- SK_PASS exit ---
+	insns = append(insns,
+		bpfMovImm(bpfRegR0, skPass),                         // 23
+		bpfExitInsn(),                                        // 24
 	)
 
 	return insns
 }
 
-// skSkbMapFDPlaceholder is the map fd value in the bytecode that gets replaced.
+// skSkbMapFDPlaceholder is the sockhash map fd placeholder in the verdict bytecode.
 const skSkbMapFDPlaceholder = 0
 
-// setupSockmapImpl creates the sockmap, sockhash, and sk_skb programs.
+// skSkbPolicyFDPlaceholder is the policy map fd placeholder in the verdict bytecode.
+const skSkbPolicyFDPlaceholder = 1
+
+// setupSockmapImpl creates the sockmap, sockhash, policy map, and sk_skb programs.
 func setupSockmapImpl(config SockmapConfig) error {
 	// Create SOCKHASH map for socket cookie → socket lookup (used by verdict program)
 	hashFD, err := createBPFMap(
@@ -122,6 +157,18 @@ func setupSockmapImpl(config SockmapConfig) error {
 		return fmt.Errorf("failed to create sockhash map: %w", err)
 	}
 
+	// Create policy map for redirect policy (cookie → flags)
+	policyFD, err := createBPFMap(
+		1, // BPF_MAP_TYPE_HASH
+		8, // key size (uint64 cookie)
+		4, // value size (uint32 flags)
+		config.MaxEntries,
+	)
+	if err != nil {
+		syscall.Close(hashFD)
+		return fmt.Errorf("failed to create policy map: %w", err)
+	}
+
 	// Create SOCKMAP for storing sockets (sk_skb programs attach here;
 	// incoming data on any socket in this map triggers the programs)
 	mapFD, err := createBPFMap(
@@ -131,6 +178,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 		config.MaxEntries,
 	)
 	if err != nil {
+		syscall.Close(policyFD)
 		syscall.Close(hashFD)
 		return fmt.Errorf("failed to create sockmap: %w", err)
 	}
@@ -138,9 +186,10 @@ func setupSockmapImpl(config SockmapConfig) error {
 	// Build and load sk_skb stream parser
 	parserInsns := buildSKSkbParserProgram()
 	parserBytecode := encodeBPFInsns(parserInsns)
-	parserFD, err := loadSKSkbProgram(parserBytecode, 0, "xray_skb_parse")
+	parserFD, err := loadSKSkbProgram(parserBytecode, 0, 0, "xray_skb_parse")
 	if err != nil {
 		syscall.Close(hashFD)
+		syscall.Close(policyFD)
 		syscall.Close(mapFD)
 		return fmt.Errorf("failed to load sk_skb parser: %w", err)
 	}
@@ -148,10 +197,11 @@ func setupSockmapImpl(config SockmapConfig) error {
 	// Build and load sk_skb stream verdict
 	verdictInsns := buildSKSkbVerdictProgram()
 	verdictBytecode := encodeBPFInsns(verdictInsns)
-	verdictFD, err := loadSKSkbProgram(verdictBytecode, hashFD, "xray_skb_vrdt")
+	verdictFD, err := loadSKSkbProgram(verdictBytecode, hashFD, policyFD, "xray_skb_vrdt")
 	if err != nil {
 		syscall.Close(parserFD)
 		syscall.Close(hashFD)
+		syscall.Close(policyFD)
 		syscall.Close(mapFD)
 		return fmt.Errorf("failed to load sk_skb verdict: %w", err)
 	}
@@ -161,6 +211,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 		syscall.Close(verdictFD)
 		syscall.Close(parserFD)
 		syscall.Close(hashFD)
+		syscall.Close(policyFD)
 		syscall.Close(mapFD)
 		return fmt.Errorf("failed to attach sk_skb programs: %w", err)
 	}
@@ -169,6 +220,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 	// This prevents double-close if teardownSockmapImpl runs after a
 	// partial setup failure that already closed the local FDs above.
 	sockhashFD = hashFD
+	policyMapFD = policyFD
 	sockmapFD = mapFD
 	skSkbParserFD = parserFD
 	skSkbVerdictFD = verdictFD
@@ -196,6 +248,10 @@ func teardownSockmapImpl() error {
 	if sockhashFD >= 0 {
 		syscall.Close(sockhashFD)
 		sockhashFD = -1
+	}
+	if policyMapFD >= 0 {
+		syscall.Close(policyMapFD)
+		policyMapFD = -1
 	}
 	if sockmapFD >= 0 {
 		syscall.Close(sockmapFD)
@@ -352,9 +408,10 @@ func releaseSockmapSlot(fd int) (uint32, bool) {
 }
 
 // loadSKSkbProgram loads an sk_skb BPF program with optional map fd relocation.
-func loadSKSkbProgram(insns []uint64, sockhashMapFD int, name string) (int, error) {
-	// Patch map fd placeholder with actual sockhash map fd (no-op if no LD_IMM64 in insns)
+func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) (int, error) {
+	// Patch map fd placeholders with actual map fds (no-op if no matching LD_IMM64 in insns)
 	patchMapFD(insns, skSkbMapFDPlaceholder, int32(sockhashMapFD))
+	patchMapFD(insns, skSkbPolicyFDPlaceholder, int32(polMapFD))
 
 	license := []byte("GPL\x00")
 
@@ -525,6 +582,25 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 	}
 
 	return fd, nil
+}
+
+// setPolicyEntry writes a redirect policy entry for the given socket cookie.
+func setPolicyEntry(cookie uint64, flags uint32) error {
+	if policyMapFD < 0 {
+		return nil // policy map not created — no-op (backward compat)
+	}
+	key := cookie
+	value := flags
+	return bpfMapUpdate(policyMapFD, unsafe.Pointer(&key), unsafe.Pointer(&value))
+}
+
+// deletePolicyEntry removes the redirect policy entry for the given socket cookie.
+func deletePolicyEntry(cookie uint64) error {
+	if policyMapFD < 0 {
+		return nil
+	}
+	key := cookie
+	return bpfMapDelete(policyMapFD, unsafe.Pointer(&key))
 }
 
 // isSocketAlive probes whether a file descriptor is still a valid, open socket.

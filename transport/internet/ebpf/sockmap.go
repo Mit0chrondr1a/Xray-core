@@ -51,6 +51,23 @@ type SockPairKey struct {
 	OutboundFD int
 }
 
+// CryptoHint describes the TLS/crypto state of a socket for redirect policy decisions.
+type CryptoHint uint8
+
+const (
+	CryptoNone         CryptoHint = 0 // raw TCP
+	CryptoKTLSBoth     CryptoHint = 1 // kTLS TX+RX
+	CryptoKTLSTxOnly   CryptoHint = 2
+	CryptoKTLSRxOnly   CryptoHint = 3
+	CryptoUserspaceTLS CryptoHint = 4 // Go/uTLS — not eligible
+)
+
+const (
+	PolicyAllowRedirect uint32 = 1 << 0
+	PolicyUseIngress    uint32 = 1 << 1
+	PolicyKTLSActive    uint32 = 1 << 2
+)
+
 // SockPair represents a pair of sockets being proxied.
 type SockPair struct {
 	// InboundConn is the inbound connection (client side).
@@ -65,6 +82,10 @@ type SockPair struct {
 	BytesForwarded uint64
 	// Active indicates if the pair is actively proxying.
 	Active bool
+	// InboundCrypto is the crypto state of the inbound connection.
+	InboundCrypto CryptoHint
+	// OutboundCrypto is the crypto state of the outbound connection.
+	OutboundCrypto CryptoHint
 }
 
 // NewSockmapManager creates a new sockmap manager.
@@ -131,6 +152,12 @@ func (m *SockmapManager) Disable() error {
 // RegisterPair registers a socket pair for zero-copy proxying.
 // Both connections must be TCP connections without TLS encryption.
 func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
+	return m.RegisterPairWithCrypto(inbound, outbound, CryptoNone, CryptoNone)
+}
+
+// RegisterPairWithCrypto registers a socket pair for zero-copy proxying with crypto awareness.
+// The crypto hints are used to compute a redirect policy that the verdict program consults.
+func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inboundCrypto, outboundCrypto CryptoHint) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -162,8 +189,23 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 		return err
 	}
 
+	// Compute redirect policy from crypto hints.
+	policy := computeRedirectPolicy(inboundCrypto, outboundCrypto)
+
+	// Write policy entries before sockmap registration so the verdict program
+	// can consult them as soon as data arrives.
+	if err := setPolicyEntry(inboundCookie, policy); err != nil {
+		return err
+	}
+	if err := setPolicyEntry(outboundCookie, policy); err != nil {
+		deletePolicyEntry(inboundCookie)
+		return err
+	}
+
 	// Add both sockets to sockmap
 	if err := m.addToSockmap(inboundFD); err != nil {
+		deletePolicyEntry(inboundCookie)
+		deletePolicyEntry(outboundCookie)
 		if isSockmapFull(err) {
 			m.fullRejects.Add(1)
 		}
@@ -171,6 +213,8 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 	}
 	if err := m.addToSockmap(outboundFD); err != nil {
 		m.removeFromSockmap(inboundFD)
+		deletePolicyEntry(inboundCookie)
+		deletePolicyEntry(outboundCookie)
 		if isSockmapFull(err) {
 			m.fullRejects.Add(1)
 		}
@@ -182,6 +226,8 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 	if err := m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie); err != nil {
 		m.removeFromSockmap(inboundFD)
 		m.removeFromSockmap(outboundFD)
+		deletePolicyEntry(inboundCookie)
+		deletePolicyEntry(outboundCookie)
 		return err
 	}
 
@@ -195,6 +241,8 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 		InboundCookie:  inboundCookie,
 		OutboundCookie: outboundCookie,
 		Active:         true,
+		InboundCrypto:  inboundCrypto,
+		OutboundCrypto: outboundCrypto,
 	}
 
 	m.pairs.Store(key, pair)
@@ -257,6 +305,8 @@ func (m *SockmapManager) unregisterPairLocked(key SockPairKey) error {
 	if err := m.removeFromSockmap(key.OutboundFD); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	deletePolicyEntry(pair.InboundCookie)
+	deletePolicyEntry(pair.OutboundCookie)
 
 	m.activePairs.Add(-1)
 	return firstErr
@@ -312,6 +362,31 @@ func CanUseZeroCopy(inbound, outbound net.Conn) bool {
 	_, ok1 := inbound.(*net.TCPConn)
 	_, ok2 := outbound.(*net.TCPConn)
 	return ok1 && ok2
+}
+
+// CanUseZeroCopyWithCrypto returns true if the connection pair can use
+// zero-copy given their crypto states. Both must be raw TCP connections
+// and the redirect policy must allow it.
+func CanUseZeroCopyWithCrypto(inbound, outbound net.Conn, inCrypto, outCrypto CryptoHint) bool {
+	_, ok1 := inbound.(*net.TCPConn)
+	_, ok2 := outbound.(*net.TCPConn)
+	if !ok1 || !ok2 {
+		return false
+	}
+	return computeRedirectPolicy(inCrypto, outCrypto)&PolicyAllowRedirect != 0
+}
+
+// computeRedirectPolicy determines the redirect policy flags for a pair of
+// sockets based on their crypto states.
+func computeRedirectPolicy(inbound, outbound CryptoHint) uint32 {
+	switch {
+	case inbound == CryptoNone && outbound == CryptoNone:
+		return PolicyAllowRedirect // classic raw TCP
+	case inbound == CryptoKTLSBoth && outbound == CryptoKTLSBoth:
+		return PolicyAllowRedirect | PolicyKTLSActive // kernel handles encrypt/decrypt
+	default:
+		return 0 // asymmetric or partial — unsafe
+	}
 }
 
 // getConnFD extracts the file descriptor from a net.Conn.
