@@ -3,28 +3,34 @@
 package ebpf
 
 import (
+	"context"
+	stdErrors "errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
 
+	xerrors "github.com/xtls/xray-core/common/errors"
 	"golang.org/x/sys/unix"
 )
 
 var (
-	sockmapFD         int = -1
-	sockhashFD        int = -1
-	policyMapFD       int = -1
-	skSkbParserFD     int = -1
-	skSkbVerdictFD    int = -1
-	sockmapMaxEntries uint32
+	sockhashFD      int = -1
+	policyMapFD     int = -1
+	skSkbParserFD   int = -1
+	skSkbVerdictFD  int = -1
+	sockmapAttachFD int = -1
+	sockmapPinPath  string
 
-	sockmapSlotMu sync.Mutex
-	sockmapSlots  map[int]uint32
-	sockmapFree   []uint32
-	sockmapNext   atomic.Uint32
+	sockmapAttachMaxEntries uint32
+	sockmapAttachSlotMu     sync.Mutex
+	sockmapAttachSlots      map[int]uint32
+	sockmapAttachFree       []uint32
+	sockmapAttachNext       atomic.Uint32
 )
 
 // buildSKSkbParserProgram generates a minimal sk_skb stream parser that
@@ -41,7 +47,7 @@ func buildSKSkbParserProgram() []bpfInsn {
 }
 
 // buildSKSkbVerdictProgram generates the sk_skb stream verdict BPF program.
-// When data arrives on a socket in the SOCKMAP, this program fires:
+// When data arrives on a socket in the sk_skb attach map, this program fires:
 //  1. Gets the receiving socket's cookie via bpf_get_socket_cookie
 //  2. Looks up the cookie in the policy map to check redirect permission
 //  3. If denied (flags & 1 == 0), returns SK_PASS (data to userspace)
@@ -67,18 +73,18 @@ func buildSKSkbVerdictProgram() []bpfInsn {
 
 	insns := []bpfInsn{
 		// r6 = skb (callee-saved)
-		bpfMovReg(bpfRegR6, bpfRegR1),                      // 0
+		bpfMovReg(bpfRegR6, bpfRegR1), // 0
 
 		// Zero the key area on the stack
-		bpfStoreImm(bpfDW, bpfRegR10, int16(stackKey), 0),  // 1
+		bpfStoreImm(bpfDW, bpfRegR10, int16(stackKey), 0), // 1
 
 		// r1 = skb for bpf_get_socket_cookie
-		bpfMovReg(bpfRegR1, bpfRegR6),                      // 2
+		bpfMovReg(bpfRegR1, bpfRegR6), // 2
 		// r0 = bpf_get_socket_cookie(skb) — helper #46
-		bpfCallHelper(bpfFuncGetSocketCookie),               // 3
+		bpfCallHelper(bpfFuncGetSocketCookie), // 3
 
 		// r7 = cookie (callee-saved)
-		bpfMovReg(bpfRegR7, bpfRegR0),                      // 4
+		bpfMovReg(bpfRegR7, bpfRegR0), // 4
 
 		// Store cookie as key on stack
 		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR7, int16(stackKey)), // 5
@@ -91,19 +97,19 @@ func buildSKSkbVerdictProgram() []bpfInsn {
 		policyMapInsns[0],
 		policyMapInsns[1],
 		// r2 = &key
-		bpfMovReg(bpfRegR2, bpfRegR10),                     // 8
-		bpfAddImm(bpfRegR2, int32(stackKey)),                // 9
+		bpfMovReg(bpfRegR2, bpfRegR10),       // 8
+		bpfAddImm(bpfRegR2, int32(stackKey)), // 9
 		// r0 = bpf_map_lookup_elem(policy_map, &key)
-		bpfCallHelper(bpfFuncMapLookupElem),                 // 10
+		bpfCallHelper(bpfFuncMapLookupElem), // 10
 
 		// If no policy entry (r0 == NULL), allow redirect (backward compat)
-		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 3),                  // 11: if NULL, skip to redirect section (+3)
+		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 3), // 11: if NULL, skip to redirect section (+3)
 
 		// Policy entry found: load flags, check allow bit
-		bpfLoadMem(bpfW, bpfRegR0, bpfRegR0, 0),            // 12: r0 = *(u32*)(r0+0)
-		bpfAndImm32(bpfRegR0, int32(PolicyAllowRedirect)),   // 13: r0 &= 1
+		bpfLoadMem(bpfW, bpfRegR0, bpfRegR0, 0),           // 12: r0 = *(u32*)(r0+0)
+		bpfAndImm32(bpfRegR0, int32(PolicyAllowRedirect)), // 13: r0 &= 1
 		// Deny path must bypass redirect helper setup and jump to SK_PASS epilogue.
-		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 8),                  // 14: if zero → SK_PASS exit (+8 to insn 23)
+		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 8), // 14: if zero → SK_PASS exit (+8 to insn 23)
 	)
 
 	// --- Redirect section ---
@@ -112,7 +118,7 @@ func buildSKSkbVerdictProgram() []bpfInsn {
 		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR7, int16(stackKey)), // 15
 
 		// r1 = skb
-		bpfMovReg(bpfRegR1, bpfRegR6),                      // 16
+		bpfMovReg(bpfRegR1, bpfRegR6), // 16
 	)
 
 	// r2 = sockhash map fd (LD_IMM64, 2 instructions, patched at load time)
@@ -121,18 +127,18 @@ func buildSKSkbVerdictProgram() []bpfInsn {
 		sockhashInsns[0],
 		sockhashInsns[1],
 		// r3 = &key
-		bpfMovReg(bpfRegR3, bpfRegR10),                     // 19
-		bpfAddImm(bpfRegR3, int32(stackKey)),                // 20
+		bpfMovReg(bpfRegR3, bpfRegR10),       // 19
+		bpfAddImm(bpfRegR3, int32(stackKey)), // 20
 		// r4 = flags (0 = redirect to egress)
-		bpfMovImm(bpfRegR4, 0),                              // 21
+		bpfMovImm(bpfRegR4, 0), // 21
 		// call bpf_sk_redirect_hash — helper #72
-		bpfCallHelper(bpfFuncSKRedirectHash),                // 22
+		bpfCallHelper(bpfFuncSKRedirectHash), // 22
 	)
 
 	// --- SK_PASS exit ---
 	insns = append(insns,
-		bpfMovImm(bpfRegR0, skPass),                         // 23
-		bpfExitInsn(),                                        // 24
+		bpfMovImm(bpfRegR0, skPass), // 23
+		bpfExitInsn(),               // 24
 	)
 
 	return insns
@@ -144,22 +150,28 @@ const skSkbMapFDPlaceholder = 0
 // skSkbPolicyFDPlaceholder is the policy map fd placeholder in the verdict bytecode.
 const skSkbPolicyFDPlaceholder = 1
 
-// setupSockmapImpl creates the sockmap, sockhash, policy map, and sk_skb programs.
+// setupSockmapImpl creates the SOCKHASH, LRU policy map, and sk_skb programs.
+// Preferred attach is SOCKHASH; kernels that do not support sk_skb-on-SOCKHASH
+// fall back to a dedicated SOCKMAP attach map while still redirecting via SOCKHASH.
 func setupSockmapImpl(config SockmapConfig) error {
-	// Create SOCKHASH map for socket cookie → socket lookup (used by verdict program)
+	// Create SOCKHASH map for cookie→socket redirect.
 	hashFD, err := createBPFMap(
-		18, // BPF_MAP_TYPE_SOCKHASH
-		8,  // key size (uint64 cookie)
-		4,  // value size (socket fd, resolved to socket by kernel)
+		bpfMapTypeSockhash,
+		8, // key size (uint64 cookie)
+		4, // value size (socket fd, resolved to socket by kernel)
 		config.MaxEntries,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create sockhash map: %w", err)
 	}
+	attachFD := hashFD
+	usingSockmapFallback := false
+	fallbackAttachFD := -1
 
-	// Create policy map for redirect policy (cookie → flags)
+	// Create LRU policy map for redirect policy (cookie → flags).
+	// LRU_HASH provides automatic kernel-side eviction under pressure.
 	policyFD, err := createBPFMap(
-		1, // BPF_MAP_TYPE_HASH
+		bpfMapTypeLRUHash,
 		8, // key size (uint64 cookie)
 		4, // value size (uint32 flags)
 		config.MaxEntries,
@@ -169,20 +181,6 @@ func setupSockmapImpl(config SockmapConfig) error {
 		return fmt.Errorf("failed to create policy map: %w", err)
 	}
 
-	// Create SOCKMAP for storing sockets (sk_skb programs attach here;
-	// incoming data on any socket in this map triggers the programs)
-	mapFD, err := createBPFMap(
-		15, // BPF_MAP_TYPE_SOCKMAP
-		4,
-		4,
-		config.MaxEntries,
-	)
-	if err != nil {
-		syscall.Close(policyFD)
-		syscall.Close(hashFD)
-		return fmt.Errorf("failed to create sockmap: %w", err)
-	}
-
 	// Build and load sk_skb stream parser
 	parserInsns := buildSKSkbParserProgram()
 	parserBytecode := encodeBPFInsns(parserInsns)
@@ -190,7 +188,6 @@ func setupSockmapImpl(config SockmapConfig) error {
 	if err != nil {
 		syscall.Close(hashFD)
 		syscall.Close(policyFD)
-		syscall.Close(mapFD)
 		return fmt.Errorf("failed to load sk_skb parser: %w", err)
 	}
 
@@ -202,41 +199,108 @@ func setupSockmapImpl(config SockmapConfig) error {
 		syscall.Close(parserFD)
 		syscall.Close(hashFD)
 		syscall.Close(policyFD)
-		syscall.Close(mapFD)
 		return fmt.Errorf("failed to load sk_skb verdict: %w", err)
 	}
 
-	// Attach both programs to sockmap
-	if err := attachSKSkbToSockmap(parserFD, verdictFD, mapFD); err != nil {
-		syscall.Close(verdictFD)
-		syscall.Close(parserFD)
-		syscall.Close(hashFD)
-		syscall.Close(policyFD)
-		syscall.Close(mapFD)
-		return fmt.Errorf("failed to attach sk_skb programs: %w", err)
+	// Preferred attach target is SOCKHASH (kernel 4.20+).
+	if err := attachSKSkbToMap(parserFD, verdictFD, hashFD); err != nil {
+		if !shouldFallbackToSockmapAttach(err) {
+			syscall.Close(verdictFD)
+			syscall.Close(parserFD)
+			syscall.Close(hashFD)
+			syscall.Close(policyFD)
+			return fmt.Errorf("failed to attach sk_skb programs to sockhash: %w", err)
+		}
+
+		// Compatibility fallback for older kernels:
+		// attach sk_skb to SOCKMAP, but keep redirect lookups in SOCKHASH.
+		fallbackAttachFD, err = createBPFMap(
+			bpfMapTypeSockmap,
+			4, // key size (uint32 slot)
+			4, // value size (socket fd)
+			config.MaxEntries,
+		)
+		if err != nil {
+			syscall.Close(verdictFD)
+			syscall.Close(parserFD)
+			syscall.Close(hashFD)
+			syscall.Close(policyFD)
+			return fmt.Errorf("failed to create sockmap attach fallback: %w", err)
+		}
+		if err := attachSKSkbToMap(parserFD, verdictFD, fallbackAttachFD); err != nil {
+			syscall.Close(fallbackAttachFD)
+			syscall.Close(verdictFD)
+			syscall.Close(parserFD)
+			syscall.Close(hashFD)
+			syscall.Close(policyFD)
+			return fmt.Errorf("failed to attach sk_skb programs to sockhash and fallback sockmap: %w", err)
+		}
+		attachFD = fallbackAttachFD
+		usingSockmapFallback = true
+	}
+
+	// Pin maps to BPF filesystem with 0600 permissions
+	pinDir := ""
+	if config.PinPath != "" {
+		pinDir = filepath.Clean(config.PinPath)
+		if err := pinMaps(pinDir, hashFD, policyFD); err != nil {
+			if fallbackAttachFD >= 0 {
+				syscall.Close(fallbackAttachFD)
+			}
+			syscall.Close(verdictFD)
+			syscall.Close(parserFD)
+			syscall.Close(hashFD)
+			syscall.Close(policyFD)
+			return fmt.Errorf("failed to pin BPF maps: %w", err)
+		}
 	}
 
 	// Commit to global state only after all operations succeed.
-	// This prevents double-close if teardownSockmapImpl runs after a
-	// partial setup failure that already closed the local FDs above.
 	sockhashFD = hashFD
 	policyMapFD = policyFD
-	sockmapFD = mapFD
 	skSkbParserFD = parserFD
 	skSkbVerdictFD = verdictFD
-	sockmapSlotMu.Lock()
-	sockmapMaxEntries = config.MaxEntries
-	sockmapSlots = make(map[int]uint32)
-	sockmapFree = nil
-	sockmapNext.Store(0)
-	sockmapSlotMu.Unlock()
+	if usingSockmapFallback {
+		sockmapAttachFD = attachFD
+		sockmapAttachMaxEntries = config.MaxEntries
+		sockmapAttachSlots = make(map[int]uint32)
+		sockmapAttachFree = nil
+		sockmapAttachNext.Store(0)
+	} else {
+		sockmapAttachFD = -1
+		sockmapAttachMaxEntries = 0
+		sockmapAttachSlots = nil
+		sockmapAttachFree = nil
+		sockmapAttachNext.Store(0)
+	}
+	sockmapPinPath = pinDir
+
+	// Drop excess capabilities (defense-in-depth, non-fatal)
+	if config.DropCapabilities {
+		if err := dropExcessCapabilities(); err != nil {
+			ctx := context.Background()
+			xerrors.LogWarning(ctx, "failed to drop excess capabilities: ", err)
+		}
+	}
 
 	return nil
 }
 
 // teardownSockmapImpl cleans up sockmap resources.
-// Closing the SOCKMAP fd implicitly detaches all attached programs.
+// Closing the active attach map FD detaches attached sk_skb programs.
 func teardownSockmapImpl() error {
+	// Unpin maps before closing FDs (best-effort)
+	if sockmapPinPath != "" {
+		unpinBPFMap(sockhashPinPath(sockmapPinPath))
+		unpinBPFMap(policyPinPath(sockmapPinPath))
+		os.Remove(sockmapPinPath)
+		sockmapPinPath = ""
+	}
+
+	if sockmapAttachFD >= 0 {
+		syscall.Close(sockmapAttachFD)
+		sockmapAttachFD = -1
+	}
 	if skSkbVerdictFD >= 0 {
 		syscall.Close(skSkbVerdictFD)
 		skSkbVerdictFD = -1
@@ -253,55 +317,11 @@ func teardownSockmapImpl() error {
 		syscall.Close(policyMapFD)
 		policyMapFD = -1
 	}
-	if sockmapFD >= 0 {
-		syscall.Close(sockmapFD)
-		sockmapFD = -1
-	}
-	sockmapSlotMu.Lock()
-	sockmapMaxEntries = 0
-	sockmapSlots = nil
-	sockmapFree = nil
-	sockmapNext.Store(0)
-	sockmapSlotMu.Unlock()
+	sockmapAttachMaxEntries = 0
+	sockmapAttachSlots = nil
+	sockmapAttachFree = nil
+	sockmapAttachNext.Store(0)
 	return nil
-}
-
-// addToSockmapImpl adds a socket to the sockmap.
-func addToSockmapImpl(fd int) error {
-	if sockmapFD < 0 {
-		return ErrSockmapNotEnabled
-	}
-
-	slot, created, err := assignSockmapSlot(fd)
-	if err != nil {
-		return err
-	}
-
-	key := slot
-	value := uint32(fd)
-
-	if err := bpfMapUpdate(sockmapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
-		if created {
-			releaseSockmapSlot(fd)
-		}
-		return err
-	}
-
-	return nil
-}
-
-// removeFromSockmapImpl removes a socket from the sockmap.
-func removeFromSockmapImpl(fd int) error {
-	if sockmapFD < 0 {
-		return nil
-	}
-
-	key, ok := releaseSockmapSlot(fd)
-	if !ok {
-		return nil
-	}
-
-	return bpfMapDelete(sockmapFD, unsafe.Pointer(&key))
 }
 
 // setupForwardingImpl configures bidirectional forwarding between sockets.
@@ -327,11 +347,60 @@ func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCooki
 		return err
 	}
 
+	// Older kernels attach sk_skb to SOCKMAP only; mirror sockets into the
+	// fallback attach map so packets trigger parser/verdict programs.
+	if sockmapAttachFD >= 0 {
+		inboundSlot, inboundCreated, err := assignSockmapAttachSlot(inboundFD)
+		if err != nil {
+			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
+			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+			return err
+		}
+		attachKey := inboundSlot
+		attachValue := uint32(inboundFD)
+		if err := bpfMapUpdate(sockmapAttachFD, unsafe.Pointer(&attachKey), unsafe.Pointer(&attachValue)); err != nil {
+			if inboundCreated {
+				releaseSockmapAttachSlot(inboundFD)
+			}
+			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
+			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+			return err
+		}
+
+		outboundSlot, outboundCreated, err := assignSockmapAttachSlot(outboundFD)
+		if err != nil {
+			if inboundCreated {
+				if attachInboundKey, ok := releaseSockmapAttachSlot(inboundFD); ok {
+					_ = bpfMapDelete(sockmapAttachFD, unsafe.Pointer(&attachInboundKey))
+				}
+			}
+			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
+			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+			return err
+		}
+		attachKey = outboundSlot
+		attachValue = uint32(outboundFD)
+		if err := bpfMapUpdate(sockmapAttachFD, unsafe.Pointer(&attachKey), unsafe.Pointer(&attachValue)); err != nil {
+			if outboundCreated {
+				releaseSockmapAttachSlot(outboundFD)
+			}
+			if inboundCreated {
+				if attachInboundKey, ok := releaseSockmapAttachSlot(inboundFD); ok {
+					_ = bpfMapDelete(sockmapAttachFD, unsafe.Pointer(&attachInboundKey))
+				}
+			}
+			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
+			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+			return err
+		}
+	}
+
 	return nil
 }
 
-// removeForwardingImpl removes bidirectional forwarding entries from sockhash.
-func removeForwardingImpl(inboundCookie, outboundCookie uint64) error {
+// removeForwardingImpl removes bidirectional forwarding entries from sockhash
+// and from the fallback attach map when enabled.
+func removeForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
 	if sockhashFD < 0 {
 		return nil
 	}
@@ -346,64 +415,73 @@ func removeForwardingImpl(inboundCookie, outboundCookie uint64) error {
 		firstErr = err
 	}
 
+	if sockmapAttachFD >= 0 {
+		attachKey, ok := releaseSockmapAttachSlot(inboundFD)
+		if ok {
+			if err := bpfMapDelete(sockmapAttachFD, unsafe.Pointer(&attachKey)); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		attachKey, ok = releaseSockmapAttachSlot(outboundFD)
+		if ok {
+			if err := bpfMapDelete(sockmapAttachFD, unsafe.Pointer(&attachKey)); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
 	return firstErr
 }
 
-func assignSockmapSlot(fd int) (slot uint32, created bool, err error) {
-	// Fast path: reserve a fresh slot with an atomic increment.
-	slot = sockmapNext.Add(1) - 1
-	if slot < sockmapMaxEntries {
-		sockmapSlotMu.Lock()
-		if sockmapSlots == nil {
-			sockmapSlots = make(map[int]uint32)
+func assignSockmapAttachSlot(fd int) (slot uint32, created bool, err error) {
+	slot = sockmapAttachNext.Add(1) - 1
+	if slot < sockmapAttachMaxEntries {
+		sockmapAttachSlotMu.Lock()
+		if sockmapAttachSlots == nil {
+			sockmapAttachSlots = make(map[int]uint32)
 		}
-		// Check for existing assignment under lock.
-		if existing, ok := sockmapSlots[fd]; ok {
-			// Reclaim the reserved slot so repeated registration attempts
-			// do not consume effective sockmap capacity.
-			sockmapFree = append(sockmapFree, slot)
-			sockmapSlotMu.Unlock()
+		if existing, ok := sockmapAttachSlots[fd]; ok {
+			sockmapAttachFree = append(sockmapAttachFree, slot)
+			sockmapAttachSlotMu.Unlock()
 			return existing, false, nil
 		}
-		sockmapSlots[fd] = slot
-		sockmapSlotMu.Unlock()
+		sockmapAttachSlots[fd] = slot
+		sockmapAttachSlotMu.Unlock()
 		return slot, true, nil
 	}
-	// Undo on overflow.
-	sockmapNext.Add(^uint32(0))
+	sockmapAttachNext.Add(^uint32(0))
 
-	// Slow path: acquire mutex to try free list.
-	sockmapSlotMu.Lock()
-	defer sockmapSlotMu.Unlock()
+	sockmapAttachSlotMu.Lock()
+	defer sockmapAttachSlotMu.Unlock()
 
-	if sockmapSlots == nil {
-		sockmapSlots = make(map[int]uint32)
+	if sockmapAttachSlots == nil {
+		sockmapAttachSlots = make(map[int]uint32)
 	}
-	if existing, ok := sockmapSlots[fd]; ok {
+	if existing, ok := sockmapAttachSlots[fd]; ok {
 		return existing, false, nil
 	}
 
-	if len(sockmapFree) > 0 {
-		i := len(sockmapFree) - 1
-		slot = sockmapFree[i]
-		sockmapFree = sockmapFree[:i]
-		sockmapSlots[fd] = slot
+	if len(sockmapAttachFree) > 0 {
+		i := len(sockmapAttachFree) - 1
+		slot = sockmapAttachFree[i]
+		sockmapAttachFree = sockmapAttachFree[:i]
+		sockmapAttachSlots[fd] = slot
 		return slot, true, nil
 	}
 
-	return 0, false, fmt.Errorf("sockmap is full (max entries %d)", sockmapMaxEntries)
+	return 0, false, fmt.Errorf("sockmap attach map is full (max entries %d)", sockmapAttachMaxEntries)
 }
 
-func releaseSockmapSlot(fd int) (uint32, bool) {
-	sockmapSlotMu.Lock()
-	defer sockmapSlotMu.Unlock()
+func releaseSockmapAttachSlot(fd int) (uint32, bool) {
+	sockmapAttachSlotMu.Lock()
+	defer sockmapAttachSlotMu.Unlock()
 
-	slot, ok := sockmapSlots[fd]
+	slot, ok := sockmapAttachSlots[fd]
 	if !ok {
 		return 0, false
 	}
-	delete(sockmapSlots, fd)
-	sockmapFree = append(sockmapFree, slot)
+	delete(sockmapAttachSlots, fd)
+	sockmapAttachFree = append(sockmapAttachFree, slot)
 	return slot, true
 }
 
@@ -466,8 +544,8 @@ func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) 
 	return int(fd), nil
 }
 
-// attachSKSkbToSockmap attaches sk_skb stream parser and verdict to a sockmap.
-func attachSKSkbToSockmap(parserFD, verdictFD, mapFD int) error {
+// attachSKSkbToMap attaches sk_skb stream parser and verdict to a map.
+func attachSKSkbToMap(parserFD, verdictFD, mapFD int) error {
 	// Attach parser (BPF_SK_SKB_STREAM_PARSER = 4)
 	if err := attachBPFProgToMap(mapFD, parserFD, 4); err != nil {
 		return fmt.Errorf("parser: %w", err)
@@ -475,12 +553,18 @@ func attachSKSkbToSockmap(parserFD, verdictFD, mapFD int) error {
 
 	// Attach verdict (BPF_SK_SKB_STREAM_VERDICT = 5)
 	if err := attachBPFProgToMap(mapFD, verdictFD, 5); err != nil {
-		// Detach parser on partial failure to leave sockmap in clean state.
+		// Detach parser on partial failure to leave map in clean state.
 		detachBPFProgFromMap(mapFD, parserFD, 4)
 		return fmt.Errorf("verdict: %w", err)
 	}
 
 	return nil
+}
+
+func shouldFallbackToSockmapAttach(err error) bool {
+	return stdErrors.Is(err, syscall.EINVAL) ||
+		stdErrors.Is(err, syscall.EOPNOTSUPP) ||
+		stdErrors.Is(err, syscall.ENOTSUP)
 }
 
 // detachBPFProgFromMap detaches a BPF program from a map. Best-effort.
@@ -526,6 +610,120 @@ func attachBPFProgToMap(mapFD, progFD int, attachType uint32) error {
 
 	if errno != 0 {
 		return errno
+	}
+
+	return nil
+}
+
+// pinBPFMap pins a BPF map fd to the BPF filesystem via BPF_OBJ_PIN (cmd 6).
+func pinBPFMap(fd int, path string) error {
+	if err := pinBPFMapOnce(fd, path); err != nil {
+		// Recover from stale pin files and from races with prior unclean exits.
+		if !stdErrors.Is(err, syscall.EEXIST) {
+			return err
+		}
+		if err := removeExistingPin(path); err != nil {
+			return err
+		}
+		return pinBPFMapOnce(fd, path)
+	}
+	return nil
+}
+
+func pinBPFMapOnce(fd int, path string) error {
+	pathBytes := append([]byte(path), 0)
+	attr := struct {
+		pathname  uint64
+		bpfFD     uint32
+		fileFlags uint32
+	}{
+		pathname: uint64(uintptr(unsafe.Pointer(&pathBytes[0]))),
+		bpfFD:    uint32(fd),
+	}
+
+	_, _, errno := syscall.Syscall(
+		unix.SYS_BPF,
+		6, // BPF_OBJ_PIN
+		uintptr(unsafe.Pointer(&attr)),
+		unsafe.Sizeof(attr),
+	)
+	if errno != 0 {
+		return fmt.Errorf("BPF_OBJ_PIN %s: %w", path, errno)
+	}
+	return nil
+}
+
+// unpinBPFMap removes a pinned BPF map from the filesystem. Best-effort.
+func unpinBPFMap(path string) {
+	os.Remove(path)
+}
+
+// ensureBPFPinDir creates the BPF pin directory with root-only access.
+func ensureBPFPinDir(dir string) error {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	if err := os.Chown(dir, 0, 0); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0700)
+}
+
+func sockhashPinPath(pinDir string) string {
+	return filepath.Join(pinDir, "sockhash")
+}
+
+func policyPinPath(pinDir string) string {
+	return filepath.Join(pinDir, "policy")
+}
+
+func removeExistingPin(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove existing pin %s: %w", path, err)
+	}
+	return nil
+}
+
+// pinMaps pins SOCKHASH and policy maps to the BPF filesystem with 0600 root-only permissions.
+func pinMaps(pinPath string, hashFD, policyFD int) error {
+	if err := ensureBPFPinDir(pinPath); err != nil {
+		return fmt.Errorf("ensure pin dir: %w", err)
+	}
+
+	sockhashPath := sockhashPinPath(pinPath)
+	policyPath := policyPinPath(pinPath)
+	if err := removeExistingPin(sockhashPath); err != nil {
+		return err
+	}
+	if err := removeExistingPin(policyPath); err != nil {
+		return err
+	}
+
+	if err := pinBPFMap(hashFD, sockhashPath); err != nil {
+		return err
+	}
+	if err := os.Chown(sockhashPath, 0, 0); err != nil {
+		unpinBPFMap(sockhashPath)
+		return err
+	}
+	if err := os.Chmod(sockhashPath, 0600); err != nil {
+		unpinBPFMap(sockhashPath)
+		return err
+	}
+
+	if err := pinBPFMap(policyFD, policyPath); err != nil {
+		unpinBPFMap(sockhashPath)
+		return err
+	}
+	if err := os.Chown(policyPath, 0, 0); err != nil {
+		unpinBPFMap(policyPath)
+		unpinBPFMap(sockhashPath)
+		return err
+	}
+	if err := os.Chmod(policyPath, 0600); err != nil {
+		unpinBPFMap(policyPath)
+		unpinBPFMap(sockhashPath)
+		return err
 	}
 
 	return nil

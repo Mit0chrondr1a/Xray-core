@@ -4,7 +4,10 @@ package ebpf
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -283,59 +286,6 @@ func TestSockmapDisableWaitsForSweeperExit(t *testing.T) {
 	}
 }
 
-func TestAssignSockmapSlotDuplicateFDReclaimsCapacity(t *testing.T) {
-	sockmapSlotMu.Lock()
-	oldMaxEntries := sockmapMaxEntries
-	oldSlots := sockmapSlots
-	oldFree := sockmapFree
-	oldNext := sockmapNext.Load()
-
-	sockmapMaxEntries = 4
-	sockmapSlots = make(map[int]uint32)
-	sockmapFree = nil
-	sockmapNext.Store(0)
-	sockmapSlotMu.Unlock()
-
-	defer func() {
-		sockmapSlotMu.Lock()
-		sockmapMaxEntries = oldMaxEntries
-		sockmapSlots = oldSlots
-		sockmapFree = oldFree
-		sockmapNext.Store(oldNext)
-		sockmapSlotMu.Unlock()
-	}()
-
-	slot, created, err := assignSockmapSlot(100)
-	if err != nil {
-		t.Fatalf("initial assign failed: %v", err)
-	}
-	if !created || slot != 0 {
-		t.Fatalf("unexpected initial assignment: slot=%d created=%v", slot, created)
-	}
-
-	for i := 0; i < 3; i++ {
-		slot, created, err = assignSockmapSlot(100)
-		if err != nil {
-			t.Fatalf("duplicate assign %d failed: %v", i, err)
-		}
-		if created || slot != 0 {
-			t.Fatalf("duplicate assign %d should reuse slot 0, got slot=%d created=%v", i, slot, created)
-		}
-	}
-
-	for _, fd := range []int{101, 102, 103} {
-		if _, created, err := assignSockmapSlot(fd); err != nil {
-			t.Fatalf("assign for fd %d failed: %v", fd, err)
-		} else if !created {
-			t.Fatalf("assign for fd %d should create a new slot", fd)
-		}
-	}
-
-	if _, _, err := assignSockmapSlot(104); err == nil {
-		t.Fatal("expected sockmap full once all 4 slots are assigned")
-	}
-}
-
 func TestCanUseZeroCopy(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -521,7 +471,8 @@ func TestSockmapStatsCapacity(t *testing.T) {
 		t.Skip("sockmap not supported on this system")
 	}
 
-	// Use a tiny config to test capacity tracking
+	// Use a tiny config: MaxEntries=4 means 2 pairs fill the SOCKHASH.
+	// The third pair should trigger LRU eviction of the oldest pair.
 	mgr := NewSockmapManager(SockmapConfig{MaxEntries: 4})
 	if err := mgr.Enable(); err != nil {
 		t.Fatal(err)
@@ -558,12 +509,12 @@ func TestSockmapStatsCapacity(t *testing.T) {
 		}
 	}()
 
-	// Register first pair — uses 2 of 4 slots
+	// Register first pair — uses 2 of 4 entries
 	if err := mgr.RegisterPair(pairs[0].client, pairs[0].server); err != nil {
 		t.Fatalf("RegisterPair 0: %v", err)
 	}
 
-	// Register second pair — uses 4 of 4 slots
+	// Register second pair — uses 4 of 4 entries
 	if err := mgr.RegisterPair(pairs[1].client, pairs[1].server); err != nil {
 		t.Fatalf("RegisterPair 1: %v", err)
 	}
@@ -576,24 +527,293 @@ func TestSockmapStatsCapacity(t *testing.T) {
 		t.Fatalf("expected peak 2, got %d", stats.PeakPairs)
 	}
 
-	// Third pair should fail — sockmap full
+	// Third pair should succeed via LRU eviction of the oldest pair (pair 0).
 	err := mgr.RegisterPair(pairs[2].client, pairs[2].server)
-	if err == nil {
-		t.Fatal("expected error registering pair when sockmap is full")
+	if err != nil {
+		t.Fatalf("RegisterPair 2 should succeed via LRU eviction: %v", err)
 	}
 
+	// Verify pair 0 was evicted (oldest in LRU).
 	stats = mgr.GetSockmapStats()
-	if stats.FullRejects == 0 {
-		t.Fatal("expected fullRejects > 0")
+	if stats.ActivePairs != 2 {
+		t.Fatalf("expected 2 active pairs after eviction, got %d", stats.ActivePairs)
 	}
 
-	// Unregister one, then third should succeed
-	mgr.UnregisterPair(pairs[0].client, pairs[0].server)
-	if err := mgr.RegisterPair(pairs[2].client, pairs[2].server); err != nil {
-		t.Fatalf("RegisterPair 2 after free: %v", err)
-	}
 	mgr.UnregisterPair(pairs[1].client, pairs[1].server)
 	mgr.UnregisterPair(pairs[2].client, pairs[2].server)
+}
+
+func TestSockmapLRUEviction(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	// MaxEntries=4 means 2 pairs fill the SOCKHASH.
+	mgr := NewSockmapManager(SockmapConfig{MaxEntries: 4})
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	type connPair struct {
+		client, server net.Conn
+		listener       net.Listener
+	}
+
+	makePair := func() connPair {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch := make(chan net.Conn, 1)
+		go func() { c, _ := l.Accept(); ch <- c }()
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			l.Close()
+			t.Fatal(err)
+		}
+		s := <-ch
+		return connPair{c, s, l}
+	}
+
+	p0 := makePair()
+	defer func() { p0.client.Close(); p0.server.Close(); p0.listener.Close() }()
+	p1 := makePair()
+	defer func() { p1.client.Close(); p1.server.Close(); p1.listener.Close() }()
+	p2 := makePair()
+	defer func() { p2.client.Close(); p2.server.Close(); p2.listener.Close() }()
+
+	// Fill: p0 (oldest), then p1
+	if err := mgr.RegisterPair(p0.client, p0.server); err != nil {
+		t.Fatalf("RegisterPair p0: %v", err)
+	}
+	if err := mgr.RegisterPair(p1.client, p1.server); err != nil {
+		t.Fatalf("RegisterPair p1: %v", err)
+	}
+
+	// p2 should evict p0 (LRU tail)
+	if err := mgr.RegisterPair(p2.client, p2.server); err != nil {
+		t.Fatalf("RegisterPair p2 should succeed via LRU eviction: %v", err)
+	}
+
+	// Verify LRU list has exactly 2 entries
+	mgr.lruMu.Lock()
+	lruLen := mgr.lruList.Len()
+	mgr.lruMu.Unlock()
+	if lruLen != 2 {
+		t.Fatalf("expected LRU list length 2, got %d", lruLen)
+	}
+
+	// Verify p0 is no longer tracked
+	p0key := SockPairKey{InboundFD: getFDOrSkip(t, p0.client), OutboundFD: getFDOrSkip(t, p0.server)}
+	if _, ok := mgr.pairs.Load(p0key); ok {
+		t.Fatal("evicted pair p0 should not be in pairs map")
+	}
+
+	mgr.UnregisterPair(p1.client, p1.server)
+	mgr.UnregisterPair(p2.client, p2.server)
+}
+
+func TestPolicyMapLRU(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	// Create a manager with tiny capacity to verify the LRU_HASH policy map
+	// auto-evicts without error when over capacity.
+	mgr := NewSockmapManager(SockmapConfig{MaxEntries: 4})
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	// The policy map is LRU_HASH (type 9). Writing beyond max_entries
+	// should not return an error — kernel auto-evicts the oldest entry.
+	for i := uint64(0); i < 10; i++ {
+		if err := setPolicyEntry(i, PolicyAllowRedirect); err != nil {
+			t.Fatalf("setPolicyEntry(%d) failed: %v (LRU_HASH should auto-evict)", i, err)
+		}
+	}
+}
+
+func TestMapPinning(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	pinPath := filepath.Join(t.TempDir(), "xray-test-bpf")
+
+	mgr := NewSockmapManager(SockmapConfig{
+		MaxEntries: 64,
+		PinPath:    pinPath,
+	})
+	if err := mgr.Enable(); err != nil {
+		t.Fatalf("Enable with pin path failed: %v", err)
+	}
+
+	// Verify pin files exist
+	for _, name := range []string{"sockhash", "policy"} {
+		path := filepath.Join(pinPath, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("pin file %s not found: %v", name, err)
+		}
+		mode := info.Mode().Perm()
+		if mode != 0600 {
+			t.Fatalf("pin file %s has mode %o, want 0600", name, mode)
+		}
+	}
+
+	// Verify pin directory permissions
+	dirInfo, err := os.Stat(pinPath)
+	if err != nil {
+		t.Fatalf("pin dir not found: %v", err)
+	}
+	if dirInfo.Mode().Perm() != 0700 {
+		t.Fatalf("pin dir has mode %o, want 0700", dirInfo.Mode().Perm())
+	}
+
+	// Disable should unpin
+	if err := mgr.Disable(); err != nil {
+		t.Fatalf("Disable failed: %v", err)
+	}
+
+	for _, name := range []string{"sockhash", "policy"} {
+		path := filepath.Join(pinPath, name)
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("pin file %s should be removed after Disable", name)
+		}
+	}
+}
+
+func TestMapPinningReplacesStalePins(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	pinPath := filepath.Join(t.TempDir(), "xray-test-bpf")
+	if err := os.MkdirAll(pinPath, 0700); err != nil {
+		t.Fatalf("mkdir pin path: %v", err)
+	}
+	for _, name := range []string{"sockhash", "policy"} {
+		if err := os.WriteFile(filepath.Join(pinPath, name), []byte("stale"), 0600); err != nil {
+			t.Fatalf("create stale pin file %s: %v", name, err)
+		}
+	}
+
+	mgr := NewSockmapManager(SockmapConfig{
+		MaxEntries: 64,
+		PinPath:    pinPath,
+	})
+	if err := mgr.Enable(); err != nil {
+		t.Fatalf("Enable with stale pin files failed: %v", err)
+	}
+	defer mgr.Disable()
+
+	for _, name := range []string{"sockhash", "policy"} {
+		path := filepath.Join(pinPath, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("pin file %s not found after replacement: %v", name, err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("pin file %s has mode %o, want 0600", name, info.Mode().Perm())
+		}
+	}
+}
+
+func TestDropCapabilities(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	// Test that dropExcessCapabilities doesn't panic or return errors
+	// that would prevent operation. We can't easily test the actual
+	// capability restriction in a test process that may not have
+	// the required caps to begin with.
+	err := dropExcessCapabilities()
+	if err != nil {
+		// EPERM is expected if running without sufficient privileges
+		if errno, ok := err.(syscall.Errno); ok && errno == syscall.EPERM {
+			t.Skipf("insufficient privileges to test capability dropping: %v", err)
+		}
+		t.Logf("dropExcessCapabilities error (may be expected): %v", err)
+	}
+}
+
+func TestSweepLRUEviction(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	// MaxEntries=8 means 4 pairs fill the SOCKHASH.
+	// Register 4 pairs (>90% utilization), run sweep, verify eviction.
+	mgr := NewSockmapManager(SockmapConfig{MaxEntries: 8})
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	type connPair struct {
+		client, server net.Conn
+		listener       net.Listener
+	}
+
+	makePair := func() connPair {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch := make(chan net.Conn, 1)
+		go func() { c, _ := l.Accept(); ch <- c }()
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			l.Close()
+			t.Fatal(err)
+		}
+		s := <-ch
+		return connPair{c, s, l}
+	}
+
+	var allPairs []connPair
+	for i := 0; i < 4; i++ {
+		p := makePair()
+		allPairs = append(allPairs, p)
+	}
+	defer func() {
+		for _, p := range allPairs {
+			p.client.Close()
+			p.server.Close()
+			p.listener.Close()
+		}
+	}()
+
+	for i, p := range allPairs {
+		if err := mgr.RegisterPair(p.client, p.server); err != nil {
+			t.Fatalf("RegisterPair %d: %v", i, err)
+		}
+	}
+
+	stats := mgr.GetSockmapStats()
+	if stats.ActivePairs != 4 {
+		t.Fatalf("expected 4 active pairs, got %d", stats.ActivePairs)
+	}
+
+	// 4 pairs * 2 entries = 8 entries in SOCKHASH with MaxEntries=8.
+	// utilization = 8/8 = 100% > 90%, so sweep should evict ~10% = 1 pair.
+	mgr.doSweep()
+
+	stats = mgr.GetSockmapStats()
+	// After sweep, at least 1 pair should have been proactively evicted.
+	if stats.ActivePairs >= 4 {
+		t.Fatalf("expected fewer than 4 active pairs after sweep eviction, got %d", stats.ActivePairs)
+	}
 }
 
 func TestSockmapSweep(t *testing.T) {
@@ -797,9 +1017,9 @@ func BenchmarkSockmapRegisterUnregister(b *testing.B) {
 
 func TestComputeRedirectPolicy(t *testing.T) {
 	tests := []struct {
-		name     string
-		inbound  CryptoHint
-		outbound CryptoHint
+		name      string
+		inbound   CryptoHint
+		outbound  CryptoHint
 		wantAllow bool
 		wantKTLS  bool
 	}{
@@ -975,4 +1195,14 @@ func BenchmarkSockmapConcurrentRegister(b *testing.B) {
 			listener.Close()
 		}
 	})
+}
+
+// getFDOrSkip extracts the fd from a net.Conn, skipping the test on error.
+func getFDOrSkip(t *testing.T, conn net.Conn) int {
+	t.Helper()
+	fd, err := getConnFD(conn)
+	if err != nil {
+		t.Skipf("cannot extract fd: %v", err)
+	}
+	return fd
 }

@@ -16,23 +16,13 @@ func teardownSockmapImpl() error {
 	return nil
 }
 
-// addToSockmapImpl is a no-op on non-Linux systems.
-func addToSockmapImpl(fd int) error {
-	return ErrSockmapNotSupported
-}
-
-// removeFromSockmapImpl is a no-op on non-Linux systems.
-func removeFromSockmapImpl(fd int) error {
-	return nil
-}
-
 // setupForwardingImpl is a no-op on non-Linux systems.
 func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
 	return ErrSockmapNotSupported
 }
 
 // removeForwardingImpl is a no-op on non-Linux systems.
-func removeForwardingImpl(inboundCookie, outboundCookie uint64) error {
+func removeForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
 	return nil
 }
 

@@ -1,15 +1,18 @@
 package ebpf
 
 import (
+	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
-	"github.com/xtls/xray-core/common/errors"
+	xerrors "github.com/xtls/xray-core/common/errors"
 )
 
 // SockmapManager manages sockmap-based zero-copy TCP proxying.
@@ -28,6 +31,11 @@ type SockmapManager struct {
 	peakPairs     atomic.Int64 // high-water mark
 	staleCleanups atomic.Int64 // entries removed by sweeper
 	lastWarningNs atomic.Int64 // rate-limit warnings to 1/min
+
+	// Userspace LRU eviction for SOCKHASH
+	lruList  *list.List                    // front=MRU, back=LRU
+	lruIndex map[SockPairKey]*list.Element // O(1) lookup
+	lruMu    sync.Mutex                    // guards lruList and lruIndex
 
 	// Sweeper lifecycle
 	sweepDone chan struct{}
@@ -88,10 +96,16 @@ type SockPair struct {
 	OutboundCrypto CryptoHint
 }
 
+// maxEvictRetries is the maximum number of LRU eviction attempts when
+// SOCKHASH is full.
+const maxEvictRetries = 3
+
 // NewSockmapManager creates a new sockmap manager.
 func NewSockmapManager(config SockmapConfig) *SockmapManager {
 	return &SockmapManager{
-		config: config,
+		config:   config,
+		lruList:  list.New(),
+		lruIndex: make(map[SockPairKey]*list.Element),
 	}
 }
 
@@ -192,7 +206,7 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 	// Compute redirect policy from crypto hints.
 	policy := computeRedirectPolicy(inboundCrypto, outboundCrypto)
 
-	// Write policy entries before sockmap registration so the verdict program
+	// Write policy entries before forwarding registration so the verdict program
 	// can consult them as soon as data arrives.
 	if err := setPolicyEntry(inboundCookie, policy); err != nil {
 		return err
@@ -202,32 +216,14 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 		return err
 	}
 
-	// Add both sockets to sockmap
-	if err := m.addToSockmap(inboundFD); err != nil {
+	// Setup forwarding — inserts both sockets into SOCKHASH.
+	// On capacity error, attempt LRU eviction and retry.
+	if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie); err != nil {
 		deletePolicyEntry(inboundCookie)
 		deletePolicyEntry(outboundCookie)
 		if isSockmapFull(err) {
 			m.fullRejects.Add(1)
 		}
-		return err
-	}
-	if err := m.addToSockmap(outboundFD); err != nil {
-		m.removeFromSockmap(inboundFD)
-		deletePolicyEntry(inboundCookie)
-		deletePolicyEntry(outboundCookie)
-		if isSockmapFull(err) {
-			m.fullRejects.Add(1)
-		}
-		return err
-	}
-
-	// Setup sk_skb verdict program to forward data.
-	// Pass cookies already obtained above to avoid redundant getsockopt(SO_COOKIE).
-	if err := m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie); err != nil {
-		m.removeFromSockmap(inboundFD)
-		m.removeFromSockmap(outboundFD)
-		deletePolicyEntry(inboundCookie)
-		deletePolicyEntry(outboundCookie)
 		return err
 	}
 
@@ -247,6 +243,12 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 
 	m.pairs.Store(key, pair)
 
+	// Push to LRU front (most recently used).
+	m.lruMu.Lock()
+	elem := m.lruList.PushFront(key)
+	m.lruIndex[key] = elem
+	m.lruMu.Unlock()
+
 	// Update capacity counters.
 	active := m.activePairs.Add(1)
 	m.totalPairs.Add(1)
@@ -254,6 +256,49 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 	m.checkUtilization(active)
 
 	return nil
+}
+
+// setupForwardingWithEviction attempts setupForwarding, evicting LRU pairs
+// on ENOSPC/E2BIG errors (up to maxEvictRetries attempts).
+func (m *SockmapManager) setupForwardingWithEviction(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
+	err := m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie)
+	if err == nil {
+		return nil
+	}
+	if !isSockmapFull(err) {
+		return err
+	}
+
+	for i := 0; i < maxEvictRetries; i++ {
+		if !m.evictLRU() {
+			return err // nothing to evict
+		}
+		err = m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie)
+		if err == nil {
+			return nil
+		}
+		if !isSockmapFull(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// evictLRU removes the least-recently-used pair. Returns false if no pairs to evict.
+func (m *SockmapManager) evictLRU() bool {
+	m.lruMu.Lock()
+	back := m.lruList.Back()
+	if back == nil {
+		m.lruMu.Unlock()
+		return false
+	}
+	key := back.Value.(SockPairKey)
+	m.lruList.Remove(back)
+	delete(m.lruIndex, key)
+	m.lruMu.Unlock()
+
+	m.unregisterPairLocked(key)
+	return true
 }
 
 // UnregisterPair removes a socket pair from sockmap proxying.
@@ -295,14 +340,16 @@ func (m *SockmapManager) unregisterPairLocked(key SockPairKey) error {
 	pair := v.(*SockPair)
 	pair.Active = false
 
+	// Remove from LRU tracking.
+	m.lruMu.Lock()
+	if elem, ok := m.lruIndex[key]; ok {
+		m.lruList.Remove(elem)
+		delete(m.lruIndex, key)
+	}
+	m.lruMu.Unlock()
+
 	var firstErr error
-	if err := m.removeForwarding(pair.InboundCookie, pair.OutboundCookie); err != nil {
-		firstErr = err
-	}
-	if err := m.removeFromSockmap(key.InboundFD); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	if err := m.removeFromSockmap(key.OutboundFD); err != nil && firstErr == nil {
+	if err := m.removeForwarding(key.InboundFD, key.OutboundFD, pair.InboundCookie, pair.OutboundCookie); err != nil {
 		firstErr = err
 	}
 	deletePolicyEntry(pair.InboundCookie)
@@ -414,7 +461,7 @@ func (m *SockmapManager) checkUtilization(active int64) {
 		return
 	}
 
-	// Each pair uses 2 slots.
+	// Each pair uses 2 entries in the SOCKHASH.
 	utilization := float64(active*2) / float64(maxEntries)
 	if utilization < 0.75 {
 		return
@@ -432,9 +479,9 @@ func (m *SockmapManager) checkUtilization(active int64) {
 
 	ctx := context.Background()
 	if utilization >= 0.90 {
-		errors.LogInfo(ctx, fmt.Sprintf("sockmap utilization critical: %d/%d slots (%.0f%%)", active*2, maxEntries, utilization*100))
+		xerrors.LogInfo(ctx, fmt.Sprintf("sockmap utilization critical: %d/%d entries (%.0f%%)", active*2, maxEntries, utilization*100))
 	} else {
-		errors.LogInfo(ctx, fmt.Sprintf("sockmap utilization high: %d/%d slots (%.0f%%)", active*2, maxEntries, utilization*100))
+		xerrors.LogInfo(ctx, fmt.Sprintf("sockmap utilization high: %d/%d entries (%.0f%%)", active*2, maxEntries, utilization*100))
 	}
 }
 
@@ -458,6 +505,8 @@ func (m *SockmapManager) sweepStaleEntries(done <-chan struct{}) {
 }
 
 // doSweep performs one sweep pass over all pairs.
+// After cleaning stale pairs, if utilization exceeds 90%, proactively
+// evicts the oldest 10% of pairs.
 func (m *SockmapManager) doSweep() {
 	var staleKeys []SockPairKey
 
@@ -493,18 +542,37 @@ func (m *SockmapManager) doSweep() {
 		ctx := context.Background()
 		for _, key := range staleKeys {
 			if err := m.unregisterPairLocked(key); err != nil {
-				errors.LogInfoInner(ctx, err, fmt.Sprintf("sockmap sweeper: failed to clean stale pair fd=%d↔%d", key.InboundFD, key.OutboundFD))
+				xerrors.LogInfoInner(ctx, err, fmt.Sprintf("sockmap sweeper: failed to clean stale pair fd=%d↔%d", key.InboundFD, key.OutboundFD))
 			} else {
-				errors.LogInfo(ctx, fmt.Sprintf("sockmap sweeper: cleaned stale pair fd=%d↔%d", key.InboundFD, key.OutboundFD))
+				xerrors.LogInfo(ctx, fmt.Sprintf("sockmap sweeper: cleaned stale pair fd=%d↔%d", key.InboundFD, key.OutboundFD))
 			}
 			m.staleCleanups.Add(1)
 		}
 	}
+
+	// Proactive LRU eviction at high utilization.
+	maxEntries := int64(m.config.MaxEntries)
+	if maxEntries > 0 {
+		active := m.activePairs.Load()
+		utilization := float64(active*2) / float64(maxEntries)
+		if utilization > 0.90 {
+			// Evict oldest 10% of pairs.
+			evictCount := int(float64(active) * 0.10)
+			if evictCount < 1 {
+				evictCount = 1
+			}
+			for i := 0; i < evictCount; i++ {
+				if !m.evictLRU() {
+					break
+				}
+			}
+		}
+	}
 }
 
-// isSockmapFull returns true if the error indicates the sockmap is at capacity.
+// isSockmapFull returns true if the error indicates the SOCKHASH is at capacity.
 func isSockmapFull(err error) bool {
-	return err != nil && err.Error() != "" && len(err.Error()) > 15 && err.Error()[:15] == "sockmap is full"
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.E2BIG)
 }
 
 // Platform-specific implementations
@@ -516,18 +584,10 @@ func (m *SockmapManager) teardownSockmap() error {
 	return teardownSockmapImpl()
 }
 
-func (m *SockmapManager) addToSockmap(fd int) error {
-	return addToSockmapImpl(fd)
-}
-
-func (m *SockmapManager) removeFromSockmap(fd int) error {
-	return removeFromSockmapImpl(fd)
-}
-
 func (m *SockmapManager) setupForwarding(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
 	return setupForwardingImpl(inboundFD, outboundFD, inboundCookie, outboundCookie)
 }
 
-func (m *SockmapManager) removeForwarding(inboundCookie, outboundCookie uint64) error {
-	return removeForwardingImpl(inboundCookie, outboundCookie)
+func (m *SockmapManager) removeForwarding(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
+	return removeForwardingImpl(inboundFD, outboundFD, inboundCookie, outboundCookie)
 }

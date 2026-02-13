@@ -91,6 +91,14 @@ func IsAvailable() bool {
 	return caps.XDPSupported || caps.SockmapSupported || caps.TCBPFSupported
 }
 
+// BPF map type constants.
+const (
+	bpfMapTypeHash     = 1
+	bpfMapTypeLRUHash  = 9
+	bpfMapTypeSockmap  = 15
+	bpfMapTypeSockhash = 18
+)
+
 // XDPConfig configures XDP program behavior.
 type XDPConfig struct {
 	// Mode specifies the XDP attach mode.
@@ -127,6 +135,14 @@ type SockmapConfig struct {
 	// MaxEntries is the maximum number of socket entries.
 	// Default is 65536.
 	MaxEntries uint32
+
+	// PinPath is the BPF filesystem directory for pinning maps.
+	// Default is "/sys/fs/bpf/xray/".
+	PinPath string
+
+	// DropCapabilities controls whether excess Linux capabilities are
+	// dropped after BPF setup. Defense-in-depth measure.
+	DropCapabilities bool
 }
 
 // RoutingCacheConfig configures the BPF routing cache.
@@ -153,6 +169,7 @@ func DefaultXDPConfig() XDPConfig {
 func DefaultSockmapConfig() SockmapConfig {
 	return SockmapConfig{
 		MaxEntries: 65536,
+		PinPath:    "/sys/fs/bpf/xray/",
 	}
 }
 
