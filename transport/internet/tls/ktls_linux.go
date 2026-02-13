@@ -67,9 +67,10 @@ var (
 
 // KTLSState tracks the kTLS state for a connection.
 type KTLSState struct {
-	Enabled bool
-	TxReady bool
-	RxReady bool
+	Enabled          bool
+	TxReady          bool
+	RxReady          bool
+	keyUpdateHandler *KTLSKeyUpdateHandler
 }
 
 // TryEnableKTLS attempts to enable kernel TLS on the given connection.
@@ -150,6 +151,14 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 		if !state.TxReady && !state.RxReady {
 			state.Enabled = false
 		}
+
+		// For TLS 1.3 with RX offload, create a KeyUpdate handler so we can
+		// process EKEYEXPIRED errors when the peer rotates traffic keys.
+		if state.RxReady && cs.Version == tls.VersionTLS13 && keys.rxSecret != nil {
+			state.keyUpdateHandler = newKTLSKeyUpdateHandler(
+				intFD, cs.CipherSuite, keys.rxSecret, keys.txSecret,
+			)
+		}
 	}); err != nil {
 		return state
 	}
@@ -171,12 +180,9 @@ func kernelKTLSSupportedCached() bool {
 
 // tlsKeys contains the extracted TLS session keys.
 type tlsKeys struct {
-	txKey []byte
-	txIV  []byte
-	txSeq []byte
-	rxKey []byte
-	rxIV  []byte
-	rxSeq []byte
+	txKey, txIV, txSeq []byte
+	rxKey, rxIV, rxSeq []byte
+	txSecret, rxSecret []byte // TLS 1.3 traffic secrets for KeyUpdate derivation
 }
 
 // extractTLSKeys extracts TLS keys from a tls.Conn using reflection.
@@ -197,12 +203,12 @@ func extractTLSKeys(conn *tls.Conn) (*tlsKeys, error) {
 
 	// Extract keys from halfConn structures
 	var err error
-	keys.txKey, keys.txIV, keys.txSeq, err = extractHalfConnKeys(outVal)
+	keys.txKey, keys.txIV, keys.txSeq, keys.txSecret, err = extractHalfConnKeys(outVal)
 	if err != nil {
 		return nil, fmt.Errorf("extract TX keys: %w", err)
 	}
 
-	keys.rxKey, keys.rxIV, keys.rxSeq, err = extractHalfConnKeys(inVal)
+	keys.rxKey, keys.rxIV, keys.rxSeq, keys.rxSecret, err = extractHalfConnKeys(inVal)
 	if err != nil {
 		return nil, fmt.Errorf("extract RX keys: %w", err)
 	}
@@ -210,8 +216,8 @@ func extractTLSKeys(conn *tls.Conn) (*tlsKeys, error) {
 	return keys, nil
 }
 
-// extractHalfConnKeys extracts key, IV, and sequence number from a halfConn.
-func extractHalfConnKeys(halfConn reflect.Value) (key, iv, seq []byte, err error) {
+// extractHalfConnKeys extracts key, IV, sequence number, and traffic secret from a halfConn.
+func extractHalfConnKeys(halfConn reflect.Value) (key, iv, seq, secret []byte, err error) {
 	// Get the sequence number
 	seqField := halfConn.FieldByName("seq")
 	if seqField.IsValid() && seqField.Kind() == reflect.Array {
@@ -222,10 +228,16 @@ func extractHalfConnKeys(halfConn reflect.Value) (key, iv, seq []byte, err error
 		seq = seqBytes
 	}
 
+	// Extract traffic secret (TLS 1.3 only; nil for TLS 1.2)
+	secretField := halfConn.FieldByName("trafficSecret")
+	if secretField.IsValid() && secretField.Kind() == reflect.Slice {
+		secret = fieldToBytes(secretField)
+	}
+
 	// Get the cipher (which is an AEAD interface)
 	cipherField := halfConn.FieldByName("cipher")
 	if !cipherField.IsValid() || cipherField.IsNil() {
-		return nil, nil, nil, fmt.Errorf("cipher field not found or nil")
+		return nil, nil, nil, nil, fmt.Errorf("cipher field not found or nil")
 	}
 
 	// The cipher is wrapped in a struct that contains the key and nonce.
@@ -237,7 +249,7 @@ func extractHalfConnKeys(halfConn reflect.Value) (key, iv, seq []byte, err error
 		cipherVal = cipherVal.Elem()
 	}
 	if !cipherVal.IsValid() {
-		return nil, nil, nil, fmt.Errorf("cipher value not valid")
+		return nil, nil, nil, nil, fmt.Errorf("cipher value not valid")
 	}
 
 	// Try to find key and nonce fields
@@ -257,10 +269,10 @@ func extractHalfConnKeys(halfConn reflect.Value) (key, iv, seq []byte, err error
 	}
 
 	if key == nil || iv == nil {
-		return nil, nil, nil, fmt.Errorf("could not extract key or IV from cipher")
+		return nil, nil, nil, nil, fmt.Errorf("could not extract key or IV from cipher")
 	}
 
-	return key, iv, seq, nil
+	return key, iv, seq, secret, nil
 }
 
 // findField recursively searches for a named field in a reflect.Value.

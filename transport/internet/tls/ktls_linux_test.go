@@ -5,16 +5,20 @@ package tls
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	gotls "crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"io"
 	"math/big"
 	"net"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func generateTestCert(t *testing.T) gotls.Certificate {
@@ -407,4 +411,186 @@ func generateTestCertForBench(b *testing.B) gotls.Certificate {
 		Certificate: [][]byte{certDER},
 		PrivateKey:  key,
 	}
+}
+
+// TestExpandLabel verifies our HKDF-Expand-Label implementation against RFC 8448 test vectors.
+// Test vector from RFC 8448 Section 3 (Simple 1-RTT Handshake, server_handshake_traffic_secret derivation).
+func TestExpandLabel(t *testing.T) {
+	// RFC 8448 test vector: deriving "key" from a known secret using SHA-256.
+	// We use the server handshake traffic secret from RFC 8448, Section 3.
+	secret, _ := hex.DecodeString("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
+	// Expected key derived from expandLabel(SHA256, secret, "key", nil, 16)
+	expectedKey, _ := hex.DecodeString("3fce516009c21727d0f2e4e86ee403bc")
+
+	result := expandLabel(crypto.SHA256, secret, "key", nil, 16)
+	if !bytes.Equal(result, expectedKey) {
+		t.Fatalf("expandLabel key mismatch:\n  got:  %x\n  want: %x", result, expectedKey)
+	}
+
+	// Also test IV derivation from the same secret
+	expectedIV, _ := hex.DecodeString("5d313eb2671276ee13000b30")
+	resultIV := expandLabel(crypto.SHA256, secret, "iv", nil, 12)
+	if !bytes.Equal(resultIV, expectedIV) {
+		t.Fatalf("expandLabel iv mismatch:\n  got:  %x\n  want: %x", resultIV, expectedIV)
+	}
+}
+
+func TestIsKeyExpired(t *testing.T) {
+	if isKeyExpired(nil) {
+		t.Fatal("nil error should not be EKEYEXPIRED")
+	}
+	if isKeyExpired(io.EOF) {
+		t.Fatal("EOF should not be EKEYEXPIRED")
+	}
+	if !isKeyExpired(unix.EKEYEXPIRED) {
+		t.Fatal("EKEYEXPIRED should be detected")
+	}
+}
+
+func TestNewKTLSKeyUpdateHandler(t *testing.T) {
+	secret := make([]byte, 32)
+	rand.Read(secret)
+
+	tests := []struct {
+		name    string
+		suite   uint16
+		wantNil bool
+	}{
+		{"AES-128-GCM-SHA256", gotls.TLS_AES_128_GCM_SHA256, false},
+		{"AES-256-GCM-SHA384", gotls.TLS_AES_256_GCM_SHA384, false},
+		{"CHACHA20-POLY1305", gotls.TLS_CHACHA20_POLY1305_SHA256, false},
+		{"unsupported", 0xFFFF, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newKTLSKeyUpdateHandler(0, tc.suite, secret, secret)
+			if tc.wantNil && h != nil {
+				t.Fatal("expected nil handler for unsupported suite")
+			}
+			if !tc.wantNil && h == nil {
+				t.Fatal("expected non-nil handler")
+			}
+		})
+	}
+}
+
+func TestKTLSReadBypassesTLSConn(t *testing.T) {
+	cert := generateTestCert(t)
+
+	serverConfig := &gotls.Config{
+		Certificates: []gotls.Certificate{cert},
+		MinVersion:   gotls.VersionTLS13,
+	}
+	clientConfig := &gotls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         gotls.VersionTLS13,
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	testData := []byte("hello kTLS bypass test")
+	serverDone := make(chan []byte, 1)
+	go func() {
+		raw, err := listener.Accept()
+		if err != nil {
+			serverDone <- nil
+			return
+		}
+		tlsRaw := gotls.Server(raw, serverConfig)
+		conn := &Conn{Conn: tlsRaw}
+		conn.HandshakeAndEnableKTLS(context.Background())
+		received, _ := io.ReadAll(conn)
+		conn.Close()
+		serverDone <- received
+	}()
+
+	rawConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn := Client(rawConn, clientConfig).(*Conn)
+	if err := clientConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Whether kTLS is active or not, Read/Write through Conn should work
+	if _, err := clientConn.Write(testData); err != nil {
+		t.Fatal("Write failed:", err)
+	}
+	clientConn.Close()
+
+	received := <-serverDone
+	if received == nil {
+		t.Fatal("server received nil")
+	}
+	if !bytes.Equal(received, testData) {
+		t.Fatalf("data mismatch: got %q, want %q", received, testData)
+	}
+
+	t.Logf("kTLS client state: %+v", clientConn.KTLSEnabled())
+}
+
+func TestTrafficSecretExtraction(t *testing.T) {
+	cert := generateTestCert(t)
+
+	serverConfig := &gotls.Config{
+		Certificates: []gotls.Certificate{cert},
+		MinVersion:   gotls.VersionTLS13,
+		MaxVersion:   gotls.VersionTLS13,
+	}
+	clientConfig := &gotls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         gotls.VersionTLS13,
+		MaxVersion:         gotls.VersionTLS13,
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		tlsRaw := gotls.Server(raw, serverConfig)
+		_ = tlsRaw.Handshake()
+		_, _ = io.Copy(io.Discard, tlsRaw)
+		_ = tlsRaw.Close()
+	}()
+
+	rawConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsRaw := gotls.Client(rawConn, clientConfig)
+	conn := &Conn{Conn: tlsRaw}
+	if err := conn.HandshakeContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := extractTLSKeys(conn.Conn)
+	if err != nil {
+		t.Fatalf("extractTLSKeys failed: %v", err)
+	}
+
+	if len(keys.txSecret) == 0 {
+		t.Fatal("TLS 1.3 should have tx traffic secret")
+	}
+	if len(keys.rxSecret) == 0 {
+		t.Fatal("TLS 1.3 should have rx traffic secret")
+	}
+	t.Logf("TLS 1.3 traffic secrets: tx=%d bytes, rx=%d bytes", len(keys.txSecret), len(keys.rxSecret))
+
+	_ = conn.Close()
+	<-serverDone
 }

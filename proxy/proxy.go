@@ -278,9 +278,13 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				w.ob.CanSpliceCopy = 1
 			}
 		}
-		readerConn, readCounter, _ := UnwrapRawConn(w.conn)
+		readerConn, readCounter, _, readerHandler := UnwrapRawConn(w.conn)
 		w.directReadCounter = readCounter
-		w.Reader = buf.NewReader(readerConn)
+		if readerHandler != nil {
+			w.Reader = buf.NewReader(&ktlsReader{Conn: readerConn, handler: readerHandler})
+		} else {
+			w.Reader = buf.NewReader(readerConn)
+		}
 	}
 	return buffer, err
 }
@@ -340,7 +344,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			// 	w.ob.CanSpliceCopy = 1
 			// }
 		}
-		rawConn, _, writerCounter := UnwrapRawConn(w.conn)
+		rawConn, _, writerCounter, _ := UnwrapRawConn(w.conn)
 		w.Writer = buf.NewWriter(rawConn)
 		w.directWriteCounter = writerCounter
 		*switchToDirectCopy = false
@@ -666,9 +670,28 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx conte
 	}
 }
 
+// ktlsReader wraps a raw connection to handle EKEYEXPIRED errors from kTLS
+// when the peer sends a TLS 1.3 KeyUpdate message.
+type ktlsReader struct {
+	net.Conn
+	handler *tls.KTLSKeyUpdateHandler
+}
+
+func (r *ktlsReader) Read(b []byte) (int, error) {
+	n, err := r.Conn.Read(b)
+	if err != nil && tls.IsKeyExpired(err) && r.handler != nil {
+		if herr := r.handler.Handle(); herr != nil {
+			return 0, herr
+		}
+		return r.Conn.Read(b)
+	}
+	return n, err
+}
+
 // UnwrapRawConn support unwrap encryption, stats, tls, utls, reality, proxyproto, uds-wrapper conn and get raw tcp/uds conn from it
-func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
+func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.KTLSKeyUpdateHandler) {
 	var readCounter, writerCounter stats.Counter
+	var handler *tls.KTLSKeyUpdateHandler
 	if conn != nil {
 		isEncryption := false
 		if commonConn, ok := conn.(*encryption.CommonConn); ok {
@@ -676,7 +699,7 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 			isEncryption = true
 		}
 		if xorConn, ok := conn.(*encryption.XorConn); ok {
-			return xorConn, nil, nil // full-random xorConn should not be penetrated
+			return xorConn, nil, nil, nil // full-random xorConn should not be penetrated
 		}
 		if statConn, ok := conn.(*stat.CounterConnection); ok {
 			conn = statConn.Connection
@@ -685,6 +708,7 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 		}
 		if !isEncryption { // avoids double penetration
 			if xc, ok := conn.(*tls.Conn); ok {
+				handler = xc.KTLSKeyUpdateHandler()
 				conn = xc.NetConn()
 			} else if utlsConn, ok := conn.(*tls.UConn); ok {
 				conn = utlsConn.NetConn()
@@ -702,16 +726,20 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 			conn = uc.UnixConn
 		}
 	}
-	return conn, readCounter, writerCounter
+	return conn, readCounter, writerCounter, handler
 }
 
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
 func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
-	readerConn, readCounter, _ := UnwrapRawConn(readerConn)
-	writerConn, _, writeCounter := UnwrapRawConn(writerConn)
-	reader := buf.NewReader(readerConn)
+	readerConn, readCounter, _, readerHandler := UnwrapRawConn(readerConn)
+	writerConn, _, writeCounter, _ := UnwrapRawConn(writerConn)
+	var readerForBuf net.Conn = readerConn
+	if readerHandler != nil {
+		readerForBuf = &ktlsReader{Conn: readerConn, handler: readerHandler}
+	}
+	reader := buf.NewReader(readerForBuf)
 	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
@@ -783,6 +811,12 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 			if statWriter != nil {
 				statWriter.Counter.Add(w) // user stats
+			}
+			if err != nil && readerHandler != nil && tls.IsKeyExpired(err) {
+				if herr := readerHandler.Handle(); herr != nil {
+					return herr
+				}
+				continue // retry splice after key update
 			}
 			if err != nil && errors.Cause(err) != io.EOF {
 				return err

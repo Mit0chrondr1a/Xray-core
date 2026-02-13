@@ -32,12 +32,50 @@ type Conn struct {
 
 const tlsCloseTimeout = 250 * time.Millisecond
 
+// Read overrides tls.Conn.Read. When kTLS RX is active, reads bypass the
+// Go TLS record layer (the kernel already decrypted) and handle EKEYEXPIRED
+// from TLS 1.3 KeyUpdate messages.
+func (c *Conn) Read(b []byte) (int, error) {
+	if c.ktls.RxReady {
+		n, err := c.Conn.NetConn().Read(b)
+		if err != nil && isKeyExpired(err) && c.ktls.keyUpdateHandler != nil {
+			if herr := c.ktls.keyUpdateHandler.Handle(); herr != nil {
+				return 0, herr
+			}
+			return c.Conn.NetConn().Read(b)
+		}
+		return n, err
+	}
+	return c.Conn.Read(b)
+}
+
+// Write overrides tls.Conn.Write. When kTLS TX is active, writes bypass the
+// Go TLS record layer (the kernel handles encryption).
+func (c *Conn) Write(b []byte) (int, error) {
+	if c.ktls.TxReady {
+		return c.Conn.NetConn().Write(b)
+	}
+	return c.Conn.Write(b)
+}
+
+// Close overrides tls.Conn.Close. When kTLS TX is active, closing via
+// tls.Conn.Close() would double-encrypt the close_notify alert. Instead
+// we close the raw socket directly.
 func (c *Conn) Close() error {
+	if c.ktls.TxReady {
+		return c.Conn.NetConn().Close()
+	}
 	timer := time.AfterFunc(tlsCloseTimeout, func() {
 		c.Conn.NetConn().Close()
 	})
 	defer timer.Stop()
 	return c.Conn.Close()
+}
+
+// KTLSKeyUpdateHandler returns the KeyUpdate handler for this connection,
+// or nil if kTLS RX is not active or the connection uses TLS 1.2.
+func (c *Conn) KTLSKeyUpdateHandler() *KTLSKeyUpdateHandler {
+	return c.ktls.keyUpdateHandler
 }
 
 func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
