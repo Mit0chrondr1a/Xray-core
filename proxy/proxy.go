@@ -781,6 +781,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 					if err := mgr.UnregisterPair(readerConn, writerConn); err != nil {
 						errors.LogDebugInner(ctx, err, "CopyRawConn sockmap unregister failed")
 					}
+					// Prevent GC from finalizing connections while BPF ops used their FDs.
+					runtime.KeepAlive(readerConn)
+					runtime.KeepAlive(writerConn)
 					if waitErr != nil {
 						errors.LogDebugInner(ctx, waitErr, "CopyRawConn sockmap wait failed, falling back to splice")
 					} else if !fallbackToSplice {

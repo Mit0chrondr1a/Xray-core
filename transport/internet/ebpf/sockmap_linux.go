@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -22,7 +23,7 @@ var (
 	sockmapSlotMu sync.Mutex
 	sockmapSlots  map[int]uint32
 	sockmapFree   []uint32
-	sockmapNext   uint32
+	sockmapNext   atomic.Uint32
 )
 
 // buildSKSkbParserProgram generates a minimal sk_skb stream parser that
@@ -175,7 +176,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 	sockmapMaxEntries = config.MaxEntries
 	sockmapSlots = make(map[int]uint32)
 	sockmapFree = nil
-	sockmapNext = 0
+	sockmapNext.Store(0)
 	sockmapSlotMu.Unlock()
 
 	return nil
@@ -204,7 +205,7 @@ func teardownSockmapImpl() error {
 	sockmapMaxEntries = 0
 	sockmapSlots = nil
 	sockmapFree = nil
-	sockmapNext = 0
+	sockmapNext.Store(0)
 	sockmapSlotMu.Unlock()
 	return nil
 }
@@ -293,6 +294,29 @@ func removeForwardingImpl(inboundCookie, outboundCookie uint64) error {
 }
 
 func assignSockmapSlot(fd int) (slot uint32, created bool, err error) {
+	// Fast path: reserve a fresh slot with an atomic increment.
+	slot = sockmapNext.Add(1) - 1
+	if slot < sockmapMaxEntries {
+		sockmapSlotMu.Lock()
+		if sockmapSlots == nil {
+			sockmapSlots = make(map[int]uint32)
+		}
+		// Check for existing assignment under lock.
+		if existing, ok := sockmapSlots[fd]; ok {
+			// Reclaim the reserved slot so repeated registration attempts
+			// do not consume effective sockmap capacity.
+			sockmapFree = append(sockmapFree, slot)
+			sockmapSlotMu.Unlock()
+			return existing, false, nil
+		}
+		sockmapSlots[fd] = slot
+		sockmapSlotMu.Unlock()
+		return slot, true, nil
+	}
+	// Undo on overflow.
+	sockmapNext.Add(^uint32(0))
+
+	// Slow path: acquire mutex to try free list.
 	sockmapSlotMu.Lock()
 	defer sockmapSlotMu.Unlock()
 
@@ -307,16 +331,11 @@ func assignSockmapSlot(fd int) (slot uint32, created bool, err error) {
 		i := len(sockmapFree) - 1
 		slot = sockmapFree[i]
 		sockmapFree = sockmapFree[:i]
-	} else {
-		if sockmapNext >= sockmapMaxEntries {
-			return 0, false, fmt.Errorf("sockmap is full (max entries %d)", sockmapMaxEntries)
-		}
-		slot = sockmapNext
-		sockmapNext++
+		sockmapSlots[fd] = slot
+		return slot, true, nil
 	}
 
-	sockmapSlots[fd] = slot
-	return slot, true, nil
+	return 0, false, fmt.Errorf("sockmap is full (max entries %d)", sockmapMaxEntries)
 }
 
 func releaseSockmapSlot(fd int) (uint32, bool) {
@@ -506,4 +525,21 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 	}
 
 	return fd, nil
+}
+
+// isSocketAlive probes whether a file descriptor is still a valid, open socket.
+// It uses getsockopt(SO_ERROR) which returns EBADF for closed/invalid FDs.
+func isSocketAlive(fd int) bool {
+	var serr int32
+	serrLen := uint32(4)
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_GETSOCKOPT,
+		uintptr(fd),
+		uintptr(syscall.SOL_SOCKET),
+		uintptr(syscall.SO_ERROR),
+		uintptr(unsafe.Pointer(&serr)),
+		uintptr(unsafe.Pointer(&serrLen)),
+		0,
+	)
+	return errno == 0
 }

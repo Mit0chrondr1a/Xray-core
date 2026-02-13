@@ -1,18 +1,48 @@
 package ebpf
 
 import (
+	"context"
+	"fmt"
 	"net"
+	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/xtls/xray-core/common/errors"
 )
 
 // SockmapManager manages sockmap-based zero-copy TCP proxying.
 // It enables direct data transfer between sockets without copying
 // through userspace.
 type SockmapManager struct {
-	mu      sync.RWMutex
+	mu      sync.RWMutex // read lock guards pair ops; write lock guards setup/teardown
 	config  SockmapConfig
-	enabled bool
-	pairs   map[SockPairKey]*SockPair
+	enabled atomic.Bool
+	pairs   sync.Map // SockPairKey → *SockPair
+
+	// Capacity monitoring
+	activePairs   atomic.Int64
+	totalPairs    atomic.Int64 // lifetime total
+	fullRejects   atomic.Int64 // registration failures due to capacity
+	peakPairs     atomic.Int64 // high-water mark
+	staleCleanups atomic.Int64 // entries removed by sweeper
+	lastWarningNs atomic.Int64 // rate-limit warnings to 1/min
+
+	// Sweeper lifecycle
+	sweepDone chan struct{}
+	sweepWG   sync.WaitGroup
+}
+
+// SockmapStats provides a snapshot of sockmap manager statistics.
+type SockmapStats struct {
+	ActivePairs   int64
+	TotalPairs    int64
+	FullRejects   int64
+	PeakPairs     int64
+	StaleCleanups int64
+	Enabled       bool
+	MaxEntries    uint32
 }
 
 // SockPairKey identifies a socket pair for proxying.
@@ -41,7 +71,6 @@ type SockPair struct {
 func NewSockmapManager(config SockmapConfig) *SockmapManager {
 	return &SockmapManager{
 		config: config,
-		pairs:  make(map[SockPairKey]*SockPair),
 	}
 }
 
@@ -59,7 +88,12 @@ func (m *SockmapManager) Enable() error {
 		return err
 	}
 
-	m.enabled = true
+	done := make(chan struct{})
+	m.sweepDone = done
+	m.sweepWG.Add(1)
+	go m.sweepStaleEntries(done)
+
+	m.enabled.Store(true)
 	return nil
 }
 
@@ -68,30 +102,39 @@ func (m *SockmapManager) Disable() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if !m.enabled {
+	if !m.enabled.Load() {
 		return nil
 	}
 
-	// Close all active pairs
-	for key := range m.pairs {
-		m.unregisterPairLocked(key)
+	// Stop sweeper before cleaning up pairs.
+	if m.sweepDone != nil {
+		close(m.sweepDone)
+		m.sweepWG.Wait()
+		m.sweepDone = nil
 	}
+
+	// Close all active pairs
+	m.pairs.Range(func(k, v any) bool {
+		key := k.(SockPairKey)
+		m.unregisterPairLocked(key)
+		return true
+	})
 
 	if err := m.teardownSockmap(); err != nil {
 		return err
 	}
 
-	m.enabled = false
+	m.enabled.Store(false)
 	return nil
 }
 
 // RegisterPair registers a socket pair for zero-copy proxying.
 // Both connections must be TCP connections without TLS encryption.
 func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	if !m.enabled {
+	if !m.enabled.Load() {
 		return ErrSockmapNotEnabled
 	}
 
@@ -121,10 +164,16 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 
 	// Add both sockets to sockmap
 	if err := m.addToSockmap(inboundFD); err != nil {
+		if isSockmapFull(err) {
+			m.fullRejects.Add(1)
+		}
 		return err
 	}
 	if err := m.addToSockmap(outboundFD); err != nil {
 		m.removeFromSockmap(inboundFD)
+		if isSockmapFull(err) {
+			m.fullRejects.Add(1)
+		}
 		return err
 	}
 
@@ -136,6 +185,10 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 		return err
 	}
 
+	// Prevent GC from finalizing connections while BPF ops used their FDs.
+	runtime.KeepAlive(inbound)
+	runtime.KeepAlive(outbound)
+
 	pair := &SockPair{
 		InboundConn:    inbound,
 		OutboundConn:   outbound,
@@ -144,14 +197,21 @@ func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 		Active:         true,
 	}
 
-	m.pairs[key] = pair
+	m.pairs.Store(key, pair)
+
+	// Update capacity counters.
+	active := m.activePairs.Add(1)
+	m.totalPairs.Add(1)
+	m.updatePeakPairs(active)
+	m.checkUtilization(active)
+
 	return nil
 }
 
 // UnregisterPair removes a socket pair from sockmap proxying.
 func (m *SockmapManager) UnregisterPair(inbound, outbound net.Conn) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	inboundFD, err := getConnFD(inbound)
 	if err != nil {
@@ -168,18 +228,26 @@ func (m *SockmapManager) UnregisterPair(inbound, outbound net.Conn) error {
 		OutboundFD: outboundFD,
 	}
 
-	return m.unregisterPairLocked(key)
+	err = m.unregisterPairLocked(key)
+
+	// Prevent GC from finalizing connections while BPF cleanup used their FDs.
+	runtime.KeepAlive(inbound)
+	runtime.KeepAlive(outbound)
+
+	return err
 }
 
-// unregisterPairLocked removes a pair without holding the lock.
+// unregisterPairLocked removes a pair. Safe to call concurrently.
 func (m *SockmapManager) unregisterPairLocked(key SockPairKey) error {
-	pair, ok := m.pairs[key]
-	if !ok {
+	v, loaded := m.pairs.LoadAndDelete(key)
+	if !loaded {
 		return nil
 	}
 
-	var firstErr error
+	pair := v.(*SockPair)
 	pair.Active = false
+
+	var firstErr error
 	if err := m.removeForwarding(pair.InboundCookie, pair.OutboundCookie); err != nil {
 		firstErr = err
 	}
@@ -190,16 +258,13 @@ func (m *SockmapManager) unregisterPairLocked(key SockPairKey) error {
 		firstErr = err
 	}
 
-	delete(m.pairs, key)
+	m.activePairs.Add(-1)
 	return firstErr
 }
 
 // GetStats returns a snapshot of statistics for a socket pair.
 // The returned SockPair is a copy; callers cannot mutate internal state.
 func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (SockPair, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	inboundFD, err := getConnFD(inbound)
 	if err != nil {
 		return SockPair{}, false
@@ -215,18 +280,29 @@ func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (SockPair, bool) {
 		OutboundFD: outboundFD,
 	}
 
-	pair, ok := m.pairs[key]
+	v, ok := m.pairs.Load(key)
 	if !ok {
 		return SockPair{}, false
 	}
-	return *pair, true
+	return *v.(*SockPair), true
+}
+
+// GetSockmapStats returns a snapshot of overall sockmap statistics.
+func (m *SockmapManager) GetSockmapStats() SockmapStats {
+	return SockmapStats{
+		ActivePairs:   m.activePairs.Load(),
+		TotalPairs:    m.totalPairs.Load(),
+		FullRejects:   m.fullRejects.Load(),
+		PeakPairs:     m.peakPairs.Load(),
+		StaleCleanups: m.staleCleanups.Load(),
+		Enabled:       m.enabled.Load(),
+		MaxEntries:    m.config.MaxEntries,
+	}
 }
 
 // IsEnabled returns true if sockmap proxying is active.
 func (m *SockmapManager) IsEnabled() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.enabled
+	return m.enabled.Load()
 }
 
 // CanUseZeroCopy returns true if the connection pair can use zero-copy.
@@ -241,6 +317,119 @@ func CanUseZeroCopy(inbound, outbound net.Conn) bool {
 // getConnFD extracts the file descriptor from a net.Conn.
 func getConnFD(conn net.Conn) (int, error) {
 	return getConnFDImpl(conn)
+}
+
+// updatePeakPairs updates the high-water mark via CAS loop.
+func (m *SockmapManager) updatePeakPairs(current int64) {
+	for {
+		peak := m.peakPairs.Load()
+		if current <= peak {
+			return
+		}
+		if m.peakPairs.CompareAndSwap(peak, current) {
+			return
+		}
+	}
+}
+
+// checkUtilization logs warnings when approaching sockmap capacity.
+func (m *SockmapManager) checkUtilization(active int64) {
+	maxEntries := int64(m.config.MaxEntries)
+	if maxEntries == 0 {
+		return
+	}
+
+	// Each pair uses 2 slots.
+	utilization := float64(active*2) / float64(maxEntries)
+	if utilization < 0.75 {
+		return
+	}
+
+	// Rate-limit warnings to 1 per 60 seconds.
+	now := time.Now().UnixNano()
+	last := m.lastWarningNs.Load()
+	if now-last < int64(60*time.Second) {
+		return
+	}
+	if !m.lastWarningNs.CompareAndSwap(last, now) {
+		return // another goroutine just warned
+	}
+
+	ctx := context.Background()
+	if utilization >= 0.90 {
+		errors.LogInfo(ctx, fmt.Sprintf("sockmap utilization critical: %d/%d slots (%.0f%%)", active*2, maxEntries, utilization*100))
+	} else {
+		errors.LogInfo(ctx, fmt.Sprintf("sockmap utilization high: %d/%d slots (%.0f%%)", active*2, maxEntries, utilization*100))
+	}
+}
+
+// sweepStaleEntries periodically checks for stale sockmap entries.
+// A stale entry is one where the FD is no longer valid or has been
+// reused by a different socket (cookie mismatch).
+func (m *SockmapManager) sweepStaleEntries(done <-chan struct{}) {
+	defer m.sweepWG.Done()
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			m.doSweep()
+		}
+	}
+}
+
+// doSweep performs one sweep pass over all pairs.
+func (m *SockmapManager) doSweep() {
+	var staleKeys []SockPairKey
+
+	m.pairs.Range(func(k, v any) bool {
+		key := k.(SockPairKey)
+		pair := v.(*SockPair)
+
+		// Check if inbound FD is still alive.
+		if !isSocketAlive(key.InboundFD) {
+			staleKeys = append(staleKeys, key)
+			return true
+		}
+		// Check if outbound FD is still alive.
+		if !isSocketAlive(key.OutboundFD) {
+			staleKeys = append(staleKeys, key)
+			return true
+		}
+
+		// Verify socket cookies haven't changed (FD reuse detection).
+		if cookie, err := getSocketCookie(key.InboundFD); err == nil && cookie != pair.InboundCookie {
+			staleKeys = append(staleKeys, key)
+			return true
+		}
+		if cookie, err := getSocketCookie(key.OutboundFD); err == nil && cookie != pair.OutboundCookie {
+			staleKeys = append(staleKeys, key)
+			return true
+		}
+
+		return true
+	})
+
+	if len(staleKeys) > 0 {
+		ctx := context.Background()
+		for _, key := range staleKeys {
+			if err := m.unregisterPairLocked(key); err != nil {
+				errors.LogInfoInner(ctx, err, fmt.Sprintf("sockmap sweeper: failed to clean stale pair fd=%d↔%d", key.InboundFD, key.OutboundFD))
+			} else {
+				errors.LogInfo(ctx, fmt.Sprintf("sockmap sweeper: cleaned stale pair fd=%d↔%d", key.InboundFD, key.OutboundFD))
+			}
+			m.staleCleanups.Add(1)
+		}
+	}
+}
+
+// isSockmapFull returns true if the error indicates the sockmap is at capacity.
+func isSockmapFull(err error) bool {
+	return err != nil && err.Error() != "" && len(err.Error()) > 15 && err.Error()[:15] == "sockmap is full"
 }
 
 // Platform-specific implementations

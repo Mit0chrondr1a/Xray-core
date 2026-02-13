@@ -45,3 +45,8 @@ func getSocketCookie(fd int) (uint64, error) {
 func getConnFDImpl(conn net.Conn) (int, error) {
 	return -1, ErrSockmapNotSupported
 }
+
+// isSocketAlive always returns false on non-Linux systems.
+func isSocketAlive(fd int) bool {
+	return false
+}
