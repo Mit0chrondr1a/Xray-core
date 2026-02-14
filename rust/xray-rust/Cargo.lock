@@ -760,6 +760,7 @@ dependencies = [
  "sha2",
  "webpki-roots 0.26.11",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

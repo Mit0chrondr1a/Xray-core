@@ -1,14 +1,14 @@
 use std::ffi::c_void;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
+use zeroize::{Zeroize, Zeroizing, ZeroizeOnDrop};
 
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{
     ClientConfig, ClientConnection, ConnectionTrafficSecrets, ServerConfig, ServerConnection,
-    StreamOwned,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,8 @@ pub struct XrayTlsResult {
     pub tx_secret: [u8; 48],
     pub rx_secret: [u8; 48],
     pub secret_len: u8,
+    pub drained_ptr: *mut u8,
+    pub drained_len: u32,
 }
 
 impl XrayTlsResult {
@@ -44,6 +46,8 @@ impl XrayTlsResult {
             tx_secret: [0u8; 48],
             rx_secret: [0u8; 48],
             secret_len: 0,
+            drained_ptr: std::ptr::null_mut(),
+            drained_len: 0,
         }
     }
 
@@ -54,12 +58,22 @@ impl XrayTlsResult {
         self.error_msg[..len].copy_from_slice(&bytes[..len]);
         self.error_msg[len] = 0;
     }
+
+    /// Zero out the tx_secret and rx_secret arrays and reset secret_len.
+    /// Called after secrets have been consumed to avoid leaving key material
+    /// in the FFI result struct.
+    pub(crate) fn zeroize_secrets(&mut self) {
+        self.tx_secret.zeroize();
+        self.rx_secret.zeroize();
+        self.secret_len = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // TlsState — kept alive across FFI boundary for KeyUpdate
 // ---------------------------------------------------------------------------
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct TlsState {
     fd: i32,
     cipher_suite: u16,
@@ -580,6 +594,92 @@ impl rustls::KeyLog for SecretCapture {
 }
 
 // ---------------------------------------------------------------------------
+// RecordReader — reads exactly one TLS record at a time from the socket.
+// Prevents rustls from over-reading past the current record boundary,
+// which would cause data loss when kTLS takes over the socket.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct RecordReader {
+    pub(crate) tcp: TcpStream,
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+}
+
+impl RecordReader {
+    pub(crate) fn new(tcp: TcpStream) -> Self {
+        Self {
+            tcp,
+            buf: Vec::new(),
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    /// Read exactly one TLS record from the socket into the internal buffer,
+    /// then serve it incrementally via the `Read` trait.
+    fn fill_record(&mut self) -> std::io::Result<()> {
+        // Read 5-byte TLS record header
+        let mut header = [0u8; 5];
+        self.tcp.read_exact(&mut header)?;
+
+        let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if payload_len > 16384 + 256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("TLS record too large: {}", payload_len),
+            ));
+        }
+
+        // Assemble full record: header + payload
+        self.buf.clear();
+        self.buf.reserve(5 + payload_len);
+        self.buf.extend_from_slice(&header);
+        self.buf.resize(5 + payload_len, 0);
+        self.tcp.read_exact(&mut self.buf[5..])?;
+        self.pos = 0;
+        self.len = 5 + payload_len;
+        Ok(())
+    }
+}
+
+impl Read for RecordReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // If we have buffered data from the current record, serve it
+        if self.pos < self.len {
+            let n = (self.len - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        // Read the next record from the socket
+        self.fill_record()?;
+        let n = (self.len - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+
+/// Drain any plaintext rustls buffered internally during the handshake.
+/// With RecordReader this should always be empty, but provides defense-in-depth.
+pub(crate) fn drain_plaintext<S: rustls::SideData>(
+    conn: &mut rustls::ConnectionCommon<S>,
+) -> Vec<u8> {
+    let mut drained = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match conn.reader().read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => drained.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    drained
+}
+
+// ---------------------------------------------------------------------------
 // Internal handshake logic
 // ---------------------------------------------------------------------------
 
@@ -615,6 +715,7 @@ fn do_handshake(
         Vec<u8>,
         Vec<u8>, // tx base traffic secret
         Vec<u8>, // rx base traffic secret
+        Vec<u8>, // drained plaintext data
     ),
     String,
 > {
@@ -649,27 +750,16 @@ fn do_handshake(
             return Err(format!("dup: {}", std::io::Error::last_os_error()));
         }
         let tcp = unsafe { TcpStream::from_raw_fd(dup_fd) };
-        let mut stream = StreamOwned::new(conn, tcp);
+        let mut reader = RecordReader::new(tcp);
 
-        // Drive handshake by doing a zero-byte read
-        let mut buf = [0u8; 1];
-        // The handshake completes during read/write operations
-        loop {
-            match stream.read(&mut buf) {
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(e) => {
-                    // If handshake is done, that's fine
-                    if !stream.conn.is_handshaking() {
-                        break;
-                    }
-                    return Err(format!("handshake read: {}", e));
-                }
-            }
-        }
+        // Drive handshake record-by-record
+        drive_handshake!(&mut conn, &mut reader)
+            .map_err(|e| format!("handshake: {}", e))?;
 
-        let tls_version = stream
-            .conn
+        // Drain any plaintext rustls buffered (should be empty with RecordReader)
+        let drained = drain_plaintext(&mut conn);
+
+        let tls_version = conn
             .protocol_version()
             .map(|v| match v {
                 rustls::ProtocolVersion::TLSv1_2 => 0x0303u16,
@@ -678,16 +768,13 @@ fn do_handshake(
             })
             .unwrap_or(0);
 
-        let negotiated_alpn: Vec<u8> = stream
-            .conn
+        let negotiated_alpn: Vec<u8> = conn
             .alpn_protocol()
             .map(|a| a.to_vec())
             .unwrap_or_default();
 
-        // Extract secrets, consuming the connection
-        conn = stream.conn;
         // Close dup'd fd
-        drop(stream.sock);
+        drop(reader);
 
         let secrets = conn
             .dangerous_extract_secrets()
@@ -697,8 +784,11 @@ fn do_handshake(
         let (rx_seq, rx_secrets) = secrets.rx;
 
         // Server: TX = server secret, RX = client secret
-        let tx_secret = capture.server_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let rx_secret = capture.client_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut tx_secret = Zeroizing::new(capture.server_secret.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        let mut rx_secret = Zeroizing::new(capture.client_secret.lock().unwrap_or_else(|e| e.into_inner()).clone());
+
+        let tx_out = std::mem::take(&mut *tx_secret);
+        let rx_out = std::mem::take(&mut *rx_secret);
 
         Ok((
             tls_version,
@@ -707,8 +797,9 @@ fn do_handshake(
             tx_seq,
             rx_seq,
             negotiated_alpn,
-            tx_secret,
-            rx_secret,
+            tx_out,
+            rx_out,
+            drained,
         ))
     } else {
         // --- Client path ---
@@ -793,25 +884,16 @@ fn do_handshake(
             return Err(format!("dup: {}", std::io::Error::last_os_error()));
         }
         let tcp = unsafe { TcpStream::from_raw_fd(dup_fd) };
-        let mut stream = StreamOwned::new(conn, tcp);
+        let mut reader = RecordReader::new(tcp);
 
-        // Drive handshake
-        let mut buf = [0u8; 1];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(e) => {
-                    if !stream.conn.is_handshaking() {
-                        break;
-                    }
-                    return Err(format!("handshake read: {}", e));
-                }
-            }
-        }
+        // Drive handshake record-by-record
+        drive_handshake!(&mut conn, &mut reader)
+            .map_err(|e| format!("handshake: {}", e))?;
 
-        let tls_version = stream
-            .conn
+        // Drain any plaintext rustls buffered (should be empty with RecordReader)
+        let drained = drain_plaintext(&mut conn);
+
+        let tls_version = conn
             .protocol_version()
             .map(|v| match v {
                 rustls::ProtocolVersion::TLSv1_2 => 0x0303u16,
@@ -820,14 +902,13 @@ fn do_handshake(
             })
             .unwrap_or(0);
 
-        let negotiated_alpn: Vec<u8> = stream
-            .conn
+        let negotiated_alpn: Vec<u8> = conn
             .alpn_protocol()
             .map(|a| a.to_vec())
             .unwrap_or_default();
 
-        conn = stream.conn;
-        drop(stream.sock);
+        // Close dup'd fd
+        drop(reader);
 
         let secrets = conn
             .dangerous_extract_secrets()
@@ -837,8 +918,11 @@ fn do_handshake(
         let (rx_seq, rx_secrets) = secrets.rx;
 
         // Client: TX = client secret, RX = server secret
-        let tx_secret = capture.client_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let rx_secret = capture.server_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut tx_secret = Zeroizing::new(capture.client_secret.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        let mut rx_secret = Zeroizing::new(capture.server_secret.lock().unwrap_or_else(|e| e.into_inner()).clone());
+
+        let tx_out = std::mem::take(&mut *tx_secret);
+        let rx_out = std::mem::take(&mut *rx_secret);
 
         Ok((
             tls_version,
@@ -847,8 +931,9 @@ fn do_handshake(
             tx_seq,
             rx_seq,
             negotiated_alpn,
-            tx_secret,
-            rx_secret,
+            tx_out,
+            rx_out,
+            drained,
         ))
     }
 }
@@ -859,20 +944,22 @@ fn do_handshake(
 
 #[no_mangle]
 pub extern "C" fn xray_tls_config_new(is_server: bool) -> *mut TlsConfig {
-    Box::into_raw(Box::new(TlsConfig {
-        is_server,
-        server_name: None,
-        certs: Vec::new(),
-        root_cas: Vec::new(),
-        use_system_roots: false,
-        alpn_protocols: Vec::new(),
-        min_version: None,
-        max_version: None,
-        insecure_skip_verify: false,
-        pinned_cert_sha256: Vec::new(),
-        verify_names: Vec::new(),
-        key_log_path: None,
-    }))
+    ffi_catch_ptr!({
+        Box::into_raw(Box::new(TlsConfig {
+            is_server,
+            server_name: None,
+            certs: Vec::new(),
+            root_cas: Vec::new(),
+            use_system_roots: false,
+            alpn_protocols: Vec::new(),
+            min_version: None,
+            max_version: None,
+            insecure_skip_verify: false,
+            pinned_cert_sha256: Vec::new(),
+            verify_names: Vec::new(),
+            key_log_path: None,
+        }))
+    })
 }
 
 #[no_mangle]
@@ -881,14 +968,16 @@ pub extern "C" fn xray_tls_config_set_server_name(
     name_ptr: *const u8,
     name_len: usize,
 ) {
-    if cfg.is_null() { return; }
-    let cfg = unsafe { &mut *cfg };
-    let name = if name_ptr.is_null() || name_len == 0 {
-        &[] as &[u8]
-    } else {
-        unsafe { std::slice::from_raw_parts(name_ptr, name_len) }
-    };
-    cfg.server_name = String::from_utf8(name.to_vec()).ok();
+    ffi_catch_void!({
+        if cfg.is_null() { return; }
+        let cfg = unsafe { &mut *cfg };
+        let name = if name_ptr.is_null() || name_len == 0 {
+            &[] as &[u8]
+        } else {
+            unsafe { std::slice::from_raw_parts(name_ptr, name_len) }
+        };
+        cfg.server_name = String::from_utf8(name.to_vec()).ok();
+    })
 }
 
 #[no_mangle]
@@ -899,8 +988,8 @@ pub extern "C" fn xray_tls_config_add_cert_pem(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    if cfg.is_null() { return -1; }
-    let result = std::panic::catch_unwind(|| {
+    ffi_catch_i32!({
+        if cfg.is_null() { return -1; }
         let cfg = unsafe { &mut *cfg };
         if cert_ptr.is_null() || cert_len == 0 || key_ptr.is_null() || key_len == 0 {
             return -1;
@@ -924,8 +1013,7 @@ pub extern "C" fn xray_tls_config_add_cert_pem(
             }
             _ => -2,
         }
-    });
-    result.unwrap_or(-99)
+    })
 }
 
 #[no_mangle]
@@ -934,8 +1022,8 @@ pub extern "C" fn xray_tls_config_add_root_ca_pem(
     ca_ptr: *const u8,
     ca_len: usize,
 ) -> i32 {
-    if cfg.is_null() { return -1; }
-    let result = std::panic::catch_unwind(|| {
+    ffi_catch_i32!({
+        if cfg.is_null() { return -1; }
         let cfg = unsafe { &mut *cfg };
         if ca_ptr.is_null() || ca_len == 0 {
             return -1;
@@ -952,15 +1040,16 @@ pub extern "C" fn xray_tls_config_add_root_ca_pem(
 
         cfg.root_cas.extend(certs);
         0
-    });
-    result.unwrap_or(-99)
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn xray_tls_config_use_system_roots(cfg: *mut TlsConfig) {
-    if cfg.is_null() { return; }
-    let cfg = unsafe { &mut *cfg };
-    cfg.use_system_roots = true;
+    ffi_catch_void!({
+        if cfg.is_null() { return; }
+        let cfg = unsafe { &mut *cfg };
+        cfg.use_system_roots = true;
+    })
 }
 
 #[no_mangle]
@@ -969,44 +1058,50 @@ pub extern "C" fn xray_tls_config_set_alpn(
     protos_ptr: *const u8,
     protos_len: usize,
 ) {
-    if cfg.is_null() { return; }
-    let cfg = unsafe { &mut *cfg };
-    let data = if protos_ptr.is_null() || protos_len == 0 {
-        &[] as &[u8]
-    } else {
-        unsafe { std::slice::from_raw_parts(protos_ptr, protos_len) }
-    };
+    ffi_catch_void!({
+        if cfg.is_null() { return; }
+        let cfg = unsafe { &mut *cfg };
+        let data = if protos_ptr.is_null() || protos_len == 0 {
+            &[] as &[u8]
+        } else {
+            unsafe { std::slice::from_raw_parts(protos_ptr, protos_len) }
+        };
 
-    // Parse length-prefixed TLS wire format
-    cfg.alpn_protocols.clear();
-    let mut pos = 0;
-    while pos < data.len() {
-        let len = data[pos] as usize;
-        pos += 1;
-        if len == 0 {
-            continue;
+        // Parse length-prefixed TLS wire format
+        cfg.alpn_protocols.clear();
+        let mut pos = 0;
+        while pos < data.len() {
+            let len = data[pos] as usize;
+            pos += 1;
+            if len == 0 {
+                continue;
+            }
+            if pos + len > data.len() {
+                break;
+            }
+            cfg.alpn_protocols.push(data[pos..pos + len].to_vec());
+            pos += len;
         }
-        if pos + len > data.len() {
-            break;
-        }
-        cfg.alpn_protocols.push(data[pos..pos + len].to_vec());
-        pos += len;
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn xray_tls_config_set_versions(cfg: *mut TlsConfig, min: u16, max: u16) {
-    if cfg.is_null() { return; }
-    let cfg = unsafe { &mut *cfg };
-    cfg.min_version = Some(min);
-    cfg.max_version = Some(max);
+    ffi_catch_void!({
+        if cfg.is_null() { return; }
+        let cfg = unsafe { &mut *cfg };
+        cfg.min_version = Some(min);
+        cfg.max_version = Some(max);
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn xray_tls_config_set_insecure_skip_verify(cfg: *mut TlsConfig, skip: bool) {
-    if cfg.is_null() { return; }
-    let cfg = unsafe { &mut *cfg };
-    cfg.insecure_skip_verify = skip;
+    ffi_catch_void!({
+        if cfg.is_null() { return; }
+        let cfg = unsafe { &mut *cfg };
+        cfg.insecure_skip_verify = skip;
+    })
 }
 
 #[no_mangle]
@@ -1015,11 +1110,13 @@ pub extern "C" fn xray_tls_config_pin_cert_sha256(
     hash_ptr: *const u8,
     hash_len: usize,
 ) {
-    if cfg.is_null() { return; }
-    let cfg = unsafe { &mut *cfg };
-    if hash_ptr.is_null() || hash_len == 0 { return; }
-    let hash = unsafe { std::slice::from_raw_parts(hash_ptr, hash_len) };
-    cfg.pinned_cert_sha256.push(hash.to_vec());
+    ffi_catch_void!({
+        if cfg.is_null() { return; }
+        let cfg = unsafe { &mut *cfg };
+        if hash_ptr.is_null() || hash_len == 0 { return; }
+        let hash = unsafe { std::slice::from_raw_parts(hash_ptr, hash_len) };
+        cfg.pinned_cert_sha256.push(hash.to_vec());
+    })
 }
 
 #[no_mangle]
@@ -1028,13 +1125,15 @@ pub extern "C" fn xray_tls_config_add_verify_name(
     name_ptr: *const u8,
     name_len: usize,
 ) {
-    if cfg.is_null() { return; }
-    let cfg = unsafe { &mut *cfg };
-    if name_ptr.is_null() || name_len == 0 { return; }
-    let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
-    if let Ok(s) = String::from_utf8(name.to_vec()) {
-        cfg.verify_names.push(s);
-    }
+    ffi_catch_void!({
+        if cfg.is_null() { return; }
+        let cfg = unsafe { &mut *cfg };
+        if name_ptr.is_null() || name_len == 0 { return; }
+        let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+        if let Ok(s) = String::from_utf8(name.to_vec()) {
+            cfg.verify_names.push(s);
+        }
+    })
 }
 
 #[no_mangle]
@@ -1043,21 +1142,25 @@ pub extern "C" fn xray_tls_config_set_key_log_path(
     path_ptr: *const u8,
     path_len: usize,
 ) {
-    if cfg.is_null() { return; }
-    let cfg = unsafe { &mut *cfg };
-    let path = if path_ptr.is_null() || path_len == 0 {
-        &[] as &[u8]
-    } else {
-        unsafe { std::slice::from_raw_parts(path_ptr, path_len) }
-    };
-    cfg.key_log_path = String::from_utf8(path.to_vec()).ok();
+    ffi_catch_void!({
+        if cfg.is_null() { return; }
+        let cfg = unsafe { &mut *cfg };
+        let path = if path_ptr.is_null() || path_len == 0 {
+            &[] as &[u8]
+        } else {
+            unsafe { std::slice::from_raw_parts(path_ptr, path_len) }
+        };
+        cfg.key_log_path = String::from_utf8(path.to_vec()).ok();
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn xray_tls_config_free(cfg: *mut TlsConfig) {
-    if !cfg.is_null() {
-        let _ = unsafe { Box::from_raw(cfg) };
-    }
+    ffi_catch_void!({
+        if !cfg.is_null() {
+            let _ = unsafe { Box::from_raw(cfg) };
+        }
+    })
 }
 
 // ===========================================================================
@@ -1078,7 +1181,7 @@ pub extern "C" fn xray_tls_handshake(
         out.set_error(-1, "null config pointer");
         return -1;
     }
-    let result = std::panic::catch_unwind(|| {
+    ffi_catch_i32!({
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
 
@@ -1094,6 +1197,7 @@ pub extern "C" fn xray_tls_handshake(
             negotiated_alpn,
             tx_secret,
             rx_secret,
+            drained,
         ) = match do_handshake(fd, cfg) {
             Ok(v) => v,
             Err(e) => {
@@ -1162,31 +1266,49 @@ pub extern "C" fn xray_tls_handshake(
             out.rx_secret[..len].copy_from_slice(&rx_secret[..len]);
         }
 
+        // Forward drained data to Go
+        if !drained.is_empty() {
+            let len = drained.len();
+            let boxed = drained.into_boxed_slice();
+            out.drained_ptr = Box::into_raw(boxed) as *mut u8;
+            out.drained_len = len as u32;
+        }
+
         0
-    });
-    result.unwrap_or_else(|_| {
-        let out = unsafe { &mut *out };
-        out.set_error(-1, "panic in xray_tls_handshake");
-        -1
     })
 }
 
 #[no_mangle]
 pub extern "C" fn xray_tls_key_update(state: *mut TlsState) -> i32 {
-    if state.is_null() {
-        return -1;
-    }
-    let _state = unsafe { &mut *state };
-    // TLS 1.3 KeyUpdate requires re-deriving traffic keys from the
-    // current application traffic secret. This is a placeholder that
-    // will be implemented when the Go side sends KeyUpdate signals.
-    // For now, kTLS in kernel 6.x handles KeyUpdate transparently.
-    0
+    ffi_catch_i32!({
+        if state.is_null() {
+            return -1;
+        }
+        let _state = unsafe { &mut *state };
+        // TLS 1.3 KeyUpdate requires re-deriving traffic keys from the
+        // current application traffic secret. This is a placeholder that
+        // will be implemented when the Go side sends KeyUpdate signals.
+        // For now, kTLS in kernel 6.x handles KeyUpdate transparently.
+        0
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn xray_tls_state_free(state: *mut TlsState) {
-    if !state.is_null() {
-        let _ = unsafe { Box::from_raw(state) };
-    }
+    ffi_catch_void!({
+        if !state.is_null() {
+            let _ = unsafe { Box::from_raw(state) };
+        }
+    })
+}
+
+/// Free a drained-data buffer previously returned in XrayTlsResult.
+/// Go calls this after copying the bytes via C.GoBytes().
+#[no_mangle]
+pub extern "C" fn xray_tls_drained_free(ptr: *mut u8, len: usize) {
+    ffi_catch_void!({
+        if !ptr.is_null() && len > 0 {
+            let _ = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)) };
+        }
+    })
 }

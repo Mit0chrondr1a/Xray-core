@@ -17,12 +17,13 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 pub struct Tls13State {
     pub client_app_secret: Vec<u8>,
     pub server_app_secret: Vec<u8>,
@@ -812,15 +813,14 @@ pub fn complete_tls13_handshake(
 #[repr(C)]
 pub struct XrayTls13Result {
     pub cipher_suite: u16,
-    pub client_secret_ptr: *mut u8,
-    pub client_secret_len: usize,
-    pub server_secret_ptr: *mut u8,
-    pub server_secret_len: usize,
-    pub cert_chain_ptr: *mut u8,
-    pub cert_chain_len: usize,
-    pub transcript_hash_ptr: *mut u8,
-    pub transcript_hash_len: usize,
-    pub state_handle: *mut std::ffi::c_void,
+    pub client_secret: [u8; 48],    // copied inline (max SHA-384 = 48 bytes)
+    pub client_secret_len: u8,
+    pub server_secret: [u8; 48],
+    pub server_secret_len: u8,
+    pub transcript_hash: [u8; 48],
+    pub transcript_hash_len: u8,
+    pub cert_chain_written: usize,  // bytes written to Go-provided cert buffer
+    pub cert_chain_needed: usize,   // total bytes needed
     pub error_code: i32,
     pub error_msg: [u8; 256],
 }
@@ -829,15 +829,14 @@ impl XrayTls13Result {
     fn new() -> Self {
         Self {
             cipher_suite: 0,
-            client_secret_ptr: std::ptr::null_mut(),
+            client_secret: [0u8; 48],
             client_secret_len: 0,
-            server_secret_ptr: std::ptr::null_mut(),
+            server_secret: [0u8; 48],
             server_secret_len: 0,
-            cert_chain_ptr: std::ptr::null_mut(),
-            cert_chain_len: 0,
-            transcript_hash_ptr: std::ptr::null_mut(),
+            transcript_hash: [0u8; 48],
             transcript_hash_len: 0,
-            state_handle: std::ptr::null_mut(),
+            cert_chain_written: 0,
+            cert_chain_needed: 0,
             error_code: 0,
             error_msg: [0u8; 256],
         }
@@ -850,13 +849,6 @@ impl XrayTls13Result {
         self.error_msg[..len].copy_from_slice(&bytes[..len]);
         self.error_msg[len] = 0;
     }
-}
-
-/// Holds the allocated buffers for a Tls13State so they can be freed.
-pub(crate) struct Tls13StateFFI {
-    pub(crate) state: Tls13State,
-    // Serialized cert chain: count(4) + [len(4) + cert_der]*
-    pub(crate) cert_chain_buf: Vec<u8>,
 }
 
 /// Install kTLS for a TLS 1.3 connection using secrets from the minimal
@@ -889,6 +881,8 @@ pub extern "C" fn xray_tls13_handshake(
     client_hello_ptr: *const u8,
     client_hello_len: usize,
     ecdh_privkey_ptr: *const u8,
+    cert_buf_ptr: *mut u8,
+    cert_buf_cap: usize,
     out: *mut XrayTls13Result,
 ) -> i32 {
     if out.is_null() { return -1; }
@@ -898,7 +892,7 @@ pub extern "C" fn xray_tls13_handshake(
         out.set_error(-1, "null input pointer");
         return -1;
     }
-    let result = std::panic::catch_unwind(|| {
+    ffi_catch_i32!({
         let out = unsafe { &mut *out };
         *out = XrayTls13Result::new();
 
@@ -916,31 +910,35 @@ pub extern "C" fn xray_tls13_handshake(
             Ok(state) => {
                 out.cipher_suite = state.cipher_suite;
 
-                // Serialize cert chain: count(4 LE) + [len(4 LE) + der_bytes]*
-                let mut cert_buf = Vec::new();
-                cert_buf.extend_from_slice(&(state.server_cert_chain.len() as u32).to_le_bytes());
+                // Copy secrets inline
+                let cs_len = state.client_app_secret.len().min(48);
+                out.client_secret[..cs_len].copy_from_slice(&state.client_app_secret[..cs_len]);
+                out.client_secret_len = cs_len as u8;
+
+                let ss_len = state.server_app_secret.len().min(48);
+                out.server_secret[..ss_len].copy_from_slice(&state.server_app_secret[..ss_len]);
+                out.server_secret_len = ss_len as u8;
+
+                let th_len = state.transcript_hash.len().min(48);
+                out.transcript_hash[..th_len].copy_from_slice(&state.transcript_hash[..th_len]);
+                out.transcript_hash_len = th_len as u8;
+
+                // Serialize cert chain into Go-provided buffer
+                // Format: count(4 LE) + [len(4 LE) + der_bytes]*
+                let mut cert_data = Vec::new();
+                cert_data.extend_from_slice(&(state.server_cert_chain.len() as u32).to_le_bytes());
                 for cert in &state.server_cert_chain {
-                    cert_buf.extend_from_slice(&(cert.len() as u32).to_le_bytes());
-                    cert_buf.extend_from_slice(cert);
+                    cert_data.extend_from_slice(&(cert.len() as u32).to_le_bytes());
+                    cert_data.extend_from_slice(cert);
                 }
+                out.cert_chain_needed = cert_data.len();
 
-                let ffi_state = Box::new(Tls13StateFFI {
-                    state,
-                    cert_chain_buf: cert_buf,
-                });
-
-                let ptr = Box::into_raw(ffi_state);
-                let ffi = unsafe { &*ptr };
-
-                out.client_secret_ptr = ffi.state.client_app_secret.as_ptr() as *mut u8;
-                out.client_secret_len = ffi.state.client_app_secret.len();
-                out.server_secret_ptr = ffi.state.server_app_secret.as_ptr() as *mut u8;
-                out.server_secret_len = ffi.state.server_app_secret.len();
-                out.cert_chain_ptr = ffi.cert_chain_buf.as_ptr() as *mut u8;
-                out.cert_chain_len = ffi.cert_chain_buf.len();
-                out.transcript_hash_ptr = ffi.state.transcript_hash.as_ptr() as *mut u8;
-                out.transcript_hash_len = ffi.state.transcript_hash.len();
-                out.state_handle = ptr as *mut std::ffi::c_void;
+                if !cert_buf_ptr.is_null() && cert_buf_cap > 0 {
+                    let write_len = cert_data.len().min(cert_buf_cap);
+                    let dest = unsafe { std::slice::from_raw_parts_mut(cert_buf_ptr, write_len) };
+                    dest.copy_from_slice(&cert_data[..write_len]);
+                    out.cert_chain_written = write_len;
+                }
                 0
             }
             Err(e) => {
@@ -948,55 +946,47 @@ pub extern "C" fn xray_tls13_handshake(
                 1
             }
         }
-    });
-    result.unwrap_or_else(|_| {
-        let out = unsafe { &mut *out };
-        out.set_error(-1, "panic in xray_tls13_handshake");
-        -1
     })
 }
 
+/// No-op: XrayTls13Result no longer holds an opaque state handle.
+/// Kept for backward compatibility with Go callers.
 #[no_mangle]
-pub extern "C" fn xray_tls13_state_free(state: *mut std::ffi::c_void) {
-    if !state.is_null() {
-        let _ = unsafe { Box::from_raw(state as *mut Tls13StateFFI) };
-    }
+pub extern "C" fn xray_tls13_state_free(_state: *mut std::ffi::c_void) {
+    // No-op: all data is now copied inline into XrayTls13Result.
 }
 
-/// Install kTLS using the application traffic secrets from a completed
-/// TLS 1.3 handshake. Called after xray_tls13_handshake succeeds.
+/// Install kTLS using application traffic secrets directly.
+/// Called after xray_tls13_handshake succeeds — secrets are passed from Go
+/// (which copied them from the XrayTls13Result inline arrays).
 #[no_mangle]
 pub extern "C" fn xray_tls13_install_ktls(
     fd: i32,
-    state: *const std::ffi::c_void,
+    cipher_suite: u16,
+    client_secret_ptr: *const u8,
+    client_secret_len: usize,
+    server_secret_ptr: *const u8,
+    server_secret_len: usize,
     out_ktls_tx: *mut bool,
     out_ktls_rx: *mut bool,
 ) -> i32 {
-    if state.is_null() || out_ktls_tx.is_null() || out_ktls_rx.is_null() {
+    if out_ktls_tx.is_null() || out_ktls_rx.is_null() {
         return -1;
     }
-    let result = std::panic::catch_unwind(|| {
-        let ffi = unsafe { &*(state as *const Tls13StateFFI) };
-        let cs = ffi.state.cipher_suite;
+    if client_secret_ptr.is_null() || server_secret_ptr.is_null() {
+        return -1;
+    }
+    ffi_catch_i32!({
+        let client_secret = unsafe { std::slice::from_raw_parts(client_secret_ptr, client_secret_len) };
+        let server_secret = unsafe { std::slice::from_raw_parts(server_secret_ptr, server_secret_len) };
+        let cs = cipher_suite;
         let alg = HashAlg::from_cipher_suite(cs);
 
         let inner = || -> Result<(bool, bool), Tls13Error> {
-            let tx_key = hkdf_expand_label(
-                alg,
-                &ffi.state.client_app_secret,
-                "key",
-                &[],
-                key_length(cs),
-            )?;
-            let tx_iv = hkdf_expand_label(alg, &ffi.state.client_app_secret, "iv", &[], 12)?;
-            let rx_key = hkdf_expand_label(
-                alg,
-                &ffi.state.server_app_secret,
-                "key",
-                &[],
-                key_length(cs),
-            )?;
-            let rx_iv = hkdf_expand_label(alg, &ffi.state.server_app_secret, "iv", &[], 12)?;
+            let tx_key = hkdf_expand_label(alg, client_secret, "key", &[], key_length(cs))?;
+            let tx_iv = hkdf_expand_label(alg, client_secret, "iv", &[], 12)?;
+            let rx_key = hkdf_expand_label(alg, server_secret, "key", &[], key_length(cs))?;
+            let rx_iv = hkdf_expand_label(alg, server_secret, "iv", &[], 12)?;
 
             // ULP setup
             if crate::tls::setup_ulp_pub(fd).is_err() {
@@ -1014,8 +1004,7 @@ pub extern "C" fn xray_tls13_install_ktls(
             *out_ktls_rx = rx_ok;
         }
         0
-    });
-    result.unwrap_or(-1)
+    })
 }
 
 /// Low-level kTLS install using raw key/iv bytes.

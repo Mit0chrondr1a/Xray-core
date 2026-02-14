@@ -31,14 +31,27 @@ type TlsResult struct {
 	StateHandle *TlsStateHandle
 	TxSecret    []byte
 	RxSecret    []byte
+	DrainedData []byte
+}
+
+// ZeroSecrets zeroes the traffic secret fields after they have been copied.
+func (r *TlsResult) ZeroSecrets() {
+	for i := range r.TxSecret {
+		r.TxSecret[i] = 0
+	}
+	for i := range r.RxSecret {
+		r.RxSecret[i] = 0
+	}
+	r.TxSecret = nil
+	r.RxSecret = nil
 }
 
 // --- TLS Config Builder Stubs ---
 
 func TlsConfigNew(bool) *TlsConfigHandle                             { return nil }
 func TlsConfigSetServerName(*TlsConfigHandle, string)                {}
-func TlsConfigAddCertPEM(*TlsConfigHandle, []byte, []byte)           {}
-func TlsConfigAddRootCAPEM(*TlsConfigHandle, []byte)                 {}
+func TlsConfigAddCertPEM(*TlsConfigHandle, []byte, []byte) error     { return errNotAvailable }
+func TlsConfigAddRootCAPEM(*TlsConfigHandle, []byte) error           { return errNotAvailable }
 func TlsConfigUseSystemRoots(*TlsConfigHandle)                       {}
 func TlsConfigSetALPN(*TlsConfigHandle, []byte)                      {}
 func TlsConfigSetVersions(*TlsConfigHandle, uint16, uint16)          {}

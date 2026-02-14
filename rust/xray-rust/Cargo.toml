@@ -23,6 +23,9 @@ chacha20poly1305 = "0.10"
 hmac = "0.12"
 ed25519-dalek = { version = "2", features = ["hazmat"] }
 
+# Security
+zeroize = { version = "1", features = ["derive"] }
+
 # System
 libc = "0.2"
 

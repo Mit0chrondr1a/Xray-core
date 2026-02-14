@@ -22,13 +22,15 @@ struct xray_tls_result {
     uint8_t  tx_secret[48];
     uint8_t  rx_secret[48];
     uint8_t  secret_len;
+    uint8_t* drained_ptr;
+    uint32_t drained_len;
 };
 
 // TLS config builder
 extern void*   xray_tls_config_new(bool is_server);
 extern void    xray_tls_config_set_server_name(void* cfg, const uint8_t* name, size_t len);
-extern void    xray_tls_config_add_cert_pem(void* cfg, const uint8_t* cert, size_t cert_len, const uint8_t* key, size_t key_len);
-extern void    xray_tls_config_add_root_ca_pem(void* cfg, const uint8_t* ca, size_t len);
+extern int32_t xray_tls_config_add_cert_pem(void* cfg, const uint8_t* cert, size_t cert_len, const uint8_t* key, size_t key_len);
+extern int32_t xray_tls_config_add_root_ca_pem(void* cfg, const uint8_t* ca, size_t len);
 extern void    xray_tls_config_use_system_roots(void* cfg);
 extern void    xray_tls_config_set_alpn(void* cfg, const uint8_t* protos, size_t len);
 extern void    xray_tls_config_set_versions(void* cfg, uint16_t min_ver, uint16_t max_ver);
@@ -42,6 +44,7 @@ extern void    xray_tls_config_free(void* cfg);
 extern int32_t xray_tls_handshake(int fd, const void* cfg, bool is_client, struct xray_tls_result* out);
 extern int32_t xray_tls_key_update(void* state_handle);
 extern void    xray_tls_state_free(void* state_handle);
+extern void    xray_tls_drained_free(uint8_t* ptr, size_t len);
 
 // REALITY config builder
 extern void*   xray_reality_config_new(bool is_client);
@@ -101,6 +104,19 @@ type TlsResult struct {
 	StateHandle *TlsStateHandle
 	TxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
 	RxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
+	DrainedData []byte // plaintext drained from rustls after handshake
+}
+
+// ZeroSecrets zeroes the traffic secret fields after they have been copied.
+func (r *TlsResult) ZeroSecrets() {
+	for i := range r.TxSecret {
+		r.TxSecret[i] = 0
+	}
+	for i := range r.RxSecret {
+		r.RxSecret[i] = 0
+	}
+	r.TxSecret = nil
+	r.RxSecret = nil
 }
 
 // --- TLS Config Builder ---
@@ -127,20 +143,28 @@ func TlsConfigSetServerName(h *TlsConfigHandle, name string) {
 	C.xray_tls_config_set_server_name(h.ptr, (*C.uint8_t)(unsafe.Pointer(&nameBytes[0])), C.size_t(len(nameBytes)))
 }
 
-func TlsConfigAddCertPEM(h *TlsConfigHandle, certPEM, keyPEM []byte) {
+func TlsConfigAddCertPEM(h *TlsConfigHandle, certPEM, keyPEM []byte) error {
 	if h == nil || len(certPEM) == 0 || len(keyPEM) == 0 {
-		return
+		return errors.New("native: nil handle or empty cert/key")
 	}
-	C.xray_tls_config_add_cert_pem(h.ptr,
+	rc := C.xray_tls_config_add_cert_pem(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(&certPEM[0])), C.size_t(len(certPEM)),
 		(*C.uint8_t)(unsafe.Pointer(&keyPEM[0])), C.size_t(len(keyPEM)))
+	if rc != 0 {
+		return errors.New("native: failed to add cert PEM")
+	}
+	return nil
 }
 
-func TlsConfigAddRootCAPEM(h *TlsConfigHandle, caPEM []byte) {
+func TlsConfigAddRootCAPEM(h *TlsConfigHandle, caPEM []byte) error {
 	if h == nil || len(caPEM) == 0 {
-		return
+		return errors.New("native: nil handle or empty CA PEM")
 	}
-	C.xray_tls_config_add_root_ca_pem(h.ptr, (*C.uint8_t)(unsafe.Pointer(&caPEM[0])), C.size_t(len(caPEM)))
+	rc := C.xray_tls_config_add_root_ca_pem(h.ptr, (*C.uint8_t)(unsafe.Pointer(&caPEM[0])), C.size_t(len(caPEM)))
+	if rc != 0 {
+		return errors.New("native: failed to add root CA PEM")
+	}
+	return nil
 }
 
 func TlsConfigUseSystemRoots(h *TlsConfigHandle) {
@@ -240,6 +264,7 @@ func TlsHandshake(fd int, cfg *TlsConfigHandle, isClient bool) (*TlsResult, erro
 		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
 	extractSecrets(result, &cResult)
+	extractDrained(result, &cResult)
 	return result, nil
 }
 
@@ -438,6 +463,7 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
 	extractSecrets(result, &cResult)
+	extractDrained(result, &cResult)
 	return result, nil
 }
 
@@ -507,6 +533,7 @@ func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error
 		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
 	extractSecrets(result, &cResult)
+	extractDrained(result, &cResult)
 	return result, nil
 }
 
@@ -515,6 +542,14 @@ func extractSecrets(result *TlsResult, cResult *C.struct_xray_tls_result) {
 	if secretLen := int(cResult.secret_len); secretLen > 0 {
 		result.TxSecret = C.GoBytes(unsafe.Pointer(&cResult.tx_secret[0]), C.int(secretLen))
 		result.RxSecret = C.GoBytes(unsafe.Pointer(&cResult.rx_secret[0]), C.int(secretLen))
+	}
+}
+
+// extractDrained copies drained plaintext from the C result and frees the Rust buffer.
+func extractDrained(result *TlsResult, cResult *C.struct_xray_tls_result) {
+	if cResult.drained_ptr != nil && cResult.drained_len > 0 {
+		result.DrainedData = C.GoBytes(unsafe.Pointer(cResult.drained_ptr), C.int(cResult.drained_len))
+		C.xray_tls_drained_free(cResult.drained_ptr, C.size_t(cResult.drained_len))
 	}
 }
 
