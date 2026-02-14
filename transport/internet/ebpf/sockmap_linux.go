@@ -18,19 +18,39 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var (
-	sockhashFD      int = -1
-	policyMapFD     int = -1
-	skSkbParserFD   int = -1
-	skSkbVerdictFD  int = -1
-	sockmapAttachFD int = -1
+// ebpfState holds all BPF file descriptors and configuration that must be
+// read/written atomically. Readers load the pointer once and use a consistent
+// snapshot, eliminating the data race where a teardown could leave readers
+// with a mix of old and new (closed) FDs.
+type ebpfState struct {
+	sockhashFD      int
+	policyMapFD     int
+	skSkbParserFD   int
+	skSkbVerdictFD  int
+	sockmapAttachFD int
 	sockmapPinPath  string
 
 	sockmapAttachMaxEntries uint32
-	sockmapAttachSlotMu     sync.Mutex
-	sockmapAttachSlots      map[int]uint32
-	sockmapAttachFree       []uint32
-	sockmapAttachNext       atomic.Uint32
+}
+
+var currentState atomic.Pointer[ebpfState]
+
+func init() {
+	currentState.Store(&ebpfState{
+		sockhashFD:      -1,
+		policyMapFD:     -1,
+		skSkbParserFD:   -1,
+		skSkbVerdictFD:  -1,
+		sockmapAttachFD: -1,
+	})
+}
+
+// Slot management globals have their own mutex and don't need atomic state.
+var (
+	sockmapAttachSlotMu sync.Mutex
+	sockmapAttachSlots  map[int]uint32
+	sockmapAttachFree   []uint32
+	sockmapAttachNext   atomic.Uint32
 )
 
 // buildSKSkbParserProgram generates a minimal sk_skb stream parser that
@@ -266,24 +286,28 @@ func setupSockmapImpl(config SockmapConfig) error {
 	}
 
 	// Commit to global state only after all operations succeed.
-	sockhashFD = hashFD
-	policyMapFD = policyFD
-	skSkbParserFD = parserFD
-	skSkbVerdictFD = verdictFD
+	// Build the new state struct and store it atomically so readers
+	// always see a fully-consistent snapshot.
+	newState := &ebpfState{
+		sockhashFD:     hashFD,
+		policyMapFD:    policyFD,
+		skSkbParserFD:  parserFD,
+		skSkbVerdictFD: verdictFD,
+		sockmapPinPath: pinDir,
+	}
 	if usingSockmapFallback {
-		sockmapAttachFD = attachFD
-		sockmapAttachMaxEntries = config.MaxEntries
+		newState.sockmapAttachFD = attachFD
+		newState.sockmapAttachMaxEntries = config.MaxEntries
 		sockmapAttachSlots = make(map[int]uint32)
 		sockmapAttachFree = nil
 		sockmapAttachNext.Store(0)
 	} else {
-		sockmapAttachFD = -1
-		sockmapAttachMaxEntries = 0
+		newState.sockmapAttachFD = -1
 		sockmapAttachSlots = nil
 		sockmapAttachFree = nil
 		sockmapAttachNext.Store(0)
 	}
-	sockmapPinPath = pinDir
+	currentState.Store(newState)
 
 	// Drop excess capabilities (defense-in-depth, non-fatal)
 	if config.DropCapabilities {
@@ -298,46 +322,62 @@ func setupSockmapImpl(config SockmapConfig) error {
 
 // teardownSockmapImpl cleans up sockmap resources.
 // Closing the active attach map FD detaches attached sk_skb programs.
+//
+// The closed state is published atomically BEFORE closing old FDs so that
+// concurrent readers (setupForwardingImpl, removeForwardingImpl) never
+// observe a half-torn-down state.
 func teardownSockmapImpl() error {
+	// Capture old state before swapping.
+	oldState := currentState.Load()
+
 	// Unpin maps before closing FDs (best-effort)
-	if sockmapPinPath != "" {
-		unpinBPFMap(sockhashPinPath(sockmapPinPath))
-		unpinBPFMap(policyPinPath(sockmapPinPath))
-		os.Remove(sockmapPinPath)
-		sockmapPinPath = ""
+	if oldState.sockmapPinPath != "" {
+		unpinBPFMap(sockhashPinPath(oldState.sockmapPinPath))
+		unpinBPFMap(policyPinPath(oldState.sockmapPinPath))
+		os.Remove(oldState.sockmapPinPath)
 	}
 
-	if sockmapAttachFD >= 0 {
-		syscall.Close(sockmapAttachFD)
-		sockmapAttachFD = -1
+	// Publish closed state atomically so readers immediately see all FDs as -1.
+	closedState := &ebpfState{
+		sockhashFD:      -1,
+		policyMapFD:     -1,
+		skSkbParserFD:   -1,
+		skSkbVerdictFD:  -1,
+		sockmapAttachFD: -1,
 	}
-	if skSkbVerdictFD >= 0 {
-		syscall.Close(skSkbVerdictFD)
-		skSkbVerdictFD = -1
-	}
-	if skSkbParserFD >= 0 {
-		syscall.Close(skSkbParserFD)
-		skSkbParserFD = -1
-	}
-	if sockhashFD >= 0 {
-		syscall.Close(sockhashFD)
-		sockhashFD = -1
-	}
-	if policyMapFD >= 0 {
-		syscall.Close(policyMapFD)
-		policyMapFD = -1
-	}
-	sockmapAttachMaxEntries = 0
+	currentState.Store(closedState)
+
+	// Reset slot management globals.
 	sockmapAttachSlots = nil
 	sockmapAttachFree = nil
 	sockmapAttachNext.Store(0)
+
+	// Now close old FDs. Readers that loaded oldState before the swap may
+	// still have in-flight syscalls, but the kernel refcounts BPF map FDs
+	// so those syscalls complete safely.
+	if oldState.sockmapAttachFD >= 0 {
+		syscall.Close(oldState.sockmapAttachFD)
+	}
+	if oldState.skSkbVerdictFD >= 0 {
+		syscall.Close(oldState.skSkbVerdictFD)
+	}
+	if oldState.skSkbParserFD >= 0 {
+		syscall.Close(oldState.skSkbParserFD)
+	}
+	if oldState.sockhashFD >= 0 {
+		syscall.Close(oldState.sockhashFD)
+	}
+	if oldState.policyMapFD >= 0 {
+		syscall.Close(oldState.policyMapFD)
+	}
 	return nil
 }
 
 // setupForwardingImpl configures bidirectional forwarding between sockets.
 // Cookies are passed from the caller to avoid redundant getsockopt(SO_COOKIE) calls.
 func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
-	if sockhashFD < 0 {
+	st := currentState.Load()
+	if st.sockhashFD < 0 {
 		return ErrSockmapNotEnabled
 	}
 
@@ -345,62 +385,62 @@ func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCooki
 	inboundKey := inboundCookie
 	key := inboundKey
 	value := uint32(outboundFD)
-	if err := bpfMapUpdate(sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+	if err := bpfMapUpdate(st.sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
 		return err
 	}
 
 	// Map outbound socket to inbound
 	key = outboundCookie
 	value = uint32(inboundFD)
-	if err := bpfMapUpdate(sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
-		_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+	if err := bpfMapUpdate(st.sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+		_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&inboundKey))
 		return err
 	}
 
 	// Older kernels attach sk_skb to SOCKMAP only; mirror sockets into the
 	// fallback attach map so packets trigger parser/verdict programs.
-	if sockmapAttachFD >= 0 {
-		inboundSlot, inboundCreated, err := assignSockmapAttachSlot(inboundFD)
+	if st.sockmapAttachFD >= 0 {
+		inboundSlot, inboundCreated, err := assignSockmapAttachSlot(inboundFD, st.sockmapAttachMaxEntries)
 		if err != nil {
-			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
-			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key))
+			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&inboundKey))
 			return err
 		}
 		attachKey := inboundSlot
 		attachValue := uint32(inboundFD)
-		if err := bpfMapUpdate(sockmapAttachFD, unsafe.Pointer(&attachKey), unsafe.Pointer(&attachValue)); err != nil {
+		if err := bpfMapUpdate(st.sockmapAttachFD, unsafe.Pointer(&attachKey), unsafe.Pointer(&attachValue)); err != nil {
 			if inboundCreated {
 				releaseSockmapAttachSlot(inboundFD)
 			}
-			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
-			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key))
+			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&inboundKey))
 			return err
 		}
 
-		outboundSlot, outboundCreated, err := assignSockmapAttachSlot(outboundFD)
+		outboundSlot, outboundCreated, err := assignSockmapAttachSlot(outboundFD, st.sockmapAttachMaxEntries)
 		if err != nil {
 			if inboundCreated {
 				if attachInboundKey, ok := releaseSockmapAttachSlot(inboundFD); ok {
-					_ = bpfMapDelete(sockmapAttachFD, unsafe.Pointer(&attachInboundKey))
+					_ = bpfMapDelete(st.sockmapAttachFD, unsafe.Pointer(&attachInboundKey))
 				}
 			}
-			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
-			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key))
+			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&inboundKey))
 			return err
 		}
 		attachKey = outboundSlot
 		attachValue = uint32(outboundFD)
-		if err := bpfMapUpdate(sockmapAttachFD, unsafe.Pointer(&attachKey), unsafe.Pointer(&attachValue)); err != nil {
+		if err := bpfMapUpdate(st.sockmapAttachFD, unsafe.Pointer(&attachKey), unsafe.Pointer(&attachValue)); err != nil {
 			if outboundCreated {
 				releaseSockmapAttachSlot(outboundFD)
 			}
 			if inboundCreated {
 				if attachInboundKey, ok := releaseSockmapAttachSlot(inboundFD); ok {
-					_ = bpfMapDelete(sockmapAttachFD, unsafe.Pointer(&attachInboundKey))
+					_ = bpfMapDelete(st.sockmapAttachFD, unsafe.Pointer(&attachInboundKey))
 				}
 			}
-			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
-			_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&inboundKey))
+			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key))
+			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&inboundKey))
 			return err
 		}
 	}
@@ -411,30 +451,31 @@ func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCooki
 // removeForwardingImpl removes bidirectional forwarding entries from sockhash
 // and from the fallback attach map when enabled.
 func removeForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
-	if sockhashFD < 0 {
+	st := currentState.Load()
+	if st.sockhashFD < 0 {
 		return nil
 	}
 
 	var firstErr error
 	key := inboundCookie
-	if err := bpfMapDelete(sockhashFD, unsafe.Pointer(&key)); err != nil && firstErr == nil {
+	if err := bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key)); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	key = outboundCookie
-	if err := bpfMapDelete(sockhashFD, unsafe.Pointer(&key)); err != nil && firstErr == nil {
+	if err := bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key)); err != nil && firstErr == nil {
 		firstErr = err
 	}
 
-	if sockmapAttachFD >= 0 {
+	if st.sockmapAttachFD >= 0 {
 		attachKey, ok := releaseSockmapAttachSlot(inboundFD)
 		if ok {
-			if err := bpfMapDelete(sockmapAttachFD, unsafe.Pointer(&attachKey)); err != nil && firstErr == nil {
+			if err := bpfMapDelete(st.sockmapAttachFD, unsafe.Pointer(&attachKey)); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
 		attachKey, ok = releaseSockmapAttachSlot(outboundFD)
 		if ok {
-			if err := bpfMapDelete(sockmapAttachFD, unsafe.Pointer(&attachKey)); err != nil && firstErr == nil {
+			if err := bpfMapDelete(st.sockmapAttachFD, unsafe.Pointer(&attachKey)); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
@@ -443,9 +484,9 @@ func removeForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCook
 	return firstErr
 }
 
-func assignSockmapAttachSlot(fd int) (slot uint32, created bool, err error) {
+func assignSockmapAttachSlot(fd int, maxEntries uint32) (slot uint32, created bool, err error) {
 	slot = sockmapAttachNext.Add(1) - 1
-	if slot < sockmapAttachMaxEntries {
+	if slot < maxEntries {
 		sockmapAttachSlotMu.Lock()
 		if sockmapAttachSlots == nil {
 			sockmapAttachSlots = make(map[int]uint32)
@@ -479,7 +520,7 @@ func assignSockmapAttachSlot(fd int) (slot uint32, created bool, err error) {
 		return slot, true, nil
 	}
 
-	return 0, false, fmt.Errorf("sockmap attach map is full (max entries %d)", sockmapAttachMaxEntries)
+	return 0, false, fmt.Errorf("sockmap attach map is full (max entries %d)", maxEntries)
 }
 
 func releaseSockmapAttachSlot(fd int) (uint32, bool) {
@@ -794,21 +835,23 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 
 // setPolicyEntry writes a redirect policy entry for the given socket cookie.
 func setPolicyEntry(cookie uint64, flags uint32) error {
-	if policyMapFD < 0 {
+	st := currentState.Load()
+	if st.policyMapFD < 0 {
 		return nil // policy map not created — no-op (backward compat)
 	}
 	key := cookie
 	value := flags
-	return bpfMapUpdate(policyMapFD, unsafe.Pointer(&key), unsafe.Pointer(&value))
+	return bpfMapUpdate(st.policyMapFD, unsafe.Pointer(&key), unsafe.Pointer(&value))
 }
 
 // deletePolicyEntry removes the redirect policy entry for the given socket cookie.
 func deletePolicyEntry(cookie uint64) error {
-	if policyMapFD < 0 {
+	st := currentState.Load()
+	if st.policyMapFD < 0 {
 		return nil
 	}
 	key := cookie
-	return bpfMapDelete(policyMapFD, unsafe.Pointer(&key))
+	return bpfMapDelete(st.policyMapFD, unsafe.Pointer(&key))
 }
 
 // isSocketAlive probes whether a file descriptor is still a valid, open socket.

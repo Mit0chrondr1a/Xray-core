@@ -1096,7 +1096,7 @@ func TestPolicyMapLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if policyMapFD < 0 {
+	if currentState.Load().policyMapFD < 0 {
 		t.Fatal("policyMapFD should be >= 0 after Enable")
 	}
 
@@ -1104,7 +1104,7 @@ func TestPolicyMapLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if policyMapFD != -1 {
+	if currentState.Load().policyMapFD != -1 {
 		t.Fatal("policyMapFD should be -1 after Disable")
 	}
 }
