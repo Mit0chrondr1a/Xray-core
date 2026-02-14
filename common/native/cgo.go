@@ -216,6 +216,8 @@ func TlsConfigSetServerName(h *TlsConfigHandle, name string) {
 	}
 	nameBytes := []byte(name)
 	C.xray_tls_config_set_server_name(h.ptr, (*C.uint8_t)(unsafe.Pointer(&nameBytes[0])), C.size_t(len(nameBytes)))
+	runtime.KeepAlive(nameBytes)
+	runtime.KeepAlive(h)
 }
 
 func TlsConfigAddCertPEM(h *TlsConfigHandle, certPEM, keyPEM []byte) error {
@@ -225,6 +227,9 @@ func TlsConfigAddCertPEM(h *TlsConfigHandle, certPEM, keyPEM []byte) error {
 	rc := C.xray_tls_config_add_cert_pem(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(&certPEM[0])), C.size_t(len(certPEM)),
 		(*C.uint8_t)(unsafe.Pointer(&keyPEM[0])), C.size_t(len(keyPEM)))
+	runtime.KeepAlive(certPEM)
+	runtime.KeepAlive(keyPEM)
+	runtime.KeepAlive(h)
 	if rc != 0 {
 		return errors.New("native: failed to add cert PEM")
 	}
@@ -236,6 +241,8 @@ func TlsConfigAddRootCAPEM(h *TlsConfigHandle, caPEM []byte) error {
 		return errors.New("native: nil handle or empty CA PEM")
 	}
 	rc := C.xray_tls_config_add_root_ca_pem(h.ptr, (*C.uint8_t)(unsafe.Pointer(&caPEM[0])), C.size_t(len(caPEM)))
+	runtime.KeepAlive(caPEM)
+	runtime.KeepAlive(h)
 	if rc != 0 {
 		return errors.New("native: failed to add root CA PEM")
 	}
@@ -247,6 +254,7 @@ func TlsConfigUseSystemRoots(h *TlsConfigHandle) {
 		return
 	}
 	C.xray_tls_config_use_system_roots(h.ptr)
+	runtime.KeepAlive(h)
 }
 
 func TlsConfigSetALPN(h *TlsConfigHandle, protos []byte) {
@@ -254,6 +262,8 @@ func TlsConfigSetALPN(h *TlsConfigHandle, protos []byte) {
 		return
 	}
 	C.xray_tls_config_set_alpn(h.ptr, (*C.uint8_t)(unsafe.Pointer(&protos[0])), C.size_t(len(protos)))
+	runtime.KeepAlive(protos)
+	runtime.KeepAlive(h)
 }
 
 func TlsConfigSetVersions(h *TlsConfigHandle, minVer, maxVer uint16) {
@@ -261,6 +271,7 @@ func TlsConfigSetVersions(h *TlsConfigHandle, minVer, maxVer uint16) {
 		return
 	}
 	C.xray_tls_config_set_versions(h.ptr, C.uint16_t(minVer), C.uint16_t(maxVer))
+	runtime.KeepAlive(h)
 }
 
 func TlsConfigSetInsecureSkipVerify(h *TlsConfigHandle, skip bool) {
@@ -268,6 +279,7 @@ func TlsConfigSetInsecureSkipVerify(h *TlsConfigHandle, skip bool) {
 		return
 	}
 	C.xray_tls_config_set_insecure_skip_verify(h.ptr, C.bool(skip))
+	runtime.KeepAlive(h)
 }
 
 func TlsConfigPinCertSHA256(h *TlsConfigHandle, hash []byte) {
@@ -275,6 +287,8 @@ func TlsConfigPinCertSHA256(h *TlsConfigHandle, hash []byte) {
 		return
 	}
 	C.xray_tls_config_pin_cert_sha256(h.ptr, (*C.uint8_t)(unsafe.Pointer(&hash[0])), C.size_t(len(hash)))
+	runtime.KeepAlive(hash)
+	runtime.KeepAlive(h)
 }
 
 func TlsConfigAddVerifyName(h *TlsConfigHandle, name string) {
@@ -286,6 +300,8 @@ func TlsConfigAddVerifyName(h *TlsConfigHandle, name string) {
 		return
 	}
 	C.xray_tls_config_add_verify_name(h.ptr, (*C.uint8_t)(unsafe.Pointer(&nameBytes[0])), C.size_t(len(nameBytes)))
+	runtime.KeepAlive(nameBytes)
+	runtime.KeepAlive(h)
 }
 
 func TlsConfigSetKeyLogPath(h *TlsConfigHandle, path string) {
@@ -297,6 +313,8 @@ func TlsConfigSetKeyLogPath(h *TlsConfigHandle, path string) {
 		return
 	}
 	C.xray_tls_config_set_key_log_path(h.ptr, (*C.uint8_t)(unsafe.Pointer(&pathBytes[0])), C.size_t(len(pathBytes)))
+	runtime.KeepAlive(pathBytes)
+	runtime.KeepAlive(h)
 }
 
 func TlsConfigFree(h *TlsConfigHandle) {
@@ -316,6 +334,7 @@ func TlsHandshake(fd int, cfg *TlsConfigHandle, isClient bool) (*TlsResult, erro
 	}
 	var cResult C.struct_xray_tls_result
 	rc := C.xray_tls_handshake(C.int(fd), cfg.ptr, C.bool(isClient), &cResult)
+	runtime.KeepAlive(cfg)
 	if rc != 0 {
 		errMsg := C.GoString(&cResult.error_msg[0])
 		return nil, errors.New("native TLS handshake: " + errMsg)
@@ -348,6 +367,7 @@ func TlsKeyUpdate(h *TlsStateHandle) error {
 		return errors.New("native: nil state handle")
 	}
 	rc := C.xray_tls_key_update(h.ptr)
+	runtime.KeepAlive(h)
 	if rc != 0 {
 		return errors.New("native: key update failed")
 	}
@@ -394,6 +414,8 @@ func RealityConfigSetServerPubkey(h *RealityConfigHandle, key []byte) {
 		return
 	}
 	C.xray_reality_config_set_server_pubkey(h.ptr, (*C.uint8_t)(unsafe.Pointer(&key[0])), C.size_t(len(key)))
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetShortId(h *RealityConfigHandle, id []byte) {
@@ -401,6 +423,8 @@ func RealityConfigSetShortId(h *RealityConfigHandle, id []byte) {
 		return
 	}
 	C.xray_reality_config_set_short_id(h.ptr, (*C.uint8_t)(unsafe.Pointer(&id[0])), C.size_t(len(id)))
+	runtime.KeepAlive(id)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetMldsa65Verify(h *RealityConfigHandle, key []byte) {
@@ -408,6 +432,8 @@ func RealityConfigSetMldsa65Verify(h *RealityConfigHandle, key []byte) {
 		return
 	}
 	C.xray_reality_config_set_mldsa65_verify(h.ptr, (*C.uint8_t)(unsafe.Pointer(&key[0])), C.size_t(len(key)))
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetVersion(h *RealityConfigHandle, x, y, z uint8) {
@@ -415,6 +441,7 @@ func RealityConfigSetVersion(h *RealityConfigHandle, x, y, z uint8) {
 		return
 	}
 	C.xray_reality_config_set_version(h.ptr, C.uint8_t(x), C.uint8_t(y), C.uint8_t(z))
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigFree(h *RealityConfigHandle) {
@@ -431,6 +458,8 @@ func RealityConfigSetPrivateKey(h *RealityConfigHandle, key []byte) {
 		return
 	}
 	C.xray_reality_config_set_private_key(h.ptr, (*C.uint8_t)(unsafe.Pointer(&key[0])), C.size_t(len(key)))
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetServerNames(h *RealityConfigHandle, data []byte) {
@@ -438,6 +467,8 @@ func RealityConfigSetServerNames(h *RealityConfigHandle, data []byte) {
 		return
 	}
 	C.xray_reality_config_set_server_names(h.ptr, (*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)))
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetShortIds(h *RealityConfigHandle, data []byte) {
@@ -445,6 +476,8 @@ func RealityConfigSetShortIds(h *RealityConfigHandle, data []byte) {
 		return
 	}
 	C.xray_reality_config_set_short_ids(h.ptr, (*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)))
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetMldsa65Key(h *RealityConfigHandle, key []byte) {
@@ -452,6 +485,8 @@ func RealityConfigSetMldsa65Key(h *RealityConfigHandle, key []byte) {
 		return
 	}
 	C.xray_reality_config_set_mldsa65_key(h.ptr, (*C.uint8_t)(unsafe.Pointer(&key[0])), C.size_t(len(key)))
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetDest(h *RealityConfigHandle, addr string) {
@@ -463,6 +498,8 @@ func RealityConfigSetDest(h *RealityConfigHandle, addr string) {
 		return
 	}
 	C.xray_reality_config_set_dest(h.ptr, (*C.uint8_t)(unsafe.Pointer(&addrBytes[0])), C.size_t(len(addrBytes)))
+	runtime.KeepAlive(addrBytes)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetMaxTimeDiff(h *RealityConfigHandle, ms uint64) {
@@ -470,6 +507,7 @@ func RealityConfigSetMaxTimeDiff(h *RealityConfigHandle, ms uint64) {
 		return
 	}
 	C.xray_reality_config_set_max_time_diff(h.ptr, C.uint64_t(ms))
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetVersionRange(h *RealityConfigHandle, minX, minY, minZ, maxX, maxY, maxZ uint8) {
@@ -477,6 +515,7 @@ func RealityConfigSetVersionRange(h *RealityConfigHandle, minX, minY, minZ, maxX
 		return
 	}
 	C.xray_reality_config_set_version_range(h.ptr, C.uint8_t(minX), C.uint8_t(minY), C.uint8_t(minZ), C.uint8_t(maxX), C.uint8_t(maxY), C.uint8_t(maxZ))
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigSetTLSCert(h *RealityConfigHandle, certPEM, keyPEM []byte) {
@@ -486,6 +525,9 @@ func RealityConfigSetTLSCert(h *RealityConfigHandle, certPEM, keyPEM []byte) {
 	C.xray_reality_config_set_tls_cert(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(&certPEM[0])), C.size_t(len(certPEM)),
 		(*C.uint8_t)(unsafe.Pointer(&keyPEM[0])), C.size_t(len(keyPEM)))
+	runtime.KeepAlive(certPEM)
+	runtime.KeepAlive(keyPEM)
+	runtime.KeepAlive(h)
 }
 
 func RealityConfigAddShortId(h *RealityConfigHandle, id []byte) {
@@ -493,6 +535,8 @@ func RealityConfigAddShortId(h *RealityConfigHandle, id []byte) {
 		return
 	}
 	C.xray_reality_config_add_short_id(h.ptr, (*C.uint8_t)(unsafe.Pointer(&id[0])), C.size_t(len(id)))
+	runtime.KeepAlive(id)
+	runtime.KeepAlive(h)
 }
 
 // --- REALITY Handshake ---
@@ -512,6 +556,9 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 		cfg.ptr,
 		&cResult,
 	)
+	runtime.KeepAlive(clientHelloRaw)
+	runtime.KeepAlive(ecdhPrivkey)
+	runtime.KeepAlive(cfg)
 	if rc != 0 {
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
@@ -548,6 +595,7 @@ func RealityServerAccept(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
 	}
 	var cResult C.struct_xray_tls_result
 	rc := C.xray_reality_server_accept(C.int(fd), cfg.ptr, &cResult)
+	runtime.KeepAlive(cfg)
 	if rc != 0 {
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
@@ -582,6 +630,7 @@ func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error
 	}
 	var cResult C.struct_xray_tls_result
 	rc := C.xray_reality_server_handshake(C.int(fd), cfg.ptr, &cResult)
+	runtime.KeepAlive(cfg)
 	if rc != 0 {
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
@@ -709,7 +758,17 @@ type MphHandle struct {
 
 // MphNew creates a new MPH table.
 func MphNew() *MphHandle {
-	return &MphHandle{ptr: C.xray_mph_new()}
+	ptr := C.xray_mph_new()
+	if ptr == nil {
+		return nil
+	}
+	h := &MphHandle{ptr: ptr}
+	runtime.SetFinalizer(h, (*MphHandle).release)
+	return h
+}
+
+func (h *MphHandle) release() {
+	MphFree(h)
 }
 
 // MphAddPattern adds a pattern. patternType: 0=Full, 1=Substr, 2=Domain.
@@ -725,11 +784,13 @@ func MphAddPattern(h *MphHandle, pattern string, patternType byte) {
 		(*C.uint8_t)(unsafe.Pointer(p)), C.size_t(len(pattern)),
 		C.uint8_t(patternType))
 	runtime.KeepAlive(pattern)
+	runtime.KeepAlive(h)
 }
 
 // MphBuild builds the MPH table. Must be called after all patterns are added.
 func MphBuild(h *MphHandle) {
 	C.xray_mph_build(h.ptr)
+	runtime.KeepAlive(h)
 }
 
 // MphMatch tests if input matches any pattern in the table.
@@ -744,12 +805,14 @@ func MphMatch(h *MphHandle, input string) bool {
 	result := bool(C.xray_mph_match(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(p)), C.size_t(len(input))))
 	runtime.KeepAlive(input)
+	runtime.KeepAlive(h)
 	return result
 }
 
 // MphFree releases the MPH table.
 func MphFree(h *MphHandle) {
 	if h != nil && h.ptr != nil {
+		runtime.SetFinalizer(h, nil)
 		C.xray_mph_free(h.ptr)
 		h.ptr = nil
 	}
@@ -764,7 +827,17 @@ type IpSetHandle struct {
 
 // IpSetNew creates a new IP set.
 func IpSetNew() *IpSetHandle {
-	return &IpSetHandle{ptr: C.xray_ipset_new()}
+	ptr := C.xray_ipset_new()
+	if ptr == nil {
+		return nil
+	}
+	h := &IpSetHandle{ptr: ptr}
+	runtime.SetFinalizer(h, (*IpSetHandle).release)
+	return h
+}
+
+func (h *IpSetHandle) release() {
+	IpSetFree(h)
 }
 
 // IpSetAddPrefix adds a CIDR prefix. ipBytes must be 4 (IPv4) or 16 (IPv6) bytes.
@@ -776,11 +849,13 @@ func IpSetAddPrefix(h *IpSetHandle, ipBytes []byte, prefixBits int) {
 		(*C.uint8_t)(unsafe.Pointer(&ipBytes[0])), C.size_t(len(ipBytes)),
 		C.uint8_t(prefixBits))
 	runtime.KeepAlive(ipBytes)
+	runtime.KeepAlive(h)
 }
 
 // IpSetBuild finalizes the IP set after all prefixes are added.
 func IpSetBuild(h *IpSetHandle) {
 	C.xray_ipset_build(h.ptr)
+	runtime.KeepAlive(h)
 }
 
 // IpSetContains checks whether an IP is in the set.
@@ -791,22 +866,28 @@ func IpSetContains(h *IpSetHandle, ipBytes []byte) bool {
 	result := bool(C.xray_ipset_contains(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(&ipBytes[0])), C.size_t(len(ipBytes))))
 	runtime.KeepAlive(ipBytes)
+	runtime.KeepAlive(h)
 	return result
 }
 
 // IpSetMax4 returns the maximum IPv4 prefix length, or 0xff if empty.
 func IpSetMax4(h *IpSetHandle) uint8 {
-	return uint8(C.xray_ipset_max4(h.ptr))
+	result := uint8(C.xray_ipset_max4(h.ptr))
+	runtime.KeepAlive(h)
+	return result
 }
 
 // IpSetMax6 returns the maximum IPv6 prefix length, or 0xff if empty.
 func IpSetMax6(h *IpSetHandle) uint8 {
-	return uint8(C.xray_ipset_max6(h.ptr))
+	result := uint8(C.xray_ipset_max6(h.ptr))
+	runtime.KeepAlive(h)
+	return result
 }
 
 // IpSetFree releases the IP set.
 func IpSetFree(h *IpSetHandle) {
 	if h != nil && h.ptr != nil {
+		runtime.SetFinalizer(h, nil)
 		C.xray_ipset_free(h.ptr)
 		h.ptr = nil
 	}
