@@ -70,6 +70,7 @@ import "C"
 
 import (
 	"errors"
+	"runtime"
 	"unsafe"
 )
 
@@ -109,7 +110,13 @@ func TlsConfigNew(isServer bool) *TlsConfigHandle {
 	if ptr == nil {
 		return nil
 	}
-	return &TlsConfigHandle{ptr: ptr}
+	h := &TlsConfigHandle{ptr: ptr}
+	runtime.SetFinalizer(h, (*TlsConfigHandle).release)
+	return h
+}
+
+func (h *TlsConfigHandle) release() {
+	TlsConfigFree(h)
 }
 
 func TlsConfigSetServerName(h *TlsConfigHandle, name string) {
@@ -194,9 +201,10 @@ func TlsConfigSetKeyLogPath(h *TlsConfigHandle, path string) {
 }
 
 func TlsConfigFree(h *TlsConfigHandle) {
-	if h == nil {
+	if h == nil || h.ptr == nil {
 		return
 	}
+	runtime.SetFinalizer(h, nil)
 	C.xray_tls_config_free(h.ptr)
 	h.ptr = nil
 }
@@ -229,6 +237,7 @@ func TlsHandshake(fd int, cfg *TlsConfigHandle, isClient bool) (*TlsResult, erro
 	}
 	if cResult.state_handle != nil {
 		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
+		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
 	extractSecrets(result, &cResult)
 	return result, nil
@@ -246,11 +255,16 @@ func TlsKeyUpdate(h *TlsStateHandle) error {
 }
 
 func TlsStateFree(h *TlsStateHandle) {
-	if h == nil {
+	if h == nil || h.ptr == nil {
 		return
 	}
+	runtime.SetFinalizer(h, nil)
 	C.xray_tls_state_free(h.ptr)
 	h.ptr = nil
+}
+
+func (h *TlsStateHandle) release() {
+	TlsStateFree(h)
 }
 
 // --- REALITY Types ---
@@ -266,7 +280,13 @@ func RealityConfigNew(isClient bool) *RealityConfigHandle {
 	if ptr == nil {
 		return nil
 	}
-	return &RealityConfigHandle{ptr: ptr}
+	h := &RealityConfigHandle{ptr: ptr}
+	runtime.SetFinalizer(h, (*RealityConfigHandle).release)
+	return h
+}
+
+func (h *RealityConfigHandle) release() {
+	RealityConfigFree(h)
 }
 
 func RealityConfigSetServerPubkey(h *RealityConfigHandle, key []byte) {
@@ -298,9 +318,10 @@ func RealityConfigSetVersion(h *RealityConfigHandle, x, y, z uint8) {
 }
 
 func RealityConfigFree(h *RealityConfigHandle) {
-	if h == nil {
+	if h == nil || h.ptr == nil {
 		return
 	}
+	runtime.SetFinalizer(h, nil)
 	C.xray_reality_config_free(h.ptr)
 	h.ptr = nil
 }
@@ -414,6 +435,7 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 	}
 	if cResult.state_handle != nil {
 		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
+		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
 	extractSecrets(result, &cResult)
 	return result, nil
@@ -448,6 +470,7 @@ func RealityServerAccept(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
 	}
 	if cResult.state_handle != nil {
 		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
+		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
 	return result, nil
 }
@@ -481,6 +504,7 @@ func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error
 	}
 	if cResult.state_handle != nil {
 		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
+		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
 	extractSecrets(result, &cResult)
 	return result, nil

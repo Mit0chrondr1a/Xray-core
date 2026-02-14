@@ -19,6 +19,9 @@ var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 type TlsConfigHandle struct{}
 type TlsStateHandle struct{}
 
+func (*TlsConfigHandle) release() {}
+func (*TlsStateHandle) release()  {}
+
 type TlsResult struct {
 	KtlsTx      bool
 	KtlsRx      bool
@@ -60,6 +63,8 @@ func TlsStateFree(*TlsStateHandle) {}
 // --- REALITY Types ---
 
 type RealityConfigHandle struct{}
+
+func (*RealityConfigHandle) release() {}
 
 // --- REALITY Config Builder Stubs ---
 
