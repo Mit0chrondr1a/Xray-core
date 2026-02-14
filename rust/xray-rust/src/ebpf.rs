@@ -1,24 +1,23 @@
 //! Aya-based eBPF loader, map management, and FFI exports.
 //!
 //! Replaces Go raw-bytecode BPF infrastructure with Aya-rs for:
-//!   - Proper BPF map pinning and recovery (zero-downtime restarts)
+//!   - Deterministic BPF map pinning lifecycle
 //!   - SK_MSG cork program attachment
 //!   - Type-safe map operations
 //!
-//! Zero-downtime recovery flow:
-//!   1. Try to recover pinned maps from /sys/fs/bpf/xray/
-//!   2. Load fresh eBPF programs (programs aren't pinned)
-//!   3. If recovered maps exist, replace maps in loaded programs
-//!   4. If not, create fresh maps and pin them
-//!   5. Attach all programs to the SOCKHASH
+//! Setup flow:
+//!   1. Load fresh eBPF programs
+//!   2. Replace stale pin files (if any)
+//!   3. Pin maps under /sys/fs/bpf/xray/
+//!   4. Attach all programs to the SOCKHASH
 
 use aya::{
-    maps::{HashMap, MapData, SockHash},
-    programs::{SkMsg, SkSkb, SkSkbKind},
+    maps::{Map, SockHash},
+    programs::{SkMsg, SkSkb},
     Ebpf,
 };
 use std::ffi::{c_char, CStr};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -55,11 +54,11 @@ struct EbpfState {
     sockhash_fd: i32,
     /// Policy map fd for register/unregister operations.
     policy_fd: i32,
-    /// Pin path for map recovery.
+    /// Pin path for map lifecycle management.
     pin_path: String,
 }
 
-/// Set up eBPF sockmap with pinned maps for zero-downtime recovery.
+/// Set up eBPF sockmap with pinned maps.
 ///
 /// # Arguments
 /// * `pin_path` — BPF filesystem path for pinning (e.g., "/sys/fs/bpf/xray/")
@@ -74,10 +73,7 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
         return Err("eBPF already initialized".into());
     }
 
-    // Step 1: Try to recover pinned maps.
-    let recovered = try_recover_pinned_maps(pin_path);
-
-    // Step 2: Load eBPF programs.
+    // Step 1: Load eBPF programs.
     #[cfg(feature = "ebpf-bytecode")]
     let mut bpf = Ebpf::load(EBPF_BYTECODE).map_err(|e| format!("load: {e}"))?;
 
@@ -86,56 +82,47 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
 
     #[cfg(feature = "ebpf-bytecode")]
     {
-        let (sockhash_fd, policy_fd) = match recovered {
-            Some((sh_data, pm_data)) => {
-                // Reuse existing pinned maps — socket pairs survive restart.
-                let sh_fd = sh_data.fd().as_fd().as_raw_fd();
-                let pm_fd = pm_data.fd().as_fd().as_raw_fd();
+        // Step 2: Replace stale pin files and pin current maps.
+        let pin_dir = Path::new(pin_path);
+        std::fs::create_dir_all(pin_dir)
+            .map_err(|e| format!("mkdir {pin_path}: {e}"))?;
 
-                // Replace maps in the loaded programs with the recovered ones.
-                // This ensures programs reference the pinned maps, not fresh ones.
-                bpf.maps_mut()
-                    .get_mut("SOCKHASH")
-                    .ok_or("missing SOCKHASH in program")?
-                    .reuse_fd(sh_data.fd().as_fd())
-                    .map_err(|e| format!("reuse SOCKHASH: {e}"))?;
-                bpf.maps_mut()
-                    .get_mut("POLICY_MAP")
-                    .ok_or("missing POLICY_MAP in program")?
-                    .reuse_fd(pm_data.fd().as_fd())
-                    .map_err(|e| format!("reuse POLICY_MAP: {e}"))?;
+        // Aya 0.13 doesn't expose map fd reuse for already loaded objects.
+        // Always pin the maps owned by this `Ebpf` instance so the pinned paths
+        // stay consistent with the attached programs.
+        let _ = std::fs::remove_file(pin_dir.join("sockhash"));
+        let _ = std::fs::remove_file(pin_dir.join("policy"));
 
-                (sh_fd, pm_fd)
-            }
-            None => {
-                // Fresh maps — pin for future recovery.
-                let pin_dir = Path::new(pin_path);
-                std::fs::create_dir_all(pin_dir)
-                    .map_err(|e| format!("mkdir {pin_path}: {e}"))?;
-
-                // Get map references before pinning.
-                let sockhash = bpf
-                    .map("SOCKHASH")
-                    .ok_or("missing SOCKHASH")?;
-                let sh_fd = sockhash.fd().as_fd().as_raw_fd();
-                sockhash
-                    .pin(pin_dir.join("sockhash"))
-                    .map_err(|e| format!("pin sockhash: {e}"))?;
-
-                let policy = bpf
-                    .map("POLICY_MAP")
-                    .ok_or("missing POLICY_MAP")?;
-                let pm_fd = policy.fd().as_fd().as_raw_fd();
-                policy
-                    .pin(pin_dir.join("policy"))
-                    .map_err(|e| format!("pin policy: {e}"))?;
-
-                // Set 0600 permissions on pinned files.
-                set_pin_permissions(pin_dir);
-
-                (sh_fd, pm_fd)
-            }
+        let (sockhash_fd, sockhash_map_fd) = {
+            let sockhash: SockHash<_, u64> = bpf
+                .map_mut("SOCKHASH")
+                .ok_or("missing SOCKHASH")?
+                .try_into()
+                .map_err(|e| format!("sockhash map type: {e}"))?;
+            let fd = sockhash.fd().as_fd().as_raw_fd();
+            let map_fd = sockhash
+                .fd()
+                .try_clone()
+                .map_err(|e| format!("clone SOCKHASH fd: {e}"))?;
+            sockhash
+                .pin(pin_dir.join("sockhash"))
+                .map_err(|e| format!("pin sockhash: {e}"))?;
+            (fd, map_fd)
         };
+
+        let policy = bpf
+            .map("POLICY_MAP")
+            .ok_or("missing POLICY_MAP")?;
+        let policy_fd = match policy {
+            Map::HashMap(data) | Map::LruHashMap(data) => data.fd().as_fd().as_raw_fd(),
+            _ => return Err("POLICY_MAP is not a hash map".into()),
+        };
+        policy
+            .pin(pin_dir.join("policy"))
+            .map_err(|e| format!("pin policy: {e}"))?;
+
+        // Set 0600 permissions on pinned files.
+        set_pin_permissions(pin_dir);
 
         // Step 3: Attach programs.
 
@@ -146,11 +133,8 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
             .try_into()
             .map_err(|e| format!("parser type: {e}"))?;
         parser.load().map_err(|e| format!("parser load: {e}"))?;
-        let sockhash_map = bpf
-            .map("SOCKHASH")
-            .ok_or("missing SOCKHASH for attach")?;
         parser
-            .attach(sockhash_map, SkSkbKind::StreamParser)
+            .attach(&sockhash_map_fd)
             .map_err(|e| format!("parser attach: {e}"))?;
 
         // SK_SKB stream verdict.
@@ -160,11 +144,8 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
             .try_into()
             .map_err(|e| format!("verdict type: {e}"))?;
         verdict.load().map_err(|e| format!("verdict load: {e}"))?;
-        let sockhash_map = bpf
-            .map("SOCKHASH")
-            .ok_or("missing SOCKHASH for verdict attach")?;
         verdict
-            .attach(sockhash_map, SkSkbKind::StreamVerdict)
+            .attach(&sockhash_map_fd)
             .map_err(|e| format!("verdict attach: {e}"))?;
 
         // SK_MSG verdict (cork + redirect).
@@ -176,11 +157,8 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
         msg_verdict
             .load()
             .map_err(|e| format!("sk_msg load: {e}"))?;
-        let sockhash_map = bpf
-            .map("SOCKHASH")
-            .ok_or("missing SOCKHASH for sk_msg attach")?;
         msg_verdict
-            .attach(sockhash_map)
+            .attach(&sockhash_map_fd)
             .map_err(|e| format!("sk_msg attach: {e}"))?;
 
         *guard = Some(EbpfState {
@@ -192,14 +170,6 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
 
         Ok(())
     }
-}
-
-/// Try to recover pinned maps from the BPF filesystem.
-fn try_recover_pinned_maps(pin_path: &str) -> Option<(MapData, MapData)> {
-    let pin_dir = Path::new(pin_path);
-    let sh = MapData::from_pin(pin_dir.join("sockhash")).ok()?;
-    let pm = MapData::from_pin(pin_dir.join("policy")).ok()?;
-    Some((sh, pm))
 }
 
 /// Set 0600 root-only permissions on pinned map files.
@@ -368,8 +338,6 @@ fn bpf_map_delete_raw(map_fd: i32, key: &[u8]) -> Result<(), std::io::Error> {
 }
 
 // --- FFI Exports ---
-
-use std::os::fd::AsRawFd;
 
 fn neg_errno(err: &std::io::Error) -> i32 {
     -err.raw_os_error().unwrap_or(libc::EIO)
