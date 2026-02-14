@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
@@ -494,6 +495,92 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 
 // XtlsPadding add padding to eliminate length signature during tls handshake
 func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool, ctx context.Context, testseed []uint32) *buf.Buffer {
+	// Delegate to Rust when the native library is linked.
+	if native.Available() {
+		return xtlsPaddingRust(b, command, userUUID, longPadding, ctx, testseed)
+	}
+
+	var contentLen int32 = 0
+	var paddingLen int32 = 0
+	if b != nil {
+		contentLen = b.Len()
+	}
+	if contentLen < int32(testseed[0]) && longPadding {
+		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[1])))
+		if err != nil {
+			errors.LogDebugInner(ctx, err, "failed to generate padding")
+		}
+		paddingLen = int32(l.Int64()) + int32(testseed[2]) - contentLen
+	} else {
+		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[3])))
+		if err != nil {
+			errors.LogDebugInner(ctx, err, "failed to generate padding")
+		}
+		paddingLen = int32(l.Int64())
+	}
+	if paddingLen > buf.Size-21-contentLen {
+		paddingLen = buf.Size - 21 - contentLen
+	}
+	newbuffer := buf.New()
+	if userUUID != nil {
+		newbuffer.Write(*userUUID)
+		*userUUID = nil
+	}
+	hdr := [5]byte{command, byte(contentLen >> 8), byte(contentLen), byte(paddingLen >> 8), byte(paddingLen)}
+	newbuffer.Write(hdr[:])
+	if b != nil {
+		newbuffer.Write(b.Bytes())
+		b.Release()
+		b = nil
+	}
+	newbuffer.Extend(paddingLen)
+	errors.LogDebug(ctx, "XtlsPadding ", contentLen, " ", paddingLen, " ", command)
+	return newbuffer
+}
+
+// xtlsPaddingRust delegates Vision padding to the Rust native library.
+func xtlsPaddingRust(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool, ctx context.Context, testseed []uint32) *buf.Buffer {
+	var data []byte
+	if b != nil {
+		data = b.Bytes()
+	}
+	var uuid []byte
+	if userUUID != nil {
+		uuid = *userUUID
+	}
+
+	// Ensure testseed has 4 elements.
+	var seeds [4]uint32
+	copy(seeds[:], testseed)
+
+	outBuf := buf.New()
+	// Extend to full capacity to get a writable slice, then resize after.
+	outBytes := outBuf.Extend(buf.Size)
+
+	n, err := native.VisionPad(data, command, uuid, longPadding, seeds, outBytes)
+	if err != nil {
+		// Fallback to Go implementation on error.
+		outBuf.Release()
+		errors.LogDebugInner(ctx, err, "native VisionPad failed, falling back to Go")
+		return xtlsPaddingGoFallback(b, command, userUUID, longPadding, ctx, testseed)
+	}
+
+	// Resize to actual written length.
+	outBuf.Resize(0, int32(n))
+
+	// Clean up inputs.
+	if userUUID != nil {
+		*userUUID = nil
+	}
+	if b != nil {
+		b.Release()
+	}
+
+	return outBuf
+}
+
+// xtlsPaddingGoFallback is the original Go padding implementation.
+func xtlsPaddingGoFallback(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool, ctx context.Context, testseed []uint32) *buf.Buffer {
 	var contentLen int32 = 0
 	var paddingLen int32 = 0
 	if b != nil {

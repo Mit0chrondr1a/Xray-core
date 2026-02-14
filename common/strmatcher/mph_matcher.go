@@ -3,9 +3,12 @@ package strmatcher
 import (
 	"math/bits"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"unsafe"
+
+	"github.com/xtls/xray-core/common/native"
 )
 
 // PrimeRK is the prime base used in Rabin-Karp algorithm.
@@ -24,16 +27,23 @@ func RollingHash(s string) uint32 {
 // 1. `full` and `domain` patterns are matched by Rabin-Karp algorithm and minimal perfect hash table;
 // 2. `substr` patterns are matched by ac automaton;
 // 3. `regex` patterns are matched with the regex library.
+type nativePattern struct {
+	pattern string
+	typ     byte
+}
+
 type MphMatcherGroup struct {
-	Ac            *ACAutomaton
-	OtherMatchers []MatcherEntry
-	Rules         []string
-	Level0        []uint32
-	Level0Mask    int
-	Level1        []uint32
-	Level1Mask    int
-	Count         uint32
-	RuleMap       *map[string]uint32
+	Ac             *ACAutomaton
+	OtherMatchers  []MatcherEntry
+	Rules          []string
+	Level0         []uint32
+	Level0Mask     int
+	Level1         []uint32
+	Level1Mask     int
+	Count          uint32
+	RuleMap        *map[string]uint32
+	nativeHandle   *native.MphHandle
+	nativePatterns []nativePattern
 }
 
 func (g *MphMatcherGroup) AddFullOrDomainPattern(pattern string, t Type) {
@@ -70,9 +80,11 @@ func (g *MphMatcherGroup) AddPattern(pattern string, t Type) (uint32, error) {
 			g.Ac = NewACAutomaton()
 		}
 		g.Ac.Add(pattern, t)
+		g.nativePatterns = append(g.nativePatterns, nativePattern{pattern: pattern, typ: byte(t)})
 	case Full, Domain:
 		pattern = strings.ToLower(pattern)
 		g.AddFullOrDomainPattern(pattern, t)
+		g.nativePatterns = append(g.nativePatterns, nativePattern{pattern: pattern, typ: byte(t)})
 	case Regex:
 		r, err := regexp.Compile(pattern)
 		if err != nil {
@@ -93,6 +105,21 @@ func (g *MphMatcherGroup) Build() {
 	if g.Ac != nil {
 		g.Ac.Build()
 	}
+
+	// Build native Rust MPH table if available.
+	if native.Available() && len(g.nativePatterns) > 0 {
+		h := native.MphNew()
+		for _, np := range g.nativePatterns {
+			native.MphAddPattern(h, np.pattern, np.typ)
+		}
+		native.MphBuild(h)
+		g.nativeHandle = h
+		runtime.SetFinalizer(g, func(g *MphMatcherGroup) {
+			native.MphFree(g.nativeHandle)
+		})
+	}
+	g.nativePatterns = nil // free accumulator
+
 	keyLen := len(*g.RuleMap)
 	if keyLen == 0 {
 		keyLen = 1
@@ -168,6 +195,20 @@ func (g *MphMatcherGroup) Lookup(h uint32, s string) bool {
 
 // Match implements IndexMatcher.Match.
 func (g *MphMatcherGroup) Match(pattern string) []uint32 {
+	if g.nativeHandle != nil {
+		// Use native Rust MPH for Full/Domain/Substr matching.
+		if native.MphMatch(g.nativeHandle, pattern) {
+			return []uint32{1}
+		}
+		// Fall through to regex (OtherMatchers) only.
+		for _, e := range g.OtherMatchers {
+			if e.M.Match(pattern) {
+				return []uint32{e.Id}
+			}
+		}
+		return nil
+	}
+
 	result := []uint32{}
 	hash := uint32(0)
 	for i := len(pattern) - 1; i >= 0; i-- {

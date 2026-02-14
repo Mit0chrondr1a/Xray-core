@@ -12,7 +12,7 @@ import (
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
-	"lukechampine.com/blake3"
+	"github.com/xtls/xray-core/common/native"
 )
 
 type ClientInstance struct {
@@ -54,7 +54,7 @@ func (i *ClientInstance) Init(nfsPKeysBytes [][]byte, xorMode, seconds uint32, p
 			}
 			i.RelaysLength += 1088 + 32
 		}
-		i.Hash32s[j] = blake3.Sum256(k)
+		i.Hash32s[j] = native.Blake3Sum256(k)
 	}
 	i.RelaysLength -= 32
 	i.XorMode = xorMode

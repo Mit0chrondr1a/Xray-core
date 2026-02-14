@@ -6,7 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 
-	"lukechampine.com/blake3"
+	"github.com/xtls/xray-core/common/native"
 )
 
 func Curve25519Genkey(StdEncoding bool, input_base64 string) {
@@ -58,6 +58,6 @@ func genCurve25519(inputPrivateKey []byte) (privateKey []byte, password []byte, 
 		return
 	}
 	password = key.PublicKey().Bytes()
-	hash32 = blake3.Sum256(password)
+	hash32 = native.Blake3Sum256(password)
 	return
 }

@@ -7,7 +7,7 @@ import (
 	"fmt"
 
 	"github.com/xtls/xray-core/main/commands/base"
-	"lukechampine.com/blake3"
+	"github.com/xtls/xray-core/common/native"
 )
 
 var cmdMLKEM768 = &base.Command{
@@ -55,6 +55,6 @@ func genMLKEM768(inputSeed *[64]byte) (seed [64]byte, client []byte, hash32 [32]
 	}
 	key, _ := mlkem.NewDecapsulationKey768(seed[:])
 	client = key.EncapsulationKey().Bytes()
-	hash32 = blake3.Sum256(client)
+	hash32 = native.Blake3Sum256(client)
 	return
 }

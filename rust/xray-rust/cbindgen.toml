@@ -1,0 +1,12 @@
+[export]
+include = []
+exclude = []
+
+[fn]
+prefix = ""
+args = "auto"
+
+[struct]
+derive_eq = true
+
+language = "C"

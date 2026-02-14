@@ -143,6 +143,27 @@ func TestGeoIPMatcherRegression(t *testing.T) {
 	}
 }
 
+func TestGeoIPMatcherIgnoresInvalidPrefixes(t *testing.T) {
+	cidrList := []*router.CIDR{
+		{Ip: []byte{10, 0, 0, 0}, Prefix: 33},                                                 // invalid IPv4 prefix
+		{Ip: []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, Prefix: 129}, // invalid IPv6 prefix
+		{Ip: []byte{10, 123, 0, 0}, Prefix: 16},                                               // valid entry should still be usable
+	}
+
+	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{Cidr: cidrList})
+	common.Must(err)
+
+	if matcher.Match(net.ParseAddress("10.0.0.1").IP()) {
+		t.Error("invalid IPv4 /33 prefix must be ignored")
+	}
+	if matcher.Match(net.ParseAddress("2001:db8::1").IP()) {
+		t.Error("invalid IPv6 /129 prefix must be ignored")
+	}
+	if !matcher.Match(net.ParseAddress("10.123.45.67").IP()) {
+		t.Error("valid prefix should still match")
+	}
+}
+
 func TestGeoIPReverseMatcher(t *testing.T) {
 	cidrList := []*router.CIDR{
 		{Ip: []byte{8, 8, 8, 8}, Prefix: 32},
@@ -182,7 +203,7 @@ func TestGeoIPReverseMatcher(t *testing.T) {
 }
 
 func TestGeoIPMatcher4CN(t *testing.T) {
-	ips, err := loadGeoIP("CN")
+	ips, err := loadGeoIP(t, "CN")
 	common.Must(err)
 
 	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{
@@ -196,7 +217,7 @@ func TestGeoIPMatcher4CN(t *testing.T) {
 }
 
 func TestGeoIPMatcher6US(t *testing.T) {
-	ips, err := loadGeoIP("US")
+	ips, err := loadGeoIP(t, "US")
 	common.Must(err)
 
 	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{
@@ -209,10 +230,12 @@ func TestGeoIPMatcher6US(t *testing.T) {
 	}
 }
 
-func loadGeoIP(country string) ([]*router.CIDR, error) {
+func loadGeoIP(tb testing.TB, country string) ([]*router.CIDR, error) {
+	tb.Helper()
 	path, err := getAssetPath("geoip.dat")
 	if err != nil {
-		return nil, err
+		tb.Skip(err)
+		return nil, nil
 	}
 	geoipBytes, err := filesystem.ReadFile(path)
 	if err != nil {
@@ -234,7 +257,7 @@ func loadGeoIP(country string) ([]*router.CIDR, error) {
 }
 
 func BenchmarkGeoIPMatcher4CN(b *testing.B) {
-	ips, err := loadGeoIP("CN")
+	ips, err := loadGeoIP(b, "CN")
 	common.Must(err)
 
 	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{
@@ -250,7 +273,7 @@ func BenchmarkGeoIPMatcher4CN(b *testing.B) {
 }
 
 func BenchmarkGeoIPMatcher6US(b *testing.B) {
-	ips, err := loadGeoIP("US")
+	ips, err := loadGeoIP(b, "US")
 	common.Must(err)
 
 	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{

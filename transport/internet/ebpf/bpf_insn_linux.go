@@ -118,10 +118,11 @@ const (
 	bpfFuncMapUpdateElem    = 2
 	bpfFuncMapDeleteElem    = 3
 	bpfFuncKtimeGetNs       = 5
+	bpfFuncXdpAdjustHead    = 44
 	bpfFuncGetSocketCookie  = 46
+	bpfFuncMsgCorkBytes     = 70
 	bpfFuncMsgRedirectHash  = 71
 	bpfFuncSKRedirectHash   = 72
-	bpfFuncXdpAdjustHead    = 44
 )
 
 // BPF pseudo map fd source register value

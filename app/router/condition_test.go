@@ -300,10 +300,12 @@ func TestRoutingRule(t *testing.T) {
 	}
 }
 
-func loadGeoSite(country string) ([]*Domain, error) {
+func loadGeoSite(tb testing.TB, country string) ([]*Domain, error) {
+	tb.Helper()
 	path, err := getAssetPath("geosite.dat")
 	if err != nil {
-		return nil, err
+		tb.Skip(err)
+		return nil, nil
 	}
 	geositeBytes, err := filesystem.ReadFile(path)
 	if err != nil {
@@ -325,7 +327,7 @@ func loadGeoSite(country string) ([]*Domain, error) {
 }
 
 func TestChinaSites(t *testing.T) {
-	domains, err := loadGeoSite("CN")
+	domains, err := loadGeoSite(t, "CN")
 	common.Must(err)
 
 	acMatcher, err := NewMphMatcherGroup(domains)
@@ -367,7 +369,7 @@ func TestChinaSites(t *testing.T) {
 }
 
 func BenchmarkMphDomainMatcher(b *testing.B) {
-	domains, err := loadGeoSite("CN")
+	domains, err := loadGeoSite(b, "CN")
 	common.Must(err)
 
 	matcher, err := NewMphMatcherGroup(domains)
@@ -412,7 +414,7 @@ func BenchmarkMultiGeoIPMatcher(b *testing.B) {
 	var geoips []*GeoIP
 
 	{
-		ips, err := loadGeoIP("CN")
+		ips, err := loadGeoIP(b, "CN")
 		common.Must(err)
 		geoips = append(geoips, &GeoIP{
 			CountryCode: "CN",
@@ -421,7 +423,7 @@ func BenchmarkMultiGeoIPMatcher(b *testing.B) {
 	}
 
 	{
-		ips, err := loadGeoIP("JP")
+		ips, err := loadGeoIP(b, "JP")
 		common.Must(err)
 		geoips = append(geoips, &GeoIP{
 			CountryCode: "JP",
@@ -430,7 +432,7 @@ func BenchmarkMultiGeoIPMatcher(b *testing.B) {
 	}
 
 	{
-		ips, err := loadGeoIP("CA")
+		ips, err := loadGeoIP(b, "CA")
 		common.Must(err)
 		geoips = append(geoips, &GeoIP{
 			CountryCode: "CA",
@@ -439,7 +441,7 @@ func BenchmarkMultiGeoIPMatcher(b *testing.B) {
 	}
 
 	{
-		ips, err := loadGeoIP("US")
+		ips, err := loadGeoIP(b, "US")
 		common.Must(err)
 		geoips = append(geoips, &GeoIP{
 			CountryCode: "US",

@@ -14,7 +14,7 @@ import (
 
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
-	"lukechampine.com/blake3"
+	"github.com/xtls/xray-core/common/native"
 )
 
 type ServerSession struct {
@@ -65,7 +65,7 @@ func (i *ServerInstance) Init(nfsSKeysBytes [][]byte, xorMode uint32, secondsFro
 			i.NfsPKeysBytes[j] = i.NfsSKeys[j].(*mlkem.DecapsulationKey768).EncapsulationKey().Bytes()
 			i.RelaysLength += 1088 + 32
 		}
-		i.Hash32s[j] = blake3.Sum256(i.NfsPKeysBytes[j])
+		i.Hash32s[j] = native.Blake3Sum256(i.NfsPKeysBytes[j])
 	}
 	i.RelaysLength -= 32
 	i.XorMode = xorMode

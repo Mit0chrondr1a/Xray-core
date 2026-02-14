@@ -14,6 +14,7 @@ set -euo pipefail
 #   - eBPF XDP + sockmap programs
 #   - Configurable TLS session cache (XRAY_TLS_CACHE_SIZE env)
 #   - [XRAY_CGO=1] Rust-accelerated TLS via rustls + native kTLS
+#   - [XRAY_CGO=1] Rust-accelerated Blake3 KDF, MPH domain matcher, GeoIP matcher, Vision padding
 #
 # Usage:
 #   ./build.sh              # Build for current platform (pure Go)
@@ -28,6 +29,33 @@ ZIG="${ZIG:-zig}"
 OUTNAME="xray"
 GOARCH="${1:-amd64}"
 GOOS="linux"
+
+# Detect host platform for cross-compilation.
+HOST_GOOS=""
+case "$(uname -s)" in
+    Linux)  HOST_GOOS="linux" ;;
+    Darwin) HOST_GOOS="darwin" ;;
+    MINGW*|MSYS*|CYGWIN*) HOST_GOOS="windows" ;;
+esac
+
+HOST_GOARCH=""
+case "$(uname -m)" in
+    x86_64)  HOST_GOARCH="amd64" ;;
+    aarch64) HOST_GOARCH="arm64" ;;
+esac
+
+# Fallback to go env if uname mapping did not determine host platform.
+if [ -z "$HOST_GOOS" ]; then
+    HOST_GOOS=$("$GO" env GOOS 2>/dev/null || true)
+fi
+if [ -z "$HOST_GOARCH" ]; then
+    HOST_GOARCH=$("$GO" env GOARCH 2>/dev/null || true)
+fi
+
+IS_CROSS_BUILD=0
+if [ "$GOOS" != "$HOST_GOOS" ] || [ "$GOARCH" != "$HOST_GOARCH" ]; then
+    IS_CROSS_BUILD=1
+fi
 
 COMMID=$(git describe --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS="-s -w -buildid= -X github.com/xtls/xray-core/core.build=${COMMID}"
@@ -114,6 +142,28 @@ WEOF
         arm64) RUST_CPU_FLAGS="-C target-cpu=cortex-a53" ;;
     esac
 
+    # Step 0: Build eBPF programs (requires nightly + bpfel-unknown-none target).
+    # These are compiled to BPF bytecode and embedded in the userspace crate
+    # via include_bytes_aligned! at compile time.
+    EBPF_TARGET="bpfel-unknown-none"
+    EBPF_FEATURES=""
+    if command -v rustup &>/dev/null && rustup toolchain list | grep -q nightly; then
+        echo "Building eBPF programs for ${EBPF_TARGET}..."
+        if cargo +nightly build \
+            -Z build-std=core \
+            --target "$EBPF_TARGET" \
+            --release \
+            --manifest-path rust/xray-ebpf/Cargo.toml \
+            --target-dir rust/xray-ebpf/target 2>/dev/null; then
+            EBPF_FEATURES="--features ebpf-bytecode"
+            echo "eBPF programs built successfully"
+        else
+            echo "Warning: eBPF build failed (non-fatal), continuing without SK_MSG cork + Aya"
+        fi
+    else
+        echo "Warning: nightly toolchain not found, skipping eBPF build (SK_MSG cork + Aya unavailable)"
+    fi
+
     # Build Rust static library for the musl target.
     # -Z build-std rebuilds std from source so we don't need a pre-installed
     # musl sysroot. RUSTC_BOOTSTRAP=1 allows this on stable rustc.
@@ -132,7 +182,8 @@ WEOF
         cargo build -Z build-std=std,panic_abort --release \
             --manifest-path rust/xray-rust/Cargo.toml \
             --target "$RUST_TARGET" \
-            --target-dir rust/xray-rust/target
+            --target-dir rust/xray-rust/target \
+            ${EBPF_FEATURES}
 
     RUST_LIB_PATH="rust/xray-rust/target/${RUST_TARGET}/release/libxray_rust.a"
     if [ ! -f "$RUST_LIB_PATH" ]; then
@@ -164,7 +215,12 @@ CGO_ENABLED="$USE_CGO" GOOS="$GOOS" GOARCH="$GOARCH" \
 
 echo "Done: $(ls -lh $OUTNAME | awk '{print $5}')"
 if [ "$USE_CGO" = "1" ]; then
-    echo "  Rust TLS + kTLS (static musl via zig)"
+    echo "  Rust-accelerated (static musl): TLS, REALITY, kTLS, Blake3 KDF, MPH matcher, GeoIP matcher, Vision padding"
+    if [ -n "${EBPF_FEATURES:-}" ]; then
+        echo "  eBPF: Aya sockmap + SK_MSG cork + pinned maps"
+    else
+        echo "  eBPF: Go fallback (no nightly toolchain for Aya)"
+    fi
 else
     echo "  Pure Go static binary"
 fi

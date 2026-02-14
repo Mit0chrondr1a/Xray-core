@@ -4,6 +4,7 @@ package native
 
 /*
 #cgo LDFLAGS: -L${SRCDIR}/../../rust/xray-rust/target/release -lxray_rust
+#cgo linux LDFLAGS: -lm -ldl -lpthread
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -68,19 +69,93 @@ extern void    xray_reality_config_add_short_id(void* cfg, const uint8_t* id, si
 extern int32_t xray_reality_client_connect(int fd, const uint8_t* client_hello_raw, size_t hello_len, const uint8_t* ecdh_privkey, size_t privkey_len, const void* reality_config, struct xray_tls_result* out);
 extern int32_t xray_reality_server_accept(int fd, const void* reality_config, struct xray_tls_result* out);
 extern int32_t xray_reality_server_handshake(int fd, const void* reality_config, struct xray_tls_result* out);
+
+// Blake3
+extern void xray_blake3_derive_key(uint8_t* out, size_t out_len,
+    const uint8_t* ctx, size_t ctx_len,
+    const uint8_t* key, size_t key_len);
+extern void xray_blake3_sum256(uint8_t* out,
+    const uint8_t* data, size_t data_len);
+extern void xray_blake3_keyed_hash(uint8_t* out, size_t out_len,
+    const uint8_t* key,
+    const uint8_t* data, size_t data_len);
+
+// MPH
+extern void* xray_mph_new();
+extern void xray_mph_add_pattern(void* table,
+    const uint8_t* pattern, size_t pattern_len, uint8_t pattern_type);
+extern void xray_mph_build(void* table);
+extern bool xray_mph_match(const void* table,
+    const uint8_t* input, size_t input_len);
+extern void xray_mph_free(void* table);
+
+// GeoIP
+extern void* xray_ipset_new();
+extern void xray_ipset_add_prefix(void* ipset,
+    const uint8_t* ip_bytes, size_t ip_len, uint8_t prefix_bits);
+extern void xray_ipset_build(void* ipset);
+extern bool xray_ipset_contains(const void* ipset,
+    const uint8_t* ip_bytes, size_t ip_len);
+extern uint8_t xray_ipset_max4(const void* ipset);
+extern uint8_t xray_ipset_max6(const void* ipset);
+extern void xray_ipset_free(void* ipset);
+
+// Vision padding/unpadding
+struct xray_vision_unpad_state {
+    int32_t remaining_command;
+    int32_t remaining_content;
+    int32_t remaining_padding;
+    int32_t current_command;
+};
+
+extern int32_t xray_vision_pad(
+    const uint8_t* data, uint32_t data_len,
+    uint8_t command,
+    const uint8_t* uuid,
+    bool long_padding,
+    const uint32_t* testseed,
+    uint8_t* out_buf, uint32_t out_cap
+);
+
+extern int32_t xray_vision_unpad(
+    const uint8_t* data, uint32_t data_len,
+    struct xray_vision_unpad_state* state,
+    const uint8_t* uuid, uint32_t uuid_len,
+    uint8_t* out_buf, uint32_t out_cap
+);
+
+// eBPF sockmap management
+extern int32_t xray_ebpf_available();
+extern int32_t xray_ebpf_setup(const char* pin_path, uint32_t max_entries, uint32_t cork_threshold);
+extern int32_t xray_ebpf_teardown();
+extern int32_t xray_ebpf_register_pair(int32_t inbound_fd, int32_t outbound_fd, uint64_t inbound_cookie, uint64_t outbound_cookie, uint32_t policy_flags);
+extern int32_t xray_ebpf_unregister_pair(uint64_t inbound_cookie, uint64_t outbound_cookie);
 */
 import "C"
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
+	"syscall"
+	"unicode/utf8"
 	"unsafe"
+
+	"lukechampine.com/blake3"
 )
 
-// Available returns true when the native Rust library is linked.
+// Available reports whether the native Rust implementations are linked.
 func Available() bool {
 	return true
 }
+
+// EbpfAvailable reports whether Rust eBPF bytecode support is compiled in.
+func EbpfAvailable() bool {
+	return C.xray_ebpf_available() != 0
+}
+
+// ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
+var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 
 // --- TLS Types ---
 
@@ -553,5 +628,292 @@ func extractDrained(result *TlsResult, cResult *C.struct_xray_tls_result) {
 	}
 }
 
-// ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
-var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
+// --- Blake3 ---
+
+// Blake3DeriveKey derives a key using BLAKE3's KDF mode.
+func Blake3DeriveKey(out []byte, ctx string, key []byte) {
+	if len(out) == 0 {
+		return
+	}
+	// Rust's blake3 derive_key API requires UTF-8 context; keep exact Go behavior for
+	// binary contexts by falling back to the pure-Go implementation.
+	if !utf8.ValidString(ctx) {
+		blake3.DeriveKey(out, ctx, key)
+		return
+	}
+	var ctxPtr *C.uint8_t
+	if len(ctx) > 0 {
+		ctxPtr = (*C.uint8_t)(unsafe.Pointer(unsafe.StringData(ctx)))
+	}
+	var keyPtr *C.uint8_t
+	if len(key) > 0 {
+		keyPtr = (*C.uint8_t)(unsafe.Pointer(&key[0]))
+	}
+	C.xray_blake3_derive_key(
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), C.size_t(len(out)),
+		ctxPtr, C.size_t(len(ctx)),
+		keyPtr, C.size_t(len(key)),
+	)
+}
+
+// Blake3Sum256 computes a 32-byte BLAKE3 hash.
+func Blake3Sum256(data []byte) [32]byte {
+	var out [32]byte
+	var dataPtr *C.uint8_t
+	if len(data) > 0 {
+		dataPtr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
+	}
+	C.xray_blake3_sum256((*C.uint8_t)(unsafe.Pointer(&out[0])), dataPtr, C.size_t(len(data)))
+	return out
+}
+
+// Blake3KeyedHash computes a BLAKE3 keyed hash (MAC mode).
+func Blake3KeyedHash(key *[32]byte, data []byte, outLen int) []byte {
+	if outLen <= 0 {
+		return nil
+	}
+	out := make([]byte, outLen)
+	var dataPtr *C.uint8_t
+	if len(data) > 0 {
+		dataPtr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
+	}
+	C.xray_blake3_keyed_hash(
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), C.size_t(outLen),
+		(*C.uint8_t)(unsafe.Pointer(&key[0])),
+		dataPtr, C.size_t(len(data)),
+	)
+	return out
+}
+
+// --- MPH ---
+
+// MphHandle is an opaque handle to a Rust MPH table.
+type MphHandle struct {
+	ptr unsafe.Pointer
+}
+
+// MphNew creates a new MPH table.
+func MphNew() *MphHandle {
+	return &MphHandle{ptr: C.xray_mph_new()}
+}
+
+// MphAddPattern adds a pattern. patternType: 0=Full, 1=Substr, 2=Domain.
+func MphAddPattern(h *MphHandle, pattern string, patternType byte) {
+	var p *byte
+	if len(pattern) > 0 {
+		p = unsafe.StringData(pattern)
+	} else {
+		var z byte
+		p = &z
+	}
+	C.xray_mph_add_pattern(h.ptr,
+		(*C.uint8_t)(unsafe.Pointer(p)), C.size_t(len(pattern)),
+		C.uint8_t(patternType))
+}
+
+// MphBuild builds the MPH table. Must be called after all patterns are added.
+func MphBuild(h *MphHandle) {
+	C.xray_mph_build(h.ptr)
+}
+
+// MphMatch tests if input matches any pattern in the table.
+func MphMatch(h *MphHandle, input string) bool {
+	var p *byte
+	if len(input) > 0 {
+		p = unsafe.StringData(input)
+	} else {
+		var z byte
+		p = &z
+	}
+	return bool(C.xray_mph_match(h.ptr,
+		(*C.uint8_t)(unsafe.Pointer(p)), C.size_t(len(input))))
+}
+
+// MphFree releases the MPH table.
+func MphFree(h *MphHandle) {
+	if h != nil && h.ptr != nil {
+		C.xray_mph_free(h.ptr)
+		h.ptr = nil
+	}
+}
+
+// --- GeoIP ---
+
+// IpSetHandle is an opaque handle to a Rust IP prefix set.
+type IpSetHandle struct {
+	ptr unsafe.Pointer
+}
+
+// IpSetNew creates a new IP set.
+func IpSetNew() *IpSetHandle {
+	return &IpSetHandle{ptr: C.xray_ipset_new()}
+}
+
+// IpSetAddPrefix adds a CIDR prefix. ipBytes must be 4 (IPv4) or 16 (IPv6) bytes.
+func IpSetAddPrefix(h *IpSetHandle, ipBytes []byte, prefixBits int) {
+	if len(ipBytes) == 0 {
+		return
+	}
+	C.xray_ipset_add_prefix(h.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&ipBytes[0])), C.size_t(len(ipBytes)),
+		C.uint8_t(prefixBits))
+}
+
+// IpSetBuild finalizes the IP set after all prefixes are added.
+func IpSetBuild(h *IpSetHandle) {
+	C.xray_ipset_build(h.ptr)
+}
+
+// IpSetContains checks whether an IP is in the set.
+func IpSetContains(h *IpSetHandle, ipBytes []byte) bool {
+	if len(ipBytes) == 0 {
+		return false
+	}
+	return bool(C.xray_ipset_contains(h.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&ipBytes[0])), C.size_t(len(ipBytes))))
+}
+
+// IpSetMax4 returns the maximum IPv4 prefix length, or 0xff if empty.
+func IpSetMax4(h *IpSetHandle) uint8 {
+	return uint8(C.xray_ipset_max4(h.ptr))
+}
+
+// IpSetMax6 returns the maximum IPv6 prefix length, or 0xff if empty.
+func IpSetMax6(h *IpSetHandle) uint8 {
+	return uint8(C.xray_ipset_max6(h.ptr))
+}
+
+// IpSetFree releases the IP set.
+func IpSetFree(h *IpSetHandle) {
+	if h != nil && h.ptr != nil {
+		C.xray_ipset_free(h.ptr)
+		h.ptr = nil
+	}
+}
+
+// --- Vision Padding FFI ---
+
+// VisionUnpadState is the stateful unpadding parser state (matches Rust's VisionUnpadState).
+type VisionUnpadState struct {
+	RemainingCommand int32
+	RemainingContent int32
+	RemainingPadding int32
+	CurrentCommand   int32
+}
+
+// NewVisionUnpadState returns an initialized unpadding state.
+func NewVisionUnpadState() *VisionUnpadState {
+	return &VisionUnpadState{
+		RemainingCommand: -1,
+		RemainingContent: -1,
+		RemainingPadding: -1,
+		CurrentCommand:   0,
+	}
+}
+
+// VisionPad pads a plaintext buffer with Vision framing.
+// Returns the number of bytes written to out, or an error.
+func VisionPad(data []byte, command byte, uuid []byte, longPadding bool, testseed [4]uint32, out []byte) (int, error) {
+	var dataPtr *C.uint8_t
+	if len(data) > 0 {
+		dataPtr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
+	}
+	var uuidPtr *C.uint8_t
+	if len(uuid) > 0 {
+		uuidPtr = (*C.uint8_t)(unsafe.Pointer(&uuid[0]))
+	}
+	n := C.xray_vision_pad(
+		dataPtr, C.uint32_t(len(data)),
+		C.uint8_t(command),
+		uuidPtr,
+		C.bool(longPadding),
+		(*C.uint32_t)(unsafe.Pointer(&testseed[0])),
+		(*C.uint8_t)(unsafe.Pointer(&out[0])),
+		C.uint32_t(len(out)),
+	)
+	if n < 0 {
+		return 0, errors.New("native: vision pad failed")
+	}
+	return int(n), nil
+}
+
+// VisionUnpad removes Vision padding and extracts content.
+// Returns the number of content bytes written to out, or an error.
+// The state is updated in-place for streaming across multiple calls.
+func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) (int, error) {
+	if state == nil || len(data) == 0 {
+		return 0, errors.New("native: nil state or empty data")
+	}
+	var uuidPtr *C.uint8_t
+	var uuidLen C.uint32_t
+	if len(uuid) > 0 {
+		uuidPtr = (*C.uint8_t)(unsafe.Pointer(&uuid[0]))
+		uuidLen = C.uint32_t(len(uuid))
+	}
+	n := C.xray_vision_unpad(
+		(*C.uint8_t)(unsafe.Pointer(&data[0])), C.uint32_t(len(data)),
+		(*C.struct_xray_vision_unpad_state)(unsafe.Pointer(state)),
+		uuidPtr, uuidLen,
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), C.uint32_t(len(out)),
+	)
+	if n < 0 {
+		return 0, errors.New("native: vision unpad failed")
+	}
+	return int(n), nil
+}
+
+// --- eBPF FFI ---
+
+// EbpfSetup initializes eBPF sockmap with pinned maps for zero-downtime recovery.
+func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {
+	cPath := C.CString(pinPath)
+	defer C.free(unsafe.Pointer(cPath))
+	rc := C.xray_ebpf_setup(cPath, C.uint32_t(maxEntries), C.uint32_t(corkThreshold))
+	if rc != 0 {
+		return errors.New("native: ebpf setup failed")
+	}
+	return nil
+}
+
+// EbpfTeardown tears down eBPF programs and unpins maps.
+func EbpfTeardown() error {
+	rc := C.xray_ebpf_teardown()
+	if rc != 0 {
+		return errors.New("native: ebpf teardown failed")
+	}
+	return nil
+}
+
+// EbpfRegisterPair registers a socket pair for bidirectional forwarding.
+func EbpfRegisterPair(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64, policyFlags uint32) error {
+	rc := C.xray_ebpf_register_pair(
+		C.int32_t(inboundFD), C.int32_t(outboundFD),
+		C.uint64_t(inboundCookie), C.uint64_t(outboundCookie),
+		C.uint32_t(policyFlags),
+	)
+	if rc != 0 {
+		return ebpfErrno("ebpf register pair", rc)
+	}
+	return nil
+}
+
+// EbpfUnregisterPair unregisters a socket pair.
+func EbpfUnregisterPair(inboundCookie, outboundCookie uint64) error {
+	rc := C.xray_ebpf_unregister_pair(C.uint64_t(inboundCookie), C.uint64_t(outboundCookie))
+	if rc != 0 {
+		return ebpfErrno("ebpf unregister pair", rc)
+	}
+	return nil
+}
+
+func ebpfErrno(op string, rc C.int32_t) error {
+	if rc == 0 {
+		return nil
+	}
+	code := int32(rc)
+	if code < 0 {
+		errno := syscall.Errno(-code)
+		return fmt.Errorf("native: %s failed: %w", op, errno)
+	}
+	return fmt.Errorf("native: %s failed with code %d", op, code)
+}

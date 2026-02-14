@@ -16,7 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"golang.org/x/crypto/chacha20poly1305"
-	"lukechampine.com/blake3"
+	"github.com/xtls/xray-core/common/native"
 )
 
 var OutBytesPool = sync.Pool{
@@ -159,7 +159,7 @@ const MaxPaddingLength = 20000
 
 func NewAEAD(ctx, key []byte, useAES bool) *AEAD {
 	k := make([]byte, 32)
-	blake3.DeriveKey(k, string(ctx), key)
+	native.Blake3DeriveKey(k, string(ctx), key)
 	var aead cipher.AEAD
 	if useAES {
 		block := common.Must2(aes.NewCipher(k))

@@ -26,8 +26,21 @@ ed25519-dalek = { version = "2", features = ["hazmat"] }
 # Security
 zeroize = { version = "1", features = ["derive"] }
 
+# Accelerated matchers + hashing
+blake3 = "1"
+aho-corasick = "1"
+ahash = "0.8"
+getrandom = "0.3"
+
+# eBPF userspace (Aya loader for sockmap + pinned maps)
+aya = { version = "0.13", optional = true }
+
 # System
 libc = "0.2"
+
+[features]
+default = []
+ebpf-bytecode = ["aya"]
 
 [profile.release]
 lto = true

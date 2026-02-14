@@ -2,10 +2,20 @@
 
 package native
 
-import "errors"
+import (
+	"errors"
+	"unsafe"
+
+	"lukechampine.com/blake3"
+)
 
 // Available returns false when the native Rust library is not linked.
 func Available() bool {
+	return false
+}
+
+// EbpfAvailable reports whether native eBPF support is available.
+func EbpfAvailable() bool {
 	return false
 }
 
@@ -111,3 +121,83 @@ func RealityServerAccept(int, *RealityConfigHandle) (*TlsResult, error) {
 func RealityServerHandshake(int, *RealityConfigHandle) (*TlsResult, error) {
 	return nil, errNotAvailable
 }
+
+// --- Blake3 (delegates to lukechampine.com/blake3) ---
+
+// Blake3DeriveKey derives a key using BLAKE3's KDF mode.
+func Blake3DeriveKey(out []byte, ctx string, key []byte) {
+	blake3.DeriveKey(out, ctx, key)
+}
+
+// Blake3Sum256 computes a 32-byte BLAKE3 hash.
+func Blake3Sum256(data []byte) [32]byte {
+	return blake3.Sum256(data)
+}
+
+// Blake3KeyedHash computes a BLAKE3 keyed hash (MAC mode).
+func Blake3KeyedHash(key *[32]byte, data []byte, outLen int) []byte {
+	h := blake3.New(outLen, key[:])
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+// --- MPH (stubs — caller must fall back to Go implementation) ---
+
+// MphHandle is an opaque handle to a native MPH table.
+type MphHandle struct {
+	ptr unsafe.Pointer
+}
+
+func MphNew() *MphHandle                        { return nil }
+func MphAddPattern(*MphHandle, string, byte)     {}
+func MphBuild(*MphHandle)                        {}
+func MphMatch(*MphHandle, string) bool           { return false }
+func MphFree(*MphHandle)                         {}
+
+// --- GeoIP (stubs — caller must fall back to Go implementation) ---
+
+// IpSetHandle is an opaque handle to a native IP prefix set.
+type IpSetHandle struct {
+	ptr unsafe.Pointer
+}
+
+func IpSetNew() *IpSetHandle                  { return nil }
+func IpSetAddPrefix(*IpSetHandle, []byte, int) {}
+func IpSetBuild(*IpSetHandle)                 {}
+func IpSetContains(*IpSetHandle, []byte) bool { return false }
+func IpSetMax4(*IpSetHandle) uint8            { return 0xff }
+func IpSetMax6(*IpSetHandle) uint8            { return 0xff }
+func IpSetFree(*IpSetHandle)                  {}
+
+// --- Vision Padding Stubs ---
+
+type VisionUnpadState struct {
+	RemainingCommand int32
+	RemainingContent int32
+	RemainingPadding int32
+	CurrentCommand   int32
+}
+
+func NewVisionUnpadState() *VisionUnpadState {
+	return &VisionUnpadState{
+		RemainingCommand: -1,
+		RemainingContent: -1,
+		RemainingPadding: -1,
+		CurrentCommand:   0,
+	}
+}
+
+func VisionPad([]byte, byte, []byte, bool, [4]uint32, []byte) (int, error) {
+	return 0, errNotAvailable
+}
+
+func VisionUnpad([]byte, *VisionUnpadState, []byte, []byte) (int, error) {
+	return 0, errNotAvailable
+}
+
+// --- eBPF Stubs ---
+
+func EbpfSetup(string, uint32, uint32) error                  { return errNotAvailable }
+func EbpfTeardown() error                                     { return errNotAvailable }
+func EbpfRegisterPair(int, int, uint64, uint64, uint32) error { return errNotAvailable }
+func EbpfUnregisterPair(uint64, uint64) error                 { return errNotAvailable }

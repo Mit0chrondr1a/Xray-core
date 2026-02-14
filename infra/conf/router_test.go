@@ -49,7 +49,7 @@ func TestToCidrList(t *testing.T) {
 
 	geoipPath, err := getAssetPath("geoip.dat")
 	if err != nil {
-		t.Fatal(err)
+		t.Skip(err)
 	}
 
 	common.Must(filesystem.CopyFile(filepath.Join(tempDir, "geoip.dat"), geoipPath))

@@ -3,11 +3,13 @@ package router
 import (
 	"context"
 	"net/netip"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 
 	"go4.org/netipx"
@@ -34,8 +36,9 @@ type GeoIPMatcher interface {
 }
 
 type GeoIPSet struct {
-	ipv4, ipv6 *netipx.IPSet
-	max4, max6 uint8
+	nativeHandle *native.IpSetHandle
+	ipv4, ipv6   *netipx.IPSet
+	max4, max6   uint8
 }
 
 type HeuristicGeoIPMatcher struct {
@@ -58,6 +61,17 @@ func (m *HeuristicGeoIPMatcher) Match(ip net.IP) bool {
 }
 
 func (m *HeuristicGeoIPMatcher) matchAddr(ipx netip.Addr) bool {
+	if m.ipset.nativeHandle != nil {
+		var b []byte
+		if ipx.Is4() {
+			ip4 := ipx.As4()
+			b = ip4[:]
+		} else {
+			ip16 := ipx.As16()
+			b = ip16[:]
+		}
+		return native.IpSetContains(m.ipset.nativeHandle, b) != m.reverse
+	}
 	if ipx.Is4() {
 		return m.ipset.ipv4.Contains(ipx) != m.reverse
 	}
@@ -819,6 +833,43 @@ func (f *GeoIPSetFactory) GetOrCreate(key string, cidrGroups [][]*CIDR) (*GeoIPS
 }
 
 func (f *GeoIPSetFactory) Create(cidrGroups ...[]*CIDR) (*GeoIPSet, error) {
+	if native.Available() {
+		handle := native.IpSetNew()
+		for _, cidrGroup := range cidrGroups {
+			for i, cidrEntry := range cidrGroup {
+				cidrGroup[i] = nil
+				ipBytes := cidrEntry.GetIp()
+				prefixLen := int(cidrEntry.GetPrefix())
+				switch len(ipBytes) {
+				case 4:
+					if prefixLen < 0 || prefixLen > 32 {
+						errors.LogError(context.Background(), "ignore created invalid prefix from addr ", ipBytes, " and length ", prefixLen)
+						continue
+					}
+					native.IpSetAddPrefix(handle, ipBytes, prefixLen)
+				case 16:
+					if prefixLen < 0 || prefixLen > 128 {
+						errors.LogError(context.Background(), "ignore created invalid prefix from addr ", ipBytes, " and length ", prefixLen)
+						continue
+					}
+					native.IpSetAddPrefix(handle, ipBytes, prefixLen)
+				default:
+					errors.LogError(context.Background(), "ignore invalid IP byte slice: ", ipBytes)
+				}
+			}
+		}
+		native.IpSetBuild(handle)
+		set := &GeoIPSet{
+			nativeHandle: handle,
+			max4:         native.IpSetMax4(handle),
+			max6:         native.IpSetMax6(handle),
+		}
+		runtime.SetFinalizer(set, func(s *GeoIPSet) {
+			native.IpSetFree(s.nativeHandle)
+		})
+		return set, nil
+	}
+
 	var ipv4Builder, ipv6Builder netipx.IPSetBuilder
 
 	for _, cidrGroup := range cidrGroups {

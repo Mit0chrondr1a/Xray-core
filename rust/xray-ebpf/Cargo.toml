@@ -1,0 +1,22 @@
+[package]
+name = "xray-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+
+[[bin]]
+name = "xray-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2
+overflow-checks = false
+debug-assertions = false
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1

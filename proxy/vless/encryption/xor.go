@@ -5,12 +5,12 @@ import (
 	"crypto/cipher"
 	"net"
 
-	"lukechampine.com/blake3"
+	"github.com/xtls/xray-core/common/native"
 )
 
 func NewCTR(key, iv []byte) cipher.Stream {
 	k := make([]byte, 32)
-	blake3.DeriveKey(k, "VLESS", key) // avoids using key directly
+	native.Blake3DeriveKey(k, "VLESS", key) // avoids using key directly
 	block, _ := aes.NewCipher(k)
 	return cipher.NewCTR(block, iv)
 	//chacha20.NewUnauthenticatedCipher()

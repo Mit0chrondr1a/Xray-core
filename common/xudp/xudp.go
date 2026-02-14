@@ -16,7 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
-	"lukechampine.com/blake3"
+	"github.com/xtls/xray-core/common/native"
 )
 
 var AddrParser = protocol.NewAddressParser(
@@ -54,9 +54,10 @@ func GetGlobalID(ctx context.Context) (globalID [8]byte) {
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.Network == net.Network_UDP &&
 		(inbound.Name == "dokodemo-door" || inbound.Name == "socks" || inbound.Name == "shadowsocks" || inbound.Name == "tun") {
-		h := blake3.New(8, BaseKey)
-		h.Write([]byte(inbound.Source.String()))
-		copy(globalID[:], h.Sum(nil))
+		var keyArr [32]byte
+		copy(keyArr[:], BaseKey)
+		result := native.Blake3KeyedHash(&keyArr, []byte(inbound.Source.String()), 8)
+		copy(globalID[:], result)
 		if Show {
 			errors.LogInfo(ctx, fmt.Sprintf("XUDP inbound.Source.String(): %v\tglobalID: %v\n", inbound.Source.String(), globalID))
 		}
