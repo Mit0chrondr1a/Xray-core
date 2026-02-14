@@ -32,6 +32,14 @@ type SockmapManager struct {
 	staleCleanups atomic.Int64 // entries removed by sweeper
 	lastWarningNs atomic.Int64 // rate-limit warnings to 1/min
 
+	// Contention detection
+	regFailures       atomic.Int64 // RegisterPair failures (lifetime, any cause)
+	regWindowStartNs  atomic.Int64 // start time of registration failure window
+	regWindowTotal    atomic.Int64 // registrations attempted in current window
+	regWindowFailures atomic.Int64 // failed registrations in current window
+	sweepStaleRatio   atomic.Int64 // last sweep: stale-found * 1000 / total-checked (permille)
+	spliceFallbacks   atomic.Int64 // times sockmap was skipped due to contention
+
 	// Userspace LRU eviction for SOCKHASH
 	lruList  *list.List                    // front=MRU, back=LRU
 	lruIndex map[SockPairKey]*list.Element // O(1) lookup
@@ -44,13 +52,15 @@ type SockmapManager struct {
 
 // SockmapStats provides a snapshot of sockmap manager statistics.
 type SockmapStats struct {
-	ActivePairs   int64
-	TotalPairs    int64
-	FullRejects   int64
-	PeakPairs     int64
-	StaleCleanups int64
-	Enabled       bool
-	MaxEntries    uint32
+	ActivePairs     int64
+	TotalPairs      int64
+	FullRejects     int64
+	PeakPairs       int64
+	StaleCleanups   int64
+	RegFailures     int64
+	SpliceFallbacks int64
+	Enabled         bool
+	MaxEntries      uint32
 }
 
 // SockPairKey identifies a socket pair for proxying.
@@ -98,7 +108,11 @@ type SockPair struct {
 
 // maxEvictRetries is the maximum number of LRU eviction attempts when
 // SOCKHASH is full.
-const maxEvictRetries = 3
+const (
+	maxEvictRetries      = 3
+	regFailureWindow     = 60 * time.Second
+	regFailureMinSamples = int64(20)
+)
 
 // NewSockmapManager creates a new sockmap manager.
 func NewSockmapManager(config SockmapConfig) *SockmapManager {
@@ -127,6 +141,12 @@ func (m *SockmapManager) Enable() error {
 	m.sweepDone = done
 	m.sweepWG.Add(1)
 	go m.sweepStaleEntries(done)
+
+	nowNs := time.Now().UnixNano()
+	m.regWindowStartNs.Store(nowNs)
+	m.regWindowTotal.Store(0)
+	m.regWindowFailures.Store(0)
+	m.sweepStaleRatio.Store(0)
 
 	m.enabled.Store(true)
 	return nil
@@ -219,6 +239,8 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 	// Setup forwarding — inserts both sockets into SOCKHASH.
 	// On capacity error, attempt LRU eviction and retry.
 	if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie); err != nil {
+		m.regFailures.Add(1)
+		m.recordRegistrationAttempt(true)
 		deletePolicyEntry(inboundCookie)
 		deletePolicyEntry(outboundCookie)
 		if isSockmapFull(err) {
@@ -226,6 +248,7 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 		}
 		return err
 	}
+	m.recordRegistrationAttempt(false)
 
 	// Prevent GC from finalizing connections while BPF ops used their FDs.
 	runtime.KeepAlive(inbound)
@@ -387,19 +410,55 @@ func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (SockPair, bool) {
 // GetSockmapStats returns a snapshot of overall sockmap statistics.
 func (m *SockmapManager) GetSockmapStats() SockmapStats {
 	return SockmapStats{
-		ActivePairs:   m.activePairs.Load(),
-		TotalPairs:    m.totalPairs.Load(),
-		FullRejects:   m.fullRejects.Load(),
-		PeakPairs:     m.peakPairs.Load(),
-		StaleCleanups: m.staleCleanups.Load(),
-		Enabled:       m.enabled.Load(),
-		MaxEntries:    m.config.MaxEntries,
+		ActivePairs:     m.activePairs.Load(),
+		TotalPairs:      m.totalPairs.Load(),
+		FullRejects:     m.fullRejects.Load(),
+		PeakPairs:       m.peakPairs.Load(),
+		StaleCleanups:   m.staleCleanups.Load(),
+		RegFailures:     m.regFailures.Load(),
+		SpliceFallbacks: m.spliceFallbacks.Load(),
+		Enabled:         m.enabled.Load(),
+		MaxEntries:      m.config.MaxEntries,
 	}
 }
 
 // IsEnabled returns true if sockmap proxying is active.
 func (m *SockmapManager) IsEnabled() bool {
 	return m.enabled.Load()
+}
+
+// ShouldFallbackToSplice returns true when sockmap contention is detected,
+// indicating callers should use splice(2) directly instead.
+//
+// Heuristic: if >20% of recent registrations failed, or the sweeper found
+// >10% stale entries (indicating FD churn / redirect failures), skip sockmap.
+// Resets automatically: registration failures are tracked in a rotating
+// time window, and sweepStaleRatio is refreshed every sweep cycle (60s).
+func (m *SockmapManager) ShouldFallbackToSplice() bool {
+	if !m.enabled.Load() {
+		return true
+	}
+
+	nowNs := time.Now().UnixNano()
+	m.rotateRegFailureWindow(nowNs)
+
+	// Check registration failure rate in the current window.
+	total := m.regWindowTotal.Load()
+	failures := m.regWindowFailures.Load()
+	if total > regFailureMinSamples && failures*5 > total {
+		// >20% failure rate with enough samples
+		m.spliceFallbacks.Add(1)
+		return true
+	}
+
+	// Check stale sweep ratio (permille).
+	if m.sweepStaleRatio.Load() > 100 {
+		// >10% of pairs were stale last sweep
+		m.spliceFallbacks.Add(1)
+		return true
+	}
+
+	return false
 }
 
 // CanUseZeroCopy returns true if the connection pair can use zero-copy.
@@ -451,6 +510,37 @@ func (m *SockmapManager) updatePeakPairs(current int64) {
 		if m.peakPairs.CompareAndSwap(peak, current) {
 			return
 		}
+	}
+}
+
+// rotateRegFailureWindow resets registration counters when the current
+// observation window expires.
+func (m *SockmapManager) rotateRegFailureWindow(nowNs int64) {
+	start := m.regWindowStartNs.Load()
+	if start == 0 {
+		if m.regWindowStartNs.CompareAndSwap(0, nowNs) {
+			m.regWindowTotal.Store(0)
+			m.regWindowFailures.Store(0)
+		}
+		return
+	}
+	if nowNs-start < int64(regFailureWindow) {
+		return
+	}
+	if m.regWindowStartNs.CompareAndSwap(start, nowNs) {
+		m.regWindowTotal.Store(0)
+		m.regWindowFailures.Store(0)
+	}
+}
+
+// recordRegistrationAttempt updates recent registration counters used by
+// contention fallback heuristics.
+func (m *SockmapManager) recordRegistrationAttempt(failed bool) {
+	nowNs := time.Now().UnixNano()
+	m.rotateRegFailureWindow(nowNs)
+	m.regWindowTotal.Add(1)
+	if failed {
+		m.regWindowFailures.Add(1)
 	}
 }
 
@@ -509,8 +599,10 @@ func (m *SockmapManager) sweepStaleEntries(done <-chan struct{}) {
 // evicts the oldest 10% of pairs.
 func (m *SockmapManager) doSweep() {
 	var staleKeys []SockPairKey
+	var totalChecked int
 
 	m.pairs.Range(func(k, v any) bool {
+		totalChecked++
 		key := k.(SockPairKey)
 		pair := v.(*SockPair)
 
@@ -537,6 +629,13 @@ func (m *SockmapManager) doSweep() {
 
 		return true
 	})
+
+	// Update stale ratio for contention detection.
+	if totalChecked > 0 {
+		m.sweepStaleRatio.Store(int64(len(staleKeys)) * 1000 / int64(totalChecked))
+	} else {
+		m.sweepStaleRatio.Store(0)
+	}
 
 	if len(staleKeys) > 0 {
 		ctx := context.Background()

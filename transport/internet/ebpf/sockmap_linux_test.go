@@ -36,36 +36,72 @@ func TestSockmapManagerEnable(t *testing.T) {
 
 func TestBuildSKSkbVerdictProgramDenyPolicyJumpsToSKPass(t *testing.T) {
 	insns := buildSKSkbVerdictProgram()
-	const (
-		denyJumpIdx     = 14
-		redirectCallIdx = 22
-		skPassIdx       = 23
-		skPassValue     = 1
-	)
-
-	if len(insns) <= skPassIdx+1 {
-		t.Fatalf("unexpected verdict program length: got %d, want at least %d", len(insns), skPassIdx+2)
+	redirectCallIdx := -1
+	skPassIdx := -1
+	for i, insn := range insns {
+		if insn.code == (bpfClassJMP|bpfCall) && insn.imm == bpfFuncSKRedirectHash {
+			redirectCallIdx = i
+		}
+		if insn.code == (bpfALU64|bpfMov|bpfK) && insn.dst == bpfRegR0 && insn.imm == 1 {
+			if i+1 < len(insns) && insns[i+1].code == (bpfClassJMP|bpfExit) {
+				skPassIdx = i
+			}
+		}
 	}
 
-	denyJump := insns[denyJumpIdx]
-	if denyJump.code != (bpfClassJMP|bpfJEQ|bpfK) || denyJump.dst != bpfRegR0 || denyJump.imm != 0 {
-		t.Fatalf("unexpected deny-policy jump instruction at %d: %+v", denyJumpIdx, denyJump)
+	if redirectCallIdx < 0 {
+		t.Fatal("redirect helper call not found in verdict program")
+	}
+	if skPassIdx < 0 {
+		t.Fatal("SK_PASS epilogue not found in verdict program")
 	}
 
-	target := denyJumpIdx + 1 + int(denyJump.off)
-	if target != skPassIdx {
-		t.Fatalf("deny-policy jump target mismatch: got %d, want %d", target, skPassIdx)
+	denyJumpIdx := -1
+	for i, insn := range insns {
+		if insn.code != (bpfClassJMP|bpfJEQ|bpfK) || insn.dst != bpfRegR0 || insn.imm != 0 {
+			continue
+		}
+		target := i + 1 + int(insn.off)
+		if target == skPassIdx {
+			denyJumpIdx = i
+			break
+		}
 	}
+
+	if denyJumpIdx < 0 {
+		t.Fatal("deny-policy jump to SK_PASS not found")
+	}
+
+	target := denyJumpIdx + 1 + int(insns[denyJumpIdx].off)
 	if target == redirectCallIdx {
 		t.Fatalf("deny-policy jump incorrectly targets redirect helper at %d", redirectCallIdx)
 	}
+}
 
-	skPassInsn := insns[skPassIdx]
-	if skPassInsn.code != (bpfALU64|bpfMov|bpfK) || skPassInsn.dst != bpfRegR0 || skPassInsn.imm != skPassValue {
-		t.Fatalf("unexpected SK_PASS instruction at %d: %+v", skPassIdx, skPassInsn)
+func TestBuildSKSkbVerdictProgramRedirectDefaultsToEgress(t *testing.T) {
+	insns := buildSKSkbVerdictProgram()
+
+	egressSetIdx := -1
+	ingressSetIdx := -1
+	for i, insn := range insns {
+		if insn.code == (bpfALU64|bpfMov|bpfK) && insn.dst == bpfRegR4 {
+			switch insn.imm {
+			case 0:
+				egressSetIdx = i
+			case 1:
+				ingressSetIdx = i
+			}
+		}
 	}
-	if insns[skPassIdx+1].code != (bpfClassJMP | bpfExit) {
-		t.Fatalf("missing BPF exit after SK_PASS at %d", skPassIdx+1)
+
+	if egressSetIdx < 0 {
+		t.Fatal("redirect flags should default to egress (r4=0)")
+	}
+	if ingressSetIdx < 0 {
+		t.Fatal("verdict program should retain conditional ingress redirect support (r4=1)")
+	}
+	if egressSetIdx > ingressSetIdx {
+		t.Fatalf("egress default (idx=%d) should be set before optional ingress override (idx=%d)", egressSetIdx, ingressSetIdx)
 	}
 }
 

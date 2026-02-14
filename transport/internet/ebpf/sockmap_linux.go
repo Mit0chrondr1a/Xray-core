@@ -51,7 +51,8 @@ func buildSKSkbParserProgram() []bpfInsn {
 //  1. Gets the receiving socket's cookie via bpf_get_socket_cookie
 //  2. Looks up the cookie in the policy map to check redirect permission
 //  3. If denied (flags & 1 == 0), returns SK_PASS (data to userspace)
-//  4. If allowed (or no policy entry), redirects via SOCKHASH
+//  4. If allowed (or no policy entry), redirects via SOCKHASH (egress by default)
+//  5. If policy sets PolicyUseIngress, redirect into target ingress queue
 //
 // This achieves true zero-copy TCP proxying — data arriving from the
 // network on one socket is forwarded directly to the paired socket
@@ -88,57 +89,66 @@ func buildSKSkbVerdictProgram() []bpfInsn {
 
 		// Store cookie as key on stack
 		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR7, int16(stackKey)), // 5
+
+		// Default policy for missing entries: allow redirect, egress direction.
+		bpfMovImm32(bpfRegR8, int32(PolicyAllowRedirect)), // 6
 	}
 
 	// --- Policy map lookup ---
 	// r1 = policy map fd (LD_IMM64, 2 instructions, patched at load time)
-	policyMapInsns := bpfLoadMapFD(bpfRegR1, skSkbPolicyFDPlaceholder) // 6, 7
+	policyMapInsns := bpfLoadMapFD(bpfRegR1, skSkbPolicyFDPlaceholder) // 7, 8
 	insns = append(insns,
 		policyMapInsns[0],
 		policyMapInsns[1],
 		// r2 = &key
-		bpfMovReg(bpfRegR2, bpfRegR10),       // 8
-		bpfAddImm(bpfRegR2, int32(stackKey)), // 9
+		bpfMovReg(bpfRegR2, bpfRegR10),       // 9
+		bpfAddImm(bpfRegR2, int32(stackKey)), // 10
 		// r0 = bpf_map_lookup_elem(policy_map, &key)
-		bpfCallHelper(bpfFuncMapLookupElem), // 10
+		bpfCallHelper(bpfFuncMapLookupElem), // 11
 
-		// If no policy entry (r0 == NULL), allow redirect (backward compat)
-		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 3), // 11: if NULL, skip to redirect section (+3)
+		// If a policy entry exists, load flags into r8.
+		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 1),       // 12: if NULL, skip load
+		bpfLoadMem(bpfW, bpfRegR8, bpfRegR0, 0), // 13: r8 = *(u32*)(r0+0)
 
-		// Policy entry found: load flags, check allow bit
-		bpfLoadMem(bpfW, bpfRegR0, bpfRegR0, 0),           // 12: r0 = *(u32*)(r0+0)
-		bpfAndImm32(bpfRegR0, int32(PolicyAllowRedirect)), // 13: r0 &= 1
+		// Check allow bit.
+		bpfMovReg(bpfRegR0, bpfRegR8),                     // 14
+		bpfAndImm32(bpfRegR0, int32(PolicyAllowRedirect)), // 15: r0 &= 1
 		// Deny path must bypass redirect helper setup and jump to SK_PASS epilogue.
-		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 8), // 14: if zero → SK_PASS exit (+8 to insn 23)
+		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 12), // 16: if zero → SK_PASS exit (+12 to insn 29)
 	)
 
 	// --- Redirect section ---
 	insns = append(insns,
 		// Restore cookie to stack key (may have been clobbered by helper)
-		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR7, int16(stackKey)), // 15
+		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR7, int16(stackKey)), // 17
 
 		// r1 = skb
-		bpfMovReg(bpfRegR1, bpfRegR6), // 16
+		bpfMovReg(bpfRegR1, bpfRegR6), // 18
 	)
 
 	// r2 = sockhash map fd (LD_IMM64, 2 instructions, patched at load time)
-	sockhashInsns := bpfLoadMapFD(bpfRegR2, skSkbMapFDPlaceholder) // 17, 18
+	sockhashInsns := bpfLoadMapFD(bpfRegR2, skSkbMapFDPlaceholder) // 19, 20
 	insns = append(insns,
 		sockhashInsns[0],
 		sockhashInsns[1],
 		// r3 = &key
-		bpfMovReg(bpfRegR3, bpfRegR10),       // 19
-		bpfAddImm(bpfRegR3, int32(stackKey)), // 20
-		// r4 = flags (0 = redirect to egress)
-		bpfMovImm(bpfRegR4, 0), // 21
+		bpfMovReg(bpfRegR3, bpfRegR10),       // 21
+		bpfAddImm(bpfRegR3, int32(stackKey)), // 22
+		// r4 = flags, default egress (0)
+		bpfMovImm(bpfRegR4, 0), // 23
+		// If policy requests ingress, set r4=1.
+		bpfMovReg(bpfRegR0, bpfRegR8),                  // 24
+		bpfAndImm32(bpfRegR0, int32(PolicyUseIngress)), // 25
+		bpfJmpImm(bpfJEQ, bpfRegR0, 0, 1),              // 26
+		bpfMovImm(bpfRegR4, 1),                         // 27
 		// call bpf_sk_redirect_hash — helper #72
-		bpfCallHelper(bpfFuncSKRedirectHash), // 22
+		bpfCallHelper(bpfFuncSKRedirectHash), // 28
 	)
 
 	// --- SK_PASS exit ---
 	insns = append(insns,
-		bpfMovImm(bpfRegR0, skPass), // 23
-		bpfExitInsn(),               // 24
+		bpfMovImm(bpfRegR0, skPass), // 29
+		bpfExitInsn(),               // 30
 	)
 
 	return insns
