@@ -697,8 +697,8 @@ fn do_handshake(
         let (rx_seq, rx_secrets) = secrets.rx;
 
         // Server: TX = server secret, RX = client secret
-        let tx_secret = capture.server_secret.lock().unwrap().clone();
-        let rx_secret = capture.client_secret.lock().unwrap().clone();
+        let tx_secret = capture.server_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let rx_secret = capture.client_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         Ok((
             tls_version,
@@ -837,8 +837,8 @@ fn do_handshake(
         let (rx_seq, rx_secrets) = secrets.rx;
 
         // Client: TX = client secret, RX = server secret
-        let tx_secret = capture.client_secret.lock().unwrap().clone();
-        let rx_secret = capture.server_secret.lock().unwrap().clone();
+        let tx_secret = capture.client_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let rx_secret = capture.server_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         Ok((
             tls_version,
@@ -881,8 +881,13 @@ pub extern "C" fn xray_tls_config_set_server_name(
     name_ptr: *const u8,
     name_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+    let name = if name_ptr.is_null() || name_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(name_ptr, name_len) }
+    };
     cfg.server_name = String::from_utf8(name.to_vec()).ok();
 }
 
@@ -894,8 +899,12 @@ pub extern "C" fn xray_tls_config_add_cert_pem(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
+    if cfg.is_null() { return -1; }
     let result = std::panic::catch_unwind(|| {
         let cfg = unsafe { &mut *cfg };
+        if cert_ptr.is_null() || cert_len == 0 || key_ptr.is_null() || key_len == 0 {
+            return -1;
+        }
         let cert_pem = unsafe { std::slice::from_raw_parts(cert_ptr, cert_len) };
         let key_pem = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
 
@@ -925,8 +934,12 @@ pub extern "C" fn xray_tls_config_add_root_ca_pem(
     ca_ptr: *const u8,
     ca_len: usize,
 ) -> i32 {
+    if cfg.is_null() { return -1; }
     let result = std::panic::catch_unwind(|| {
         let cfg = unsafe { &mut *cfg };
+        if ca_ptr.is_null() || ca_len == 0 {
+            return -1;
+        }
         let ca_pem = unsafe { std::slice::from_raw_parts(ca_ptr, ca_len) };
 
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &*ca_pem)
@@ -945,6 +958,7 @@ pub extern "C" fn xray_tls_config_add_root_ca_pem(
 
 #[no_mangle]
 pub extern "C" fn xray_tls_config_use_system_roots(cfg: *mut TlsConfig) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
     cfg.use_system_roots = true;
 }
@@ -955,8 +969,13 @@ pub extern "C" fn xray_tls_config_set_alpn(
     protos_ptr: *const u8,
     protos_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let data = unsafe { std::slice::from_raw_parts(protos_ptr, protos_len) };
+    let data = if protos_ptr.is_null() || protos_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(protos_ptr, protos_len) }
+    };
 
     // Parse length-prefixed TLS wire format
     cfg.alpn_protocols.clear();
@@ -964,6 +983,9 @@ pub extern "C" fn xray_tls_config_set_alpn(
     while pos < data.len() {
         let len = data[pos] as usize;
         pos += 1;
+        if len == 0 {
+            continue;
+        }
         if pos + len > data.len() {
             break;
         }
@@ -974,6 +996,7 @@ pub extern "C" fn xray_tls_config_set_alpn(
 
 #[no_mangle]
 pub extern "C" fn xray_tls_config_set_versions(cfg: *mut TlsConfig, min: u16, max: u16) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
     cfg.min_version = Some(min);
     cfg.max_version = Some(max);
@@ -981,6 +1004,7 @@ pub extern "C" fn xray_tls_config_set_versions(cfg: *mut TlsConfig, min: u16, ma
 
 #[no_mangle]
 pub extern "C" fn xray_tls_config_set_insecure_skip_verify(cfg: *mut TlsConfig, skip: bool) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
     cfg.insecure_skip_verify = skip;
 }
@@ -991,7 +1015,9 @@ pub extern "C" fn xray_tls_config_pin_cert_sha256(
     hash_ptr: *const u8,
     hash_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
+    if hash_ptr.is_null() || hash_len == 0 { return; }
     let hash = unsafe { std::slice::from_raw_parts(hash_ptr, hash_len) };
     cfg.pinned_cert_sha256.push(hash.to_vec());
 }
@@ -1002,7 +1028,9 @@ pub extern "C" fn xray_tls_config_add_verify_name(
     name_ptr: *const u8,
     name_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
+    if name_ptr.is_null() || name_len == 0 { return; }
     let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
     if let Ok(s) = String::from_utf8(name.to_vec()) {
         cfg.verify_names.push(s);
@@ -1015,8 +1043,13 @@ pub extern "C" fn xray_tls_config_set_key_log_path(
     path_ptr: *const u8,
     path_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let path = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+    let path = if path_ptr.is_null() || path_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(path_ptr, path_len) }
+    };
     cfg.key_log_path = String::from_utf8(path.to_vec()).ok();
 }
 
@@ -1038,6 +1071,13 @@ pub extern "C" fn xray_tls_handshake(
     _is_client: bool,
     out: *mut XrayTlsResult,
 ) -> i32 {
+    if out.is_null() { return -1; }
+    if cfg.is_null() {
+        let out = unsafe { &mut *out };
+        *out = XrayTlsResult::new();
+        out.set_error(-1, "null config pointer");
+        return -1;
+    }
     let result = std::panic::catch_unwind(|| {
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();

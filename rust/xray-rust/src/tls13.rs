@@ -131,7 +131,7 @@ fn hkdf_expand_label(
     label: &str,
     context: &[u8],
     length: usize,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Tls13Error> {
     // Build HkdfLabel: length(2) + label(variable) + context(variable)
     let tls_label = format!("tls13 {}", label);
     let label_bytes = tls_label.as_bytes();
@@ -146,18 +146,22 @@ fn hkdf_expand_label(
     let mut out = vec![0u8; length];
     match alg {
         HashAlg::Sha256 => {
-            let hkdf = Hkdf::<Sha256>::from_prk(secret).unwrap();
-            hkdf.expand(&hkdf_label, &mut out).unwrap();
+            let hkdf = Hkdf::<Sha256>::from_prk(secret)
+                .map_err(|e| Tls13Error::Crypto(format!("hkdf from_prk: {}", e)))?;
+            hkdf.expand(&hkdf_label, &mut out)
+                .map_err(|e| Tls13Error::Crypto(format!("hkdf expand: {}", e)))?;
         }
         HashAlg::Sha384 => {
-            let hkdf = Hkdf::<Sha384>::from_prk(secret).unwrap();
-            hkdf.expand(&hkdf_label, &mut out).unwrap();
+            let hkdf = Hkdf::<Sha384>::from_prk(secret)
+                .map_err(|e| Tls13Error::Crypto(format!("hkdf from_prk: {}", e)))?;
+            hkdf.expand(&hkdf_label, &mut out)
+                .map_err(|e| Tls13Error::Crypto(format!("hkdf expand: {}", e)))?;
         }
     }
-    out
+    Ok(out)
 }
 
-fn derive_secret(alg: HashAlg, secret: &[u8], label: &str, transcript_hash: &[u8]) -> Vec<u8> {
+fn derive_secret(alg: HashAlg, secret: &[u8], label: &str, transcript_hash: &[u8]) -> Result<Vec<u8>, Tls13Error> {
     hkdf_expand_label(alg, secret, label, transcript_hash, alg.output_len())
 }
 
@@ -538,19 +542,21 @@ fn extract_certificates(cert_msg: &[u8]) -> Vec<Vec<u8>> {
     certs
 }
 
-fn compute_finished_verify_data(alg: HashAlg, base_key: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
-    let finished_key = hkdf_expand_label(alg, base_key, "finished", &[], alg.output_len());
+fn compute_finished_verify_data(alg: HashAlg, base_key: &[u8], transcript_hash: &[u8]) -> Result<Vec<u8>, Tls13Error> {
+    let finished_key = hkdf_expand_label(alg, base_key, "finished", &[], alg.output_len())?;
 
     match alg {
         HashAlg::Sha256 => {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&finished_key).unwrap();
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&finished_key)
+                .map_err(|e| Tls13Error::Crypto(format!("hmac new: {}", e)))?;
             mac.update(transcript_hash);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
         HashAlg::Sha384 => {
-            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(&finished_key).unwrap();
+            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(&finished_key)
+                .map_err(|e| Tls13Error::Crypto(format!("hmac new: {}", e)))?;
             mac.update(transcript_hash);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
     }
 }
@@ -606,7 +612,7 @@ pub fn complete_tls13_handshake(
 
     // derive "derived" secret for handshake
     let empty_hash = hash_bytes(alg, &[]);
-    let derived_early = derive_secret(alg, &early_secret, "derived", &empty_hash);
+    let derived_early = derive_secret(alg, &early_secret, "derived", &empty_hash)?;
 
     // handshake_secret = HKDF-Extract(salt=derived_early, IKM=shared_secret)
     let handshake_secret = hkdf_extract(alg, &derived_early, shared_secret.as_bytes());
@@ -620,19 +626,19 @@ pub fn complete_tls13_handshake(
         &handshake_secret,
         "s hs traffic",
         &transcript_hash_ch_sh,
-    );
+    )?;
     let client_hs_secret = derive_secret(
         alg,
         &handshake_secret,
         "c hs traffic",
         &transcript_hash_ch_sh,
-    );
+    )?;
 
     // Derive handshake traffic keys
-    let s_hs_key = hkdf_expand_label(alg, &server_hs_secret, "key", &[], key_length(cipher_suite));
-    let s_hs_iv = hkdf_expand_label(alg, &server_hs_secret, "iv", &[], 12);
-    let c_hs_key = hkdf_expand_label(alg, &client_hs_secret, "key", &[], key_length(cipher_suite));
-    let c_hs_iv = hkdf_expand_label(alg, &client_hs_secret, "iv", &[], 12);
+    let s_hs_key = hkdf_expand_label(alg, &server_hs_secret, "key", &[], key_length(cipher_suite))?;
+    let s_hs_iv = hkdf_expand_label(alg, &server_hs_secret, "iv", &[], 12)?;
+    let c_hs_key = hkdf_expand_label(alg, &client_hs_secret, "key", &[], key_length(cipher_suite))?;
+    let c_hs_iv = hkdf_expand_label(alg, &client_hs_secret, "iv", &[], 12)?;
 
     // Step 5-6: Read encrypted handshake messages
     // Server sends: EncryptedExtensions, Certificate, CertificateVerify, Finished
@@ -704,7 +710,7 @@ pub fn complete_tls13_handshake(
                         alg,
                         &server_hs_secret,
                         &transcript_before_finished,
-                    );
+                    )?;
 
                     // Finished message body is after header (4 bytes)
                     if msg_data.len() < 4 + expected.len() {
@@ -743,7 +749,7 @@ pub fn complete_tls13_handshake(
     // Step 7-8: Send client Finished
     let transcript_hash_for_client_fin = hash_bytes(alg, &transcript);
     let client_verify_data =
-        compute_finished_verify_data(alg, &client_hs_secret, &transcript_hash_for_client_fin);
+        compute_finished_verify_data(alg, &client_hs_secret, &transcript_hash_for_client_fin)?;
 
     // Build Finished message: type(0x14) + length(3) + verify_data
     let mut finished_msg = Vec::with_capacity(4 + client_verify_data.len());
@@ -778,14 +784,14 @@ pub fn complete_tls13_handshake(
     transcript.extend_from_slice(&finished_msg);
 
     // Step 9: Derive application traffic secrets
-    let derived_hs = derive_secret(alg, &handshake_secret, "derived", &empty_hash);
+    let derived_hs = derive_secret(alg, &handshake_secret, "derived", &empty_hash)?;
     let master_secret = hkdf_extract(alg, &derived_hs, &zeros);
 
     let full_transcript_hash = hash_bytes(alg, &transcript);
     let client_app_secret =
-        derive_secret(alg, &master_secret, "c ap traffic", &full_transcript_hash);
+        derive_secret(alg, &master_secret, "c ap traffic", &full_transcript_hash)?;
     let server_app_secret =
-        derive_secret(alg, &master_secret, "s ap traffic", &full_transcript_hash);
+        derive_secret(alg, &master_secret, "s ap traffic", &full_transcript_hash)?;
 
     // Drop the dup'd stream (closes dup'd fd)
     drop(stream);
@@ -857,21 +863,24 @@ pub(crate) struct Tls13StateFFI {
 /// handshake engine. Called internally from the REALITY client path.
 /// Returns (ktls_tx, ktls_rx).
 pub(crate) fn install_ktls_from_tls13_state(fd: i32, state: &Tls13State) -> (bool, bool) {
-    let cs = state.cipher_suite;
-    let alg = HashAlg::from_cipher_suite(cs);
+    let inner = || -> Result<(bool, bool), Tls13Error> {
+        let cs = state.cipher_suite;
+        let alg = HashAlg::from_cipher_suite(cs);
 
-    let tx_key = hkdf_expand_label(alg, &state.client_app_secret, "key", &[], key_length(cs));
-    let tx_iv = hkdf_expand_label(alg, &state.client_app_secret, "iv", &[], 12);
-    let rx_key = hkdf_expand_label(alg, &state.server_app_secret, "key", &[], key_length(cs));
-    let rx_iv = hkdf_expand_label(alg, &state.server_app_secret, "iv", &[], 12);
+        let tx_key = hkdf_expand_label(alg, &state.client_app_secret, "key", &[], key_length(cs))?;
+        let tx_iv = hkdf_expand_label(alg, &state.client_app_secret, "iv", &[], 12)?;
+        let rx_key = hkdf_expand_label(alg, &state.server_app_secret, "key", &[], key_length(cs))?;
+        let rx_iv = hkdf_expand_label(alg, &state.server_app_secret, "iv", &[], 12)?;
 
-    if crate::tls::setup_ulp_pub(fd).is_err() {
-        return (false, false);
-    }
+        if crate::tls::setup_ulp_pub(fd).is_err() {
+            return Ok((false, false));
+        }
 
-    let tx_ok = install_ktls_raw(fd, 1, cs, &tx_key, &tx_iv, 0).is_ok();
-    let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, 0).is_ok();
-    (tx_ok, rx_ok)
+        let tx_ok = install_ktls_raw(fd, 1, cs, &tx_key, &tx_iv, 0).is_ok();
+        let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, 0).is_ok();
+        Ok((tx_ok, rx_ok))
+    };
+    inner().unwrap_or((false, false))
 }
 
 #[no_mangle]
@@ -882,9 +891,21 @@ pub extern "C" fn xray_tls13_handshake(
     ecdh_privkey_ptr: *const u8,
     out: *mut XrayTls13Result,
 ) -> i32 {
+    if out.is_null() { return -1; }
+    if client_hello_ptr.is_null() || ecdh_privkey_ptr.is_null() {
+        let out = unsafe { &mut *out };
+        *out = XrayTls13Result::new();
+        out.set_error(-1, "null input pointer");
+        return -1;
+    }
     let result = std::panic::catch_unwind(|| {
         let out = unsafe { &mut *out };
         *out = XrayTls13Result::new();
+
+        if client_hello_len > 16388 {
+            out.set_error(-1, "client_hello_len exceeds TLS record limit");
+            return -1;
+        }
 
         let ch = unsafe { std::slice::from_raw_parts(client_hello_ptr, client_hello_len) };
         let pk = unsafe { std::slice::from_raw_parts(ecdh_privkey_ptr, 32) };
@@ -951,40 +972,43 @@ pub extern "C" fn xray_tls13_install_ktls(
     out_ktls_tx: *mut bool,
     out_ktls_rx: *mut bool,
 ) -> i32 {
+    if state.is_null() || out_ktls_tx.is_null() || out_ktls_rx.is_null() {
+        return -1;
+    }
     let result = std::panic::catch_unwind(|| {
         let ffi = unsafe { &*(state as *const Tls13StateFFI) };
         let cs = ffi.state.cipher_suite;
         let alg = HashAlg::from_cipher_suite(cs);
 
-        let tx_key = hkdf_expand_label(
-            alg,
-            &ffi.state.client_app_secret,
-            "key",
-            &[],
-            key_length(cs),
-        );
-        let tx_iv = hkdf_expand_label(alg, &ffi.state.client_app_secret, "iv", &[], 12);
-        let rx_key = hkdf_expand_label(
-            alg,
-            &ffi.state.server_app_secret,
-            "key",
-            &[],
-            key_length(cs),
-        );
-        let rx_iv = hkdf_expand_label(alg, &ffi.state.server_app_secret, "iv", &[], 12);
+        let inner = || -> Result<(bool, bool), Tls13Error> {
+            let tx_key = hkdf_expand_label(
+                alg,
+                &ffi.state.client_app_secret,
+                "key",
+                &[],
+                key_length(cs),
+            )?;
+            let tx_iv = hkdf_expand_label(alg, &ffi.state.client_app_secret, "iv", &[], 12)?;
+            let rx_key = hkdf_expand_label(
+                alg,
+                &ffi.state.server_app_secret,
+                "key",
+                &[],
+                key_length(cs),
+            )?;
+            let rx_iv = hkdf_expand_label(alg, &ffi.state.server_app_secret, "iv", &[], 12)?;
 
-        // ULP setup
-        if let Err(_) = crate::tls::setup_ulp_pub(fd) {
-            unsafe {
-                *out_ktls_tx = false;
-                *out_ktls_rx = false;
+            // ULP setup
+            if crate::tls::setup_ulp_pub(fd).is_err() {
+                return Ok((false, false));
             }
-            return 0;
-        }
 
-        let tx_ok = install_ktls_raw(fd, 1, cs, &tx_key, &tx_iv, 0).is_ok();
-        let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, 0).is_ok();
+            let tx_ok = install_ktls_raw(fd, 1, cs, &tx_key, &tx_iv, 0).is_ok();
+            let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, 0).is_ok();
+            Ok((tx_ok, rx_ok))
+        };
 
+        let (tx_ok, rx_ok) = inner().unwrap_or((false, false));
         unsafe {
             *out_ktls_tx = tx_ok;
             *out_ktls_rx = rx_ok;

@@ -74,12 +74,13 @@ impl std::fmt::Display for RealityError {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn reality_auth_key(shared_secret: &[u8], random_prefix: &[u8]) -> Vec<u8> {
+fn reality_auth_key(shared_secret: &[u8], random_prefix: &[u8]) -> Result<Vec<u8>, RealityError> {
     // AuthKey = HKDF-SHA256(shared_secret, random[:20], info="REALITY")
     let hkdf = Hkdf::<Sha256>::new(Some(random_prefix), shared_secret);
     let mut key = vec![0u8; 32];
-    hkdf.expand(b"REALITY", &mut key).unwrap();
-    key
+    hkdf.expand(b"REALITY", &mut key)
+        .map_err(|e| RealityError::Protocol(format!("hkdf expand: {}", e)))?;
+    Ok(key)
 }
 
 fn aes_gcm_seal(key: &[u8], nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
@@ -133,10 +134,8 @@ fn verify_reality_cert_hmac(cert_der: &[u8], auth_key: &[u8]) -> bool {
         Err(_) => return false,
     };
     mac.update(&pubkey);
-    let expected = mac.finalize().into_bytes();
-
-    // Constant-time comparison
-    expected.as_slice() == signature
+    // Constant-time comparison via hmac crate's verify_slice
+    mac.verify_slice(&signature).is_ok()
 }
 
 /// Minimal DER parsing to extract the Ed25519 public key and the signature
@@ -287,7 +286,7 @@ pub fn reality_client_connect(
     let shared_secret = privkey.diffie_hellman(&pubkey);
 
     // Derive auth key
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20]);
+    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])?;
 
     // Build session_id plaintext: version(3) + reserved(1) + timestamp(4) + short_id(8)
     let mut session_id_plain = [0u8; 16];
@@ -452,7 +451,7 @@ pub fn reality_server_accept(
     let shared_secret = privkey.diffie_hellman(&client_pubkey);
 
     // Derive auth key
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20]);
+    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])?;
 
     // Decrypt session_id: nonce=random[20:32], ciphertext=encrypted_session_id,
     // aad=ClientHello raw with session_id zeroed (matches Go's REALITY server).
@@ -779,7 +778,8 @@ fn reality_server_handshake_full(
     let client_pubkey = PublicKey::from(client_x25519);
     let shared_secret = privkey.diffie_hellman(&client_pubkey);
 
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20]);
+    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])
+        .map_err(|e| (2, format!("auth key: {}", e)))?;
 
     // Decrypt session_id with AAD = ClientHello raw with session_id zeroed
     // (matches Go's github.com/xtls/reality server behavior).
@@ -920,8 +920,8 @@ fn reality_server_handshake_full(
     let state_handle = Box::into_raw(state) as *mut c_void;
 
     // Server: TX = server secret, RX = client secret
-    let tx_secret = capture.server_secret.lock().unwrap().clone();
-    let rx_secret = capture.client_secret.lock().unwrap().clone();
+    let tx_secret = capture.server_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let rx_secret = capture.client_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     Ok((
         cipher_suite,
@@ -1110,7 +1110,9 @@ pub extern "C" fn xray_reality_config_set_server_pubkey(
     key_ptr: *const u8,
     _len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
+    if key_ptr.is_null() { return; }
     let key = unsafe { std::slice::from_raw_parts(key_ptr, 32) };
     let mut k = [0u8; 32];
     k.copy_from_slice(key);
@@ -1123,7 +1125,9 @@ pub extern "C" fn xray_reality_config_set_private_key(
     key_ptr: *const u8,
     _len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
+    if key_ptr.is_null() { return; }
     let key = unsafe { std::slice::from_raw_parts(key_ptr, 32) };
     let mut k = [0u8; 32];
     k.copy_from_slice(key);
@@ -1136,8 +1140,13 @@ pub extern "C" fn xray_reality_config_set_short_id(
     id_ptr: *const u8,
     id_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let id = unsafe { std::slice::from_raw_parts(id_ptr, id_len) };
+    let id = if id_ptr.is_null() || id_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(id_ptr, id_len) }
+    };
     cfg.short_id = id.to_vec();
 }
 
@@ -1147,8 +1156,13 @@ pub extern "C" fn xray_reality_config_set_mldsa65_verify(
     key_ptr: *const u8,
     key_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+    let key = if key_ptr.is_null() || key_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(key_ptr, key_len) }
+    };
     cfg.mldsa65_verify_key = key.to_vec();
 }
 
@@ -1159,6 +1173,7 @@ pub extern "C" fn xray_reality_config_set_version(
     minor: u8,
     patch: u8,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
     cfg.version = (major, minor, patch);
 }
@@ -1176,8 +1191,13 @@ pub extern "C" fn xray_reality_config_set_server_names(
     data_ptr: *const u8,
     data_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    let data = if data_ptr.is_null() || data_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(data_ptr, data_len) }
+    };
     // Parse as null-separated UTF-8 strings
     cfg.server_names.clear();
     for chunk in data.split(|&b| b == 0) {
@@ -1195,8 +1215,13 @@ pub extern "C" fn xray_reality_config_set_short_ids(
     data_ptr: *const u8,
     data_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    let data = if data_ptr.is_null() || data_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(data_ptr, data_len) }
+    };
     // Parse as null-separated binary short IDs
     cfg.short_ids.clear();
     for chunk in data.split(|&b| b == 0) {
@@ -1212,8 +1237,13 @@ pub extern "C" fn xray_reality_config_set_mldsa65_key(
     key_ptr: *const u8,
     key_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+    let key = if key_ptr.is_null() || key_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(key_ptr, key_len) }
+    };
     cfg.mldsa65_sign_key = key.to_vec();
 }
 
@@ -1223,8 +1253,13 @@ pub extern "C" fn xray_reality_config_set_dest(
     addr_ptr: *const u8,
     addr_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let addr = unsafe { std::slice::from_raw_parts(addr_ptr, addr_len) };
+    let addr = if addr_ptr.is_null() || addr_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(addr_ptr, addr_len) }
+    };
     if let Ok(s) = std::str::from_utf8(addr) {
         cfg.dest = s.to_string();
     }
@@ -1232,6 +1267,7 @@ pub extern "C" fn xray_reality_config_set_dest(
 
 #[no_mangle]
 pub extern "C" fn xray_reality_config_set_max_time_diff(cfg: *mut RealityConfig, ms: u64) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
     cfg.max_time_diff = ms;
 }
@@ -1246,6 +1282,7 @@ pub extern "C" fn xray_reality_config_set_version_range(
     max_minor: u8,
     max_patch: u8,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
     cfg.version_range = Some((
         (min_major, min_minor, min_patch),
@@ -1261,9 +1298,18 @@ pub extern "C" fn xray_reality_config_set_tls_cert(
     key_ptr: *const u8,
     key_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
-    let cert = unsafe { std::slice::from_raw_parts(cert_ptr, cert_len) };
-    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+    let cert = if cert_ptr.is_null() || cert_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(cert_ptr, cert_len) }
+    };
+    let key = if key_ptr.is_null() || key_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(key_ptr, key_len) }
+    };
     cfg.tls_cert_pem = cert.to_vec();
     cfg.tls_key_pem = key.to_vec();
 }
@@ -1275,7 +1321,9 @@ pub extern "C" fn xray_reality_config_add_short_id(
     id_ptr: *const u8,
     id_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
+    if id_ptr.is_null() || id_len == 0 { return; }
     let id = unsafe { std::slice::from_raw_parts(id_ptr, id_len) };
     cfg.short_ids.push(id.to_vec());
 }
@@ -1286,7 +1334,9 @@ pub extern "C" fn xray_reality_config_add_server_name(
     name_ptr: *const u8,
     name_len: usize,
 ) {
+    if cfg.is_null() { return; }
     let cfg = unsafe { &mut *cfg };
+    if name_ptr.is_null() || name_len == 0 { return; }
     let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
     if let Ok(s) = String::from_utf8(name.to_vec()) {
         cfg.server_names.push(s);
@@ -1308,11 +1358,24 @@ pub extern "C" fn xray_reality_client_connect(
     cfg: *const RealityConfig,
     out: *mut XrayTlsResult,
 ) -> i32 {
+    if out.is_null() { return -1; }
+    if cfg.is_null() || client_hello_ptr.is_null() || ecdh_privkey_ptr.is_null() {
+        let out = unsafe { &mut *out };
+        *out = XrayTlsResult::new();
+        out.set_error(-1, "null input pointer");
+        return -1;
+    }
     let result = std::panic::catch_unwind(|| {
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
 
         let cfg = unsafe { &*cfg };
+
+        if client_hello_len > 16388 {
+            out.set_error(-1, "client_hello_len exceeds TLS record limit");
+            return -1;
+        }
+
         let ch = unsafe { std::slice::from_raw_parts_mut(client_hello_ptr, client_hello_len) };
         let pk = unsafe { std::slice::from_raw_parts(ecdh_privkey_ptr, 32) };
         let mut privkey = [0u8; 32];
@@ -1392,6 +1455,13 @@ pub extern "C" fn xray_reality_server_accept(
     cfg: *const RealityConfig,
     out: *mut XrayTlsResult,
 ) -> i32 {
+    if out.is_null() { return -1; }
+    if cfg.is_null() {
+        let out = unsafe { &mut *out };
+        *out = XrayTlsResult::new();
+        out.set_error(-1, "null config pointer");
+        return -1;
+    }
     let result = std::panic::catch_unwind(|| {
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
@@ -1449,6 +1519,13 @@ pub extern "C" fn xray_reality_server_handshake(
     cfg: *const RealityConfig,
     out: *mut XrayTlsResult,
 ) -> i32 {
+    if out.is_null() { return -1; }
+    if cfg.is_null() {
+        let out = unsafe { &mut *out };
+        *out = XrayTlsResult::new();
+        out.set_error(-1, "null config pointer");
+        return -1;
+    }
     let result = std::panic::catch_unwind(|| {
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
