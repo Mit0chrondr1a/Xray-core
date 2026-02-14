@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -91,7 +92,6 @@ func executeRun(cmd *base.Command, args []string) {
 		fmt.Println("Failed to start:", err)
 		os.Exit(-1)
 	}
-	defer server.Close()
 
 	/*
 		conf.FileCache = nil
@@ -103,10 +103,26 @@ func executeRun(cmd *base.Command, args []string) {
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	{
-		osSignals := make(chan os.Signal, 1)
-		signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
-		<-osSignals
+	osSignals := make(chan os.Signal, 1)
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
+	sig := <-osSignals
+	errors.LogInfo(context.Background(), "received signal ", sig, ", shutting down...")
+
+	// Grace period: allow in-flight connections to finish
+	done := make(chan struct{})
+	go func() {
+		server.Close()
+		close(done)
+	}()
+
+	// Wait for clean shutdown or second signal/timeout
+	select {
+	case <-done:
+		errors.LogInfo(context.Background(), "shutdown complete")
+	case <-time.After(15 * time.Second):
+		errors.LogWarning(context.Background(), "shutdown timed out after 15s, forcing exit")
+	case sig = <-osSignals:
+		errors.LogWarning(context.Background(), "received second signal ", sig, ", forcing exit")
 	}
 }
 
