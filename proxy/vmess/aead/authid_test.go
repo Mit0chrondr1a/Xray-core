@@ -11,7 +11,8 @@ import (
 
 func TestCreateAuthID(t *testing.T) {
 	key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
-	authid := CreateAuthID(key, time.Now().Unix())
+	authid, err := CreateAuthID(key, time.Now().Unix())
+	assert.NoError(t, err)
 
 	fmt.Println(key)
 	fmt.Println(authid)
@@ -19,7 +20,8 @@ func TestCreateAuthID(t *testing.T) {
 
 func TestCreateAuthIDAndDecode(t *testing.T) {
 	key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
-	authid := CreateAuthID(key, time.Now().Unix())
+	authid, err := CreateAuthID(key, time.Now().Unix())
+	assert.NoError(t, err)
 
 	fmt.Println(key)
 	fmt.Println(authid)
@@ -27,7 +29,7 @@ func TestCreateAuthIDAndDecode(t *testing.T) {
 	AuthDecoder := NewAuthIDDecoderHolder()
 	var keyw [16]byte
 	copy(keyw[:], key)
-	AuthDecoder.AddUser(keyw, "Demo User")
+	assert.NoError(t, AuthDecoder.AddUser(keyw, "Demo User"))
 	res, err := AuthDecoder.Match(authid)
 	fmt.Println(res)
 	fmt.Println(err)
@@ -37,7 +39,8 @@ func TestCreateAuthIDAndDecode(t *testing.T) {
 
 func TestCreateAuthIDAndDecode2(t *testing.T) {
 	key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
-	authid := CreateAuthID(key, time.Now().Unix())
+	authid, err := CreateAuthID(key, time.Now().Unix())
+	assert.NoError(t, err)
 
 	fmt.Println(key)
 	fmt.Println(authid)
@@ -45,7 +48,7 @@ func TestCreateAuthIDAndDecode2(t *testing.T) {
 	AuthDecoder := NewAuthIDDecoderHolder()
 	var keyw [16]byte
 	copy(keyw[:], key)
-	AuthDecoder.AddUser(keyw, "Demo User")
+	assert.NoError(t, AuthDecoder.AddUser(keyw, "Demo User"))
 	res, err := AuthDecoder.Match(authid)
 	fmt.Println(res)
 	fmt.Println(err)
@@ -53,7 +56,8 @@ func TestCreateAuthIDAndDecode2(t *testing.T) {
 	assert.Nil(t, err)
 
 	key2 := KDF16([]byte("Demo Key for Auth ID Test2"), "Demo Path for Auth ID Test")
-	authid2 := CreateAuthID(key2, time.Now().Unix())
+	authid2, err := CreateAuthID(key2, time.Now().Unix())
+	assert.NoError(t, err)
 
 	res2, err2 := AuthDecoder.Match(authid2)
 	assert.EqualError(t, err2, "user do not exist")
@@ -62,7 +66,8 @@ func TestCreateAuthIDAndDecode2(t *testing.T) {
 
 func TestCreateAuthIDAndDecodeMassive(t *testing.T) {
 	key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
-	authid := CreateAuthID(key, time.Now().Unix())
+	authid, err := CreateAuthID(key, time.Now().Unix())
+	assert.NoError(t, err)
 
 	fmt.Println(key)
 	fmt.Println(authid)
@@ -70,7 +75,7 @@ func TestCreateAuthIDAndDecodeMassive(t *testing.T) {
 	AuthDecoder := NewAuthIDDecoderHolder()
 	var keyw [16]byte
 	copy(keyw[:], key)
-	AuthDecoder.AddUser(keyw, "Demo User")
+	assert.NoError(t, AuthDecoder.AddUser(keyw, "Demo User"))
 	res, err := AuthDecoder.Match(authid)
 	fmt.Println(res)
 	fmt.Println(err)
@@ -81,10 +86,11 @@ func TestCreateAuthIDAndDecodeMassive(t *testing.T) {
 		key2 := KDF16([]byte("Demo Key for Auth ID Test2"), "Demo Path for Auth ID Test", strconv.Itoa(i))
 		var keyw2 [16]byte
 		copy(keyw2[:], key2)
-		AuthDecoder.AddUser(keyw2, "Demo User"+strconv.Itoa(i))
+		assert.NoError(t, AuthDecoder.AddUser(keyw2, "Demo User"+strconv.Itoa(i)))
 	}
 
-	authid3 := CreateAuthID(key, time.Now().Unix())
+	authid3, err := CreateAuthID(key, time.Now().Unix())
+	assert.NoError(t, err)
 
 	res2, err2 := AuthDecoder.Match(authid3)
 	assert.Equal(t, "Demo User", res2)
@@ -93,7 +99,8 @@ func TestCreateAuthIDAndDecodeMassive(t *testing.T) {
 
 func TestCreateAuthIDAndDecodeSuperMassive(t *testing.T) {
 	key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
-	authid := CreateAuthID(key, time.Now().Unix())
+	authid, err := CreateAuthID(key, time.Now().Unix())
+	assert.NoError(t, err)
 
 	fmt.Println(key)
 	fmt.Println(authid)
@@ -101,7 +108,7 @@ func TestCreateAuthIDAndDecodeSuperMassive(t *testing.T) {
 	AuthDecoder := NewAuthIDDecoderHolder()
 	var keyw [16]byte
 	copy(keyw[:], key)
-	AuthDecoder.AddUser(keyw, "Demo User")
+	assert.NoError(t, AuthDecoder.AddUser(keyw, "Demo User"))
 	res, err := AuthDecoder.Match(authid)
 	fmt.Println(res)
 	fmt.Println(err)
@@ -112,10 +119,11 @@ func TestCreateAuthIDAndDecodeSuperMassive(t *testing.T) {
 		key2 := KDF16([]byte("Demo Key for Auth ID Test2"), "Demo Path for Auth ID Test", strconv.Itoa(i))
 		var keyw2 [16]byte
 		copy(keyw2[:], key2)
-		AuthDecoder.AddUser(keyw2, "Demo User"+strconv.Itoa(i))
+		assert.NoError(t, AuthDecoder.AddUser(keyw2, "Demo User"+strconv.Itoa(i)))
 	}
 
-	authid3 := CreateAuthID(key, time.Now().Unix())
+	authid3, err := CreateAuthID(key, time.Now().Unix())
+	assert.NoError(t, err)
 
 	before := time.Now()
 	res2, err2 := AuthDecoder.Match(authid3)

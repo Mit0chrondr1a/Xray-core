@@ -23,36 +23,48 @@ var (
 	ErrReplay       = errors.New("replayed request")
 )
 
-func CreateAuthID(cmdKey []byte, time int64) [16]byte {
+func CreateAuthID(cmdKey []byte, time int64) ([16]byte, error) {
 	buf := bytes.NewBuffer(nil)
-	common.Must(binary.Write(buf, binary.BigEndian, time))
-	var zero uint32
-	common.Must2(io.CopyN(buf, rand3.Reader, 4))
-	zero = crc32.ChecksumIEEE(buf.Bytes())
-	common.Must(binary.Write(buf, binary.BigEndian, zero))
-	aesBlock := NewCipherFromKey(cmdKey)
+	if err := binary.Write(buf, binary.BigEndian, time); err != nil {
+		return [16]byte{}, err
+	}
+	if _, err := io.CopyN(buf, rand3.Reader, 4); err != nil {
+		return [16]byte{}, err
+	}
+	zero := crc32.ChecksumIEEE(buf.Bytes())
+	if err := binary.Write(buf, binary.BigEndian, zero); err != nil {
+		return [16]byte{}, err
+	}
+	aesBlock, err := NewCipherFromKey(cmdKey)
+	if err != nil {
+		return [16]byte{}, err
+	}
 	if buf.Len() != 16 {
-		panic("Size unexpected")
+		return [16]byte{}, errors.New("vmess: authid buffer size unexpected")
 	}
 	var result [16]byte
 	aesBlock.Encrypt(result[:], buf.Bytes())
-	return result
+	return result, nil
 }
 
-func NewCipherFromKey(cmdKey []byte) cipher.Block {
+func NewCipherFromKey(cmdKey []byte) (cipher.Block, error) {
 	aesBlock, err := aes.NewCipher(KDF16(cmdKey, KDFSaltConstAuthIDEncryptionKey))
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	return aesBlock
+	return aesBlock, nil
 }
 
 type AuthIDDecoder struct {
 	s cipher.Block
 }
 
-func NewAuthIDDecoder(cmdKey []byte) *AuthIDDecoder {
-	return &AuthIDDecoder{NewCipherFromKey(cmdKey)}
+func NewAuthIDDecoder(cmdKey []byte) (*AuthIDDecoder, error) {
+	block, err := NewCipherFromKey(cmdKey)
+	if err != nil {
+		return nil, err
+	}
+	return &AuthIDDecoder{block}, nil
 }
 
 func (aidd *AuthIDDecoder) Decode(data [16]byte) (int64, uint32, int32, []byte) {
@@ -81,15 +93,24 @@ type AuthIDDecoderItem struct {
 	ticket interface{}
 }
 
-func NewAuthIDDecoderItem(key [16]byte, ticket interface{}) *AuthIDDecoderItem {
-	return &AuthIDDecoderItem{
-		dec:    NewAuthIDDecoder(key[:]),
-		ticket: ticket,
+func NewAuthIDDecoderItem(key [16]byte, ticket interface{}) (*AuthIDDecoderItem, error) {
+	dec, err := NewAuthIDDecoder(key[:])
+	if err != nil {
+		return nil, err
 	}
+	return &AuthIDDecoderItem{
+		dec:    dec,
+		ticket: ticket,
+	}, nil
 }
 
-func (a *AuthIDDecoderHolder) AddUser(key [16]byte, ticket interface{}) {
-	a.decoders[string(key[:])] = NewAuthIDDecoderItem(key, ticket)
+func (a *AuthIDDecoderHolder) AddUser(key [16]byte, ticket interface{}) error {
+	item, err := NewAuthIDDecoderItem(key, ticket)
+	if err != nil {
+		return err
+	}
+	a.decoders[string(key[:])] = item
+	return nil
 }
 
 func (a *AuthIDDecoderHolder) RemoveUser(key [16]byte) {

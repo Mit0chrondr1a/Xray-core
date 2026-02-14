@@ -358,8 +358,8 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 
 	requestDonePost := task.OnSuccess(requestDone, task.Close(link.Writer))
 	if err := task.Run(ctx, requestDonePost, responseDone); err != nil {
-		common.Must(common.Interrupt(link.Reader))
-		common.Must(common.Interrupt(link.Writer))
+		_ = common.Interrupt(link.Reader)
+		_ = common.Interrupt(link.Writer)
 		return errors.New("connection ends").Base(err)
 	}
 

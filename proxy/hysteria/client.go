@@ -176,12 +176,15 @@ type UDPWriter struct {
 }
 
 func (w *UDPWriter) sendMsg(msg *UDPMessage) error {
-	msgN := msg.Serialize(w.buf)
+	msgN, err := msg.Serialize(w.buf)
+	if err != nil {
+		return err
+	}
 	if msgN < 0 {
 		// Message larger than buffer, silent drop
 		return nil
 	}
-	_, err := w.Writer.Write(w.buf[:msgN])
+	_, err = w.Writer.Write(w.buf[:msgN])
 	return err
 }
 

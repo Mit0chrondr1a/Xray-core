@@ -14,7 +14,8 @@ func TestOpenVMessAEADHeader(t *testing.T) {
 	key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
 	var keyw [16]byte
 	copy(keyw[:], key)
-	sealed := SealVMessAEADHeader(keyw, TestHeader)
+	sealed, err := SealVMessAEADHeader(keyw, TestHeader)
+	assert.NoError(t, err)
 
 	AEADR := bytes.NewReader(sealed)
 
@@ -33,7 +34,8 @@ func TestOpenVMessAEADHeader2(t *testing.T) {
 	key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
 	var keyw [16]byte
 	copy(keyw[:], key)
-	sealed := SealVMessAEADHeader(keyw, TestHeader)
+	sealed, err := SealVMessAEADHeader(keyw, TestHeader)
+	assert.NoError(t, err)
 
 	AEADR := bytes.NewReader(sealed)
 
@@ -53,7 +55,8 @@ func TestOpenVMessAEADHeader4(t *testing.T) {
 		key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
 		var keyw [16]byte
 		copy(keyw[:], key)
-		sealed := SealVMessAEADHeader(keyw, TestHeader)
+		sealed, err := SealVMessAEADHeader(keyw, TestHeader)
+		assert.NoError(t, err)
 		var sealedm [16]byte
 		copy(sealedm[:], sealed)
 		sealed[i] ^= 0xff
@@ -81,7 +84,8 @@ func TestOpenVMessAEADHeader4Massive(t *testing.T) {
 			key := KDF16([]byte("Demo Key for Auth ID Test"), "Demo Path for Auth ID Test")
 			var keyw [16]byte
 			copy(keyw[:], key)
-			sealed := SealVMessAEADHeader(keyw, TestHeader)
+			sealed, err := SealVMessAEADHeader(keyw, TestHeader)
+			assert.NoError(t, err)
 			var sealedm [16]byte
 			copy(sealedm[:], sealed)
 			sealed[i] ^= 0xff

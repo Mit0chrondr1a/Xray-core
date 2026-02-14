@@ -11,12 +11,15 @@ import (
 	"github.com/xtls/xray-core/common/crypto"
 )
 
-func SealVMessAEADHeader(key [16]byte, data []byte) []byte {
-	generatedAuthID := CreateAuthID(key[:], time.Now().Unix())
+func SealVMessAEADHeader(key [16]byte, data []byte) ([]byte, error) {
+	generatedAuthID, err := CreateAuthID(key[:], time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
 
 	connectionNonce := make([]byte, 8)
 	if _, err := io.ReadFull(rand.Reader, connectionNonce); err != nil {
-		panic(err.Error())
+		return nil, err
 	}
 
 	aeadPayloadLengthSerializeBuffer := bytes.NewBuffer(nil)
@@ -57,7 +60,7 @@ func SealVMessAEADHeader(key [16]byte, data []byte) []byte {
 	common.Must2(outputBuffer.Write(connectionNonce))                  // 8
 	common.Must2(outputBuffer.Write(payloadHeaderAEADEncrypted))
 
-	return outputBuffer.Bytes()
+	return outputBuffer.Bytes(), nil
 }
 
 func OpenVMessAEADHeader(key [16]byte, authid [16]byte, data io.Reader) ([]byte, bool, int, error) {

@@ -51,7 +51,9 @@ func (v *TimedUserValidator) Add(u *protocol.MemoryUser) error {
 
 	var cmdkeyfl [16]byte
 	copy(cmdkeyfl[:], account.ID.CmdKey())
-	v.aeadDecoderHolder.AddUser(cmdkeyfl, u)
+	if err := v.aeadDecoderHolder.AddUser(cmdkeyfl, u); err != nil {
+		return errors.New("failed to add user to AEAD decoder").Base(err)
+	}
 
 	return nil
 }

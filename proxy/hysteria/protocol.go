@@ -42,12 +42,24 @@ func WriteTCPRequest(w io.Writer, addr string) error {
 		int(quicvarint.Len(uint64(addrLen))) + addrLen +
 		int(quicvarint.Len(uint64(paddingLen))) + paddingLen
 	buf := make([]byte, sz)
-	i := varintPut(buf, FrameTypeTCPRequest)
-	i += varintPut(buf[i:], uint64(addrLen))
+	n, err := varintPut(buf, FrameTypeTCPRequest)
+	if err != nil {
+		return err
+	}
+	i := n
+	n, err = varintPut(buf[i:], uint64(addrLen))
+	if err != nil {
+		return err
+	}
+	i += n
 	i += copy(buf[i:], addr)
-	i += varintPut(buf[i:], uint64(paddingLen))
+	n, err = varintPut(buf[i:], uint64(paddingLen))
+	if err != nil {
+		return err
+	}
+	i += n
 	copy(buf[i:], padding)
-	_, err := w.Write(buf)
+	_, err = w.Write(buf)
 	return err
 }
 
@@ -123,19 +135,22 @@ func (m *UDPMessage) Size() int {
 	return m.HeaderSize() + len(m.Data)
 }
 
-func (m *UDPMessage) Serialize(buf []byte) int {
+func (m *UDPMessage) Serialize(buf []byte) (int, error) {
 	// Make sure the buffer is big enough
 	if len(buf) < m.Size() {
-		return -1
+		return -1, nil
 	}
 	// binary.BigEndian.PutUint32(buf, m.SessionID)
 	binary.BigEndian.PutUint16(buf[4:], m.PacketID)
 	buf[6] = m.FragID
 	buf[7] = m.FragCount
-	i := varintPut(buf[8:], uint64(len(m.Addr)))
+	i, err := varintPut(buf[8:], uint64(len(m.Addr)))
+	if err != nil {
+		return 0, err
+	}
 	i += copy(buf[8+i:], m.Addr)
 	i += copy(buf[8+i:], m.Data)
-	return 8 + i
+	return 8 + i, nil
 }
 
 func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
@@ -172,22 +187,22 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 
 // varintPut is like quicvarint.Append, but instead of appending to a slice,
 // it writes to a fixed-size buffer. Returns the number of bytes written.
-func varintPut(b []byte, i uint64) int {
+func varintPut(b []byte, i uint64) (int, error) {
 	if i <= maxVarInt1 {
 		b[0] = uint8(i)
-		return 1
+		return 1, nil
 	}
 	if i <= maxVarInt2 {
 		b[0] = uint8(i>>8) | 0x40
 		b[1] = uint8(i)
-		return 2
+		return 2, nil
 	}
 	if i <= maxVarInt4 {
 		b[0] = uint8(i>>24) | 0x80
 		b[1] = uint8(i >> 16)
 		b[2] = uint8(i >> 8)
 		b[3] = uint8(i)
-		return 4
+		return 4, nil
 	}
 	if i <= maxVarInt8 {
 		b[0] = uint8(i>>56) | 0xc0
@@ -198,7 +213,7 @@ func varintPut(b []byte, i uint64) int {
 		b[5] = uint8(i >> 16)
 		b[6] = uint8(i >> 8)
 		b[7] = uint8(i)
-		return 8
+		return 8, nil
 	}
-	panic(fmt.Sprintf("%#x doesn't fit into 62 bits", i))
+	return 0, fmt.Errorf("varint: %#x doesn't fit into 62 bits", i)
 }

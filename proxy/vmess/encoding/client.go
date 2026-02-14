@@ -95,7 +95,10 @@ func (c *ClientSession) EncodeRequestHeader(header *protocol.RequestHeader, writ
 
 	var fixedLengthCmdKey [16]byte
 	copy(fixedLengthCmdKey[:], account.ID.CmdKey())
-	vmessout := vmessaead.SealVMessAEADHeader(fixedLengthCmdKey, buffer.Bytes())
+	vmessout, err := vmessaead.SealVMessAEADHeader(fixedLengthCmdKey, buffer.Bytes())
+	if err != nil {
+		return errors.New("failed to seal AEAD header").Base(err)
+	}
 	common.Must2(io.Copy(writer, bytes.NewReader(vmessout)))
 
 	return nil
@@ -151,7 +154,9 @@ func (c *ClientSession) EncodeRequestBody(request *protocol.RequestHeader, write
 		return crypto.NewAuthenticationWriter(auth, sizeParser, writer, request.Command.TransferType(), padding), nil
 	case protocol.SecurityType_CHACHA20_POLY1305:
 		aead, err := chacha20poly1305.New(GenerateChacha20Poly1305Key(c.requestBodyKey[:]))
-		common.Must(err)
+		if err != nil {
+			return nil, errors.New("vmess: chacha20poly1305 init failed").Base(err)
+		}
 
 		auth := &crypto.AEADAuthenticator{
 			AEAD:                    aead,
@@ -161,7 +166,9 @@ func (c *ClientSession) EncodeRequestBody(request *protocol.RequestHeader, write
 		if request.Option.Has(protocol.RequestOptionAuthenticatedLength) {
 			AuthenticatedLengthKey := vmessaead.KDF16(c.requestBodyKey[:], "auth_len")
 			AuthenticatedLengthKeyAEAD, err := chacha20poly1305.New(GenerateChacha20Poly1305Key(AuthenticatedLengthKey))
-			common.Must(err)
+			if err != nil {
+				return nil, errors.New("vmess: chacha20poly1305 length auth init failed").Base(err)
+			}
 
 			lengthAuth := &crypto.AEADAuthenticator{
 				AEAD:                    AuthenticatedLengthKeyAEAD,
@@ -304,7 +311,10 @@ func (c *ClientSession) DecodeResponseBody(request *protocol.RequestHeader, read
 		}
 		return crypto.NewAuthenticationReader(auth, sizeParser, reader, request.Command.TransferType(), padding), nil
 	case protocol.SecurityType_CHACHA20_POLY1305:
-		aead, _ := chacha20poly1305.New(GenerateChacha20Poly1305Key(c.responseBodyKey[:]))
+		aead, err := chacha20poly1305.New(GenerateChacha20Poly1305Key(c.responseBodyKey[:]))
+		if err != nil {
+			return nil, errors.New("vmess: chacha20poly1305 init failed").Base(err)
+		}
 
 		auth := &crypto.AEADAuthenticator{
 			AEAD:                    aead,
@@ -314,7 +324,9 @@ func (c *ClientSession) DecodeResponseBody(request *protocol.RequestHeader, read
 		if request.Option.Has(protocol.RequestOptionAuthenticatedLength) {
 			AuthenticatedLengthKey := vmessaead.KDF16(c.requestBodyKey[:], "auth_len")
 			AuthenticatedLengthKeyAEAD, err := chacha20poly1305.New(GenerateChacha20Poly1305Key(AuthenticatedLengthKey))
-			common.Must(err)
+			if err != nil {
+				return nil, errors.New("vmess: chacha20poly1305 length auth init failed").Base(err)
+			}
 
 			lengthAuth := &crypto.AEADAuthenticator{
 				AEAD:                    AuthenticatedLengthKeyAEAD,
