@@ -834,7 +834,8 @@ type REALITYConfig struct {
 	MaxClientVer string          `json:"maxClientVer"`
 	MaxTimeDiff  uint64          `json:"maxTimeDiff"`
 	ShortIds     []string        `json:"shortIds"`
-	Mldsa65Seed  string          `json:"mldsa65Seed"`
+	Mldsa65Seed      string `json:"mldsa65Seed"`
+	KeyRotationHours uint32 `json:"keyRotationHours"`
 
 	LimitFallbackUpload   LimitFallback `json:"limitFallbackUpload"`
 	LimitFallbackDownload LimitFallback `json:"limitFallbackDownload"`
@@ -943,6 +944,7 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
 		config.Xver = c.Xver
 		config.ServerNames = c.ServerNames
 		config.MaxTimeDiff = c.MaxTimeDiff
+		config.KeyRotationHours = c.KeyRotationHours
 
 		if c.Mldsa65Seed != "" {
 			if c.Mldsa65Seed == c.PrivateKey {

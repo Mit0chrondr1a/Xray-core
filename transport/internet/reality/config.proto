@@ -31,6 +31,8 @@ message Config {
   repeated int64 spider_y = 27;
 
   string master_key_log = 31;
+
+  uint32 key_rotation_hours = 32;
 }
 
 message LimitFallback {
