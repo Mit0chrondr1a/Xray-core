@@ -81,6 +81,9 @@ func (c *Conn) Write(b []byte) (int, error) {
 // tls.Conn.Close() would double-encrypt the close_notify alert. Instead
 // we close the raw socket directly.
 func (c *Conn) Close() error {
+	if c.ktls.keyUpdateHandler != nil {
+		c.ktls.keyUpdateHandler.Close()
+	}
 	if c.ktls.TxReady {
 		return c.Conn.NetConn().Close()
 	}
@@ -263,11 +266,22 @@ type RustConn struct {
 	cipher       uint16
 	serverName   string
 	writeRecords uint64
+	drainedData  []byte
+	drainedOff   int
 }
 
 var _ Interface = (*RustConn)(nil)
 
 func (c *RustConn) Read(b []byte) (int, error) {
+	// Serve any drained plaintext from the handshake first
+	if c.drainedOff < len(c.drainedData) {
+		n := copy(b, c.drainedData[c.drainedOff:])
+		c.drainedOff += n
+		if c.drainedOff >= len(c.drainedData) {
+			c.drainedData = nil // release buffer
+		}
+		return n, nil
+	}
 	if c.ktls.RxReady {
 		n, err := c.rawConn.Read(b)
 		if err != nil && isKeyExpired(err) && c.ktls.keyUpdateHandler != nil {
@@ -295,6 +309,9 @@ func (c *RustConn) Write(b []byte) (int, error) {
 }
 
 func (c *RustConn) Close() error {
+	if c.ktls.keyUpdateHandler != nil {
+		c.ktls.keyUpdateHandler.Close()
+	}
 	if c.state != nil {
 		native.TlsStateFree(c.state)
 		c.state = nil
@@ -340,12 +357,13 @@ func (c *RustConn) KTLSKeyUpdateHandler() *KTLSKeyUpdateHandler {
 // Used by the REALITY package to construct a RustConn from Rust handshake output.
 func NewRustConn(rawConn net.Conn, result *native.TlsResult, serverName string) *RustConn {
 	rc := &RustConn{
-		rawConn:    rawConn,
-		state:      result.StateHandle,
-		alpn:       result.ALPN,
-		version:    result.Version,
-		cipher:     result.CipherSuite,
-		serverName: serverName,
+		rawConn:     rawConn,
+		state:       result.StateHandle,
+		alpn:        result.ALPN,
+		version:     result.Version,
+		cipher:      result.CipherSuite,
+		serverName:  serverName,
+		drainedData: result.DrainedData,
 		ktls: KTLSState{
 			Enabled: result.KtlsTx || result.KtlsRx,
 			TxReady: result.KtlsTx,
@@ -360,6 +378,8 @@ func NewRustConn(rawConn net.Conn, result *native.TlsResult, serverName string) 
 			)
 		}
 	}
+	// Zero secrets in the result after they've been copied into the handler.
+	result.ZeroSecrets()
 	return rc
 }
 
@@ -382,9 +402,13 @@ func configToNative(config *Config, dest net.Destination, isServer bool) *native
 	// Certificates
 	for _, entry := range config.Certificate {
 		if entry.Usage == Certificate_ENCIPHERMENT {
-			native.TlsConfigAddCertPEM(h, entry.Certificate, entry.Key)
+			if err := native.TlsConfigAddCertPEM(h, entry.Certificate, entry.Key); err != nil {
+				errors.LogWarning(context.Background(), "native TLS: failed to add cert: ", err)
+			}
 		} else if entry.Usage == Certificate_AUTHORITY_VERIFY {
-			native.TlsConfigAddRootCAPEM(h, entry.Certificate)
+			if err := native.TlsConfigAddRootCAPEM(h, entry.Certificate); err != nil {
+				errors.LogWarning(context.Background(), "native TLS: failed to add root CA: ", err)
+			}
 		}
 	}
 

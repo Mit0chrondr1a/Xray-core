@@ -106,6 +106,14 @@ func (kc *keyCapture) secrets() (clientSecret, serverSecret []byte) {
 	return kc.clientSecret, kc.serverSecret
 }
 
+// clear zeroes captured secrets.
+func (kc *keyCapture) clear() {
+	kc.mu.Lock()
+	defer kc.mu.Unlock()
+	zeroBytes(kc.clientSecret)
+	zeroBytes(kc.serverSecret)
+}
+
 // setupKeyCapture clones the TLS config and installs a KeyLogWriter on the
 // clone to capture traffic secrets for TLS 1.3 kTLS key derivation.
 // Cloning avoids mutating shared listener/client configs across connections.
@@ -318,7 +326,16 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 			)
 		}
 	}); err != nil {
+		keys.zero()
 		return state
+	}
+
+	// Zero key material now that it's been handed to the kernel / KeyUpdate handler.
+	keys.zero()
+
+	// Zero captured secrets if we used the capture path.
+	if conn.capture != nil {
+		conn.capture.clear()
 	}
 
 	return state
@@ -442,6 +459,16 @@ type tlsKeys struct {
 	txKey, txIV, txSeq []byte
 	rxKey, rxIV, rxSeq []byte
 	txSecret, rxSecret []byte // TLS 1.3 traffic secrets for KeyUpdate derivation
+}
+
+// zero overwrites all key material.
+func (k *tlsKeys) zero() {
+	zeroBytes(k.txKey)
+	zeroBytes(k.txIV)
+	zeroBytes(k.rxKey)
+	zeroBytes(k.rxIV)
+	zeroBytes(k.txSecret)
+	zeroBytes(k.rxSecret)
 }
 
 // extractTLSKeys extracts TLS keys from a tls.Conn using reflection.
@@ -770,6 +797,13 @@ func getRecordSeq(fd int, direction int, cipherSuiteID uint16) (uint64, error) {
 	}
 
 	return binary.BigEndian.Uint64(buf[recSeqOffset : recSeqOffset+8]), nil
+}
+
+// zeroBytes overwrites b with zeroes.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 // KTLSSupported checks if kernel TLS is available.

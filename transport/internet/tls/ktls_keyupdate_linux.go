@@ -104,7 +104,9 @@ func (h *KTLSKeyUpdateHandler) Handle() error {
 	if err := setKTLSCryptoInfo(h.fd, TLS_RX, TLS_1_3_VERSION, h.cipherSuiteID, newRxKey, newRxIV, make([]byte, 8)); err != nil {
 		return fmt.Errorf("ktls: setsockopt TLS_RX: %w", err)
 	}
+	old := h.rxSecret
 	h.rxSecret = newRxSecret
+	zeroBytes(old)
 
 	// If the peer requested a key update, respond and rotate TX keys.
 	if updateRequested == 1 {
@@ -120,7 +122,9 @@ func (h *KTLSKeyUpdateHandler) Handle() error {
 		if err := setKTLSCryptoInfo(h.fd, TLS_TX, TLS_1_3_VERSION, h.cipherSuiteID, newTxKey, newTxIV, make([]byte, 8)); err != nil {
 			return fmt.Errorf("ktls: setsockopt TLS_TX: %w", err)
 		}
+		oldTx := h.txSecret
 		h.txSecret = newTxSecret
+		zeroBytes(oldTx)
 	}
 
 	return nil
@@ -150,9 +154,19 @@ func (h *KTLSKeyUpdateHandler) InitiateUpdate() error {
 	if err := setKTLSCryptoInfo(h.fd, TLS_TX, TLS_1_3_VERSION, h.cipherSuiteID, newTxKey, newTxIV, make([]byte, 8)); err != nil {
 		return fmt.Errorf("ktls: setsockopt TLS_TX: %w", err)
 	}
+	oldTxI := h.txSecret
 	h.txSecret = newTxSecret
+	zeroBytes(oldTxI)
 
 	return nil
+}
+
+// Close zeroes all secret material held by this handler.
+func (h *KTLSKeyUpdateHandler) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	zeroBytes(h.rxSecret)
+	zeroBytes(h.txSecret)
 }
 
 // expandLabel implements HKDF-Expand-Label from RFC 8446 Section 7.1.

@@ -14,6 +14,9 @@ func (h *KTLSKeyUpdateHandler) Handle() error { return nil }
 // InitiateUpdate is a no-op on non-Linux platforms.
 func (h *KTLSKeyUpdateHandler) InitiateUpdate() error { return nil }
 
+// Close is a no-op on non-Linux platforms.
+func (h *KTLSKeyUpdateHandler) Close() {}
+
 func newKTLSKeyUpdateHandler(fd int, cipherSuiteID uint16, rxSecret, txSecret []byte) *KTLSKeyUpdateHandler {
 	return nil
 }
