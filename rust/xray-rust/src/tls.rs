@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::io::Read;
 use std::net::TcpStream;
 use std::os::unix::io::FromRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -25,6 +25,9 @@ pub struct XrayTlsResult {
     pub state_handle: *mut c_void,
     pub error_code: i32,
     pub error_msg: [u8; 256],
+    pub tx_secret: [u8; 48],
+    pub rx_secret: [u8; 48],
+    pub secret_len: u8,
 }
 
 impl XrayTlsResult {
@@ -38,6 +41,9 @@ impl XrayTlsResult {
             state_handle: std::ptr::null_mut(),
             error_code: 0,
             error_msg: [0u8; 256],
+            tx_secret: [0u8; 48],
+            rx_secret: [0u8; 48],
+            secret_len: 0,
         }
     }
 
@@ -62,6 +68,17 @@ pub struct TlsState {
     // a placeholder that tracks the connection metadata.
     _tx_secret: Vec<u8>,
     _rx_secret: Vec<u8>,
+}
+
+impl TlsState {
+    pub(crate) fn new(fd: i32, cipher_suite: u16) -> Self {
+        Self {
+            fd,
+            cipher_suite,
+            _tx_secret: Vec::new(),
+            _rx_secret: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +155,7 @@ pub(crate) fn setup_ulp_pub(fd: i32) -> std::io::Result<()> {
     setup_ulp(fd)
 }
 
-fn setup_ulp(fd: i32) -> std::io::Result<()> {
+pub(crate) fn setup_ulp(fd: i32) -> std::io::Result<()> {
     let ulp = b"tls\0";
     let ret = unsafe {
         libc::setsockopt(
@@ -163,7 +180,7 @@ fn seq_to_bytes(seq: u64) -> [u8; 8] {
 /// `iv_bytes` is the full 12-byte IV from rustls. For AES-GCM, the first 4
 /// bytes are the "salt" (implicit nonce) and the remaining 8 are the
 /// explicit IV. For ChaCha20-Poly1305, all 12 bytes are the IV.
-fn install_ktls(
+pub(crate) fn install_ktls(
     fd: i32,
     direction: i32,
     tls_version: u16,
@@ -273,7 +290,7 @@ fn install_ktls(
     Ok(())
 }
 
-fn cipher_suite_to_u16(secrets: &ConnectionTrafficSecrets) -> u16 {
+pub(crate) fn cipher_suite_to_u16(secrets: &ConnectionTrafficSecrets) -> u16 {
     match secrets {
         ConnectionTrafficSecrets::Aes128Gcm { .. } => 0x1301, // TLS_AES_128_GCM_SHA256
         ConnectionTrafficSecrets::Aes256Gcm { .. } => 0x1302, // TLS_AES_256_GCM_SHA384
@@ -519,6 +536,50 @@ impl rustls::KeyLog for FileKeyLog {
 }
 
 // ---------------------------------------------------------------------------
+// SecretCapture — intercepts base traffic secrets via KeyLog
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub(crate) struct SecretCapture {
+    pub(crate) client_secret: Mutex<Vec<u8>>,
+    pub(crate) server_secret: Mutex<Vec<u8>>,
+    file_log: Option<FileKeyLog>,
+}
+
+impl SecretCapture {
+    pub(crate) fn new(key_log_path: Option<&str>) -> Self {
+        Self {
+            client_secret: Mutex::new(Vec::new()),
+            server_secret: Mutex::new(Vec::new()),
+            file_log: key_log_path.map(|p| FileKeyLog {
+                path: p.to_string(),
+            }),
+        }
+    }
+}
+
+impl rustls::KeyLog for SecretCapture {
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        match label {
+            "CLIENT_TRAFFIC_SECRET_0" => {
+                if let Ok(mut s) = self.client_secret.lock() {
+                    *s = secret.to_vec();
+                }
+            }
+            "SERVER_TRAFFIC_SECRET_0" => {
+                if let Ok(mut s) = self.server_secret.lock() {
+                    *s = secret.to_vec();
+                }
+            }
+            _ => {}
+        }
+        if let Some(ref fl) = self.file_log {
+            fl.log(label, client_random, secret);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal handshake logic
 // ---------------------------------------------------------------------------
 
@@ -552,6 +613,8 @@ fn do_handshake(
         u64,
         u64,
         Vec<u8>,
+        Vec<u8>, // tx base traffic secret
+        Vec<u8>, // rx base traffic secret
     ),
     String,
 > {
@@ -574,9 +637,8 @@ fn do_handshake(
         if !cfg.alpn_protocols.is_empty() {
             sc.alpn_protocols = cfg.alpn_protocols.clone();
         }
-        if let Some(ref path) = cfg.key_log_path {
-            sc.key_log = Arc::new(FileKeyLog { path: path.clone() });
-        }
+        let capture = Arc::new(SecretCapture::new(cfg.key_log_path.as_deref()));
+        sc.key_log = capture.clone();
 
         let mut conn =
             ServerConnection::new(Arc::new(sc)).map_err(|e| format!("server connection: {}", e))?;
@@ -634,6 +696,10 @@ fn do_handshake(
         let (tx_seq, tx_secrets) = secrets.tx;
         let (rx_seq, rx_secrets) = secrets.rx;
 
+        // Server: TX = server secret, RX = client secret
+        let tx_secret = capture.server_secret.lock().unwrap().clone();
+        let rx_secret = capture.client_secret.lock().unwrap().clone();
+
         Ok((
             tls_version,
             tx_secrets,
@@ -641,6 +707,8 @@ fn do_handshake(
             tx_seq,
             rx_seq,
             negotiated_alpn,
+            tx_secret,
+            rx_secret,
         ))
     } else {
         // --- Client path ---
@@ -714,9 +782,8 @@ fn do_handshake(
         if !cfg.alpn_protocols.is_empty() {
             cc.alpn_protocols = cfg.alpn_protocols.clone();
         }
-        if let Some(ref path) = cfg.key_log_path {
-            cc.key_log = Arc::new(FileKeyLog { path: path.clone() });
-        }
+        let capture = Arc::new(SecretCapture::new(cfg.key_log_path.as_deref()));
+        cc.key_log = capture.clone();
 
         let mut conn = ClientConnection::new(Arc::new(cc), sni)
             .map_err(|e| format!("client connection: {}", e))?;
@@ -769,6 +836,10 @@ fn do_handshake(
         let (tx_seq, tx_secrets) = secrets.tx;
         let (rx_seq, rx_secrets) = secrets.rx;
 
+        // Client: TX = client secret, RX = server secret
+        let tx_secret = capture.client_secret.lock().unwrap().clone();
+        let rx_secret = capture.server_secret.lock().unwrap().clone();
+
         Ok((
             tls_version,
             tx_secrets,
@@ -776,6 +847,8 @@ fn do_handshake(
             tx_seq,
             rx_seq,
             negotiated_alpn,
+            tx_secret,
+            rx_secret,
         ))
     }
 }
@@ -972,14 +1045,22 @@ pub extern "C" fn xray_tls_handshake(
         let cfg = unsafe { &*cfg };
 
         // Perform TLS handshake
-        let (tls_version, tx_secrets, rx_secrets, tx_seq, rx_seq, negotiated_alpn) =
-            match do_handshake(fd, cfg) {
-                Ok(v) => v,
-                Err(e) => {
-                    out.set_error(1, &e);
-                    return 1;
-                }
-            };
+        let (
+            tls_version,
+            tx_secrets,
+            rx_secrets,
+            tx_seq,
+            rx_seq,
+            negotiated_alpn,
+            tx_secret,
+            rx_secret,
+        ) = match do_handshake(fd, cfg) {
+            Ok(v) => v,
+            Err(e) => {
+                out.set_error(1, &e);
+                return 1;
+            }
+        };
 
         out.version = tls_version;
         out.cipher_suite = cipher_suite_to_u16(&tx_secrets);
@@ -1026,14 +1107,20 @@ pub extern "C" fn xray_tls_handshake(
         out.ktls_tx = tx;
         out.ktls_rx = rx;
 
-        // Create TlsState for potential KeyUpdate
-        let state = Box::new(TlsState {
-            fd,
-            cipher_suite: out.cipher_suite,
-            _tx_secret: Vec::new(),
-            _rx_secret: Vec::new(),
-        });
+        // Create TlsState (metadata only — KeyUpdate is handled on the Go side)
+        let state = Box::new(TlsState::new(fd, out.cipher_suite));
         out.state_handle = Box::into_raw(state) as *mut c_void;
+
+        // Copy base traffic secrets for Go-side KeyUpdate handler
+        if !tx_secret.is_empty() {
+            let len = tx_secret.len().min(48);
+            out.tx_secret[..len].copy_from_slice(&tx_secret[..len]);
+            out.secret_len = len as u8;
+        }
+        if !rx_secret.is_empty() {
+            let len = rx_secret.len().min(48);
+            out.rx_secret[..len].copy_from_slice(&rx_secret[..len]);
+        }
 
         0
     });
