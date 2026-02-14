@@ -29,12 +29,17 @@ var _ Interface = (*Conn)(nil)
 
 type Conn struct {
 	*tls.Conn
-	ktls     KTLSState
-	isClient bool
-	capture  *keyCapture
+	ktls         KTLSState
+	isClient     bool
+	capture      *keyCapture
+	writeRecords uint64
 }
 
-const tlsCloseTimeout = 250 * time.Millisecond
+const (
+	tlsCloseTimeout    = 250 * time.Millisecond
+	maxRecordPayload   = 16384    // TLS max record payload size
+	keyUpdateThreshold = 1 << 24  // ~16.7M records, conservative limit below AES-GCM 2^24.5
+)
 
 // Read overrides tls.Conn.Read. When kTLS RX is active, reads bypass the
 // Go TLS record layer (the kernel already decrypted) and handle EKEYEXPIRED
@@ -54,10 +59,20 @@ func (c *Conn) Read(b []byte) (int, error) {
 }
 
 // Write overrides tls.Conn.Write. When kTLS TX is active, writes bypass the
-// Go TLS record layer (the kernel handles encryption).
+// Go TLS record layer (the kernel handles encryption) and proactively rotate
+// TX keys after keyUpdateThreshold records to stay within AES-GCM limits.
 func (c *Conn) Write(b []byte) (int, error) {
 	if c.ktls.TxReady {
-		return c.Conn.NetConn().Write(b)
+		n, err := c.Conn.NetConn().Write(b)
+		if err == nil && c.ktls.keyUpdateHandler != nil {
+			records := uint64((n + maxRecordPayload - 1) / maxRecordPayload)
+			c.writeRecords += records
+			if c.writeRecords >= keyUpdateThreshold {
+				c.ktls.keyUpdateHandler.InitiateUpdate()
+				c.writeRecords = 0
+			}
+		}
+		return n, err
 	}
 	return c.Conn.Write(b)
 }
@@ -240,13 +255,14 @@ func GeneraticUClient(c net.Conn, config *tls.Config) *utls.UConn {
 // The kernel handles TLS encryption/decryption via kTLS, so Read/Write go directly
 // to the underlying connection.
 type RustConn struct {
-	rawConn    net.Conn
-	state      *native.TlsStateHandle
-	ktls       KTLSState
-	alpn       string
-	version    uint16
-	cipher     uint16
-	serverName string
+	rawConn      net.Conn
+	state        *native.TlsStateHandle
+	ktls         KTLSState
+	alpn         string
+	version      uint16
+	cipher       uint16
+	serverName   string
+	writeRecords uint64
 }
 
 var _ Interface = (*RustConn)(nil)
@@ -254,8 +270,8 @@ var _ Interface = (*RustConn)(nil)
 func (c *RustConn) Read(b []byte) (int, error) {
 	if c.ktls.RxReady {
 		n, err := c.rawConn.Read(b)
-		if err != nil && isKeyExpired(err) && c.state != nil {
-			if herr := native.TlsKeyUpdate(c.state); herr != nil {
+		if err != nil && isKeyExpired(err) && c.ktls.keyUpdateHandler != nil {
+			if herr := c.ktls.keyUpdateHandler.Handle(); herr != nil {
 				return 0, herr
 			}
 			return c.rawConn.Read(b)
@@ -266,7 +282,16 @@ func (c *RustConn) Read(b []byte) (int, error) {
 }
 
 func (c *RustConn) Write(b []byte) (int, error) {
-	return c.rawConn.Write(b)
+	n, err := c.rawConn.Write(b)
+	if err == nil && c.ktls.keyUpdateHandler != nil {
+		records := uint64((n + maxRecordPayload - 1) / maxRecordPayload)
+		c.writeRecords += records
+		if c.writeRecords >= keyUpdateThreshold {
+			c.ktls.keyUpdateHandler.InitiateUpdate()
+			c.writeRecords = 0
+		}
+	}
+	return n, err
 }
 
 func (c *RustConn) Close() error {
@@ -320,6 +345,14 @@ func NewRustConn(rawConn net.Conn, result *native.TlsResult, serverName string) 
 			TxReady: result.KtlsTx,
 			RxReady: result.KtlsRx,
 		},
+	}
+	// Create KeyUpdate handler if base traffic secrets are available (TLS 1.3)
+	if len(result.TxSecret) > 0 && result.Version == 0x0304 {
+		if fd, err := ExtractFd(rawConn); err == nil {
+			rc.ktls.keyUpdateHandler = newKTLSKeyUpdateHandler(
+				fd, result.CipherSuite, result.RxSecret, result.TxSecret,
+			)
+		}
 	}
 	return rc
 }
@@ -477,21 +510,7 @@ func RustClient(c net.Conn, config *Config, dest net.Destination) (net.Conn, err
 		serverName = dest.Address.Domain()
 	}
 
-	rustConn := &RustConn{
-		rawConn:    c,
-		state:      result.StateHandle,
-		alpn:       result.ALPN,
-		version:    result.Version,
-		cipher:     result.CipherSuite,
-		serverName: serverName,
-		ktls: KTLSState{
-			Enabled: result.KtlsTx || result.KtlsRx,
-			TxReady: result.KtlsTx,
-			RxReady: result.KtlsRx,
-		},
-	}
-
-	return rustConn, nil
+	return NewRustConn(c, result, serverName), nil
 }
 
 // RustServer performs a TLS server handshake using the Rust rustls library
@@ -516,20 +535,7 @@ func RustServer(c net.Conn, config *Config) (net.Conn, error) {
 		return nil, errors.New("native TLS server handshake failed: ").Base(err)
 	}
 
-	rustConn := &RustConn{
-		rawConn: c,
-		state:   result.StateHandle,
-		alpn:    result.ALPN,
-		version: result.Version,
-		cipher:  result.CipherSuite,
-		ktls: KTLSState{
-			Enabled: result.KtlsTx || result.KtlsRx,
-			TxReady: result.KtlsTx,
-			RxReady: result.KtlsRx,
-		},
-	}
-
-	return rustConn, nil
+	return NewRustConn(c, result, ""), nil
 }
 
 func copyConfig(c *tls.Config) *utls.Config {

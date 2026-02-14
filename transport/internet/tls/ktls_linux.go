@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -326,6 +327,8 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 var (
 	ktlsSupportOnce sync.Once
 	ktlsSupportOK   bool
+	fullKTLSOnce    sync.Once
+	fullKTLSOK      bool
 )
 
 func kernelKTLSSupportedCached() bool {
@@ -333,6 +336,105 @@ func kernelKTLSSupportedCached() bool {
 		ktlsSupportOK = KTLSSupported()
 	})
 	return ktlsSupportOK
+}
+
+// NativeFullKTLSSupported reports whether this host supports full bidirectional
+// kTLS for the TLS 1.3 cipher suites used by native REALITY/TLS paths.
+func NativeFullKTLSSupported() bool {
+	fullKTLSOnce.Do(func() {
+		if !kernelKTLSSupportedCached() {
+			return
+		}
+		for _, suite := range []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+		} {
+			if !probeFullKTLSForTLS13Suite(suite) {
+				return
+			}
+		}
+		fullKTLSOK = true
+	})
+	return fullKTLSOK
+}
+
+func probeFullKTLSForTLS13Suite(cipherSuite uint16) bool {
+	keyLen, ok := tls13KTLSKeyLen(cipherSuite)
+	if !ok {
+		return false
+	}
+
+	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: 0,
+	})
+	if err != nil {
+		return false
+	}
+	defer ln.Close()
+
+	serverConnCh := make(chan *net.TCPConn, 1)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		c, err := ln.AcceptTCP()
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		serverConnCh <- c
+	}()
+
+	client, err := net.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+
+	var server *net.TCPConn
+	select {
+	case server = <-serverConnCh:
+	case <-serverErrCh:
+		return false
+	case <-time.After(500 * time.Millisecond):
+		return false
+	}
+	defer server.Close()
+
+	rawConn, err := client.SyscallConn()
+	if err != nil {
+		return false
+	}
+
+	var txErr error
+	var rxErr error
+	if err := rawConn.Control(func(fd uintptr) {
+		intFD := int(fd)
+		if ulpErr := syscall.SetsockoptString(intFD, syscall.SOL_TCP, unix.TCP_ULP, "tls"); ulpErr != nil {
+			txErr = ulpErr
+			return
+		}
+		key := make([]byte, keyLen)
+		iv := make([]byte, 12)
+		seq := make([]byte, 8)
+		txErr = setKTLSCryptoInfo(intFD, TLS_TX, TLS_1_3_VERSION, cipherSuite, key, iv, seq)
+		rxErr = setKTLSCryptoInfo(intFD, TLS_RX, TLS_1_3_VERSION, cipherSuite, key, iv, seq)
+	}); err != nil {
+		return false
+	}
+
+	return txErr == nil && rxErr == nil
+}
+
+func tls13KTLSKeyLen(cipherSuite uint16) (int, bool) {
+	switch cipherSuite {
+	case tls.TLS_AES_128_GCM_SHA256:
+		return 16, true
+	case tls.TLS_AES_256_GCM_SHA384, tls.TLS_CHACHA20_POLY1305_SHA256:
+		return 32, true
+	default:
+		return 0, false
+	}
 }
 
 // tlsKeys contains the extracted TLS session keys.

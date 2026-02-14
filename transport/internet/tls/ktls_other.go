@@ -29,3 +29,8 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 func KTLSSupported() bool {
 	return false
 }
+
+// NativeFullKTLSSupported returns false on non-Linux platforms.
+func NativeFullKTLSSupported() bool {
+	return false
+}

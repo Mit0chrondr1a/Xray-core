@@ -121,6 +121,35 @@ func (h *KTLSKeyUpdateHandler) Handle() error {
 	return nil
 }
 
+// InitiateUpdate proactively rotates the TX key by sending a KeyUpdate
+// message (update_not_requested) and deriving new TX traffic keys. This is
+// called after keyUpdateThreshold TLS records to stay within the AES-GCM
+// confidentiality limit (~2^24.5 records per key, RFC 8446 Section 5.5).
+func (h *KTLSKeyUpdateHandler) InitiateUpdate() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Send KeyUpdate (update_not_requested = 0)
+	kuMsg := []byte{typeKeyUpdate, 0, 0, 1, 0}
+	if err := sendControlRecord(h.fd, recordTypeHandshake, kuMsg); err != nil {
+		return fmt.Errorf("ktls: sendmsg KeyUpdate: %w", err)
+	}
+
+	hashSize := h.hashFunc.Size()
+
+	// Derive new TX secret: HKDF-Expand-Label(txSecret, "traffic upd", nil, hashSize)
+	newTxSecret := expandLabel(h.hashFunc, h.txSecret, "traffic upd", nil, hashSize)
+	newTxKey := expandLabel(h.hashFunc, newTxSecret, "key", nil, h.keyLen)
+	newTxIV := expandLabel(h.hashFunc, newTxSecret, "iv", nil, 12)
+
+	if err := setKTLSCryptoInfo(h.fd, TLS_TX, TLS_1_3_VERSION, h.cipherSuiteID, newTxKey, newTxIV, make([]byte, 8)); err != nil {
+		return fmt.Errorf("ktls: setsockopt TLS_TX: %w", err)
+	}
+	h.txSecret = newTxSecret
+
+	return nil
+}
+
 // expandLabel implements HKDF-Expand-Label from RFC 8446 Section 7.1.
 func expandLabel(hashFunc crypto.Hash, secret []byte, label string, context []byte, length int) []byte {
 	hkdfLabel := make([]byte, 0, 2+1+6+len(label)+1+len(context))
