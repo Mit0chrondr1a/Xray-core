@@ -43,6 +43,10 @@ type Conn struct {
 var (
 	maxRealitySpiderResponseBytes int64 = 1 * 1024 * 1024
 	maxRealitySpiderPaths               = 4096
+	maxSpiderConcurrency                = 4
+	spiderSemaphore                     = make(chan struct{}, 8)  // max 8 concurrent Spider sessions globally
+	spiderThreadSem                     = make(chan struct{}, 16) // max 16 concurrent Spider crawling goroutines globally
+	spiderSessionTimeout                = 30 * time.Second
 )
 
 func readSpiderBody(reader io.Reader) ([]byte, error) {
@@ -209,11 +213,11 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 			if fdErr == nil {
 				realityCfg := native.RealityConfigNew(true)
 				if realityCfg != nil {
+					defer native.RealityConfigFree(realityCfg)
 					native.RealityConfigSetServerPubkey(realityCfg, config.PublicKey)
 					native.RealityConfigSetShortId(realityCfg, config.ShortId)
 					native.RealityConfigSetVersion(realityCfg, core.Version_x, core.Version_y, core.Version_z)
 					result, rustErr := native.RealityClientConnect(fd, uConn.HandshakeState.Hello.Raw, ecdhe.Bytes(), realityCfg)
-					native.RealityConfigFree(realityCfg)
 					if rustErr == nil {
 						if result != nil && result.KtlsTx && result.KtlsRx {
 							return tls.NewRustConn(c, result, uConn.ServerName), nil
@@ -242,7 +246,21 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	if !uConn.Verified {
 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
 		go func() {
+			// Limit global concurrent Spider sessions to prevent DoS amplification.
+			select {
+			case spiderSemaphore <- struct{}{}:
+				defer func() { <-spiderSemaphore }()
+			default:
+				uConn.Close()
+				return
+			}
+			defer uConn.Close()
+
+			spiderCtx, cancel := context.WithTimeout(context.Background(), spiderSessionTimeout)
+			defer cancel()
+
 			client := &http.Client{
+				Timeout: spiderSessionTimeout,
 				Transport: &http2.Transport{
 					DialTLSContext: func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
 						if config.Show {
@@ -273,10 +291,10 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					body []byte
 				)
 				if first {
-					req, _ = http.NewRequest("GET", firstURL, nil)
+					req, _ = http.NewRequestWithContext(spiderCtx, "GET", firstURL, nil)
 				} else {
 					maps.Lock()
-					req, _ = http.NewRequest("GET", string(prefix)+getPathLocked(paths), nil)
+					req, _ = http.NewRequestWithContext(spiderCtx, "GET", string(prefix)+getPathLocked(paths), nil)
 					maps.Unlock()
 				}
 				if req == nil {
@@ -291,6 +309,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					times = int(crypto.RandBetween(config.SpiderY[4], config.SpiderY[5]))
 				}
 				for j := 0; j < times; j++ {
+					if spiderCtx.Err() != nil {
+						break
+					}
 					if !first && j == 0 {
 						req.Header.Set("Referer", firstURL)
 					}
@@ -298,11 +319,12 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					if resp, err = client.Do(req); err != nil {
 						break
 					}
-					defer resp.Body.Close()
-					req.Header.Set("Referer", req.URL.String())
-					if body, err = readSpiderBody(resp.Body); err != nil {
+					body, err = readSpiderBody(resp.Body)
+					resp.Body.Close()
+					if err != nil {
 						break
 					}
+					req.Header.Set("Referer", req.URL.String())
 					maps.Lock()
 					addSpiderPaths(paths, body, prefix)
 					req.URL.Path = getPathLocked(paths)
@@ -317,12 +339,33 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					}
 				}
 			}
-			get(true)
-			concurrency := int(crypto.RandBetween(config.SpiderY[2], config.SpiderY[3]))
-			for i := 0; i < concurrency; i++ {
-				go get(false)
+			// Gate initial crawl through global thread semaphore.
+			select {
+			case spiderThreadSem <- struct{}{}:
+				get(true)
+				<-spiderThreadSem
+			default:
+				// Global thread limit reached; skip initial crawl.
 			}
-			// Do not close the connection
+			concurrency := int(crypto.RandBetween(config.SpiderY[2], config.SpiderY[3]))
+			if concurrency > maxSpiderConcurrency {
+				concurrency = maxSpiderConcurrency
+			}
+			var wg sync.WaitGroup
+			for i := 0; i < concurrency; i++ {
+				select {
+				case spiderThreadSem <- struct{}{}:
+				default:
+					continue // global thread limit reached
+				}
+				wg.Add(1)
+				go func() {
+					defer func() { <-spiderThreadSem }()
+					defer wg.Done()
+					get(false)
+				}()
+			}
+			wg.Wait()
 		}()
 		time.Sleep(time.Duration(crypto.RandBetween(config.SpiderY[8], config.SpiderY[9])) * time.Millisecond) // return
 		return nil, errors.New("REALITY: processed invalid connection").AtWarning()

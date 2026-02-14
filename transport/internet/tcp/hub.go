@@ -5,6 +5,7 @@ import (
 	gotls "crypto/tls"
 	stderrors "errors"
 	"strings"
+	"sync"
 	"time"
 
 	goreality "github.com/xtls/reality"
@@ -13,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/ebpf"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -31,6 +33,36 @@ type Listener struct {
 }
 
 const tlsHandshakeTimeout = 8 * time.Second
+
+var (
+	realityBlacklist     *ebpf.BlacklistManager
+	realityBlacklistOnce sync.Once
+)
+
+// getRealityBlacklist returns the global REALITY auth blacklist manager,
+// lazily initialized on first call.
+func getRealityBlacklist() *ebpf.BlacklistManager {
+	realityBlacklistOnce.Do(func() {
+		realityBlacklist = ebpf.NewBlacklistManager(ebpf.DefaultBlacklistConfig())
+	})
+	return realityBlacklist
+}
+
+// extractIP extracts the IP address from a net.Addr.
+func extractIP(addr net.Addr) net.IP {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		return a.IP
+	case *net.UDPAddr:
+		return a.IP
+	}
+	// Try parsing as "host:port" string.
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseAddress(host).IP()
+}
 
 // ListenTCP creates a new Listener based on configurations.
 func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
@@ -188,13 +220,17 @@ func (v *Listener) keepAccepting() {
 								_ = conn.Close()
 								return
 							}
-							// Auth failed — socket data was only peeked, Go fallback works
+							// Auth failed in Rust path; fall through to Go REALITY.
+							// Record blacklist failure only after the final auth outcome.
 						}
 					}
 				}
 				if !rustDone {
 					realityConn, serveErr := reality.Server(conn, v.realityConfig)
 					if serveErr != nil {
+						if bl := getRealityBlacklist(); bl != nil {
+							bl.RecordFailure(extractIP(conn.RemoteAddr()))
+						}
 						errors.LogInfo(context.Background(), serveErr.Error())
 						_ = conn.Close()
 						return
