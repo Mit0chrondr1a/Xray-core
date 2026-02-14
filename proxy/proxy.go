@@ -711,7 +711,7 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 				handler = xc.KTLSKeyUpdateHandler()
 				conn = xc.NetConn()
 			} else if rc, ok := conn.(*tls.RustConn); ok {
-				// RustConn always has kTLS — KeyUpdate handled by Rust state
+				handler = rc.KTLSKeyUpdateHandler()
 				conn = rc.NetConn()
 			} else if utlsConn, ok := conn.(*tls.UConn); ok {
 				conn = utlsConn.NetConn()
@@ -730,6 +730,23 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 		}
 	}
 	return conn, readCounter, writerCounter, handler
+}
+
+// startKeyUpdateMonitor creates and starts a KeyUpdateMonitor for a raw
+// connection with the given handler. Returns nil (safe to Stop()) on any
+// failure. Used by zero-copy paths (SOCKMAP, splice) that bypass Write()
+// and thus skip the per-record write counter for TX key rotation.
+func startKeyUpdateMonitor(rawConn net.Conn, handler *tls.KTLSKeyUpdateHandler) *tls.KeyUpdateMonitor {
+	if handler == nil {
+		return nil
+	}
+	fd, err := tls.ExtractFd(rawConn)
+	if err != nil {
+		return nil
+	}
+	m := tls.NewKeyUpdateMonitor(fd, handler)
+	m.Start()
+	return m
 }
 
 // DetermineSocketCryptoHint peels off connection wrappers and returns the
@@ -810,7 +827,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	_, writerCrypto := DetermineSocketCryptoHint(writerConn)
 
 	readerConn, readCounter, _, readerHandler := UnwrapRawConn(readerConn)
-	writerConn, _, writeCounter, _ := UnwrapRawConn(writerConn)
+	writerConn, _, writeCounter, writerHandler := UnwrapRawConn(writerConn)
 	var readerForBuf net.Conn = readerConn
 	if readerHandler != nil {
 		readerForBuf = &ktlsReader{Conn: readerConn, handler: readerHandler}
@@ -846,14 +863,16 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		}
 		if splice {
 			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
-			if mgr := ebpf.GlobalSockmapManager(); mgr != nil && ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
+			if mgr := ebpf.GlobalSockmapManager(); mgr != nil && !mgr.ShouldFallbackToSplice() && ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
 				if err := mgr.RegisterPairWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto); err == nil {
 					errors.LogDebug(ctx, "CopyRawConn sockmap (crypto: reader=", int(readerCrypto), " writer=", int(writerCrypto), ")")
+					writerMonitor := startKeyUpdateMonitor(writerConn, writerHandler)
 					timer.SetTimeout(24 * time.Hour)
 					if inTimer != nil {
 						inTimer.SetTimeout(24 * time.Hour)
 					}
 					fallbackToSplice, waitErr := waitForSockmapForwarding(readerConn, writerConn)
+					writerMonitor.Stop()
 					if err := mgr.UnregisterPair(readerConn, writerConn); err != nil {
 						errors.LogDebugInner(ctx, err, "CopyRawConn sockmap unregister failed")
 					}
@@ -881,7 +900,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
+			writerMonitor := startKeyUpdateMonitor(writerConn, writerHandler)
 			w, err := tc.ReadFrom(readerConn)
+			writerMonitor.Stop()
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
 			}

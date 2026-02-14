@@ -330,6 +330,12 @@ func (c *RustConn) KTLSEnabled() KTLSState {
 	return c.ktls
 }
 
+// KTLSKeyUpdateHandler returns the KeyUpdate handler for this connection,
+// or nil if kTLS RX is not active or the connection uses TLS 1.2.
+func (c *RustConn) KTLSKeyUpdateHandler() *KTLSKeyUpdateHandler {
+	return c.ktls.keyUpdateHandler
+}
+
 // NewRustConn creates a RustConn from native handshake results.
 // Used by the REALITY package to construct a RustConn from Rust handshake output.
 func NewRustConn(rawConn net.Conn, result *native.TlsResult, serverName string) *RustConn {

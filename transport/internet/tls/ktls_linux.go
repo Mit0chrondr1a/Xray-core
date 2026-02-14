@@ -732,6 +732,46 @@ func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16
 	}
 }
 
+// getRecordSeq reads the current TLS record sequence number from the kernel
+// via getsockopt(SOL_TLS, direction). The rec_seq field is an 8-byte big-endian
+// counter at a cipher-dependent offset within the tls_crypto_info struct.
+func getRecordSeq(fd int, direction int, cipherSuiteID uint16) (uint64, error) {
+	var size uint32
+	var recSeqOffset int
+	switch cipherSuiteID {
+	case tls.TLS_AES_128_GCM_SHA256:
+		size = uint32(unsafe.Sizeof(cryptoInfoAESGCM128{}))
+		recSeqOffset = 32
+	case tls.TLS_AES_256_GCM_SHA384:
+		size = uint32(unsafe.Sizeof(cryptoInfoAESGCM256{}))
+		recSeqOffset = 48
+	case tls.TLS_CHACHA20_POLY1305_SHA256:
+		size = uint32(unsafe.Sizeof(cryptoInfoChaCha20Poly1305{}))
+		recSeqOffset = 48
+	default:
+		return 0, fmt.Errorf("unsupported cipher suite for getRecordSeq: 0x%04x", cipherSuiteID)
+	}
+
+	buf := make([]byte, int(size))
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_GETSOCKOPT,
+		uintptr(fd),
+		uintptr(SOL_TLS),
+		uintptr(direction),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&size)),
+		0,
+	)
+	if errno != 0 {
+		return 0, errno
+	}
+	if int(size) < recSeqOffset+8 {
+		return 0, fmt.Errorf("short SOL_TLS getsockopt payload: got %d bytes", size)
+	}
+
+	return binary.BigEndian.Uint64(buf[recSeqOffset : recSeqOffset+8]), nil
+}
+
 // KTLSSupported checks if kernel TLS is available.
 func KTLSSupported() bool {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)

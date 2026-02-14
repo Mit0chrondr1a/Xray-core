@@ -64,6 +64,11 @@ func newKTLSKeyUpdateHandler(fd int, cipherSuiteID uint16, rxSecret, txSecret []
 	}
 }
 
+// CipherSuiteID returns the TLS cipher suite ID used by this handler.
+func (h *KTLSKeyUpdateHandler) CipherSuiteID() uint16 {
+	return h.cipherSuiteID
+}
+
 // Handle processes a pending TLS 1.3 KeyUpdate after the kernel returns EKEYEXPIRED.
 func (h *KTLSKeyUpdateHandler) Handle() error {
 	h.mu.Lock()

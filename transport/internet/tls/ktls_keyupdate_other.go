@@ -5,6 +5,9 @@ package tls
 // KTLSKeyUpdateHandler is a no-op on non-Linux platforms.
 type KTLSKeyUpdateHandler struct{}
 
+// CipherSuiteID returns 0 on non-Linux platforms.
+func (h *KTLSKeyUpdateHandler) CipherSuiteID() uint16 { return 0 }
+
 // Handle is a no-op on non-Linux platforms.
 func (h *KTLSKeyUpdateHandler) Handle() error { return nil }
 
