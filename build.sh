@@ -161,40 +161,62 @@ WEOF
     # from silently embedding an outdated binary when the build is skipped or fails.
     rm -f "$EBPF_BYTECODE"
 
-    if command -v rustup &>/dev/null && rustup toolchain list | grep -q nightly; then
-        # Resolve the nightly toolchain's bin directory so we can put it first
-        # on PATH. This is necessary when a standalone rustc (e.g. Homebrew's
-        # rust formula) shadows rustup's proxies — `rustup run nightly` sets
-        # RUSTUP_TOOLCHAIN but doesn't modify PATH, so cargo's sub-process
-        # invocations of rustc would find the stable system compiler instead.
-        NIGHTLY_RUSTC="$(rustup which --toolchain nightly rustc 2>/dev/null || true)"
-        NIGHTLY_BIN_DIR=""
-        if [ -n "$NIGHTLY_RUSTC" ]; then
-            NIGHTLY_BIN_DIR="$(dirname "$NIGHTLY_RUSTC")"
+    if command -v rustup &>/dev/null; then
+        # Ensure nightly toolchain is installed and up-to-date.
+        # A stale nightly can break bpf-linker due to LLVM ABI changes.
+        if rustup toolchain list | grep -q nightly; then
+            echo "Updating nightly toolchain..."
+            rustup update nightly 2>&1 | tail -1 || true
+        else
+            echo "Installing nightly toolchain (required for eBPF)..."
+            if ! rustup toolchain install nightly 2>&1 | tail -1; then
+                echo "Warning: failed to install nightly, skipping eBPF build"
+            fi
         fi
 
-        # bpf-linker is required — standard linkers can't produce valid eBPF ELF
-        # because they lack BTF generation and BPF map relocation handling.
-        if ! command -v bpf-linker &>/dev/null; then
-            echo "Warning: bpf-linker not found, skipping eBPF build"
-            echo "  Install: rustup run nightly cargo install bpf-linker"
-        elif [ -z "$NIGHTLY_BIN_DIR" ]; then
-            echo "Warning: cannot locate nightly rustc, skipping eBPF build"
-        else
-            echo "Building eBPF programs (bpfel-unknown-none via bpf-linker)..."
-            if PATH="${NIGHTLY_BIN_DIR}:${PATH}" cargo build \
-                --release \
-                --manifest-path rust/xray-ebpf/Cargo.toml \
-                --target-dir rust/xray-ebpf/target; then
-                EBPF_FEATURES="--features ebpf-bytecode"
-                echo "eBPF programs built successfully"
+        if rustup toolchain list | grep -q nightly; then
+            # Resolve the nightly toolchain's bin directory so we can put it
+            # first on PATH. This is necessary when a standalone rustc (e.g.
+            # Homebrew's rust formula) shadows rustup's proxies — `rustup run
+            # nightly` sets RUSTUP_TOOLCHAIN but doesn't modify PATH, so
+            # cargo's sub-process invocations of rustc would find the stable
+            # system compiler instead.
+            NIGHTLY_RUSTC="$(rustup which --toolchain nightly rustc 2>/dev/null || true)"
+            NIGHTLY_BIN_DIR=""
+            if [ -n "$NIGHTLY_RUSTC" ]; then
+                NIGHTLY_BIN_DIR="$(dirname "$NIGHTLY_RUSTC")"
+            fi
+
+            if [ -z "$NIGHTLY_BIN_DIR" ]; then
+                echo "Warning: cannot locate nightly rustc, skipping eBPF build"
             else
-                echo "Warning: eBPF build failed (non-fatal), continuing without SK_MSG cork + Aya"
+                # Install/update bpf-linker — must be compiled against the
+                # current nightly's LLVM. cargo install is a no-op if the
+                # installed version already matches the latest crate release.
+                if ! command -v bpf-linker &>/dev/null; then
+                    echo "Installing bpf-linker (required for eBPF)..."
+                    if ! PATH="${NIGHTLY_BIN_DIR}:${PATH}" cargo install bpf-linker 2>&1 | tail -3; then
+                        echo "Warning: bpf-linker install failed, skipping eBPF build"
+                    fi
+                fi
+
+                if command -v bpf-linker &>/dev/null; then
+                    echo "Building eBPF programs (bpfel-unknown-none via bpf-linker)..."
+                    if PATH="${NIGHTLY_BIN_DIR}:${PATH}" cargo build \
+                        --release \
+                        --manifest-path rust/xray-ebpf/Cargo.toml \
+                        --target-dir rust/xray-ebpf/target; then
+                        EBPF_FEATURES="--features ebpf-bytecode"
+                        echo "eBPF programs built successfully"
+                    else
+                        echo "Warning: eBPF build failed (non-fatal), continuing without SK_MSG cork + Aya"
+                    fi
+                fi
             fi
         fi
     else
-        echo "Warning: nightly toolchain not found, skipping eBPF build"
-        echo "  Install: rustup toolchain install nightly && rustup run nightly cargo install bpf-linker"
+        echo "Warning: rustup not found, skipping eBPF build"
+        echo "  Install: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
     fi
 
     # Build Rust static library for the musl target.
