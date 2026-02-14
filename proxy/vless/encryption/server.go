@@ -1,11 +1,11 @@
 package encryption
 
 import (
-	"bytes"
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/mlkem"
 	"crypto/rand"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net"
@@ -168,7 +168,7 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 		relays = relays[index:]
 		lastCTR = NewCTR(nfsKey, iv)
 		lastCTR.XORKeyStream(relays, relays[:32])
-		if !bytes.Equal(relays[:32], i.Hash32s[j+1][:]) {
+		if subtle.ConstantTimeCompare(relays[:32], i.Hash32s[j+1][:]) != 1 {
 			return nil, errors.New("unexpected hash32: ", fmt.Sprintf("%v", relays[:32]))
 		}
 		relays = relays[32:]

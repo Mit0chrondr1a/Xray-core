@@ -111,7 +111,7 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 	if pub, ok := certs[0].PublicKey.(ed25519.PublicKey); ok {
 		h := hmac.New(sha512.New, c.AuthKey)
 		h.Write(pub)
-		if bytes.Equal(h.Sum(nil), certs[0].Signature) {
+		if hmac.Equal(h.Sum(nil), certs[0].Signature) {
 			if len(c.Config.Mldsa65Verify) > 0 {
 				if len(certs[0].Extensions) > 0 {
 					h.Write(c.HandshakeState.Hello.Raw)

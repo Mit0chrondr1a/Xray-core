@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/subtle"
 	"io"
 	"net"
 	"strconv"
@@ -59,7 +60,7 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 		headerAndData := outBytes[:5+len(b)+16]
 		EncodeHeader(headerAndData, len(b)+16)
 		max := false
-		if bytes.Equal(c.AEAD.Nonce[:], MaxNonce) {
+		if subtle.ConstantTimeCompare(c.AEAD.Nonce[:], MaxNonce) == 1 {
 			max = true
 		}
 		c.AEAD.Seal(headerAndData[:5], nil, b, headerAndData[:5])
@@ -132,7 +133,7 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 		dst = b[:len(dst)] // avoids another copy()
 	}
 	var newAEAD *AEAD
-	if bytes.Equal(c.PeerAEAD.Nonce[:], MaxNonce) {
+	if subtle.ConstantTimeCompare(c.PeerAEAD.Nonce[:], MaxNonce) == 1 {
 		newAEAD = NewAEAD(append(peerHeader[:], peerData...), c.UnitedKey, c.UseAES)
 	}
 	_, err = c.PeerAEAD.Open(dst[:0], nil, peerData, peerHeader[:])
