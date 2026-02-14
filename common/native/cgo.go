@@ -19,6 +19,9 @@ struct xray_tls_result {
     void*    state_handle;
     int32_t  error_code;
     char     error_msg[256];
+    uint8_t  tx_secret[48];
+    uint8_t  rx_secret[48];
+    uint8_t  secret_len;
 };
 
 // TLS config builder
@@ -56,9 +59,12 @@ extern void    xray_reality_config_set_max_time_diff(void* cfg, uint64_t ms);
 extern void    xray_reality_config_set_version_range(void* cfg, uint8_t min_x, uint8_t min_y, uint8_t min_z, uint8_t max_x, uint8_t max_y, uint8_t max_z);
 extern void    xray_reality_config_set_tls_cert(void* cfg, const uint8_t* cert, size_t cert_len, const uint8_t* key, size_t key_len);
 
+extern void    xray_reality_config_add_short_id(void* cfg, const uint8_t* id, size_t len);
+
 // REALITY handshake
 extern int32_t xray_reality_client_connect(int fd, const uint8_t* client_hello_raw, size_t hello_len, const uint8_t* ecdh_privkey, size_t privkey_len, const void* reality_config, struct xray_tls_result* out);
 extern int32_t xray_reality_server_accept(int fd, const void* reality_config, struct xray_tls_result* out);
+extern int32_t xray_reality_server_handshake(int fd, const void* reality_config, struct xray_tls_result* out);
 */
 import "C"
 
@@ -92,6 +98,8 @@ type TlsResult struct {
 	CipherSuite uint16
 	ALPN        string
 	StateHandle *TlsStateHandle
+	TxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
+	RxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
 }
 
 // --- TLS Config Builder ---
@@ -222,6 +230,7 @@ func TlsHandshake(fd int, cfg *TlsConfigHandle, isClient bool) (*TlsResult, erro
 	if cResult.state_handle != nil {
 		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
 	}
+	extractSecrets(result, &cResult)
 	return result, nil
 }
 
@@ -358,6 +367,13 @@ func RealityConfigSetTLSCert(h *RealityConfigHandle, certPEM, keyPEM []byte) {
 		(*C.uint8_t)(unsafe.Pointer(&keyPEM[0])), C.size_t(len(keyPEM)))
 }
 
+func RealityConfigAddShortId(h *RealityConfigHandle, id []byte) {
+	if h == nil || len(id) == 0 {
+		return
+	}
+	C.xray_reality_config_add_short_id(h.ptr, (*C.uint8_t)(unsafe.Pointer(&id[0])), C.size_t(len(id)))
+}
+
 // --- REALITY Handshake ---
 
 func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg *RealityConfigHandle) (*TlsResult, error) {
@@ -399,6 +415,7 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 	if cResult.state_handle != nil {
 		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
 	}
+	extractSecrets(result, &cResult)
 	return result, nil
 }
 
@@ -433,6 +450,48 @@ func RealityServerAccept(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
 		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
 	}
 	return result, nil
+}
+
+func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
+	if cfg == nil {
+		return nil, errors.New("native: nil reality config handle")
+	}
+	var cResult C.struct_xray_tls_result
+	rc := C.xray_reality_server_handshake(C.int(fd), cfg.ptr, &cResult)
+	if rc != 0 {
+		errMsg := C.GoString(&cResult.error_msg[0])
+		code := int32(cResult.error_code)
+		if code == 1 {
+			return nil, ErrRealityAuthFailed
+		}
+		return nil, errors.New("native REALITY server handshake: " + errMsg)
+	}
+	result := &TlsResult{
+		KtlsTx:      bool(cResult.ktls_tx),
+		KtlsRx:      bool(cResult.ktls_rx),
+		Version:     uint16(cResult.version),
+		CipherSuite: uint16(cResult.cipher_suite),
+	}
+	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
+	for i, b := range alpnBytes {
+		if b == 0 {
+			result.ALPN = string(alpnBytes[:i])
+			break
+		}
+	}
+	if cResult.state_handle != nil {
+		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
+	}
+	extractSecrets(result, &cResult)
+	return result, nil
+}
+
+// extractSecrets copies base traffic secrets from the C result to the Go TlsResult.
+func extractSecrets(result *TlsResult, cResult *C.struct_xray_tls_result) {
+	if secretLen := int(cResult.secret_len); secretLen > 0 {
+		result.TxSecret = C.GoBytes(unsafe.Pointer(&cResult.tx_secret[0]), C.int(secretLen))
+		result.RxSecret = C.GoBytes(unsafe.Pointer(&cResult.rx_secret[0]), C.int(secretLen))
+	}
 }
 
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.

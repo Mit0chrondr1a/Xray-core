@@ -26,6 +26,8 @@ type TlsResult struct {
 	CipherSuite uint16
 	ALPN        string
 	StateHandle *TlsStateHandle
+	TxSecret    []byte
+	RxSecret    []byte
 }
 
 // --- TLS Config Builder Stubs ---
@@ -76,6 +78,8 @@ func RealityConfigSetMaxTimeDiff(*RealityConfigHandle, uint64)                  
 func RealityConfigSetVersionRange(*RealityConfigHandle, uint8, uint8, uint8, uint8, uint8, uint8) {}
 func RealityConfigSetTLSCert(*RealityConfigHandle, []byte, []byte)                     {}
 
+func RealityConfigAddShortId(*RealityConfigHandle, []byte) {}
+
 // --- REALITY Handshake Stubs ---
 
 func RealityClientConnect(int, []byte, []byte, *RealityConfigHandle) (*TlsResult, error) {
@@ -83,5 +87,9 @@ func RealityClientConnect(int, []byte, []byte, *RealityConfigHandle) (*TlsResult
 }
 
 func RealityServerAccept(int, *RealityConfigHandle) (*TlsResult, error) {
+	return nil, errNotAvailable
+}
+
+func RealityServerHandshake(int, *RealityConfigHandle) (*TlsResult, error) {
 	return nil, errNotAvailable
 }
