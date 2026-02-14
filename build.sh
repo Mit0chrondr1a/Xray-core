@@ -155,6 +155,12 @@ WEOF
     # The compiled bytecode is embedded in the userspace crate (xray-rust) via
     # include_bytes_aligned! at compile time when --features ebpf-bytecode is set.
     EBPF_FEATURES=""
+    EBPF_BYTECODE="rust/xray-ebpf/target/bpfel-unknown-none/release/xray-ebpf"
+
+    # Remove stale eBPF bytecode before building to prevent include_bytes!
+    # from silently embedding an outdated binary when the build is skipped or fails.
+    rm -f "$EBPF_BYTECODE"
+
     if command -v rustup &>/dev/null && rustup toolchain list | grep -q nightly; then
         # Resolve the nightly toolchain's bin directory so we can put it first
         # on PATH. This is necessary when a standalone rustc (e.g. Homebrew's
@@ -219,7 +225,10 @@ WEOF
     fi
 
     # cgo.go expects target/release/; copy from the target-specific directory.
+    # Remove any stale copy first to prevent linking an outdated library if
+    # a previous build targeted a different architecture or feature set.
     mkdir -p rust/xray-rust/target/release
+    rm -f rust/xray-rust/target/release/libxray_rust.a
     install -m 644 "$RUST_LIB_PATH" rust/xray-rust/target/release/libxray_rust.a
     echo "Rust library: $(ls -lh rust/xray-rust/target/release/libxray_rust.a | awk '{print $5}')"
 
