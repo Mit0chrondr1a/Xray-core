@@ -17,12 +17,11 @@ set -euo pipefail
 #   - [XRAY_CGO=1] Rust-accelerated Blake3 KDF, MPH domain matcher, GeoIP matcher, Vision padding
 #
 # Usage:
-#   ./build.sh              # Build for current platform (pure Go)
+#   ./build.sh              # Build for current platform (Rust+musl, requires zig + cargo)
 #   ./build.sh amd64        # Build for amd64 (GOAMD64=v3, AVX2 required)
-#   ./build.sh arm64        # Build for arm64
-#   XRAY_CGO=1 ./build.sh          # Static binary with Rust TLS (requires zig + cargo)
-#   XRAY_CGO=1 ./build.sh arm64    # Cross-compile arm64 with Rust+musl
-#   ZIG=/path/to/zig XRAY_CGO=1 ./build.sh  # Override zig binary path
+#   ./build.sh arm64        # Cross-compile arm64 with Rust+musl
+#   XRAY_CGO=0 ./build.sh          # Pure Go static binary (no Rust)
+#   ZIG=/path/to/zig ./build.sh    # Override zig binary path
 
 GO="${GO:-go}"
 ZIG="${ZIG:-zig}"
@@ -67,7 +66,7 @@ if [ "$GOARCH" = "amd64" ]; then
     export GOAMD64=v3  # AVX2, BMI1/2, FMA — requires Haswell+ or Zen+
 fi
 
-USE_CGO="${XRAY_CGO:-0}"
+USE_CGO="${XRAY_CGO:-1}"
 
 if [ "$USE_CGO" = "1" ] && ! command -v cargo &>/dev/null; then
     echo "Warning: cargo not found, falling back to pure Go"
@@ -157,14 +156,27 @@ WEOF
     # include_bytes_aligned! at compile time when --features ebpf-bytecode is set.
     EBPF_FEATURES=""
     if command -v rustup &>/dev/null && rustup toolchain list | grep -q nightly; then
+        # Resolve the nightly toolchain's bin directory so we can put it first
+        # on PATH. This is necessary when a standalone rustc (e.g. Homebrew's
+        # rust formula) shadows rustup's proxies — `rustup run nightly` sets
+        # RUSTUP_TOOLCHAIN but doesn't modify PATH, so cargo's sub-process
+        # invocations of rustc would find the stable system compiler instead.
+        NIGHTLY_RUSTC="$(rustup which --toolchain nightly rustc 2>/dev/null || true)"
+        NIGHTLY_BIN_DIR=""
+        if [ -n "$NIGHTLY_RUSTC" ]; then
+            NIGHTLY_BIN_DIR="$(dirname "$NIGHTLY_RUSTC")"
+        fi
+
         # bpf-linker is required — standard linkers can't produce valid eBPF ELF
         # because they lack BTF generation and BPF map relocation handling.
         if ! command -v bpf-linker &>/dev/null; then
             echo "Warning: bpf-linker not found, skipping eBPF build"
-            echo "  Install: cargo +nightly install bpf-linker"
+            echo "  Install: rustup run nightly cargo install bpf-linker"
+        elif [ -z "$NIGHTLY_BIN_DIR" ]; then
+            echo "Warning: cannot locate nightly rustc, skipping eBPF build"
         else
             echo "Building eBPF programs (bpfel-unknown-none via bpf-linker)..."
-            if cargo +nightly build \
+            if PATH="${NIGHTLY_BIN_DIR}:${PATH}" cargo build \
                 --release \
                 --manifest-path rust/xray-ebpf/Cargo.toml \
                 --target-dir rust/xray-ebpf/target; then
@@ -176,7 +188,7 @@ WEOF
         fi
     else
         echo "Warning: nightly toolchain not found, skipping eBPF build"
-        echo "  Install: rustup toolchain install nightly && cargo +nightly install bpf-linker"
+        echo "  Install: rustup toolchain install nightly && rustup run nightly cargo install bpf-linker"
     fi
 
     # Build Rust static library for the musl target.

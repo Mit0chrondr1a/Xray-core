@@ -7,17 +7,18 @@
 //! 4. If allowed, redirects via SOCKHASH to the paired socket
 
 use aya_ebpf::{
-    bindings::SK_PASS,
+    bindings::sk_action::SK_PASS,
     helpers::bpf_get_socket_cookie,
-    macros::sk_skb,
-    programs::SkSkbContext,
+    macros::stream_verdict,
+    programs::SkBuffContext,
+    EbpfContext,
 };
 
 use crate::maps::{POLICY_MAP, SOCKHASH, POLICY_ALLOW_REDIRECT, POLICY_USE_INGRESS};
 
 /// Stream verdict: redirect incoming data to the paired socket.
-#[sk_skb]
-pub fn xray_skb_verdict(ctx: SkSkbContext) -> u32 {
+#[stream_verdict]
+pub fn xray_skb_verdict(ctx: SkBuffContext) -> u32 {
     match try_skb_verdict(&ctx) {
         Ok(action) => action,
         Err(_) => SK_PASS,
@@ -25,8 +26,8 @@ pub fn xray_skb_verdict(ctx: SkSkbContext) -> u32 {
 }
 
 #[inline(always)]
-fn try_skb_verdict(ctx: &SkSkbContext) -> Result<u32, ()> {
-    let cookie = unsafe { bpf_get_socket_cookie(ctx.skb as *mut _) };
+fn try_skb_verdict(ctx: &SkBuffContext) -> Result<u32, ()> {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr() as *mut _) };
 
     // Look up policy for this socket.
     let policy = match unsafe { POLICY_MAP.get(&cookie) } {
@@ -49,8 +50,7 @@ fn try_skb_verdict(ctx: &SkSkbContext) -> Result<u32, ()> {
     };
 
     // Redirect to paired socket via SOCKHASH lookup.
-    match SOCKHASH.redirect_skb(ctx, &cookie, flags) {
-        Ok(_) => Ok(SK_PASS),
-        Err(_) => Ok(SK_PASS), // on redirect failure, pass to userspace
-    }
+    let mut key = cookie;
+    let _ = SOCKHASH.redirect_skb(ctx, &mut key, flags);
+    Ok(SK_PASS)
 }

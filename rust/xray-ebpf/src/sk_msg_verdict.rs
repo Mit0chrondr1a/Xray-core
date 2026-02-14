@@ -15,7 +15,7 @@
 //!     else: look up redirect target, msg_redirect_hash() -> paired socket
 
 use aya_ebpf::{
-    bindings::SK_PASS,
+    bindings::sk_action::SK_PASS,
     helpers::{bpf_get_socket_cookie, bpf_msg_cork_bytes},
     macros::sk_msg,
     programs::SkMsgContext,
@@ -69,6 +69,7 @@ fn try_sk_msg(ctx: &SkMsgContext) -> Result<u32, ()> {
     };
 
     // Redirect the message to the paired socket.
-    let _ = SOCKHASH.redirect_msg(ctx, &cookie, flags);
+    let mut key = cookie;
+    let _ = SOCKHASH.redirect_msg(ctx, &mut key, flags);
     Ok(SK_PASS)
 }
