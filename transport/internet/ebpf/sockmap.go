@@ -115,7 +115,16 @@ const (
 )
 
 // NewSockmapManager creates a new sockmap manager.
+// The config is validated and clamped to safe bounds.
 func NewSockmapManager(config SockmapConfig) *SockmapManager {
+	// Clamp MaxEntries to sane bounds.
+	if config.MaxEntries == 0 {
+		config.MaxEntries = 65536
+	}
+	const maxSockmapEntries = 1 << 20 // 1M entries
+	if config.MaxEntries > maxSockmapEntries {
+		config.MaxEntries = maxSockmapEntries
+	}
 	return &SockmapManager{
 		config:   config,
 		lruList:  list.New(),

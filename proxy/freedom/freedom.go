@@ -439,7 +439,7 @@ func (w *NoisePacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		var noise []byte
 		var err error
 		if w.remoteAddr.Family().IsDomain() {
-			panic("impossible, remoteAddr is always IP")
+			return errors.New("remoteAddr is unexpectedly a domain")
 		}
 		for _, n := range w.noises {
 			switch n.ApplyTo {
@@ -453,7 +453,7 @@ func (w *NoisePacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				}
 			case "ip":
 			default:
-				panic("unreachable, applyTo is ip/ipv4/ipv6")
+				return errors.New("invalid noise applyTo value: ", n.ApplyTo)
 			}
 			//User input string or base64 encoded string or hex string
 			if n.Packet != nil {

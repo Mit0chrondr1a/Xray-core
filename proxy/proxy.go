@@ -404,7 +404,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 func IsCompleteRecord(buffer buf.MultiBuffer) bool {
 	b := make([]byte, buffer.Len())
 	if buffer.Copy(b) != int(buffer.Len()) {
-		panic("impossible bytes allocation")
+		return false
 	}
 	var headerLen int = 5
 	var recordLen int

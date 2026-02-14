@@ -326,7 +326,15 @@ func (c *RustConn) SetDeadline(t time.Time) error              { return c.rawCon
 func (c *RustConn) SetReadDeadline(t time.Time) error          { return c.rawConn.SetReadDeadline(t) }
 func (c *RustConn) SetWriteDeadline(t time.Time) error         { return c.rawConn.SetWriteDeadline(t) }
 func (c *RustConn) HandshakeContext(ctx context.Context) error { return nil }
-func (c *RustConn) VerifyHostname(host string) error           { return nil }
+func (c *RustConn) VerifyHostname(host string) error {
+	if c.serverName == "" {
+		return errors.New("tls: RustConn: no server name was set during handshake")
+	}
+	if host != c.serverName {
+		return errors.New("tls: RustConn: requested hostname ", host, " does not match verified server name ", c.serverName)
+	}
+	return nil
+}
 
 func (c *RustConn) HandshakeContextServerName(ctx context.Context) string {
 	return c.serverName

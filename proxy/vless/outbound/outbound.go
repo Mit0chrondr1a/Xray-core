@@ -276,7 +276,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
 			rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 		default:
-			panic("unknown VLESS request command")
+			return errors.New("unknown VLESS request command: ", request.Command)
 		}
 	default:
 		ob.CanSpliceCopy = 3

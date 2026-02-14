@@ -612,11 +612,20 @@ func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error
 	return result, nil
 }
 
-// extractSecrets copies base traffic secrets from the C result to the Go TlsResult.
+// extractSecrets copies base traffic secrets from the C result to the Go TlsResult,
+// then zeroes the C-side buffers to prevent secrets from lingering on the stack.
 func extractSecrets(result *TlsResult, cResult *C.struct_xray_tls_result) {
 	if secretLen := int(cResult.secret_len); secretLen > 0 {
 		result.TxSecret = C.GoBytes(unsafe.Pointer(&cResult.tx_secret[0]), C.int(secretLen))
 		result.RxSecret = C.GoBytes(unsafe.Pointer(&cResult.rx_secret[0]), C.int(secretLen))
+		// Zero C-side secret buffers after copying to Go.
+		for i := range cResult.tx_secret {
+			cResult.tx_secret[i] = 0
+		}
+		for i := range cResult.rx_secret {
+			cResult.rx_secret[i] = 0
+		}
+		cResult.secret_len = 0
 	}
 }
 
@@ -866,6 +875,16 @@ func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) 
 
 // EbpfSetup initializes eBPF sockmap with pinned maps for zero-downtime recovery.
 func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {
+	if pinPath == "" {
+		return errors.New("native: ebpf setup: empty pin path")
+	}
+	if maxEntries == 0 {
+		maxEntries = 65536
+	}
+	const maxAllowedEntries = 1 << 20 // 1M
+	if maxEntries > maxAllowedEntries {
+		return fmt.Errorf("native: ebpf setup: maxEntries %d exceeds limit %d", maxEntries, maxAllowedEntries)
+	}
 	cPath := C.CString(pinPath)
 	defer C.free(unsafe.Pointer(cPath))
 	rc := C.xray_ebpf_setup(cPath, C.uint32_t(maxEntries), C.uint32_t(corkThreshold))

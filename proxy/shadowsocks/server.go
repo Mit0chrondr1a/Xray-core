@@ -218,7 +218,7 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {
-		panic("no inbound metadata")
+		return errors.New("no inbound metadata in context")
 	}
 	inbound.User = request.User
 
