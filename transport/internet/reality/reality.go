@@ -11,7 +11,6 @@ import (
 	gotls "crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
-	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -198,8 +197,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
 		copy(hello.Raw[39:], hello.SessionId)
 	}
-	// Try Rust native path: performs the TLS handshake in Rust and sets up kTLS
-	if native.Available() {
+	// Try Rust native path only when full bidirectional kTLS is available and
+	// no extra ML-DSA verification is configured.
+	if native.Available() && tls.NativeFullKTLSSupported() && len(config.Mldsa65Verify) == 0 {
 		ecdhe := uConn.HandshakeState.State13.KeyShareKeys.Ecdhe
 		if ecdhe == nil {
 			ecdhe = uConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
@@ -212,24 +212,23 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					native.RealityConfigSetServerPubkey(realityCfg, config.PublicKey)
 					native.RealityConfigSetShortId(realityCfg, config.ShortId)
 					native.RealityConfigSetVersion(realityCfg, core.Version_x, core.Version_y, core.Version_z)
-					if len(config.Mldsa65Verify) > 0 {
-						native.RealityConfigSetMldsa65Verify(realityCfg, config.Mldsa65Verify)
-					}
 					result, rustErr := native.RealityClientConnect(fd, uConn.HandshakeState.Hello.Raw, ecdhe.Bytes(), realityCfg)
 					native.RealityConfigFree(realityCfg)
 					if rustErr == nil {
 						if result != nil && result.KtlsTx && result.KtlsRx {
 							return tls.NewRustConn(c, result, uConn.ServerName), nil
 						}
+						// Handshake succeeded but kTLS incomplete — socket data
+						// already consumed by Rust TLS engine, Go/uTLS fallback
+						// would attempt a second handshake and fail.
 						if result != nil && result.StateHandle != nil {
 							native.TlsStateFree(result.StateHandle)
 						}
-						errors.LogDebug(ctx, "REALITY native handshake has no full kTLS data path, fallback to Go/uTLS")
+						return nil, errors.New("REALITY: Rust handshake succeeded but kTLS incomplete")
 					}
-					if rustErr != nil && !stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
-						return nil, rustErr
-					}
-					// Auth failed — fall through to Go path
+					// Rust native client path may have already consumed socket bytes.
+					// Do not fall back to Go/uTLS on this same connection.
+					return nil, rustErr
 				}
 			}
 		}

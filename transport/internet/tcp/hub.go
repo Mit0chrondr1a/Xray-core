@@ -3,6 +3,7 @@ package tcp
 import (
 	"context"
 	gotls "crypto/tls"
+	stderrors "errors"
 	"strings"
 	"time"
 
@@ -19,13 +20,14 @@ import (
 
 // Listener is an internet.Listener that listens for TCP connections.
 type Listener struct {
-	listener      net.Listener
-	tlsConfig     *gotls.Config
-	tlsXrayConfig *tls.Config
-	realityConfig *goreality.Config
-	authConfig    internet.ConnectionAuthenticator
-	config        *Config
-	addConn       internet.ConnHandler
+	listener          net.Listener
+	tlsConfig         *gotls.Config
+	tlsXrayConfig     *tls.Config
+	realityConfig     *goreality.Config
+	realityXrayConfig *reality.Config
+	authConfig        internet.ConnectionAuthenticator
+	config            *Config
+	addConn           internet.ConnHandler
 }
 
 const tlsHandshakeTimeout = 8 * time.Second
@@ -80,6 +82,7 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 	}
 	if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
 		l.realityConfig = config.GetREALITYConfig()
+		l.realityXrayConfig = config
 		go goreality.DetectPostHandshakeRecordsLens(l.realityConfig)
 	}
 
@@ -153,13 +156,51 @@ func (v *Listener) keepAccepting() {
 					conn = tlsConn
 				}
 			} else if v.realityConfig != nil {
-				realityConn, serveErr := reality.Server(conn, v.realityConfig)
-				if serveErr != nil {
-					errors.LogInfo(context.Background(), serveErr.Error())
-					_ = conn.Close()
-					return
+				rustDone := false
+				if native.Available() && tls.NativeFullKTLSSupported() && v.realityXrayConfig != nil && len(v.realityXrayConfig.Mldsa65Seed) == 0 {
+					fd, fdErr := tls.ExtractFd(conn)
+					if fdErr == nil {
+						if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+							errors.LogWarningInner(context.Background(), err, "failed to set REALITY handshake deadline")
+							_ = conn.Close()
+							return
+						}
+						rustResult, rustErr := v.doRustRealityServer(fd)
+						if err := conn.SetDeadline(time.Time{}); err != nil {
+							errors.LogWarningInner(context.Background(), err, "failed to clear REALITY handshake deadline")
+						}
+						if rustErr == nil && rustResult.KtlsTx && rustResult.KtlsRx {
+							conn = tls.NewRustConn(conn, rustResult, "")
+							rustDone = true
+						} else {
+							if rustResult != nil && rustResult.StateHandle != nil {
+								native.TlsStateFree(rustResult.StateHandle)
+							}
+							if rustErr == nil {
+								// Handshake succeeded but kTLS incomplete — socket data
+								// already consumed by rustls, Go fallback won't work.
+								errors.LogWarning(context.Background(), "REALITY: Rust handshake OK but kTLS incomplete, closing")
+								_ = conn.Close()
+								return
+							}
+							if !stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
+								errors.LogWarningInner(context.Background(), rustErr, "Rust REALITY server handshake failed")
+								_ = conn.Close()
+								return
+							}
+							// Auth failed — socket data was only peeked, Go fallback works
+						}
+					}
 				}
-				conn = realityConn
+				if !rustDone {
+					realityConn, serveErr := reality.Server(conn, v.realityConfig)
+					if serveErr != nil {
+						errors.LogInfo(context.Background(), serveErr.Error())
+						_ = conn.Close()
+						return
+					}
+					conn = realityConn
+				}
 			}
 			if v.authConfig != nil {
 				conn = v.authConfig.Server(conn)
@@ -167,6 +208,80 @@ func (v *Listener) keepAccepting() {
 			v.addConn(stat.Connection(conn))
 		}(conn)
 	}
+}
+
+func (v *Listener) doRustRealityServer(fd int) (*native.TlsResult, error) {
+	cfg := native.RealityConfigNew(false)
+	if cfg == nil {
+		return nil, errors.New("failed to create native REALITY server config")
+	}
+	defer native.RealityConfigFree(cfg)
+
+	rc := v.realityXrayConfig
+	native.RealityConfigSetPrivateKey(cfg, rc.PrivateKey)
+
+	// Use the same SNI allowlist policy as Go REALITY.
+	if serverNames := encodeRealityServerNames(rc.ServerNames); len(serverNames) > 0 {
+		native.RealityConfigSetServerNames(cfg, serverNames)
+	}
+
+	// Set short IDs (each may contain null bytes, so add individually)
+	for _, sid := range rc.ShortIds {
+		if len(sid) > 0 {
+			native.RealityConfigAddShortId(cfg, sid)
+		}
+	}
+
+	// Set max time diff (protobuf field is in milliseconds)
+	native.RealityConfigSetMaxTimeDiff(cfg, rc.MaxTimeDiff)
+
+	// Apply min/max bounds even when only one side is configured.
+	if hasVersionRange, minVer, maxVer := realityVersionRange(rc.MinClientVer, rc.MaxClientVer); hasVersionRange {
+		native.RealityConfigSetVersionRange(cfg,
+			minVer[0], minVer[1], minVer[2],
+			maxVer[0], maxVer[1], maxVer[2])
+	}
+
+	return native.RealityServerHandshake(fd, cfg)
+}
+
+func encodeRealityServerNames(serverNames []string) []byte {
+	totalLen := 0
+	for _, name := range serverNames {
+		if len(name) > 0 {
+			totalLen += len(name) + 1 // null separator expected by native parser
+		}
+	}
+	if totalLen == 0 {
+		return nil
+	}
+
+	encoded := make([]byte, 0, totalLen)
+	for _, name := range serverNames {
+		if len(name) == 0 {
+			continue
+		}
+		encoded = append(encoded, name...)
+		encoded = append(encoded, 0)
+	}
+	return encoded
+}
+
+func realityVersionRange(minClientVer, maxClientVer []byte) (bool, [3]uint8, [3]uint8) {
+	minVer := [3]uint8{}
+	maxVer := [3]uint8{255, 255, 255}
+	hasVersionRange := false
+
+	if len(minClientVer) > 0 {
+		hasVersionRange = true
+		copy(minVer[:], minClientVer)
+	}
+	if len(maxClientVer) > 0 {
+		hasVersionRange = true
+		copy(maxVer[:], maxClientVer)
+	}
+
+	return hasVersionRange, minVer, maxVer
 }
 
 // Addr implements internet.Listener.Addr.
