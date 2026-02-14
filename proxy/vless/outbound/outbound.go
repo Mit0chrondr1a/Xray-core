@@ -55,9 +55,12 @@ type Handler struct {
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
 
-	testpre  uint32
-	initpre  sync.Once
-	preConns chan *ConnExpire
+	testpre   uint32
+	initpre   sync.Once
+	preConns  chan *ConnExpire
+	preCtx    context.Context
+	preCancel context.CancelFunc
+	preWG     sync.WaitGroup
 }
 
 type ConnExpire struct {
@@ -123,8 +126,15 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 // Close implements common.Closable.Close().
 func (h *Handler) Close() error {
+	if h.preCancel != nil {
+		h.preCancel()
+		h.preWG.Wait()
+	}
 	if h.preConns != nil {
 		close(h.preConns)
+		for ce := range h.preConns {
+			ce.Conn.Close()
+		}
 	}
 	if h.reverse != nil {
 		return h.reverse.Close()
@@ -147,18 +157,43 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	if h.testpre > 0 && h.reverse == nil {
 		h.initpre.Do(func() {
 			h.preConns = make(chan *ConnExpire)
-			for range h.testpre { // TODO: randomize
+			h.preCtx, h.preCancel = context.WithCancel(context.Background())
+			for range h.testpre {
+				h.preWG.Add(1)
 				go func() {
+					defer h.preWG.Done()
 					defer func() { recover() }()
-					ctx := xctx.ContextWithID(context.Background(), session.NewID())
+					ctx := xctx.ContextWithID(h.preCtx, session.NewID())
+					backoff := time.Millisecond * 200
 					for {
+						select {
+						case <-h.preCtx.Done():
+							return
+						default:
+						}
 						conn, err := dialer.Dial(ctx, rec.Destination)
 						if err != nil {
 							errors.LogWarningInner(ctx, err, "pre-connect failed")
+							select {
+							case <-h.preCtx.Done():
+								return
+							case <-time.After(backoff):
+							}
+							backoff = min(backoff*2, 30*time.Second)
 							continue
 						}
-						h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(time.Minute * 2)} // TODO: customize & randomize
-						time.Sleep(time.Millisecond * 200)                                             // TODO: customize & randomize
+						backoff = time.Millisecond * 200
+						select {
+						case h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(2 * time.Minute)}:
+						case <-h.preCtx.Done():
+							conn.Close()
+							return
+						}
+						select {
+						case <-h.preCtx.Done():
+							return
+						case <-time.After(time.Millisecond * 200):
+						}
 					}
 				}()
 			}
