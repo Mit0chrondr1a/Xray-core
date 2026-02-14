@@ -499,43 +499,7 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 	if native.Available() {
 		return xtlsPaddingRust(b, command, userUUID, longPadding, ctx, testseed)
 	}
-
-	var contentLen int32 = 0
-	var paddingLen int32 = 0
-	if b != nil {
-		contentLen = b.Len()
-	}
-	if contentLen < int32(testseed[0]) && longPadding {
-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[1])))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
-		}
-		paddingLen = int32(l.Int64()) + int32(testseed[2]) - contentLen
-	} else {
-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[3])))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
-		}
-		paddingLen = int32(l.Int64())
-	}
-	if paddingLen > buf.Size-21-contentLen {
-		paddingLen = buf.Size - 21 - contentLen
-	}
-	newbuffer := buf.New()
-	if userUUID != nil {
-		newbuffer.Write(*userUUID)
-		*userUUID = nil
-	}
-	hdr := [5]byte{command, byte(contentLen >> 8), byte(contentLen), byte(paddingLen >> 8), byte(paddingLen)}
-	newbuffer.Write(hdr[:])
-	if b != nil {
-		newbuffer.Write(b.Bytes())
-		b.Release()
-		b = nil
-	}
-	newbuffer.Extend(paddingLen)
-	errors.LogDebug(ctx, "XtlsPadding ", contentLen, " ", paddingLen, " ", command)
-	return newbuffer
+	return xtlsPaddingGoFallback(b, command, userUUID, longPadding, ctx, testseed)
 }
 
 // xtlsPaddingRust delegates Vision padding to the Rust native library.

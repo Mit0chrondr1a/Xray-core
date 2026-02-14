@@ -663,6 +663,9 @@ func Blake3DeriveKey(out []byte, ctx string, key []byte) {
 		ctxPtr, C.size_t(len(ctx)),
 		keyPtr, C.size_t(len(key)),
 	)
+	runtime.KeepAlive(out)
+	runtime.KeepAlive(ctx)
+	runtime.KeepAlive(key)
 }
 
 // Blake3Sum256 computes a 32-byte BLAKE3 hash.
@@ -673,6 +676,7 @@ func Blake3Sum256(data []byte) [32]byte {
 		dataPtr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
 	}
 	C.xray_blake3_sum256((*C.uint8_t)(unsafe.Pointer(&out[0])), dataPtr, C.size_t(len(data)))
+	runtime.KeepAlive(data)
 	return out
 }
 
@@ -691,6 +695,8 @@ func Blake3KeyedHash(key *[32]byte, data []byte, outLen int) []byte {
 		(*C.uint8_t)(unsafe.Pointer(&key[0])),
 		dataPtr, C.size_t(len(data)),
 	)
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(data)
 	return out
 }
 
@@ -718,6 +724,7 @@ func MphAddPattern(h *MphHandle, pattern string, patternType byte) {
 	C.xray_mph_add_pattern(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(p)), C.size_t(len(pattern)),
 		C.uint8_t(patternType))
+	runtime.KeepAlive(pattern)
 }
 
 // MphBuild builds the MPH table. Must be called after all patterns are added.
@@ -734,8 +741,10 @@ func MphMatch(h *MphHandle, input string) bool {
 		var z byte
 		p = &z
 	}
-	return bool(C.xray_mph_match(h.ptr,
+	result := bool(C.xray_mph_match(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(p)), C.size_t(len(input))))
+	runtime.KeepAlive(input)
+	return result
 }
 
 // MphFree releases the MPH table.
@@ -766,6 +775,7 @@ func IpSetAddPrefix(h *IpSetHandle, ipBytes []byte, prefixBits int) {
 	C.xray_ipset_add_prefix(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(&ipBytes[0])), C.size_t(len(ipBytes)),
 		C.uint8_t(prefixBits))
+	runtime.KeepAlive(ipBytes)
 }
 
 // IpSetBuild finalizes the IP set after all prefixes are added.
@@ -778,8 +788,10 @@ func IpSetContains(h *IpSetHandle, ipBytes []byte) bool {
 	if len(ipBytes) == 0 {
 		return false
 	}
-	return bool(C.xray_ipset_contains(h.ptr,
+	result := bool(C.xray_ipset_contains(h.ptr,
 		(*C.uint8_t)(unsafe.Pointer(&ipBytes[0])), C.size_t(len(ipBytes))))
+	runtime.KeepAlive(ipBytes)
+	return result
 }
 
 // IpSetMax4 returns the maximum IPv4 prefix length, or 0xff if empty.
@@ -840,6 +852,9 @@ func VisionPad(data []byte, command byte, uuid []byte, longPadding bool, testsee
 		(*C.uint8_t)(unsafe.Pointer(&out[0])),
 		C.uint32_t(len(out)),
 	)
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(uuid)
+	runtime.KeepAlive(out)
 	if n < 0 {
 		return 0, errors.New("native: vision pad failed")
 	}
@@ -865,6 +880,10 @@ func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) 
 		uuidPtr, uuidLen,
 		(*C.uint8_t)(unsafe.Pointer(&out[0])), C.uint32_t(len(out)),
 	)
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(state)
+	runtime.KeepAlive(uuid)
+	runtime.KeepAlive(out)
 	if n < 0 {
 		return 0, errors.New("native: vision unpad failed")
 	}
