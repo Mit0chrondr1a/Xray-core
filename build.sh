@@ -142,26 +142,41 @@ WEOF
         arm64) RUST_CPU_FLAGS="-C target-cpu=cortex-a53" ;;
     esac
 
-    # Step 0: Build eBPF programs (requires nightly + bpfel-unknown-none target).
-    # These are compiled to BPF bytecode and embedded in the userspace crate
-    # via include_bytes_aligned! at compile time.
-    EBPF_TARGET="bpfel-unknown-none"
+    # Step 0: Build eBPF programs for the BPF virtual machine.
+    #
+    # eBPF programs run inside the Linux kernel, not on a real CPU. They require:
+    #   - Nightly Rust: build-std=core rebuilds libcore for the bpfel target
+    #   - bpf-linker:   specialized LLVM linker that emits BTF (BPF Type Format)
+    #                    sections the kernel verifier requires; standard linkers
+    #                    (GNU ld, LLVM lld) cannot produce valid eBPF ELF
+    #
+    # Target, build-std, and linker are configured in rust/xray-ebpf/.cargo/config.toml
+    # so `cargo +nightly build` is all that's needed here.
+    #
+    # The compiled bytecode is embedded in the userspace crate (xray-rust) via
+    # include_bytes_aligned! at compile time when --features ebpf-bytecode is set.
     EBPF_FEATURES=""
     if command -v rustup &>/dev/null && rustup toolchain list | grep -q nightly; then
-        echo "Building eBPF programs for ${EBPF_TARGET}..."
-        if cargo +nightly build \
-            -Z build-std=core \
-            --target "$EBPF_TARGET" \
-            --release \
-            --manifest-path rust/xray-ebpf/Cargo.toml \
-            --target-dir rust/xray-ebpf/target 2>/dev/null; then
-            EBPF_FEATURES="--features ebpf-bytecode"
-            echo "eBPF programs built successfully"
+        # bpf-linker is required — standard linkers can't produce valid eBPF ELF
+        # because they lack BTF generation and BPF map relocation handling.
+        if ! command -v bpf-linker &>/dev/null; then
+            echo "Warning: bpf-linker not found, skipping eBPF build"
+            echo "  Install: cargo +nightly install bpf-linker"
         else
-            echo "Warning: eBPF build failed (non-fatal), continuing without SK_MSG cork + Aya"
+            echo "Building eBPF programs (bpfel-unknown-none via bpf-linker)..."
+            if cargo +nightly build \
+                --release \
+                --manifest-path rust/xray-ebpf/Cargo.toml \
+                --target-dir rust/xray-ebpf/target; then
+                EBPF_FEATURES="--features ebpf-bytecode"
+                echo "eBPF programs built successfully"
+            else
+                echo "Warning: eBPF build failed (non-fatal), continuing without SK_MSG cork + Aya"
+            fi
         fi
     else
-        echo "Warning: nightly toolchain not found, skipping eBPF build (SK_MSG cork + Aya unavailable)"
+        echo "Warning: nightly toolchain not found, skipping eBPF build"
+        echo "  Install: rustup toolchain install nightly && cargo +nightly install bpf-linker"
     fi
 
     # Build Rust static library for the musl target.

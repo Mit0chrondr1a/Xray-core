@@ -1,0 +1,21 @@
+# eBPF programs target the BPF virtual machine, not a real CPU architecture.
+# Standard linkers (GNU ld, LLVM lld) cannot produce valid eBPF ELF binaries
+# because they lack BTF (BPF Type Format) generation and BPF-specific relocation
+# handling that the kernel verifier requires to load the program.
+#
+# bpf-linker is a specialized LLVM wrapper that:
+#   1. Emits proper BTF sections for kernel verification
+#   2. Handles BPF map relocations (Aya's map!() macro)
+#   3. Produces CO-RE (Compile Once, Run Everywhere) compatible ELF
+#
+# Install: cargo +nightly install bpf-linker
+# Build:   cargo +nightly build --release
+
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
