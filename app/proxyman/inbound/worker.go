@@ -179,12 +179,12 @@ type udpConn struct {
 	done             *done.Instance
 	uplink           stats.Counter
 	downlink         stats.Counter
-	inactive         bool
+	inactive         atomic.Bool
 	cancel           context.CancelFunc
 }
 
 func (c *udpConn) setInactive() {
-	c.inactive = true
+	c.inactive.Store(true)
 }
 
 func (c *udpConn) updateActivity() {
@@ -207,7 +207,7 @@ func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 }
 
 func (c *udpConn) Read(buf []byte) (int, error) {
-	panic("not implemented")
+	return 0, errors.New("udpConn.Read not implemented")
 }
 
 // Write implements io.Writer.
@@ -256,6 +256,8 @@ type connID struct {
 	dest net.Destination
 }
 
+const maxUDPSessions = 16384
+
 type udpWorker struct {
 	sync.RWMutex
 
@@ -270,8 +272,9 @@ type udpWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	checker    *task.Periodic
-	activeConn map[connID]*udpConn
+	checker          *task.Periodic
+	activeConn       map[connID]*udpConn
+	sessionSemaphore chan struct{}
 
 	ctx  context.Context
 	cone bool
@@ -340,7 +343,18 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 	if !existing {
 		common.Must(w.checker.Start())
 
+		select {
+		case w.sessionSemaphore <- struct{}{}:
+		default:
+			errors.LogWarning(w.ctx, "UDP session limit reached, dropping new session from ", source)
+			conn.Close()
+			w.removeConn(id)
+			return
+		}
+
 		go func() {
+			defer func() { <-w.sessionSemaphore }()
+
 			ctx, cancel := context.WithCancel(w.ctx)
 			conn.cancel = cancel
 			sid := session.NewID()
@@ -380,7 +394,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			}
 			conn.Close()
 			// conn not removed by checker TODO may be lock worker here is better
-			if !conn.inactive {
+			if !conn.inactive.Load() {
 				conn.setInactive()
 				w.removeConn(id)
 			}
@@ -412,7 +426,7 @@ func (w *udpWorker) clean() error {
 
 	for addr, conn := range w.activeConn {
 		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 2*60 {
-			if !conn.inactive {
+			if !conn.inactive.Load() {
 				conn.setInactive()
 				delete(w.activeConn, addr)
 			}
@@ -429,6 +443,7 @@ func (w *udpWorker) clean() error {
 
 func (w *udpWorker) Start() error {
 	w.activeConn = make(map[connID]*udpConn, 16)
+	w.sessionSemaphore = make(chan struct{}, maxUDPSessions)
 	ctx := context.Background()
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
 	if err != nil {
