@@ -20,6 +20,12 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
+// maxConcurrentConns is the maximum number of concurrent connection-handling
+// goroutines per TCP listener.  This prevents unbounded goroutine growth
+// during a connection flood while remaining generous for high-throughput
+// proxy workloads.
+const maxConcurrentConns = 32768
+
 // Listener is an internet.Listener that listens for TCP connections.
 type Listener struct {
 	listener          net.Listener
@@ -30,6 +36,7 @@ type Listener struct {
 	authConfig        internet.ConnectionAuthenticator
 	config            *Config
 	addConn           internet.ConnHandler
+	connSemaphore     chan struct{}
 }
 
 const tlsHandshakeTimeout = 8 * time.Second
@@ -67,7 +74,8 @@ func extractIP(addr net.Addr) net.IP {
 // ListenTCP creates a new Listener based on configurations.
 func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
 	l := &Listener{
-		addConn: handler,
+		addConn:       handler,
+		connSemaphore: make(chan struct{}, maxConcurrentConns),
 	}
 	tcpSettings := streamSettings.ProtocolSettings.(*Config)
 	l.config = tcpSettings
@@ -148,7 +156,15 @@ func (v *Listener) keepAccepting() {
 			}
 			continue
 		}
+		select {
+		case v.connSemaphore <- struct{}{}:
+		default:
+			errors.LogWarning(context.Background(), "TCP connection limit reached (", maxConcurrentConns, "), rejecting connection from ", conn.RemoteAddr())
+			_ = conn.Close()
+			continue
+		}
 		go func(rawConn net.Conn) {
+			defer func() { <-v.connSemaphore }()
 			conn := rawConn
 			if v.tlsConfig != nil {
 				if native.Available() && v.tlsXrayConfig != nil {
