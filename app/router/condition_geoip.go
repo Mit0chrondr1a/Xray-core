@@ -817,6 +817,26 @@ type GeoIPSetFactory struct {
 
 var ipsetFactory = GeoIPSetFactory{shared: make(map[string]*GeoIPSet)}
 
+// nativeGeoIPHandles stores pre-built IpSet handles loaded by the native
+// geodata loader. Keyed by country code (upper-case). Consumed once by
+// BuildOptimizedGeoIPMatcher.
+var nativeGeoIPHandles sync.Map
+
+// StoreNativeGeoIPHandle stores a pre-built native IpSet handle for use by
+// BuildOptimizedGeoIPMatcher. Called from config loading.
+func StoreNativeGeoIPHandle(code string, handle *native.IpSetHandle) {
+	nativeGeoIPHandles.Store(code, handle)
+}
+
+// loadNativeGeoIPHandle retrieves a pre-built native IpSet handle.
+// Handles are kept in the cache for reuse across multiple rules.
+func loadNativeGeoIPHandle(code string) *native.IpSetHandle {
+	if h, ok := nativeGeoIPHandles.Load(code); ok {
+		return h.(*native.IpSetHandle)
+	}
+	return nil
+}
+
 func (f *GeoIPSetFactory) GetOrCreate(key string, cidrGroups [][]*CIDR) (*GeoIPSet, error) {
 	f.Lock()
 	defer f.Unlock()
@@ -830,6 +850,21 @@ func (f *GeoIPSetFactory) GetOrCreate(key string, cidrGroups [][]*CIDR) (*GeoIPS
 		f.shared[key] = ipset
 	}
 	return ipset, err
+}
+
+// CreateFromNativeHandle wraps a pre-built native IpSet handle.
+func (f *GeoIPSetFactory) CreateFromNativeHandle(handle *native.IpSetHandle) *GeoIPSet {
+	set := &GeoIPSet{
+		nativeHandle: handle,
+		max4:         native.IpSetMax4(handle),
+		max6:         native.IpSetMax6(handle),
+	}
+	// Keep the handle alive as long as the GeoIPSet is reachable.
+	// Do NOT free — handle is shared via nativeGeoIPCache.
+	runtime.SetFinalizer(set, func(s *GeoIPSet) {
+		runtime.KeepAlive(s.nativeHandle)
+	})
+	return set
 }
 
 func (f *GeoIPSetFactory) Create(cidrGroups ...[]*CIDR) (*GeoIPSet, error) {
@@ -949,6 +984,12 @@ func BuildOptimizedGeoIPMatcher(geoips ...*GeoIP) (GeoIPMatcher, error) {
 			if err != nil {
 				return nil, err
 			}
+			subs = append(subs, &HeuristicGeoIPMatcher{ipset: ipset, reverse: geoip.ReverseMatch})
+			continue
+		}
+		// Check for pre-built native handle (from native geodata loader)
+		if handle := loadNativeGeoIPHandle(geoip.CountryCode); handle != nil {
+			ipset := ipsetFactory.CreateFromNativeHandle(handle)
 			subs = append(subs, &HeuristicGeoIPMatcher{ipset: ipset, reverse: geoip.ReverseMatch})
 			continue
 		}

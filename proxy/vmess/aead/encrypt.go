@@ -9,9 +9,17 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/crypto"
+	"github.com/xtls/xray-core/common/native"
 )
 
 func SealVMessAEADHeader(key [16]byte, data []byte) ([]byte, error) {
+	if native.Available() {
+		return native.VMessSealHeader(key, data)
+	}
+	return sealVMessAEADHeaderGo(key, data)
+}
+
+func sealVMessAEADHeaderGo(key [16]byte, data []byte) ([]byte, error) {
 	generatedAuthID, err := CreateAuthID(key[:], time.Now().Unix())
 	if err != nil {
 		return nil, err

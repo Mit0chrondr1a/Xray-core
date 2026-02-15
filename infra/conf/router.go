@@ -3,14 +3,17 @@ package conf
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/platform/filesystem"
@@ -204,12 +207,56 @@ func loadIP(file, code string) ([]*router.CIDR, error) {
 	return geoip.Cidr, nil
 }
 
+// nativeGeoIPCache caches pre-built native IpSet handles keyed by "file:CODE".
+var nativeGeoIPCache sync.Map
+
+// loadIPNative loads a GeoIP entry using the native Rust geodata loader.
+// Returns the IpSetHandle directly, bypassing Go protobuf unmarshal.
+func loadIPNative(file, code string) (*native.IpSetHandle, error) {
+	code = strings.ToUpper(code)
+	key := file + ":" + code
+	if h, ok := nativeGeoIPCache.Load(key); ok {
+		return h.(*native.IpSetHandle), nil
+	}
+
+	path := platform.GetAssetLocation(file)
+	handles, err := native.GeoIPLoad(path, []string{code})
+	if err != nil {
+		return nil, err
+	}
+	if len(handles) == 0 || handles[0] == nil {
+		return nil, errors.New("native: code not found in ", file, ": ", code)
+	}
+	nativeGeoIPCache.Store(key, handles[0])
+	return handles[0], nil
+}
+
 func loadSite(file, code string) ([]*router.Domain, error) {
 
 	// Check if domain matcher cache is provided via environment
 	domainMatcherPath := platform.NewEnvFlag(platform.MphCachePath).GetValue(func() string { return "" })
 	if domainMatcherPath != "" {
 		return []*router.Domain{{}}, nil
+	}
+
+	// Try native Rust geodata loader (single-pass, no protobuf unmarshal).
+	if native.Available() {
+		path := platform.GetAssetLocation(file)
+		results, err := native.GeoSiteLoad(path, []string{code})
+		if err == nil && len(results) > 0 {
+			entries := results[0]
+			domains := make([]*router.Domain, len(entries))
+			for i, e := range entries {
+				domains[i] = &router.Domain{
+					Type:  router.Domain_Type(e.DomainType),
+					Value: e.Value,
+				}
+			}
+			return domains, nil
+		}
+		if err != nil {
+			errors.LogWarning(context.Background(), "native geosite load failed, falling back to Go: ", err)
+		}
 	}
 
 	bs, err := loadFile(file, code)
@@ -452,13 +499,30 @@ func ToCidrList(ips StringList) ([]*router.GeoIP, error) {
 			if len(country) == 0 {
 				return nil, errors.New("empty country name in rule")
 			}
-			geoip, err := loadIP("geoip.dat", strings.ToUpper(country))
+			countryUpper := strings.ToUpper(country)
+
+			// Try native Rust geodata loader (single-pass, no protobuf unmarshal).
+			if native.Available() {
+				handle, nativeErr := loadIPNative("geoip.dat", countryUpper)
+				if nativeErr == nil {
+					router.StoreNativeGeoIPHandle(countryUpper, handle)
+					geoipList = append(geoipList, &router.GeoIP{
+						CountryCode:  countryUpper,
+						Cidr:         nil,
+						ReverseMatch: isReverseMatch,
+					})
+					continue
+				}
+				errors.LogWarning(context.Background(), "native geoip load failed, falling back to Go: ", nativeErr)
+			}
+
+			geoip, err := loadIP("geoip.dat", countryUpper)
 			if err != nil {
 				return nil, errors.New("failed to load GeoIP: ", country).Base(err)
 			}
 
 			geoipList = append(geoipList, &router.GeoIP{
-				CountryCode:  strings.ToUpper(country),
+				CountryCode:  countryUpper,
 				Cidr:         geoip,
 				ReverseMatch: isReverseMatch,
 			})
@@ -492,13 +556,31 @@ func ToCidrList(ips StringList) ([]*router.GeoIP, error) {
 				country = country[1:]
 				isReverseMatch = true
 			}
-			geoip, err := loadIP(filename, strings.ToUpper(country))
+			countryUpper := strings.ToUpper(country)
+			codeKey := strings.ToUpper(filename + "_" + country)
+
+			// Try native Rust geodata loader.
+			if native.Available() {
+				handle, nativeErr := loadIPNative(filename, countryUpper)
+				if nativeErr == nil {
+					router.StoreNativeGeoIPHandle(codeKey, handle)
+					geoipList = append(geoipList, &router.GeoIP{
+						CountryCode:  codeKey,
+						Cidr:         nil,
+						ReverseMatch: isReverseMatch,
+					})
+					continue
+				}
+				errors.LogWarning(context.Background(), "native geoip load failed for ", filename, ":", countryUpper, ", falling back to Go: ", nativeErr)
+			}
+
+			geoip, err := loadIP(filename, countryUpper)
 			if err != nil {
 				return nil, errors.New("failed to load IPs: ", country, " from ", filename).Base(err)
 			}
 
 			geoipList = append(geoipList, &router.GeoIP{
-				CountryCode:  strings.ToUpper(filename + "_" + country),
+				CountryCode:  codeKey,
 				Cidr:         geoip,
 				ReverseMatch: isReverseMatch,
 			})

@@ -4,11 +4,13 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"io"
+	"slices"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/bytespool"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/protocol"
 )
 
@@ -85,6 +87,91 @@ func (v *AEADAuthenticator) Seal(dst, plainText []byte) ([]byte, error) {
 		additionalData = v.AdditionalDataGenerator()
 	}
 	return v.AEAD.Seal(dst, iv, plainText, additionalData), nil
+}
+
+// NativeAEADAuthenticator wraps a Rust AEAD handle for accelerated crypto.
+type NativeAEADAuthenticator struct {
+	handle                  *native.AeadHandle
+	overhead                int
+	nonceSize               int
+	NonceGenerator          BytesGenerator
+	AdditionalDataGenerator BytesGenerator
+}
+
+// NewNativeAEAD attempts to create a native AEAD authenticator from a Go cipher.AEAD.
+// Returns nil if native acceleration is unavailable or the cipher is unsupported.
+func NewNativeAEAD(aead cipher.AEAD, nonceGen BytesGenerator, aadGen BytesGenerator) *NativeAEADAuthenticator {
+	if !native.Available() {
+		return nil
+	}
+	// Detect algorithm from AEAD properties — we can't inspect the key directly,
+	// so the caller must use NewNativeAEADFromKey instead for proper detection.
+	return nil
+}
+
+// NewNativeAEADFromKey creates a native AEAD authenticator from algorithm ID and raw key.
+func NewNativeAEADFromKey(algo byte, key []byte, nonceGen BytesGenerator, aadGen BytesGenerator) *NativeAEADAuthenticator {
+	if !native.Available() {
+		return nil
+	}
+	h := native.AeadNew(algo, key)
+	if h == nil {
+		return nil
+	}
+	return &NativeAEADAuthenticator{
+		handle:                  h,
+		overhead:                native.AeadOverhead(h),
+		nonceSize:               native.AeadNonceSize(h),
+		NonceGenerator:          nonceGen,
+		AdditionalDataGenerator: aadGen,
+	}
+}
+
+func (v *NativeAEADAuthenticator) NonceSize() int { return v.nonceSize }
+func (v *NativeAEADAuthenticator) Overhead() int  { return v.overhead }
+
+func (v *NativeAEADAuthenticator) Open(dst, cipherText []byte) ([]byte, error) {
+	iv := v.NonceGenerator()
+	if len(iv) != v.nonceSize {
+		return nil, errors.New("invalid AEAD nonce size: ", len(iv))
+	}
+
+	var additionalData []byte
+	if v.AdditionalDataGenerator != nil {
+		additionalData = v.AdditionalDataGenerator()
+	}
+	// Write directly into dst to avoid double allocation.
+	needed := len(cipherText) // output buffer must be >= ct_len for in-place decryption
+	dst = slices.Grow(dst, needed)
+	start := len(dst)
+	dst = dst[:start+needed]
+	n, err := native.AeadOpenTo(v.handle, iv, additionalData, cipherText, dst[start:])
+	if err != nil {
+		return dst[:start], err
+	}
+	return dst[:start+n], nil
+}
+
+func (v *NativeAEADAuthenticator) Seal(dst, plainText []byte) ([]byte, error) {
+	iv := v.NonceGenerator()
+	if len(iv) != v.nonceSize {
+		return nil, errors.New("invalid AEAD nonce size: ", len(iv))
+	}
+
+	var additionalData []byte
+	if v.AdditionalDataGenerator != nil {
+		additionalData = v.AdditionalDataGenerator()
+	}
+	// Write directly into dst to avoid double allocation.
+	needed := len(plainText) + v.overhead
+	dst = slices.Grow(dst, needed)
+	start := len(dst)
+	dst = dst[:start+needed]
+	n, err := native.AeadSealTo(v.handle, iv, additionalData, plainText, dst[start:])
+	if err != nil {
+		return dst[:start], err
+	}
+	return dst[:start+n], nil
 }
 
 type AuthenticationReader struct {
