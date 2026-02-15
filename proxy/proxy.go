@@ -681,9 +681,13 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx conte
 				trafficState.IsTLS12orAbove = true
 				trafficState.IsTLS = true
 				if b.Len() >= 79 && trafficState.RemainingServerHello >= 79 {
-					sessionIdLen := int32(b.Byte(43))
-					cipherSuite := b.BytesRange(43+sessionIdLen+1, 43+sessionIdLen+3)
-					trafficState.Cipher = uint16(cipherSuite[0])<<8 | uint16(cipherSuite[1])
+					sessionIdLen := min(int32(b.Byte(43)), 32) // TLS session IDs are at most 32 bytes
+					if 43+sessionIdLen+3 > b.Len() {
+						errors.LogDebug(ctx, "XtlsFilterTls sessionIdLen exceeds buffer, skipping cipher suite parse")
+					} else {
+						cipherSuite := b.BytesRange(43+sessionIdLen+1, 43+sessionIdLen+3)
+						trafficState.Cipher = uint16(cipherSuite[0])<<8 | uint16(cipherSuite[1])
+					}
 				} else {
 					errors.LogDebug(ctx, "XtlsFilterTls short server hello, tls 1.2 or older? ", b.Len(), " ", trafficState.RemainingServerHello)
 				}
