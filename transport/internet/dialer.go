@@ -187,11 +187,18 @@ func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt
 		errors.LogDebug(ctx, "query SRV record for "+dest.Address.String())
 		parts := strings.SplitN(dest.Address.String(), ".", 3)
 		if len(parts) != 3 {
-			return nil, errors.New("invalid address format", dest.Address.String())
+			return nil, errors.New("invalid address format: ", dest.Address.String())
+		}
+		// SRV names must be _service._proto.name (RFC 2782)
+		if len(parts[0]) < 2 || parts[0][0] != '_' || len(parts[1]) < 2 || parts[1][0] != '_' {
+			return nil, errors.New("invalid SRV address format, expected _service._proto.name: ", dest.Address.String())
 		}
 		_, srvRecords, err := net.DefaultResolver.LookupSRV(context.Background(), parts[0][1:], parts[1][1:], parts[2])
 		if err != nil {
 			return nil, errors.New("failed to lookup SRV record").Base(err)
+		}
+		if len(srvRecords) == 0 {
+			return nil, errors.New("SRV lookup returned no records for ", dest.Address.String())
 		}
 		errors.LogDebug(ctx, "SRV record: "+fmt.Sprintf("addr=%s, port=%d, priority=%d, weight=%d", srvRecords[0].Target, srvRecords[0].Port, srvRecords[0].Priority, srvRecords[0].Weight))
 		if OverridePort {
