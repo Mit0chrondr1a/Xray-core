@@ -14,8 +14,9 @@ type Channel struct {
 	subscribers []chan interface{}
 
 	// Synchronization components
-	access sync.RWMutex
-	closed chan struct{}
+	access           sync.RWMutex
+	closed           chan struct{}
+	publishSemaphore chan struct{} // Limits goroutines spawned by non-blocking publish/broadcast
 
 	// Channel options
 	blocking   bool // Set blocking state if channel buffer reaches limit
@@ -26,10 +27,11 @@ type Channel struct {
 // NewChannel creates an instance of Statistics Channel.
 func NewChannel(config *ChannelConfig) *Channel {
 	return &Channel{
-		channel:    make(chan channelMessage, config.BufferSize),
-		subsLimit:  int(config.SubscriberLimit),
-		bufferSize: int(config.BufferSize),
-		blocking:   config.Blocking,
+		channel:          make(chan channelMessage, config.BufferSize),
+		subsLimit:        int(config.SubscriberLimit),
+		bufferSize:       int(config.BufferSize),
+		blocking:         config.Blocking,
+		publishSemaphore: make(chan struct{}, 64),
 	}
 }
 
@@ -37,7 +39,9 @@ func NewChannel(config *ChannelConfig) *Channel {
 func (c *Channel) Subscribers() []chan interface{} {
 	c.access.RLock()
 	defer c.access.RUnlock()
-	return c.subscribers
+	result := make([]chan interface{}, len(c.subscribers))
+	copy(result, c.subscribers)
+	return result
 }
 
 // Subscribe implements stats.Channel.
@@ -63,6 +67,7 @@ func (c *Channel) Unsubscribe(subscriber chan interface{}) error {
 			copy(subscribers[:i], c.subscribers[:i])
 			copy(subscribers[i:], c.subscribers[i+1:])
 			c.subscribers = subscribers
+			return nil
 		}
 	}
 	return nil
@@ -78,7 +83,7 @@ func (c *Channel) Publish(ctx context.Context, msg interface{}) {
 		if c.blocking {
 			pub.publish(c.channel)
 		} else {
-			pub.publishNonBlocking(c.channel)
+			pub.publishNonBlocking(c.channel, c.publishSemaphore)
 		}
 	}
 }
@@ -109,7 +114,7 @@ func (c *Channel) Start() error {
 						if c.blocking {
 							pub.broadcast(sub)
 						} else {
-							pub.broadcastNonBlocking(sub)
+							pub.broadcastNonBlocking(sub, c.publishSemaphore)
 						}
 					}
 				case <-c.closed: // Channel closed
@@ -149,11 +154,19 @@ func (c channelMessage) publish(publisher chan channelMessage) {
 	}
 }
 
-func (c channelMessage) publishNonBlocking(publisher chan channelMessage) {
+func (c channelMessage) publishNonBlocking(publisher chan channelMessage, semaphore chan struct{}) {
 	select {
 	case publisher <- c:
-	default: // Create another goroutine to keep sending message
-		go c.publish(publisher)
+	default: // Create another goroutine to keep sending message, bounded by semaphore
+		select {
+		case semaphore <- struct{}{}:
+			go func() {
+				defer func() { <-semaphore }()
+				c.publish(publisher)
+			}()
+		default:
+			errors.LogWarning(c.context, "dropping stats message, publish goroutine limit reached")
+		}
 	}
 }
 
@@ -164,10 +177,18 @@ func (c channelMessage) broadcast(subscriber chan interface{}) {
 	}
 }
 
-func (c channelMessage) broadcastNonBlocking(subscriber chan interface{}) {
+func (c channelMessage) broadcastNonBlocking(subscriber chan interface{}, semaphore chan struct{}) {
 	select {
 	case subscriber <- c.message:
-	default: // Create another goroutine to keep sending message
-		go c.broadcast(subscriber)
+	default: // Create another goroutine to keep sending message, bounded by semaphore
+		select {
+		case semaphore <- struct{}{}:
+			go func() {
+				defer func() { <-semaphore }()
+				c.broadcast(subscriber)
+			}()
+		default:
+			errors.LogWarning(c.context, "dropping stats message, broadcast goroutine limit reached")
+		}
 	}
 }
