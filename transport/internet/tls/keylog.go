@@ -35,7 +35,12 @@ func MasterKeyLogWriter(path string) io.Writer {
 	if err != nil {
 		errors.LogWarningInner(context.Background(), err, "failed to stat ", path, " after opening as master key log")
 	} else if info.Mode().Perm()&0o077 != 0 {
-		errors.LogWarning(context.Background(), "master key log ", path, " is more permissive than 0600")
+		if os.Getenv("XRAY_ALLOW_INSECURE_KEYLOG") != "1" {
+			errors.LogWarning(context.Background(), "master key log ", path, " is more permissive than 0600, refusing to write (set XRAY_ALLOW_INSECURE_KEYLOG=1 to override)")
+			writer.Close()
+			return nil
+		}
+		errors.LogWarning(context.Background(), "master key log ", path, " is more permissive than 0600 (override via XRAY_ALLOW_INSECURE_KEYLOG=1)")
 	}
 
 	if masterKeyLogWriters.writers == nil {

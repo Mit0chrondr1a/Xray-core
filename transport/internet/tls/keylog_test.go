@@ -3,6 +3,7 @@ package tls_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	. "github.com/xtls/xray-core/transport/internet/tls"
@@ -39,4 +40,51 @@ func TestMasterKeyLogWriterDisabled(t *testing.T) {
 	if MasterKeyLogWriter("none") != nil {
 		t.Fatal("\"none\" should disable key logging")
 	}
+}
+
+func TestMasterKeyLogWriterRefusesInsecurePerms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file permission tests not reliable on Windows")
+	}
+
+	// Clear any cached writers and env override.
+	CloseMasterKeyLogWriters()
+	t.Setenv("XRAY_ALLOW_INSECURE_KEYLOG", "")
+
+	logPath := filepath.Join(t.TempDir(), "insecure-keys.log")
+	// Create file with world-readable permissions.
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	w := MasterKeyLogWriter(logPath)
+	if w != nil {
+		t.Fatal("expected nil writer for 0644 keylog file without override")
+	}
+}
+
+func TestMasterKeyLogWriterAllowsInsecureWithEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file permission tests not reliable on Windows")
+	}
+
+	CloseMasterKeyLogWriters()
+	t.Setenv("XRAY_ALLOW_INSECURE_KEYLOG", "1")
+
+	logPath := filepath.Join(t.TempDir(), "insecure-keys-override.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	w := MasterKeyLogWriter(logPath)
+	if w == nil {
+		t.Fatal("expected writer with XRAY_ALLOW_INSECURE_KEYLOG=1 override")
+	}
+
+	// Cleanup
+	CloseMasterKeyLogWriters()
 }
