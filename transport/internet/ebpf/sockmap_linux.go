@@ -298,13 +298,17 @@ func setupSockmapImpl(config SockmapConfig) error {
 	if usingSockmapFallback {
 		newState.sockmapAttachFD = attachFD
 		newState.sockmapAttachMaxEntries = config.MaxEntries
+		sockmapAttachSlotMu.Lock()
 		sockmapAttachSlots = make(map[int]uint32)
 		sockmapAttachFree = nil
+		sockmapAttachSlotMu.Unlock()
 		sockmapAttachNext.Store(0)
 	} else {
 		newState.sockmapAttachFD = -1
+		sockmapAttachSlotMu.Lock()
 		sockmapAttachSlots = nil
 		sockmapAttachFree = nil
+		sockmapAttachSlotMu.Unlock()
 		sockmapAttachNext.Store(0)
 	}
 	currentState.Store(newState)
@@ -348,8 +352,10 @@ func teardownSockmapImpl() error {
 	currentState.Store(closedState)
 
 	// Reset slot management globals.
+	sockmapAttachSlotMu.Lock()
 	sockmapAttachSlots = nil
 	sockmapAttachFree = nil
+	sockmapAttachSlotMu.Unlock()
 	sockmapAttachNext.Store(0)
 
 	// Now close old FDs. Readers that loaded oldState before the swap may
