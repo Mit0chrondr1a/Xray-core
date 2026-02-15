@@ -1302,12 +1302,17 @@ func GeoIPLoad(path string, codes []string) ([]*IpSetHandle, error) {
 
 	pathBytes := []byte(path)
 
-	// Build arrays of code pointers and lengths
+	// Build arrays of code pointers and lengths.
+	// Pin inner byte slices so cgo allows the Go-pointer-to-Go-pointer pass.
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+
 	codePtrs := make([]*C.uint8_t, len(codes))
 	codeLens := make([]C.size_t, len(codes))
-	codeBytes := make([][]byte, len(codes)) // prevent GC
+	codeBytes := make([][]byte, len(codes))
 	for i, code := range codes {
 		codeBytes[i] = []byte(code)
+		pinner.Pin(&codeBytes[i][0])
 		codePtrs[i] = (*C.uint8_t)(unsafe.Pointer(&codeBytes[i][0]))
 		codeLens[i] = C.size_t(len(codeBytes[i]))
 	}
@@ -1357,11 +1362,15 @@ func GeoSiteLoad(path string, codes []string) ([][]GeoSiteEntry, error) {
 
 	pathBytes := []byte(path)
 
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+
 	codePtrs := make([]*C.uint8_t, len(codes))
 	codeLens := make([]C.size_t, len(codes))
 	codeBytes := make([][]byte, len(codes))
 	for i, code := range codes {
 		codeBytes[i] = []byte(code)
+		pinner.Pin(&codeBytes[i][0])
 		codePtrs[i] = (*C.uint8_t)(unsafe.Pointer(&codeBytes[i][0]))
 		codeLens[i] = C.size_t(len(codeBytes[i]))
 	}
