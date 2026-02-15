@@ -35,6 +35,9 @@ getrandom = "0.3"
 # eBPF userspace (Aya loader for sockmap + pinned maps)
 aya = { version = "0.13", optional = true }
 
+# Geodata
+memmap2 = "0.9"
+
 # System
 libc = "0.2"
 

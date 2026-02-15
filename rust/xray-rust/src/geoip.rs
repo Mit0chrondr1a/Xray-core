@@ -114,12 +114,53 @@ impl IpSet {
             max6: 0,
         }
     }
+
+    /// Create a new IpSet (crate-visible for geodata module).
+    pub(crate) fn new_internal() -> Self {
+        Self::new()
+    }
+
+    /// Add a prefix (crate-visible for geodata module).
+    pub(crate) fn add_prefix(&mut self, ip_bytes: &[u8], prefix_bits: u8) {
+        match ip_bytes.len() {
+            4 if prefix_bits <= 32 => {
+                self.ipv4.insert(ip_bytes, prefix_bits);
+                if prefix_bits > self.max4 {
+                    self.max4 = prefix_bits;
+                }
+            }
+            16 if prefix_bits <= 128 => {
+                self.ipv6.insert(ip_bytes, prefix_bits);
+                if prefix_bits > self.max6 {
+                    self.max6 = prefix_bits;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Finalize (crate-visible for geodata module).
+    pub(crate) fn build(&mut self) {
+        self.ipv4.shrink_to_fit();
+        self.ipv6.shrink_to_fit();
+    }
+
+    /// Check containment (crate-visible for geodata module tests).
+    pub(crate) fn contains_ip(&self, ip_bytes: &[u8]) -> bool {
+        match ip_bytes.len() {
+            4 => self.ipv4.contains(ip_bytes, 32),
+            16 => self.ipv6.contains(ip_bytes, 128),
+            _ => false,
+        }
+    }
 }
 
 /// Create a new empty IP set.
 #[no_mangle]
 pub extern "C" fn xray_ipset_new() -> *mut IpSet {
-    Box::into_raw(Box::new(IpSet::new()))
+    ffi_catch_ptr!({
+        Box::into_raw(Box::new(IpSet::new()))
+    })
 }
 
 /// Add a CIDR prefix to the IP set.
@@ -137,24 +178,29 @@ pub unsafe extern "C" fn xray_ipset_add_prefix(
     ip_len: usize,
     prefix_bits: u8,
 ) {
-    let ipset = &mut *ipset;
-    let ip = slice::from_raw_parts(ip_bytes, ip_len);
+    ffi_catch_void!({
+        if ipset.is_null() || ip_bytes.is_null() {
+            return;
+        }
+        let ipset = &mut *ipset;
+        let ip = slice::from_raw_parts(ip_bytes, ip_len);
 
-    match ip_len {
-        4 if prefix_bits <= 32 => {
-            ipset.ipv4.insert(ip, prefix_bits);
-            if prefix_bits > ipset.max4 {
-                ipset.max4 = prefix_bits;
+        match ip_len {
+            4 if prefix_bits <= 32 => {
+                ipset.ipv4.insert(ip, prefix_bits);
+                if prefix_bits > ipset.max4 {
+                    ipset.max4 = prefix_bits;
+                }
             }
-        }
-        16 if prefix_bits <= 128 => {
-            ipset.ipv6.insert(ip, prefix_bits);
-            if prefix_bits > ipset.max6 {
-                ipset.max6 = prefix_bits;
+            16 if prefix_bits <= 128 => {
+                ipset.ipv6.insert(ip, prefix_bits);
+                if prefix_bits > ipset.max6 {
+                    ipset.max6 = prefix_bits;
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
+    });
 }
 
 /// Finalize the IP set after all prefixes have been added.
@@ -164,9 +210,14 @@ pub unsafe extern "C" fn xray_ipset_add_prefix(
 /// `ipset` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn xray_ipset_build(ipset: *mut IpSet) {
-    let ipset = &mut *ipset;
-    ipset.ipv4.shrink_to_fit();
-    ipset.ipv6.shrink_to_fit();
+    ffi_catch_void!({
+        if ipset.is_null() {
+            return;
+        }
+        let ipset = &mut *ipset;
+        ipset.ipv4.shrink_to_fit();
+        ipset.ipv6.shrink_to_fit();
+    });
 }
 
 /// Check if an IP address is contained in the IP set.
@@ -182,13 +233,21 @@ pub unsafe extern "C" fn xray_ipset_contains(
     ip_bytes: *const u8,
     ip_len: usize,
 ) -> bool {
-    let ipset = &*ipset;
-    let ip = slice::from_raw_parts(ip_bytes, ip_len);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if ipset.is_null() || ip_bytes.is_null() {
+            return false;
+        }
+        let ipset = &*ipset;
+        let ip = slice::from_raw_parts(ip_bytes, ip_len);
 
-    match ip_len {
-        4 => ipset.ipv4.contains(ip, 32),
-        16 => ipset.ipv6.contains(ip, 128),
-        _ => false,
+        match ip_len {
+            4 => ipset.ipv4.contains(ip, 32),
+            16 => ipset.ipv6.contains(ip, 128),
+            _ => false,
+        }
+    })) {
+        Ok(v) => v,
+        Err(_) => false,
     }
 }
 
@@ -198,11 +257,19 @@ pub unsafe extern "C" fn xray_ipset_contains(
 /// `ipset` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn xray_ipset_max4(ipset: *const IpSet) -> u8 {
-    let ipset = &*ipset;
-    if ipset.max4 == 0 {
-        0xff
-    } else {
-        ipset.max4
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if ipset.is_null() {
+            return 0xff;
+        }
+        let ipset = &*ipset;
+        if ipset.max4 == 0 {
+            0xff
+        } else {
+            ipset.max4
+        }
+    })) {
+        Ok(v) => v,
+        Err(_) => 0xff,
     }
 }
 
@@ -212,11 +279,19 @@ pub unsafe extern "C" fn xray_ipset_max4(ipset: *const IpSet) -> u8 {
 /// `ipset` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn xray_ipset_max6(ipset: *const IpSet) -> u8 {
-    let ipset = &*ipset;
-    if ipset.max6 == 0 {
-        0xff
-    } else {
-        ipset.max6
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if ipset.is_null() {
+            return 0xff;
+        }
+        let ipset = &*ipset;
+        if ipset.max6 == 0 {
+            0xff
+        } else {
+            ipset.max6
+        }
+    })) {
+        Ok(v) => v,
+        Err(_) => 0xff,
     }
 }
 
