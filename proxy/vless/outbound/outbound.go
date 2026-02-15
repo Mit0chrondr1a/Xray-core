@@ -6,6 +6,7 @@ import (
 	gotls "crypto/tls"
 	"encoding/base64"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -162,7 +163,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				h.preWG.Add(1)
 				go func() {
 					defer h.preWG.Done()
-					defer func() { recover() }()
+					defer func() {
+						if r := recover(); r != nil {
+							errors.LogError(h.preCtx, "panic in VLESS pre-connect goroutine: ", r, "\n", string(debug.Stack()))
+						}
+					}()
 					ctx := xctx.ContextWithID(h.preCtx, session.NewID())
 					backoff := time.Millisecond * 200
 					for {

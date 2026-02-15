@@ -153,7 +153,11 @@ func executeRun(cmd *base.Command, args []string) {
 }
 
 func dumpConfig() int {
-	files := getConfigFilePath(false)
+	files, err := getConfigFilePath(false)
+	if err != nil {
+		fmt.Println(err)
+		return 23
+	}
 	if config, err := core.GetMergedConfig(files); err != nil {
 		fmt.Println(err)
 		time.Sleep(1 * time.Second)
@@ -190,37 +194,42 @@ func getRegepxByFormat() string {
 	}
 }
 
-func readConfDir(dirPath string) {
+func readConfDir(dirPath string) error {
 	confs, err := os.ReadDir(dirPath)
 	if err != nil {
-		log.Fatalln(err)
+		return fmt.Errorf("failed to read confdir %q: %w", dirPath, err)
 	}
 	for _, f := range confs {
 		matched, err := regexp.MatchString(getRegepxByFormat(), f.Name())
 		if err != nil {
-			log.Fatalln(err)
+			return fmt.Errorf("failed to match config file pattern for %q: %w", f.Name(), err)
 		}
 		if matched {
 			configFiles.Set(path.Join(dirPath, f.Name()))
 		}
 	}
+	return nil
 }
 
-func getConfigFilePath(verbose bool) cmdarg.Arg {
+func getConfigFilePath(verbose bool) (cmdarg.Arg, error) {
 	if dirExists(configDir) {
 		if verbose {
 			log.Println("Using confdir from arg:", configDir)
 		}
-		readConfDir(configDir)
+		if err := readConfDir(configDir); err != nil {
+			return nil, err
+		}
 	} else if envConfDir := platform.GetConfDirPath(); dirExists(envConfDir) {
 		if verbose {
 			log.Println("Using confdir from env:", envConfDir)
 		}
-		readConfDir(envConfDir)
+		if err := readConfDir(envConfDir); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(configFiles) > 0 {
-		return configFiles
+		return configFiles, nil
 	}
 
 	if workingDir, err := os.Getwd(); err == nil {
@@ -231,7 +240,7 @@ func getConfigFilePath(verbose bool) cmdarg.Arg {
 				if verbose {
 					log.Println("Using default config: ", configFile)
 				}
-				return cmdarg.Arg{configFile}
+				return cmdarg.Arg{configFile}, nil
 			}
 		}
 	}
@@ -240,13 +249,13 @@ func getConfigFilePath(verbose bool) cmdarg.Arg {
 		if verbose {
 			log.Println("Using config from env: ", configFile)
 		}
-		return cmdarg.Arg{configFile}
+		return cmdarg.Arg{configFile}, nil
 	}
 
 	if verbose {
 		log.Println("Using config from STDIN")
 	}
-	return cmdarg.Arg{"stdin:"}
+	return cmdarg.Arg{"stdin:"}, nil
 }
 
 func getConfigFormat() string {
@@ -258,7 +267,10 @@ func getConfigFormat() string {
 }
 
 func startXray() (core.Server, error) {
-	configFiles := getConfigFilePath(true)
+	configFiles, err := getConfigFilePath(true)
+	if err != nil {
+		return nil, errors.New("failed to resolve config file path").Base(err)
+	}
 
 	// config, err := core.LoadConfig(getConfigFormat(), configFiles[0], configFiles)
 

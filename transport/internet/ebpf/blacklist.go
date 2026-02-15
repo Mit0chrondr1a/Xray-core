@@ -48,8 +48,9 @@ type BlacklistManager struct {
 	progFD   int                         // XDP program fd (-1 if not attached)
 	ifindex  int
 	linkFD   int
-	stopCh   chan struct{}
-	once     sync.Once
+	stopCh    chan struct{}
+	once      sync.Once
+	closeOnce sync.Once
 }
 
 type failureRecord struct {
@@ -103,7 +104,7 @@ func (m *BlacklistManager) Disable() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	close(m.stopCh)
+	m.closeOnce.Do(func() { close(m.stopCh) })
 	return m.disableXDP()
 }
 

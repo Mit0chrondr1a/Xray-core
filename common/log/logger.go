@@ -1,9 +1,11 @@
 package log
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/platform"
@@ -25,6 +27,7 @@ type generalLogger struct {
 	buffer  chan Message
 	access  *semaphore.Instance
 	done    *done.Instance
+	dropped atomic.Int64
 }
 
 type serverityLogger struct {
@@ -36,7 +39,7 @@ type serverityLogger struct {
 func NewLogger(logWriterCreator WriterCreator) Handler {
 	return &generalLogger{
 		creator: logWriterCreator,
-		buffer:  make(chan Message, 16),
+		buffer:  make(chan Message, 256),
 		access:  semaphore.New(1),
 		done:    done.New(),
 	}
@@ -46,7 +49,7 @@ func ReplaceWithSeverityLogger(serverity Severity) {
 	w := CreateStdoutLogWriter()
 	g := &generalLogger{
 		creator: w,
-		buffer:  make(chan Message, 16),
+		buffer:  make(chan Message, 256),
 		access:  semaphore.New(1),
 		done:    done.New(),
 	}
@@ -68,6 +71,12 @@ func (l *serverityLogger) Handle(msg Message) {
 	}
 }
 
+func (l *generalLogger) flushDropped(logger Writer) {
+	if n := l.dropped.Swap(0); n > 0 {
+		logger.Write(fmt.Sprintf("[Warning] %d log message(s) were dropped due to buffer overflow", n) + platform.LineSeparator())
+	}
+}
+
 func (l *generalLogger) run() {
 	defer l.access.Signal()
 
@@ -84,11 +93,14 @@ func (l *generalLogger) run() {
 	for {
 		select {
 		case <-l.done.Wait():
+			l.flushDropped(logger)
 			return
 		case msg := <-l.buffer:
 			logger.Write(msg.String() + platform.LineSeparator())
 			dataWritten = true
+			l.flushDropped(logger)
 		case <-ticker.C:
+			l.flushDropped(logger)
 			if !dataWritten {
 				return
 			}
@@ -102,6 +114,7 @@ func (l *generalLogger) Handle(msg Message) {
 	select {
 	case l.buffer <- msg:
 	default:
+		l.dropped.Add(1)
 	}
 
 	select {
