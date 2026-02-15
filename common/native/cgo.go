@@ -124,6 +124,48 @@ extern int32_t xray_vision_unpad(
     uint8_t* out_buf, uint32_t out_cap
 );
 
+// AEAD cipher handles
+extern void* xray_aead_new(uint8_t algo, const uint8_t* key, size_t key_len);
+extern int32_t xray_aead_seal(const void* handle, const uint8_t* nonce, size_t nonce_len, const uint8_t* aad, size_t aad_len, const uint8_t* pt, size_t pt_len, uint8_t* out, size_t out_cap, size_t* out_len);
+extern int32_t xray_aead_open(const void* handle, const uint8_t* nonce, size_t nonce_len, const uint8_t* aad, size_t aad_len, const uint8_t* ct, size_t ct_len, uint8_t* out, size_t out_cap, size_t* out_len);
+extern int32_t xray_aead_overhead(const void* handle);
+extern int32_t xray_aead_nonce_size(const void* handle);
+extern void xray_aead_free(void* handle);
+
+// VMess AEAD header seal/open
+extern int32_t xray_vmess_seal_header(const uint8_t* cmd_key, const uint8_t* header, size_t header_len, uint8_t* out, size_t out_cap, size_t* out_len);
+extern int32_t xray_vmess_open_header(const uint8_t* cmd_key, const uint8_t* authid, const uint8_t* data, size_t data_len, uint8_t* out, size_t out_cap, size_t* out_len);
+
+// Geodata batch loading
+struct xray_geoip_result {
+    void** handles;
+    size_t count;
+    int32_t error_code;
+};
+
+struct xray_geosite_domain {
+    uint8_t domain_type;
+    const uint8_t* value;
+    size_t value_len;
+};
+
+struct xray_geosite_code_result {
+    struct xray_geosite_domain* domains;
+    size_t domain_count;
+};
+
+struct xray_geosite_result {
+    struct xray_geosite_code_result* entries;
+    size_t count;
+    int32_t error_code;
+    void* _owned_data;
+};
+
+extern int32_t xray_geoip_load(const uint8_t* path, size_t path_len, const uint8_t** codes, const size_t* code_lens, size_t num_codes, struct xray_geoip_result* result);
+extern void xray_geoip_result_free(struct xray_geoip_result* result);
+extern int32_t xray_geosite_load(const uint8_t* path, size_t path_len, const uint8_t** codes, const size_t* code_lens, size_t num_codes, struct xray_geosite_result* result);
+extern void xray_geosite_result_free(struct xray_geosite_result* result);
+
 // eBPF sockmap management
 extern int32_t xray_ebpf_available();
 extern int32_t xray_ebpf_setup(const char* pin_path, uint32_t max_entries, uint32_t cork_threshold);
@@ -969,6 +1011,403 @@ func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) 
 		return 0, errors.New("native: vision unpad failed")
 	}
 	return int(n), nil
+}
+
+// --- AEAD FFI ---
+
+// AEAD algorithm constants.
+const (
+	AeadAes128Gcm        = 0
+	AeadAes256Gcm        = 1
+	AeadChacha20Poly1305 = 2
+)
+
+// AeadHandle is an opaque handle to a Rust AEAD cipher.
+type AeadHandle struct {
+	ptr unsafe.Pointer
+}
+
+func (h *AeadHandle) release() {
+	AeadFree(h)
+}
+
+// AeadNew creates a new AEAD handle for the given algorithm and key.
+// algo: AeadAes128Gcm (0), AeadAes256Gcm (1), AeadChacha20Poly1305 (2).
+func AeadNew(algo byte, key []byte) *AeadHandle {
+	if len(key) == 0 {
+		return nil
+	}
+	ptr := C.xray_aead_new(C.uint8_t(algo),
+		(*C.uint8_t)(unsafe.Pointer(&key[0])), C.size_t(len(key)))
+	runtime.KeepAlive(key)
+	if ptr == nil {
+		return nil
+	}
+	h := &AeadHandle{ptr: ptr}
+	runtime.SetFinalizer(h, (*AeadHandle).release)
+	return h
+}
+
+// AeadSeal encrypts and authenticates plaintext.
+func AeadSeal(h *AeadHandle, nonce, aad, plaintext []byte) ([]byte, error) {
+	if h == nil || h.ptr == nil {
+		return nil, errors.New("native: nil AEAD handle")
+	}
+	overhead := int(C.xray_aead_overhead(h.ptr))
+	outCap := len(plaintext) + overhead
+	out := make([]byte, outCap)
+	var outLen C.size_t
+
+	var noncePtr *C.uint8_t
+	if len(nonce) > 0 {
+		noncePtr = (*C.uint8_t)(unsafe.Pointer(&nonce[0]))
+	}
+	var aadPtr *C.uint8_t
+	if len(aad) > 0 {
+		aadPtr = (*C.uint8_t)(unsafe.Pointer(&aad[0]))
+	}
+	var ptPtr *C.uint8_t
+	if len(plaintext) > 0 {
+		ptPtr = (*C.uint8_t)(unsafe.Pointer(&plaintext[0]))
+	}
+
+	rc := C.xray_aead_seal(h.ptr,
+		noncePtr, C.size_t(len(nonce)),
+		aadPtr, C.size_t(len(aad)),
+		ptPtr, C.size_t(len(plaintext)),
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), C.size_t(outCap), &outLen)
+	runtime.KeepAlive(h)
+	runtime.KeepAlive(nonce)
+	runtime.KeepAlive(aad)
+	runtime.KeepAlive(plaintext)
+	runtime.KeepAlive(out)
+	if rc != 0 {
+		return nil, fmt.Errorf("native: AEAD seal failed (rc=%d)", rc)
+	}
+	return out[:outLen], nil
+}
+
+// AeadOpen decrypts and verifies ciphertext.
+func AeadOpen(h *AeadHandle, nonce, aad, ciphertext []byte) ([]byte, error) {
+	if h == nil || h.ptr == nil {
+		return nil, errors.New("native: nil AEAD handle")
+	}
+	overhead := int(C.xray_aead_overhead(h.ptr))
+	if len(ciphertext) < overhead {
+		return nil, errors.New("native: ciphertext too short")
+	}
+	outCap := len(ciphertext) // plaintext is at most ct_len - overhead, but we need ct_len for in-place
+	out := make([]byte, outCap)
+	var outLen C.size_t
+
+	var noncePtr *C.uint8_t
+	if len(nonce) > 0 {
+		noncePtr = (*C.uint8_t)(unsafe.Pointer(&nonce[0]))
+	}
+	var aadPtr *C.uint8_t
+	if len(aad) > 0 {
+		aadPtr = (*C.uint8_t)(unsafe.Pointer(&aad[0]))
+	}
+
+	rc := C.xray_aead_open(h.ptr,
+		noncePtr, C.size_t(len(nonce)),
+		aadPtr, C.size_t(len(aad)),
+		(*C.uint8_t)(unsafe.Pointer(&ciphertext[0])), C.size_t(len(ciphertext)),
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), C.size_t(outCap), &outLen)
+	runtime.KeepAlive(h)
+	runtime.KeepAlive(nonce)
+	runtime.KeepAlive(aad)
+	runtime.KeepAlive(ciphertext)
+	runtime.KeepAlive(out)
+	if rc != 0 {
+		return nil, fmt.Errorf("native: AEAD open failed (rc=%d)", rc)
+	}
+	return out[:outLen], nil
+}
+
+// AeadSealTo encrypts plaintext directly into dst.
+// dst must have len >= len(plaintext)+overhead.
+// Returns the number of bytes written.
+func AeadSealTo(h *AeadHandle, nonce, aad, plaintext, dst []byte) (int, error) {
+	if h == nil || h.ptr == nil {
+		return 0, errors.New("native: nil AEAD handle")
+	}
+	var outLen C.size_t
+
+	var noncePtr *C.uint8_t
+	if len(nonce) > 0 {
+		noncePtr = (*C.uint8_t)(unsafe.Pointer(&nonce[0]))
+	}
+	var aadPtr *C.uint8_t
+	if len(aad) > 0 {
+		aadPtr = (*C.uint8_t)(unsafe.Pointer(&aad[0]))
+	}
+	var ptPtr *C.uint8_t
+	if len(plaintext) > 0 {
+		ptPtr = (*C.uint8_t)(unsafe.Pointer(&plaintext[0]))
+	}
+
+	rc := C.xray_aead_seal(h.ptr,
+		noncePtr, C.size_t(len(nonce)),
+		aadPtr, C.size_t(len(aad)),
+		ptPtr, C.size_t(len(plaintext)),
+		(*C.uint8_t)(unsafe.Pointer(&dst[0])), C.size_t(len(dst)), &outLen)
+	runtime.KeepAlive(h)
+	runtime.KeepAlive(nonce)
+	runtime.KeepAlive(aad)
+	runtime.KeepAlive(plaintext)
+	runtime.KeepAlive(dst)
+	if rc != 0 {
+		return 0, fmt.Errorf("native: AEAD seal failed (rc=%d)", rc)
+	}
+	return int(outLen), nil
+}
+
+// AeadOpenTo decrypts ciphertext directly into dst.
+// dst must have len >= len(ciphertext) (for in-place decryption).
+// Returns the number of plaintext bytes written.
+func AeadOpenTo(h *AeadHandle, nonce, aad, ciphertext, dst []byte) (int, error) {
+	if h == nil || h.ptr == nil {
+		return 0, errors.New("native: nil AEAD handle")
+	}
+	var outLen C.size_t
+
+	var noncePtr *C.uint8_t
+	if len(nonce) > 0 {
+		noncePtr = (*C.uint8_t)(unsafe.Pointer(&nonce[0]))
+	}
+	var aadPtr *C.uint8_t
+	if len(aad) > 0 {
+		aadPtr = (*C.uint8_t)(unsafe.Pointer(&aad[0]))
+	}
+
+	rc := C.xray_aead_open(h.ptr,
+		noncePtr, C.size_t(len(nonce)),
+		aadPtr, C.size_t(len(aad)),
+		(*C.uint8_t)(unsafe.Pointer(&ciphertext[0])), C.size_t(len(ciphertext)),
+		(*C.uint8_t)(unsafe.Pointer(&dst[0])), C.size_t(len(dst)), &outLen)
+	runtime.KeepAlive(h)
+	runtime.KeepAlive(nonce)
+	runtime.KeepAlive(aad)
+	runtime.KeepAlive(ciphertext)
+	runtime.KeepAlive(dst)
+	if rc != 0 {
+		return 0, fmt.Errorf("native: AEAD open failed (rc=%d)", rc)
+	}
+	return int(outLen), nil
+}
+
+// AeadOverhead returns the tag size for this AEAD.
+func AeadOverhead(h *AeadHandle) int {
+	if h == nil || h.ptr == nil {
+		return 0
+	}
+	result := int(C.xray_aead_overhead(h.ptr))
+	runtime.KeepAlive(h)
+	return result
+}
+
+// AeadNonceSize returns the nonce size for this AEAD.
+func AeadNonceSize(h *AeadHandle) int {
+	if h == nil || h.ptr == nil {
+		return 0
+	}
+	result := int(C.xray_aead_nonce_size(h.ptr))
+	runtime.KeepAlive(h)
+	return result
+}
+
+// AeadFree releases an AEAD handle.
+func AeadFree(h *AeadHandle) {
+	if h != nil && h.ptr != nil {
+		runtime.SetFinalizer(h, nil)
+		C.xray_aead_free(h.ptr)
+		h.ptr = nil
+	}
+}
+
+// --- VMess AEAD Header FFI ---
+
+// VMessSealHeader seals a VMess AEAD header in a single FFI call.
+// cmdKey must be exactly 16 bytes.
+// Returns the sealed output: authid[16] + encrypted_length[18] + nonce[8] + encrypted_header.
+func VMessSealHeader(cmdKey [16]byte, header []byte) ([]byte, error) {
+	// Total output: 16 (authid) + 18 (enc length) + 8 (nonce) + len(header) + 16 (tag)
+	outCap := 16 + 18 + 8 + len(header) + 16
+	out := make([]byte, outCap)
+	var outLen C.size_t
+
+	var headerPtr *C.uint8_t
+	if len(header) > 0 {
+		headerPtr = (*C.uint8_t)(unsafe.Pointer(&header[0]))
+	}
+
+	rc := C.xray_vmess_seal_header(
+		(*C.uint8_t)(unsafe.Pointer(&cmdKey[0])),
+		headerPtr, C.size_t(len(header)),
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), C.size_t(outCap), &outLen)
+	runtime.KeepAlive(cmdKey)
+	runtime.KeepAlive(header)
+	runtime.KeepAlive(out)
+	if rc != 0 {
+		return nil, fmt.Errorf("native: VMess seal header failed (rc=%d)", rc)
+	}
+	return out[:outLen], nil
+}
+
+// VMessOpenHeader opens a VMess AEAD header in a single FFI call.
+// cmdKey must be exactly 16 bytes, authid must be exactly 16 bytes.
+// data is: encrypted_length[18] + nonce[8] + encrypted_header.
+// Returns the decrypted header.
+func VMessOpenHeader(cmdKey [16]byte, authid [16]byte, data []byte) ([]byte, error) {
+	if len(data) < 26 {
+		return nil, errors.New("native: VMess data too short")
+	}
+	// Output is at most the header plaintext length.
+	// Max possible: data_len - 26 (enc_length + nonce) - 16 (tag) = data_len - 42
+	outCap := len(data)
+	out := make([]byte, outCap)
+	var outLen C.size_t
+
+	rc := C.xray_vmess_open_header(
+		(*C.uint8_t)(unsafe.Pointer(&cmdKey[0])),
+		(*C.uint8_t)(unsafe.Pointer(&authid[0])),
+		(*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)),
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), C.size_t(outCap), &outLen)
+	runtime.KeepAlive(cmdKey)
+	runtime.KeepAlive(authid)
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(out)
+	if rc != 0 {
+		return nil, fmt.Errorf("native: VMess open header failed (rc=%d)", rc)
+	}
+	return out[:outLen], nil
+}
+
+// --- Geodata Batch Loading FFI ---
+
+// GeoSiteEntry represents a single domain pattern from a GeoSite file.
+type GeoSiteEntry struct {
+	DomainType byte   // 0=Plain, 1=Regex, 2=Domain, 3=Full
+	Value      string // Domain pattern
+}
+
+// GeoIPLoad loads GeoIP data from a file and builds IpSet handles for all
+// requested country codes in a single pass. Returns one handle per code
+// (nil for codes not found in the file).
+func GeoIPLoad(path string, codes []string) ([]*IpSetHandle, error) {
+	if len(codes) == 0 {
+		return nil, nil
+	}
+
+	pathBytes := []byte(path)
+
+	// Build arrays of code pointers and lengths
+	codePtrs := make([]*C.uint8_t, len(codes))
+	codeLens := make([]C.size_t, len(codes))
+	codeBytes := make([][]byte, len(codes)) // prevent GC
+	for i, code := range codes {
+		codeBytes[i] = []byte(code)
+		codePtrs[i] = (*C.uint8_t)(unsafe.Pointer(&codeBytes[i][0]))
+		codeLens[i] = C.size_t(len(codeBytes[i]))
+	}
+
+	var result C.struct_xray_geoip_result
+
+	rc := C.xray_geoip_load(
+		(*C.uint8_t)(unsafe.Pointer(&pathBytes[0])), C.size_t(len(pathBytes)),
+		(**C.uint8_t)(unsafe.Pointer(&codePtrs[0])),
+		(*C.size_t)(unsafe.Pointer(&codeLens[0])),
+		C.size_t(len(codes)),
+		&result)
+	runtime.KeepAlive(pathBytes)
+	runtime.KeepAlive(codePtrs)
+	runtime.KeepAlive(codeLens)
+	runtime.KeepAlive(codeBytes)
+
+	if rc != 0 {
+		C.xray_geoip_result_free(&result)
+		return nil, fmt.Errorf("native: GeoIP load failed (rc=%d)", rc)
+	}
+
+	// Extract handles
+	handles := make([]*IpSetHandle, len(codes))
+	if result.handles != nil {
+		handleSlice := unsafe.Slice(result.handles, result.count)
+		for i := 0; i < int(result.count); i++ {
+			ptr := handleSlice[i]
+			if ptr != nil {
+				h := &IpSetHandle{ptr: ptr}
+				runtime.SetFinalizer(h, (*IpSetHandle).release)
+				handles[i] = h
+			}
+		}
+	}
+
+	C.xray_geoip_result_free(&result)
+	return handles, nil
+}
+
+// GeoSiteLoad loads GeoSite data from a file and returns domain patterns
+// for all requested country codes in a single pass.
+func GeoSiteLoad(path string, codes []string) ([][]GeoSiteEntry, error) {
+	if len(codes) == 0 {
+		return nil, nil
+	}
+
+	pathBytes := []byte(path)
+
+	codePtrs := make([]*C.uint8_t, len(codes))
+	codeLens := make([]C.size_t, len(codes))
+	codeBytes := make([][]byte, len(codes))
+	for i, code := range codes {
+		codeBytes[i] = []byte(code)
+		codePtrs[i] = (*C.uint8_t)(unsafe.Pointer(&codeBytes[i][0]))
+		codeLens[i] = C.size_t(len(codeBytes[i]))
+	}
+
+	var result C.struct_xray_geosite_result
+
+	rc := C.xray_geosite_load(
+		(*C.uint8_t)(unsafe.Pointer(&pathBytes[0])), C.size_t(len(pathBytes)),
+		(**C.uint8_t)(unsafe.Pointer(&codePtrs[0])),
+		(*C.size_t)(unsafe.Pointer(&codeLens[0])),
+		C.size_t(len(codes)),
+		&result)
+	runtime.KeepAlive(pathBytes)
+	runtime.KeepAlive(codePtrs)
+	runtime.KeepAlive(codeLens)
+	runtime.KeepAlive(codeBytes)
+
+	if rc != 0 {
+		C.xray_geosite_result_free(&result)
+		return nil, fmt.Errorf("native: GeoSite load failed (rc=%d)", rc)
+	}
+
+	// Extract domain lists
+	entries := make([][]GeoSiteEntry, len(codes))
+	if result.entries != nil {
+		entrySlice := unsafe.Slice(result.entries, result.count)
+		for i := 0; i < int(result.count); i++ {
+			codeResult := entrySlice[i]
+			if codeResult.domains != nil && codeResult.domain_count > 0 {
+				domainSlice := unsafe.Slice(codeResult.domains, codeResult.domain_count)
+				domainEntries := make([]GeoSiteEntry, codeResult.domain_count)
+				for j := 0; j < int(codeResult.domain_count); j++ {
+					d := domainSlice[j]
+					valBytes := unsafe.Slice(d.value, d.value_len)
+					domainEntries[j] = GeoSiteEntry{
+						DomainType: byte(d.domain_type),
+						Value:      string(valBytes), // copies bytes, safe after free
+					}
+				}
+				entries[i] = domainEntries
+			}
+		}
+	}
+
+	C.xray_geosite_result_free(&result)
+	return entries, nil
 }
 
 // --- eBPF FFI ---

@@ -195,6 +195,44 @@ func VisionUnpad([]byte, *VisionUnpadState, []byte, []byte) (int, error) {
 	return 0, errNotAvailable
 }
 
+// --- AEAD Stubs ---
+
+const (
+	AeadAes128Gcm        = 0
+	AeadAes256Gcm        = 1
+	AeadChacha20Poly1305 = 2
+)
+
+type AeadHandle struct {
+	ptr unsafe.Pointer
+}
+
+func (*AeadHandle) release() {}
+
+func AeadNew(byte, []byte) *AeadHandle                                       { return nil }
+func AeadSeal(*AeadHandle, []byte, []byte, []byte) ([]byte, error)           { return nil, errNotAvailable }
+func AeadOpen(*AeadHandle, []byte, []byte, []byte) ([]byte, error)           { return nil, errNotAvailable }
+func AeadSealTo(*AeadHandle, []byte, []byte, []byte, []byte) (int, error)    { return 0, errNotAvailable }
+func AeadOpenTo(*AeadHandle, []byte, []byte, []byte, []byte) (int, error)    { return 0, errNotAvailable }
+func AeadOverhead(*AeadHandle) int                                           { return 0 }
+func AeadNonceSize(*AeadHandle) int                                          { return 0 }
+func AeadFree(*AeadHandle)                                                   {}
+
+// --- VMess AEAD Header Stubs ---
+
+func VMessSealHeader([16]byte, []byte) ([]byte, error) { return nil, errNotAvailable }
+func VMessOpenHeader([16]byte, [16]byte, []byte) ([]byte, error) { return nil, errNotAvailable }
+
+// --- Geodata Batch Loading Stubs ---
+
+type GeoSiteEntry struct {
+	DomainType byte
+	Value      string
+}
+
+func GeoIPLoad(string, []string) ([]*IpSetHandle, error)    { return nil, errNotAvailable }
+func GeoSiteLoad(string, []string) ([][]GeoSiteEntry, error) { return nil, errNotAvailable }
+
 // --- eBPF Stubs ---
 
 func EbpfSetup(string, uint32, uint32) error                  { return errNotAvailable }
