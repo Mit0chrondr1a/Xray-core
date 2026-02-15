@@ -425,7 +425,9 @@ func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
 func (w *AuthenticationWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if mb.IsEmpty() {
 		eb, err := w.seal([]byte{})
-		common.Must(err)
+		if err != nil {
+			return err
+		}
 		return w.writer.WriteMultiBuffer(buf.MultiBuffer{eb})
 	}
 
