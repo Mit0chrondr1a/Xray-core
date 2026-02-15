@@ -183,10 +183,10 @@ func parseIP(s string) (*router.CIDR, error) {
 func loadFile(file, code string) ([]byte, error) {
 	runtime.GC()
 	r, err := filesystem.OpenAsset(file)
-	defer r.Close()
 	if err != nil {
 		return nil, errors.New("failed to open file: ", file).Base(err)
 	}
+	defer r.Close()
 	bs := find(r, []byte(code))
 	if bs == nil {
 		return nil, errors.New("code not found in ", file, ": ", code)
