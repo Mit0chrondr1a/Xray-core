@@ -137,6 +137,12 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 
 	m.tagsCache = &sync.Map{}
 
+	if handler, found := m.taggedHandler[tag]; found {
+		if err := handler.Close(); err != nil {
+			errors.LogWarningInner(ctx, err, "failed to close removed outbound handler: ", tag)
+		}
+	}
+
 	delete(m.taggedHandler, tag)
 	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
 		m.defaultHandler = nil

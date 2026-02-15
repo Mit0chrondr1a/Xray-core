@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"io"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -153,6 +154,11 @@ func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSet
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errors.LogError(ctx, "panic in WebSocket server handler goroutine: ", r, "\n", string(debug.Stack()))
+			}
+		}()
 		if err := l.server.Serve(l.listener); err != nil {
 			errors.LogWarningInner(ctx, err, "failed to serve http for WebSocket")
 		}
@@ -168,7 +174,9 @@ func (ln *Listener) Addr() net.Addr {
 
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
-	return ln.listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return ln.server.Shutdown(ctx)
 }
 
 func init() {

@@ -546,11 +546,12 @@ func (ln *Listener) Addr() net.Addr {
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
 	if ln.h3server != nil {
-		if err := ln.h3server.Close(); err != nil {
-			return err
-		}
-	} else if ln.listener != nil {
-		return ln.listener.Close()
+		return ln.h3server.Close()
+	}
+	if ln.listener != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return ln.server.Shutdown(ctx)
 	}
 	return errors.New("listener does not have an HTTP/3 server or a net.listener")
 }
