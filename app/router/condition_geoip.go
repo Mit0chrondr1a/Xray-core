@@ -853,18 +853,17 @@ func (f *GeoIPSetFactory) GetOrCreate(key string, cidrGroups [][]*CIDR) (*GeoIPS
 }
 
 // CreateFromNativeHandle wraps a pre-built native IpSet handle.
+// The handle is shared and owned by nativeGeoIPCache / nativeGeoIPHandles;
+// it must NOT be freed here. The cache retains a strong reference to the
+// handle, so it remains live as long as the cache entry exists.
+// Call ClearNativeGeoIPHandles only after all GeoIPSet references are
+// unreachable (e.g., after a full config reload replaces all matchers).
 func (f *GeoIPSetFactory) CreateFromNativeHandle(handle *native.IpSetHandle) *GeoIPSet {
-	set := &GeoIPSet{
+	return &GeoIPSet{
 		nativeHandle: handle,
 		max4:         native.IpSetMax4(handle),
 		max6:         native.IpSetMax6(handle),
 	}
-	// Keep the handle alive as long as the GeoIPSet is reachable.
-	// Do NOT free — handle is shared via nativeGeoIPCache.
-	runtime.SetFinalizer(set, func(s *GeoIPSet) {
-		runtime.KeepAlive(s.nativeHandle)
-	})
-	return set
 }
 
 func (f *GeoIPSetFactory) Create(cidrGroups ...[]*CIDR) (*GeoIPSet, error) {
