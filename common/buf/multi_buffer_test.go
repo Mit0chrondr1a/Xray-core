@@ -144,6 +144,24 @@ func TestMultiBufferReadAllLimitedToBytes(t *testing.T) {
 	}
 }
 
+func TestReadFromSizeLimit(t *testing.T) {
+	// Create a reader that produces unlimited data.
+	r := io.LimitReader(rand.Reader, 65*1024*1024) // 65 MiB, exceeds the 64 MiB limit
+	_, err := ReadFrom(r)
+	if err == nil {
+		t.Fatal("expected ReadFrom to return an error for data exceeding 64 MiB")
+	}
+
+	// Data within the limit should succeed.
+	r = io.LimitReader(rand.Reader, 1024)
+	mb, err := ReadFrom(r)
+	common.Must(err)
+	if mb.Len() != 1024 {
+		t.Fatalf("expected 1024 bytes, got %d", mb.Len())
+	}
+	ReleaseMulti(mb)
+}
+
 func TestMultiBufferCopy(t *testing.T) {
 	lb := make([]byte, 8*1024)
 	common.Must2(io.ReadFull(rand.Reader, lb))

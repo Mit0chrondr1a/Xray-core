@@ -97,15 +97,30 @@ func (mb MultiBuffer) Copy(b []byte) int {
 	return total
 }
 
+// maxReadFromBytes is the maximum total bytes ReadFrom will accumulate
+// before returning an error. This prevents unbounded memory growth when
+// reading from streams that never end or are unexpectedly large.
+// 64 MiB is generous enough for any legitimate payload (e.g. geoip.dat
+// files are typically ~5 MiB) while still guarding against OOM.
+const maxReadFromBytes = 64 * 1024 * 1024 // 64 MiB
+
 // ReadFrom reads all content from reader until EOF.
+// It returns an error if the total data exceeds maxReadFromBytes (64 MiB).
 func ReadFrom(reader io.Reader) (MultiBuffer, error) {
 	mb := GetMultiBuffer()
+	totalBytes := int32(0)
 	for {
 		b := New()
 		_, err := b.ReadFullFrom(reader, Size)
 		if b.IsEmpty() {
 			b.Release()
 		} else {
+			totalBytes += b.Len()
+			if int64(totalBytes) > maxReadFromBytes {
+				b.Release()
+				ReleaseMulti(mb)
+				return nil, errors.New("ReadFrom: data exceeds limit of ", maxReadFromBytes, " bytes")
+			}
 			mb = append(mb, b)
 		}
 		if err != nil {
