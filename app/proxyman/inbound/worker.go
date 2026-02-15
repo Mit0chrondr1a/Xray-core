@@ -450,7 +450,7 @@ func (w *udpWorker) Start() error {
 		return err
 	}
 
-	w.cone = w.ctx.Value("cone").(bool)
+	w.cone, _ = w.ctx.Value("cone").(bool)
 
 	w.checker = &task.Periodic{
 		Interval: time.Minute,
