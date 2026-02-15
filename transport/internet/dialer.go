@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/dice"
@@ -79,15 +80,21 @@ func DestIpAddress() net.IP {
 	return effectiveSystemDialer.DestIpAddress()
 }
 
-var (
+// systemDialerDeps bundles the DNS client and outbound manager so they can
+// be swapped atomically, eliminating the data race on InitSystemDialer.
+type systemDialerDeps struct {
 	dnsClient dns.Client
 	obm       outbound.Manager
-)
+}
+
+var dialerDeps atomic.Pointer[systemDialerDeps]
 
 func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
-	if dnsClient == nil {
+	deps := dialerDeps.Load()
+	if deps == nil || deps.dnsClient == nil {
 		return nil, errors.New("DNS client not initialized").AtError()
 	}
+	dnsClient := deps.dnsClient
 
 	ips, _, err := dnsClient.LookupIP(domain, dns.IPOption{
 		IPv4Enable: (localAddr == nil && strategy.PreferIP4()) || (localAddr != nil && localAddr.Family().IsIPv4() && (strategy.PreferIP4() || strategy.FallbackIP4())),
@@ -269,10 +276,11 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 	}
 
 	if len(sockopt.DialerProxy) > 0 {
-		if obm == nil {
+		deps := dialerDeps.Load()
+		if deps == nil || deps.obm == nil {
 			return nil, errors.New("there is no outbound manager for dialerProxy").AtError()
 		}
-		h := obm.GetHandler(sockopt.DialerProxy)
+		h := deps.obm.GetHandler(sockopt.DialerProxy)
 		if h == nil {
 			return nil, errors.New("there is no outbound handler for dialerProxy").AtError()
 		}
@@ -283,6 +291,8 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 }
 
 func InitSystemDialer(dc dns.Client, om outbound.Manager) {
-	dnsClient = dc
-	obm = om
+	dialerDeps.Store(&systemDialerDeps{
+		dnsClient: dc,
+		obm:       om,
+	})
 }
