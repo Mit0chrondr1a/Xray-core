@@ -247,11 +247,14 @@ pub unsafe extern "C" fn xray_vision_unpad(
             }
             pos += avail;
             st.remaining_content -= avail as i32;
-        } else {
-            // remaining_padding > 0: skip padding bytes.
+        } else if st.remaining_padding > 0 {
+            // Skip padding bytes.
             let skip = core::cmp::min(st.remaining_padding as usize, in_len - pos);
             pos += skip;
             st.remaining_padding -= skip as i32;
+        } else {
+            // Defensive: remaining_padding <= 0 with no command/content — break to prevent infinite loop.
+            break;
         }
 
         // Check if current block is complete.
@@ -280,6 +283,180 @@ pub unsafe extern "C" fn xray_vision_unpad(
     }
 
     out_pos as i32
+}
+
+// --- TLS Filtering ---
+
+/// TLS byte patterns (matches Go constants in proxy/proxy.go).
+const TLS_SERVER_HANDSHAKE_START: [u8; 3] = [0x16, 0x03, 0x03];
+const TLS_CLIENT_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
+const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
+const TLS_HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
+const TLS13_SUPPORTED_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+
+/// Stateful TLS filter state passed across FFI boundary.
+/// Fields are ordered to minimize padding (i32s first, then u16, then bools).
+#[repr(C)]
+pub struct VisionFilterState {
+    pub remaining_server_hello: i32,
+    pub number_of_packets_to_filter: i32,
+    pub cipher: u16,
+    pub is_tls: bool,
+    pub is_tls12_or_above: bool,
+    pub enable_xtls: bool,
+}
+
+// Compile-time struct size assertion: Go and C sides must agree on layout.
+const _: () = assert!(core::mem::size_of::<VisionFilterState>() == 16);
+
+/// Filter a single buffer for TLS handshake patterns and detect TLS 1.3.
+///
+/// # Arguments
+/// * `data` — buffer bytes to scan
+/// * `data_len` — length of buffer
+/// * `state` — mutable filter state (persists across calls for multi-packet)
+///
+/// # Returns
+/// 0 = continue filtering next packet, 1 = stop filtering (determined TLS version).
+///
+/// # Safety
+/// Caller must ensure all pointers are valid.
+#[no_mangle]
+pub unsafe extern "C" fn xray_vision_filter_tls(
+    data: *const u8,
+    data_len: u32,
+    state: *mut VisionFilterState,
+) -> i32 {
+    if data.is_null() || state.is_null() || data_len == 0 {
+        return 0;
+    }
+    let buf = core::slice::from_raw_parts(data, data_len as usize);
+    let st = &mut *state;
+    let buf_len = buf.len() as i32;
+
+    st.number_of_packets_to_filter -= 1;
+
+    if buf.len() >= 6 {
+        if buf[..3] == TLS_SERVER_HANDSHAKE_START
+            && buf[5] == TLS_HANDSHAKE_TYPE_SERVER_HELLO
+        {
+            st.remaining_server_hello =
+                ((buf[3] as i32) << 8 | buf[4] as i32) + 5;
+            st.is_tls12_or_above = true;
+            st.is_tls = true;
+            if buf.len() >= 79 && st.remaining_server_hello >= 79 {
+                // TLS spec: session_id is at most 32 bytes; clamp to prevent
+                // a malicious value from reading cipher bytes at an arbitrary offset.
+                let session_id_len = core::cmp::min(buf[43] as usize, 32);
+                let cs_offset = 43 + session_id_len + 1;
+                if cs_offset + 2 <= buf.len() {
+                    st.cipher =
+                        (buf[cs_offset] as u16) << 8 | buf[cs_offset + 1] as u16;
+                }
+            }
+        } else if buf[..2] == TLS_CLIENT_HANDSHAKE_START
+            && buf[5] == TLS_HANDSHAKE_TYPE_CLIENT_HELLO
+        {
+            st.is_tls = true;
+        }
+    }
+
+    if st.remaining_server_hello > 0 {
+        let end = core::cmp::min(st.remaining_server_hello, buf_len) as usize;
+        st.remaining_server_hello -= buf_len;
+        if contains_subsequence(&buf[..end], &TLS13_SUPPORTED_VERSIONS) {
+            // Check cipher suite against TLS 1.3 dictionary.
+            // 0x1301..0x1304 enable XTLS; 0x1305 (CCM_8) does not.
+            match st.cipher {
+                0x1301 | 0x1302 | 0x1303 | 0x1304 => {
+                    st.enable_xtls = true;
+                }
+                _ => {} // 0x1305 or unknown — don't enable XTLS
+            }
+            st.number_of_packets_to_filter = 0;
+            return 1; // stop: found TLS 1.3
+        } else if st.remaining_server_hello <= 0 {
+            st.number_of_packets_to_filter = 0;
+            return 1; // stop: TLS 1.2 (no supported_versions extension)
+        }
+    }
+
+    0 // continue filtering
+}
+
+/// Search for a subsequence (needle) within a byte slice (haystack).
+#[inline]
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+// --- Complete Record Detection ---
+
+/// Check whether a byte buffer consists entirely of well-formed TLS
+/// application data records (content type 0x17, version 0x0303).
+///
+/// # Returns
+/// 1 if the buffer is a sequence of complete records, 0 otherwise.
+///
+/// # Safety
+/// Caller must ensure the pointer is valid for `data_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn xray_vision_is_complete_record(
+    data: *const u8,
+    data_len: u32,
+) -> i32 {
+    if data.is_null() || data_len == 0 {
+        return 0;
+    }
+    let buf = core::slice::from_raw_parts(data, data_len as usize);
+    let total_len = buf.len();
+    let mut i = 0;
+    let mut header_len: i32 = 5;
+    let mut record_len: i32 = 0;
+
+    while i < total_len {
+        if header_len > 0 {
+            let byte_val = buf[i];
+            i += 1;
+            match header_len {
+                5 => {
+                    if byte_val != 0x17 {
+                        return 0;
+                    }
+                }
+                4 => {
+                    if byte_val != 0x03 {
+                        return 0;
+                    }
+                }
+                3 => {
+                    if byte_val != 0x03 {
+                        return 0;
+                    }
+                }
+                2 => record_len = (byte_val as i32) << 8,
+                1 => record_len |= byte_val as i32,
+                _ => {}
+            }
+            header_len -= 1;
+        } else if record_len > 0 {
+            let remaining = total_len - i;
+            if remaining < record_len as usize {
+                return 0;
+            }
+            i += record_len as usize;
+            record_len = 0;
+            header_len = 5;
+        } else {
+            return 0;
+        }
+    }
+
+    if header_len == 5 && record_len == 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -483,5 +660,316 @@ mod tests {
         assert_eq!(n, expected_len as i32);
         assert_eq!(&out[..data1.len()], data1.as_slice());
         assert_eq!(&out[data1.len()..expected_len], data2.as_slice());
+    }
+
+    // --- FilterTls tests ---
+
+    #[test]
+    fn test_filter_tls_server_hello_tls13() {
+        // Construct a minimal ServerHello with TLS 1.3 supported_versions extension.
+        // TLS record: 0x16 0x03 0x03 [length_hi] [length_lo] [handshake_type=0x02]
+        // ServerHello body needs to be >= 79 bytes for cipher extraction.
+        let mut buf = vec![0u8; 256];
+
+        // Record header
+        buf[0] = 0x16; // handshake
+        buf[1] = 0x03; // version major
+        buf[2] = 0x03; // version minor
+        let record_len: u16 = 250; // payload length
+        buf[3] = (record_len >> 8) as u8;
+        buf[4] = record_len as u8;
+
+        // Handshake header
+        buf[5] = 0x02; // ServerHello
+
+        // Fill up to byte 43 (session_id_length)
+        buf[43] = 0; // session_id_length = 0
+
+        // Cipher suite at offset 44-45 (43 + 0 + 1 = 44)
+        buf[44] = 0x13; // TLS_AES_128_GCM_SHA256 = 0x1301
+        buf[45] = 0x01;
+
+        // Embed TLS 1.3 supported_versions extension somewhere in the buffer
+        let sv = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        buf[100..106].copy_from_slice(&sv);
+
+        let mut state = VisionFilterState {
+            remaining_server_hello: -1,
+            number_of_packets_to_filter: 8,
+            cipher: 0,
+            is_tls: false,
+            is_tls12_or_above: false,
+            enable_xtls: false,
+        };
+
+        let rc = unsafe {
+            xray_vision_filter_tls(buf.as_ptr(), buf.len() as u32, &mut state)
+        };
+
+        assert_eq!(rc, 1, "should stop filtering after finding TLS 1.3");
+        assert!(state.is_tls, "should detect TLS");
+        assert!(state.is_tls12_or_above, "should detect TLS 1.2+");
+        assert_eq!(state.cipher, 0x1301, "should extract cipher suite");
+        assert!(state.enable_xtls, "should enable XTLS for AES-128-GCM");
+        assert_eq!(state.number_of_packets_to_filter, 0);
+    }
+
+    #[test]
+    fn test_filter_tls_client_hello() {
+        // ClientHello: 0x16 0x03 [any] [len_hi] [len_lo] 0x01
+        let buf = [0x16, 0x03, 0x01, 0x00, 0x80, 0x01, 0x00, 0x00];
+
+        let mut state = VisionFilterState {
+            remaining_server_hello: -1,
+            number_of_packets_to_filter: 8,
+            cipher: 0,
+            is_tls: false,
+            is_tls12_or_above: false,
+            enable_xtls: false,
+        };
+
+        let rc = unsafe {
+            xray_vision_filter_tls(buf.as_ptr(), buf.len() as u32, &mut state)
+        };
+
+        assert_eq!(rc, 0, "should continue filtering");
+        assert!(state.is_tls, "should detect TLS client hello");
+        assert!(!state.is_tls12_or_above, "client hello alone doesn't set 1.2+");
+        assert_eq!(state.number_of_packets_to_filter, 7);
+    }
+
+    #[test]
+    fn test_filter_tls_ccm8_no_xtls() {
+        // ServerHello with cipher 0x1305 (TLS_AES_128_CCM_8_SHA256) should NOT enable XTLS.
+        let mut buf = vec![0u8; 256];
+        buf[0] = 0x16;
+        buf[1] = 0x03;
+        buf[2] = 0x03;
+        let record_len: u16 = 250;
+        buf[3] = (record_len >> 8) as u8;
+        buf[4] = record_len as u8;
+        buf[5] = 0x02; // ServerHello
+        buf[43] = 0;   // session_id_length = 0
+        buf[44] = 0x13;
+        buf[45] = 0x05; // TLS_AES_128_CCM_8_SHA256
+
+        let sv = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        buf[100..106].copy_from_slice(&sv);
+
+        let mut state = VisionFilterState {
+            remaining_server_hello: -1,
+            number_of_packets_to_filter: 8,
+            cipher: 0,
+            is_tls: false,
+            is_tls12_or_above: false,
+            enable_xtls: false,
+        };
+
+        let rc = unsafe {
+            xray_vision_filter_tls(buf.as_ptr(), buf.len() as u32, &mut state)
+        };
+
+        assert_eq!(rc, 1);
+        assert_eq!(state.cipher, 0x1305);
+        assert!(!state.enable_xtls, "CCM_8 should NOT enable XTLS");
+    }
+
+    // --- IsCompleteRecord tests ---
+
+    #[test]
+    fn test_complete_record_single() {
+        // One valid TLS application data record: 0x17 0x03 0x03 [len=5] [5 bytes payload]
+        let data = [0x17, 0x03, 0x03, 0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05];
+        let rc = unsafe {
+            xray_vision_is_complete_record(data.as_ptr(), data.len() as u32)
+        };
+        assert_eq!(rc, 1, "single complete record");
+    }
+
+    #[test]
+    fn test_complete_record_multiple() {
+        // Two valid records back-to-back.
+        let mut data = Vec::new();
+        // Record 1: 3 bytes payload
+        data.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x03, 0xAA, 0xBB, 0xCC]);
+        // Record 2: 2 bytes payload
+        data.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x02, 0xDD, 0xEE]);
+
+        let rc = unsafe {
+            xray_vision_is_complete_record(data.as_ptr(), data.len() as u32)
+        };
+        assert_eq!(rc, 1, "two complete records");
+    }
+
+    #[test]
+    fn test_incomplete_record() {
+        // Truncated record (header says 10 bytes but only 3 available).
+        let data = [0x17, 0x03, 0x03, 0x00, 0x0A, 0x01, 0x02, 0x03];
+        let rc = unsafe {
+            xray_vision_is_complete_record(data.as_ptr(), data.len() as u32)
+        };
+        assert_eq!(rc, 0, "truncated record");
+    }
+
+    #[test]
+    fn test_wrong_content_type() {
+        // Wrong content type (0x16 instead of 0x17).
+        let data = [0x16, 0x03, 0x03, 0x00, 0x01, 0xFF];
+        let rc = unsafe {
+            xray_vision_is_complete_record(data.as_ptr(), data.len() as u32)
+        };
+        assert_eq!(rc, 0, "wrong content type");
+    }
+
+    #[test]
+    fn test_empty_record() {
+        let rc = unsafe {
+            xray_vision_is_complete_record(core::ptr::null(), 0)
+        };
+        assert_eq!(rc, 0, "empty/null data");
+    }
+
+    #[test]
+    fn test_filter_tls_12_detection() {
+        // ServerHello without supported_versions extension → TLS 1.2.
+        let mut buf = vec![0u8; 128];
+        // Record header
+        buf[0] = 0x16;
+        buf[1] = 0x03;
+        buf[2] = 0x03;
+        let record_len: u16 = 122; // fits in buffer, remaining drains to 0
+        buf[3] = (record_len >> 8) as u8;
+        buf[4] = record_len as u8;
+        buf[5] = 0x02; // ServerHello
+        buf[43] = 0;   // session_id_length = 0
+        buf[44] = 0x00;
+        buf[45] = 0x2F; // TLS_RSA_WITH_AES_128_CBC_SHA (not a TLS 1.3 cipher)
+        // No supported_versions extension anywhere.
+
+        let mut state = VisionFilterState {
+            remaining_server_hello: -1,
+            number_of_packets_to_filter: 8,
+            cipher: 0,
+            is_tls: false,
+            is_tls12_or_above: false,
+            enable_xtls: false,
+        };
+
+        let rc = unsafe {
+            xray_vision_filter_tls(buf.as_ptr(), buf.len() as u32, &mut state)
+        };
+
+        assert_eq!(rc, 1, "should stop after determining TLS 1.2");
+        assert!(state.is_tls);
+        assert!(state.is_tls12_or_above);
+        assert!(!state.enable_xtls, "TLS 1.2 should not enable XTLS");
+        assert_eq!(state.number_of_packets_to_filter, 0);
+        assert_eq!(state.cipher, 0x002F);
+    }
+
+    #[test]
+    fn test_filter_tls_multi_packet_server_hello() {
+        // ServerHello split across two buffers.
+        let mut buf1 = vec![0u8; 80];
+        buf1[0] = 0x16;
+        buf1[1] = 0x03;
+        buf1[2] = 0x03;
+        let record_len: u16 = 200; // longer than first buffer
+        buf1[3] = (record_len >> 8) as u8;
+        buf1[4] = record_len as u8;
+        buf1[5] = 0x02; // ServerHello
+        buf1[43] = 0;   // session_id_length = 0
+        buf1[44] = 0x13;
+        buf1[45] = 0x01; // TLS_AES_128_GCM_SHA256
+
+        let mut state = VisionFilterState {
+            remaining_server_hello: -1,
+            number_of_packets_to_filter: 8,
+            cipher: 0,
+            is_tls: false,
+            is_tls12_or_above: false,
+            enable_xtls: false,
+        };
+
+        // First call: detect ServerHello but no supported_versions yet.
+        let rc1 = unsafe {
+            xray_vision_filter_tls(buf1.as_ptr(), buf1.len() as u32, &mut state)
+        };
+        assert_eq!(rc1, 0, "should continue after partial ServerHello");
+        assert!(state.is_tls);
+        assert!(state.is_tls12_or_above);
+        assert_eq!(state.cipher, 0x1301);
+        assert!(state.remaining_server_hello > 0);
+
+        // Second call: contains supported_versions extension.
+        let mut buf2 = vec![0u8; 200];
+        let sv = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        buf2[10..16].copy_from_slice(&sv);
+
+        let rc2 = unsafe {
+            xray_vision_filter_tls(buf2.as_ptr(), buf2.len() as u32, &mut state)
+        };
+        assert_eq!(rc2, 1, "should stop after finding TLS 1.3");
+        assert!(state.enable_xtls);
+        assert_eq!(state.number_of_packets_to_filter, 0);
+    }
+
+    #[test]
+    fn test_filter_tls_short_server_hello() {
+        // ServerHello with buffer < 79 bytes — cipher extraction skipped.
+        let mut buf = vec![0u8; 60];
+        buf[0] = 0x16;
+        buf[1] = 0x03;
+        buf[2] = 0x03;
+        let record_len: u16 = 54;
+        buf[3] = (record_len >> 8) as u8;
+        buf[4] = record_len as u8;
+        buf[5] = 0x02; // ServerHello
+
+        let mut state = VisionFilterState {
+            remaining_server_hello: -1,
+            number_of_packets_to_filter: 8,
+            cipher: 0,
+            is_tls: false,
+            is_tls12_or_above: false,
+            enable_xtls: false,
+        };
+
+        let rc = unsafe {
+            xray_vision_filter_tls(buf.as_ptr(), buf.len() as u32, &mut state)
+        };
+
+        assert!(state.is_tls);
+        assert!(state.is_tls12_or_above);
+        assert_eq!(state.cipher, 0, "cipher should not be extracted from short hello");
+        // remaining_server_hello = 54 + 5 = 59, buf.len() = 60 → drains to -1
+        assert_eq!(rc, 1, "should stop as TLS 1.2 (no supported_versions)");
+        assert_eq!(state.number_of_packets_to_filter, 0);
+    }
+
+    #[test]
+    fn test_filter_tls_counter_exhaustion() {
+        // Non-TLS traffic: counter decrements to 0 without detecting TLS.
+        let data = [0x00; 64];
+
+        let mut state = VisionFilterState {
+            remaining_server_hello: -1,
+            number_of_packets_to_filter: 3,
+            cipher: 0,
+            is_tls: false,
+            is_tls12_or_above: false,
+            enable_xtls: false,
+        };
+
+        for i in 0..3 {
+            let rc = unsafe {
+                xray_vision_filter_tls(data.as_ptr(), data.len() as u32, &mut state)
+            };
+            assert_eq!(rc, 0, "should continue filtering on packet {}", i);
+        }
+
+        assert_eq!(state.number_of_packets_to_filter, 0);
+        assert!(!state.is_tls);
+        assert!(!state.enable_xtls);
     }
 }

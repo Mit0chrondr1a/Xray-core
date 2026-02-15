@@ -124,6 +124,25 @@ extern int32_t xray_vision_unpad(
     uint8_t* out_buf, uint32_t out_cap
 );
 
+// Vision TLS filter state (must match Rust's VisionFilterState layout)
+struct xray_vision_filter_state {
+    int32_t  remaining_server_hello;
+    int32_t  number_of_packets_to_filter;
+    uint16_t cipher;
+    bool     is_tls;
+    bool     is_tls12_or_above;
+    bool     enable_xtls;
+};
+
+extern int32_t xray_vision_filter_tls(
+    const uint8_t* data, uint32_t data_len,
+    struct xray_vision_filter_state* state
+);
+
+extern int32_t xray_vision_is_complete_record(
+    const uint8_t* data, uint32_t data_len
+);
+
 // AEAD cipher handles
 extern void* xray_aead_new(uint8_t algo, const uint8_t* key, size_t key_len);
 extern int32_t xray_aead_seal(const void* handle, const uint8_t* nonce, size_t nonce_len, const uint8_t* aad, size_t aad_len, const uint8_t* pt, size_t pt_len, uint8_t* out, size_t out_cap, size_t* out_len);
@@ -1051,6 +1070,51 @@ func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) 
 		return 0, errors.New("native: vision unpad failed")
 	}
 	return int(n), nil
+}
+
+// VisionFilterState is the stateful TLS filter state (matches Rust's VisionFilterState).
+// Field order matches repr(C) layout: i32, i32, u16, bool, bool, bool.
+type VisionFilterState struct {
+	RemainingServerHello   int32
+	NumberOfPacketsToFilter int32
+	Cipher                 uint16
+	IsTLS                  bool
+	IsTLS12orAbove         bool
+	EnableXtls             bool
+}
+
+// VisionFilterStateSizeC returns the C-side sizeof(struct xray_vision_filter_state).
+func VisionFilterStateSizeC() uintptr {
+	var s C.struct_xray_vision_filter_state
+	return unsafe.Sizeof(s)
+}
+
+// VisionFilterTls filters a single buffer for TLS handshake patterns.
+// Returns true if filtering should stop (TLS version determined).
+func VisionFilterTls(data []byte, state *VisionFilterState) bool {
+	if state == nil || len(data) == 0 {
+		return false
+	}
+	rc := C.xray_vision_filter_tls(
+		(*C.uint8_t)(unsafe.Pointer(&data[0])), C.uint32_t(len(data)),
+		(*C.struct_xray_vision_filter_state)(unsafe.Pointer(state)),
+	)
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(state)
+	return rc == 1
+}
+
+// VisionIsCompleteRecord checks if a byte buffer consists entirely of
+// well-formed TLS application data records.
+func VisionIsCompleteRecord(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	rc := C.xray_vision_is_complete_record(
+		(*C.uint8_t)(unsafe.Pointer(&data[0])), C.uint32_t(len(data)),
+	)
+	runtime.KeepAlive(data)
+	return rc == 1
 }
 
 // --- AEAD FFI ---

@@ -198,6 +198,29 @@ func VisionUnpad([]byte, *VisionUnpadState, []byte, []byte) (int, error) {
 	return 0, errNotAvailable
 }
 
+// VisionFilterState is the stateful TLS filter state (matches Rust's VisionFilterState).
+type VisionFilterState struct {
+	RemainingServerHello   int32
+	NumberOfPacketsToFilter int32
+	Cipher                 uint16
+	IsTLS                  bool
+	IsTLS12orAbove         bool
+	EnableXtls             bool
+}
+
+// VisionFilterStateSizeC returns the Go-side sizeof(VisionFilterState) when native is unavailable.
+func VisionFilterStateSizeC() uintptr {
+	return unsafe.Sizeof(VisionFilterState{})
+}
+
+func VisionFilterTls([]byte, *VisionFilterState) bool {
+	return false
+}
+
+func VisionIsCompleteRecord([]byte) bool {
+	return false
+}
+
 // --- AEAD Stubs ---
 
 const (
