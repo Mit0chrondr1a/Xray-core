@@ -33,6 +33,8 @@ type worker interface {
 	Proxy() proxy.Inbound
 }
 
+const maxTCPConnections = 65536
+
 type tcpWorker struct {
 	address         net.Address
 	port            net.Port
@@ -45,7 +47,8 @@ type tcpWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	hub internet.Listener
+	hub              internet.Listener
+	connSemaphore    chan struct{}
 
 	ctx context.Context
 }
@@ -137,9 +140,19 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 }
 
 func (w *tcpWorker) Start() error {
+	w.connSemaphore = make(chan struct{}, maxTCPConnections)
 	ctx := context.Background()
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
-		go w.callback(conn)
+		select {
+		case w.connSemaphore <- struct{}{}:
+			go func() {
+				defer func() { <-w.connSemaphore }()
+				w.callback(conn)
+			}()
+		default:
+			errors.LogWarning(w.ctx, "TCP connection limit reached, rejecting connection from ", conn.RemoteAddr())
+			conn.Close()
+		}
 	})
 	if err != nil {
 		return errors.New("failed to listen TCP on ", w.port).AtWarning().Base(err)
