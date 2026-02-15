@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -60,7 +61,21 @@ func (r *resolution) callbackResolution(allFeatures []features.Feature) error {
 	}
 
 	if len(input) != callbackType.NumIn() {
-		panic("Can't get all input parameters")
+		var missing []string
+		for i := 0; i < callbackType.NumIn(); i++ {
+			pt := callbackType.In(i)
+			found := false
+			for _, f := range allFeatures {
+				if reflect.TypeOf(f).AssignableTo(pt) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				missing = append(missing, pt.String())
+			}
+		}
+		return errors.New("failed to resolve all dependencies: missing features ", missing)
 	}
 
 	var err error
@@ -85,7 +100,7 @@ type Instance struct {
 	features                   []features.Feature
 	pendingResolutions         []resolution
 	pendingOptionalResolutions []resolution
-	running                    bool
+	running                    atomic.Bool
 	resolveLock                sync.Mutex
 
 	ctx context.Context
@@ -93,7 +108,7 @@ type Instance struct {
 
 // Instance state
 func (server *Instance) IsRunning() bool {
-	return server.running
+	return server.running.Load()
 }
 
 func AddInboundHandler(server *Instance, config *InboundHandlerConfig) error {
@@ -260,7 +275,7 @@ func (s *Instance) Close() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
-	s.running = false
+	s.running.Store(false)
 	// Ensure cached TLS keylog descriptors are released on all close paths.
 	defer internettls.CloseMasterKeyLogWriters()
 
@@ -282,7 +297,7 @@ func (s *Instance) Close() error {
 func (s *Instance) RequireFeatures(callback interface{}, optional bool) error {
 	callbackType := reflect.TypeOf(callback)
 	if callbackType.Kind() != reflect.Func {
-		panic("not a function")
+		return errors.New("not a function")
 	}
 
 	var featureTypes []reflect.Type
@@ -320,7 +335,7 @@ func (s *Instance) RequireFeatures(callback interface{}, optional bool) error {
 
 // AddFeature registers a feature into current Instance.
 func (s *Instance) AddFeature(feature features.Feature) error {
-	if s.running {
+	if s.running.Load() {
 		if err := feature.Start(); err != nil {
 			errors.LogInfoInner(s.ctx, err, "failed to start feature")
 		}
@@ -388,7 +403,7 @@ func (s *Instance) Start() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
-	s.running = true
+	s.running.Store(true)
 	for _, f := range s.features {
 		if err := f.Start(); err != nil {
 			return err

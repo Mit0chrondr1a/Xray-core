@@ -15,7 +15,7 @@ type result struct {
 
 func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Port, sockopt *SocketConfig, domain string) (net.Conn, error) {
 	if len(ips) < 2 {
-		panic("at least 2 ips is required to race dial")
+		return nil, errors.New("at least 2 ips is required to race dial")
 	}
 
 	prioritizeIPv6 := sockopt.HappyEyeballs.PrioritizeIpv6
@@ -81,7 +81,7 @@ func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Po
 
 		case <-timer.C:
 			if nextTryIndex == len(ips) || activeNum == maxConcurrentTry {
-				panic("impossible situation")
+				return nil, errors.New("happy eyeballs: unexpected timer fire")
 			}
 			go tcpTryDial(newCtx, src, sockopt, ips[nextTryIndex], port, nextTryIndex, resultCh)
 			activeNum++

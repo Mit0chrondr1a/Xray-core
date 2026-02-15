@@ -285,7 +285,7 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
 // Dispatch implements routing.Dispatcher.
 func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
 	if !destination.IsValid() {
-		panic("Dispatcher: Invalid destination.")
+		return nil, errors.New("Dispatcher: Invalid destination.")
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {

@@ -397,7 +397,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	scMinPostsIntervalMs := transportConfiguration.GetNormalizedScMinPostsIntervalMs()
 
 	if scMaxEachPostBytes.From <= buf.Size {
-		panic("`scMaxEachPostBytes` should be bigger than " + strconv.Itoa(buf.Size))
+		return nil, errors.New("`scMaxEachPostBytes` should be bigger than " + strconv.Itoa(buf.Size))
 	}
 
 	maxUploadSize := scMaxEachPostBytes.rand()
