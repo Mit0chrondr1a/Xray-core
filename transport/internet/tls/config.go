@@ -25,6 +25,29 @@ import (
 
 var globalSessionCache = tls.NewLRUClientSessionCache(getTLSCacheSize())
 
+// ocspTickerRegistry tracks active OCSP ticker goroutines for cancellation.
+var ocspTickerRegistry struct {
+	sync.Mutex
+	stopFuncs []func()
+}
+
+// StopAllOcspTickers cancels all active OCSP ticker goroutines.
+// Call this during config reload or shutdown to prevent goroutine leaks.
+func StopAllOcspTickers() {
+	ocspTickerRegistry.Lock()
+	defer ocspTickerRegistry.Unlock()
+	for _, stop := range ocspTickerRegistry.stopFuncs {
+		stop()
+	}
+	ocspTickerRegistry.stopFuncs = nil
+}
+
+func registerOcspTicker(stop func()) {
+	ocspTickerRegistry.Lock()
+	defer ocspTickerRegistry.Unlock()
+	ocspTickerRegistry.stopFuncs = append(ocspTickerRegistry.stopFuncs, stop)
+}
+
 func getTLSCacheSize() int {
 	if s := os.Getenv("XRAY_TLS_CACHE_SIZE"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil && n > 0 {
@@ -85,7 +108,7 @@ func (c *Config) BuildCertificates() []*atomic.Pointer[tls.Certificate] {
 			continue
 		}
 		certPtr := certs[len(certs)-1]
-		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
+		registerOcspTicker(setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
 			cert := certPtr.Load()
 			if isReloaded {
 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
@@ -105,12 +128,16 @@ func (c *Config) BuildCertificates() []*atomic.Pointer[tls.Certificate] {
 				}
 			}
 			certPtr.Store(cert)
-		})
+		}))
 	}
 	return certs
 }
 
-func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
+// setupOcspTicker starts a goroutine that periodically reloads certificates and
+// refreshes OCSP staples. It returns a stop function that cancels the goroutine.
+// Callers must eventually call the returned function to prevent goroutine leaks.
+func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) func() {
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		if entry.OneTimeLoading {
 			return
@@ -122,17 +149,18 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 			isOcspstapling = true
 		}
 		t := time.NewTicker(time.Duration(hotReloadCertInterval) * time.Second)
+		defer t.Stop()
 		for {
 			var isReloaded bool
 			if entry.CertificatePath != "" && entry.KeyPath != "" {
 				newCert, err := filesystem.ReadCert(entry.CertificatePath)
 				if err != nil {
-					errors.LogErrorInner(context.Background(), err, "failed to parse certificate")
+					errors.LogErrorInner(ctx, err, "failed to parse certificate")
 					return
 				}
 				newKey, err := filesystem.ReadCert(entry.KeyPath)
 				if err != nil {
-					errors.LogErrorInner(context.Background(), err, "failed to parse key")
+					errors.LogErrorInner(ctx, err, "failed to parse key")
 					return
 				}
 				if string(newCert) != string(entry.Certificate) || string(newKey) != string(entry.Key) {
@@ -142,9 +170,14 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 				}
 			}
 			callback(isReloaded, isOcspstapling)
-			<-t.C
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
 		}
 	}()
+	return cancel
 }
 
 func isCertificateExpired(c *tls.Certificate) bool {
@@ -180,7 +213,7 @@ func (c *Config) getCustomCA() []*Certificate {
 	for _, certificate := range c.Certificate {
 		if certificate.Usage == Certificate_AUTHORITY_ISSUE {
 			certs = append(certs, certificate)
-			setupOcspTicker(certificate, func(isReloaded, isOcspstapling bool) {})
+			registerOcspTicker(setupOcspTicker(certificate, func(isReloaded, isOcspstapling bool) {}))
 		}
 	}
 	return certs

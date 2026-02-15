@@ -278,6 +278,8 @@ func (s *Instance) Close() error {
 	s.running.Store(false)
 	// Ensure cached TLS keylog descriptors are released on all close paths.
 	defer internettls.CloseMasterKeyLogWriters()
+	// Stop all OCSP ticker goroutines to prevent leaks on config reload.
+	defer internettls.StopAllOcspTickers()
 
 	var errs []interface{}
 	for _, f := range s.features {
@@ -404,10 +406,17 @@ func (s *Instance) Start() error {
 	defer s.statusLock.Unlock()
 
 	s.running.Store(true)
+	var started []features.Feature
 	for _, f := range s.features {
 		if err := f.Start(); err != nil {
+			// Roll back already-started features in reverse order.
+			for i := len(started) - 1; i >= 0; i-- {
+				started[i].Close()
+			}
+			s.running.Store(false)
 			return err
 		}
+		started = append(started, f)
 	}
 
 	errors.LogWarning(s.ctx, "Xray ", Version(), " started")
