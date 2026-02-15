@@ -1,8 +1,9 @@
 package salamander
 
 import (
-	"crypto/rand"
+	crand "crypto/rand"
 	"fmt"
+	"math/rand/v2"
 
 	"golang.org/x/crypto/blake2b"
 )
@@ -18,8 +19,20 @@ var ErrPSKTooShort = fmt.Errorf("PSK must be at least %d bytes", smPSKMinLen)
 // SalamanderObfuscator is an obfuscator that obfuscates each packet with
 // the BLAKE2b-256 hash of a pre-shared key combined with a random salt.
 // Packet format: [8-byte salt][payload]
+
+// newCSPRNG returns a ChaCha8-based userspace PRNG seeded from crypto/rand.
+// This avoids a getrandom(2) syscall per packet while remaining unpredictable.
+func newCSPRNG() *rand.ChaCha8 {
+	var seed [32]byte
+	if _, err := crand.Read(seed[:]); err != nil {
+		panic("salamander: failed to seed CSPRNG: " + err.Error())
+	}
+	return rand.NewChaCha8(seed)
+}
+
 type SalamanderObfuscator struct {
 	PSK []byte
+	rng *rand.ChaCha8
 }
 
 func NewSalamanderObfuscator(psk []byte) (*SalamanderObfuscator, error) {
@@ -28,6 +41,7 @@ func NewSalamanderObfuscator(psk []byte) (*SalamanderObfuscator, error) {
 	}
 	return &SalamanderObfuscator{
 		PSK: psk,
+		rng: newCSPRNG(),
 	}, nil
 }
 
@@ -36,9 +50,8 @@ func (o *SalamanderObfuscator) Obfuscate(in, out []byte) int {
 	if len(out) < outLen {
 		return 0
 	}
-	if _, err := rand.Read(out[:smSaltLen]); err != nil {
-		return 0
-	}
+	// ChaCha8 Read never returns an error
+	o.rng.Read(out[:smSaltLen])
 	key := o.key(out[:smSaltLen])
 	for i, c := range in {
 		out[i+smSaltLen] = c ^ key[i%smKeyLen]
