@@ -210,6 +210,16 @@ func loadIP(file, code string) ([]*router.CIDR, error) {
 // nativeGeoIPCache caches pre-built native IpSet handles keyed by "file:CODE".
 var nativeGeoIPCache sync.Map
 
+// ClearNativeGeoIPCache removes all entries from the native GeoIP cache.
+// Safe to call during config reload; subsequent loadIPNative calls will
+// re-populate the cache from disk.
+func ClearNativeGeoIPCache() {
+	nativeGeoIPCache.Range(func(key, _ any) bool {
+		nativeGeoIPCache.Delete(key)
+		return true
+	})
+}
+
 // loadIPNative loads a GeoIP entry using the native Rust geodata loader.
 // Returns the IpSetHandle directly, bypassing Go protobuf unmarshal.
 func loadIPNative(file, code string) (*native.IpSetHandle, error) {

@@ -822,6 +822,19 @@ var ipsetFactory = GeoIPSetFactory{shared: make(map[string]*GeoIPSet)}
 // BuildOptimizedGeoIPMatcher.
 var nativeGeoIPHandles sync.Map
 
+// ClearNativeGeoIPHandles removes all entries from the native GeoIP handles
+// cache and clears the shared GeoIPSet factory cache.
+// Safe to call during config reload; subsequent builds will re-populate.
+func ClearNativeGeoIPHandles() {
+	nativeGeoIPHandles.Range(func(key, _ any) bool {
+		nativeGeoIPHandles.Delete(key)
+		return true
+	})
+	ipsetFactory.Lock()
+	ipsetFactory.shared = make(map[string]*GeoIPSet)
+	ipsetFactory.Unlock()
+}
+
 // StoreNativeGeoIPHandle stores a pre-built native IpSet handle for use by
 // BuildOptimizedGeoIPMatcher. Called from config loading.
 func StoreNativeGeoIPHandle(code string, handle *native.IpSetHandle) {
