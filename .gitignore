@@ -71,3 +71,6 @@ resources/
 # Rust build artifacts
 /rust/xray-rust/target/
 /rust/xray-ebpf/target/
+
+# Claude Code local plugins
+.claude-plugin/
