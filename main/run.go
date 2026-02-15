@@ -104,25 +104,51 @@ func executeRun(cmd *base.Command, args []string) {
 	debug.FreeOSMemory()
 
 	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
-	sig := <-osSignals
-	errors.LogInfo(context.Background(), "received signal ", sig, ", shutting down...")
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
-	// Grace period: allow in-flight connections to finish
-	done := make(chan struct{})
-	go func() {
-		server.Close()
-		close(done)
-	}()
+	for {
+		sig := <-osSignals
 
-	// Wait for clean shutdown or second signal/timeout
-	select {
-	case <-done:
-		errors.LogInfo(context.Background(), "shutdown complete")
-	case <-time.After(15 * time.Second):
-		errors.LogWarning(context.Background(), "shutdown timed out after 15s, forcing exit")
-	case sig = <-osSignals:
-		errors.LogWarning(context.Background(), "received second signal ", sig, ", forcing exit")
+		if sig == syscall.SIGHUP {
+			errors.LogInfo(context.Background(), "received SIGHUP, reloading configuration...")
+			newServer, err := startXray()
+			if err != nil {
+				errors.LogWarning(context.Background(), "failed to reload config: ", err, "; keeping current server")
+				continue
+			}
+			if err := newServer.Start(); err != nil {
+				errors.LogWarning(context.Background(), "failed to start new server: ", err, "; keeping current server")
+				newServer.Close()
+				continue
+			}
+			oldServer := server
+			server = newServer
+			oldServer.Close()
+			runtime.GC()
+			errors.LogInfo(context.Background(), "configuration reloaded successfully")
+			continue
+		}
+
+		// SIGINT or SIGTERM — shut down
+		errors.LogInfo(context.Background(), "received signal ", sig, ", shutting down...")
+
+		// Grace period: allow in-flight connections to finish
+		done := make(chan struct{})
+		go func() {
+			server.Close()
+			close(done)
+		}()
+
+		// Wait for clean shutdown or second signal/timeout
+		select {
+		case <-done:
+			errors.LogInfo(context.Background(), "shutdown complete")
+		case <-time.After(15 * time.Second):
+			errors.LogWarning(context.Background(), "shutdown timed out after 15s, forcing exit")
+		case sig = <-osSignals:
+			errors.LogWarning(context.Background(), "received second signal ", sig, ", forcing exit")
+		}
+		break
 	}
 }
 
