@@ -7,6 +7,7 @@ use zeroize::{Zeroize, Zeroizing, ZeroizeOnDrop};
 
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls_pki_types::pem::PemObject;
 use rustls::{
     ClientConfig, ClientConnection, ConnectionTrafficSecrets, ServerConfig, ServerConnection,
 };
@@ -1005,7 +1006,7 @@ pub extern "C" fn xray_tls_config_add_cert_pem(
         let cert_pem = unsafe { std::slice::from_raw_parts(cert_ptr, cert_len) };
         let key_pem = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
 
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &*cert_pem)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
             .filter_map(|r| r.ok())
             .collect();
 
@@ -1013,13 +1014,12 @@ pub extern "C" fn xray_tls_config_add_cert_pem(
             return -1;
         }
 
-        let key = rustls_pemfile::private_key(&mut &*key_pem);
-        match key {
-            Ok(Some(k)) => {
+        match PrivateKeyDer::from_pem_slice(key_pem) {
+            Ok(k) => {
                 cfg.certs.push((certs, k));
                 0
             }
-            _ => -2,
+            Err(_) => -2,
         }
     })
 }
@@ -1038,7 +1038,7 @@ pub extern "C" fn xray_tls_config_add_root_ca_pem(
         }
         let ca_pem = unsafe { std::slice::from_raw_parts(ca_ptr, ca_len) };
 
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &*ca_pem)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(ca_pem)
             .filter_map(|r| r.ok())
             .collect();
 

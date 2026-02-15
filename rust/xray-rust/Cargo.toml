@@ -9,7 +9,7 @@ crate-type = ["staticlib"]
 [dependencies]
 # Phase 1: rustls TLS (ring backend for static linking portability)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1", features = ["std"] }
 rustls-native-certs = "0.8"
 webpki-roots = "0.26"
 ring = "0.17"
