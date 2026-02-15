@@ -200,6 +200,13 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		XUDPManager.Lock()
 		x := XUDPManager.Map[meta.GlobalID]
 		if x == nil {
+			if len(XUDPManager.Map) >= maxXUDPSessions {
+				if !xudpEvictExpiring() {
+					XUDPManager.Unlock()
+					errors.LogWarning(ctx, "XUDP session map full (", maxXUDPSessions, "), rejecting new session")
+					return errors.New("XUDP session limit reached")
+				}
+			}
 			x = &XUDP{GlobalID: meta.GlobalID}
 			XUDPManager.Map[meta.GlobalID] = x
 			XUDPManager.Unlock()

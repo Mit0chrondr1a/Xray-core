@@ -227,9 +227,32 @@ func (x *XUDP) Interrupt() {
 	common.Close(x.Mux.output)
 }
 
+const maxXUDPSessions = 4096
+
 var XUDPManager struct {
 	sync.Mutex
 	Map map[[8]byte]*XUDP
+}
+
+// xudpEvictExpiring evicts the oldest expiring XUDP entry.
+// Must be called with XUDPManager.Mutex held.
+func xudpEvictExpiring() bool {
+	var oldestID [8]byte
+	var oldestExpire time.Time
+	found := false
+	for id, x := range XUDPManager.Map {
+		if x.Status == Expiring && (!found || x.Expire.Before(oldestExpire)) {
+			oldestID = id
+			oldestExpire = x.Expire
+			found = true
+		}
+	}
+	if found {
+		XUDPManager.Map[oldestID].Interrupt()
+		delete(XUDPManager.Map, oldestID)
+		errors.LogDebug(context.Background(), "XUDP evict ", oldestID)
+	}
+	return found
 }
 
 func init() {
