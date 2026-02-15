@@ -301,7 +301,9 @@ pub unsafe extern "C" fn xray_ipset_max6(ipset: *const IpSet) -> u8 {
 /// `ipset` must be valid or null. Must not be used after freeing.
 #[no_mangle]
 pub unsafe extern "C" fn xray_ipset_free(ipset: *mut IpSet) {
-    if !ipset.is_null() {
-        drop(Box::from_raw(ipset));
-    }
+    ffi_catch_void!({
+        if !ipset.is_null() {
+            drop(Box::from_raw(ipset));
+        }
+    });
 }
