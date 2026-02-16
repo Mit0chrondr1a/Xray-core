@@ -263,8 +263,8 @@ tasks:
                 printf "│  %-36s│\n" "Go:     $(go env GOVERSION)"
                 printf "│  %-36s│\n" "Commit: {{.COMMID}}"
 
-                RUST="no"; grep -qaF 'xray_blake3_hash' {{.OUT_NAME}} && RUST="yes"
-                EBPF="no"; grep -qaF 'xray_ebpf_setup' {{.OUT_NAME}} && EBPF="yes"
+                RUST="yes"  # build-rust is a dependency; link fails if lib missing
+                EBPF="no"; [ -f rust/xray-ebpf/target/bpfel-unknown-none/release/xray-ebpf ] && EBPF="yes"
                 PGO="no"; [ -f main/default.pgo ] && PGO="yes"
 
                 printf "│  %-36s│\n" "CGO:    yes"
