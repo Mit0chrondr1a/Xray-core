@@ -86,6 +86,13 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
         let pin_dir = Path::new(pin_path);
         std::fs::create_dir_all(pin_dir)
             .map_err(|e| format!("mkdir {pin_path}: {e}"))?;
+        // Harden directory permissions to 0700 (root-only), matching Go ensureBPFPinDir.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(pin_dir, perms)
+                .map_err(|e| format!("chmod {pin_path}: {e}"))?;
+        }
 
         // Aya 0.13 doesn't expose map fd reuse for already loaded objects.
         // Always pin the maps owned by this `Ebpf` instance so the pinned paths
