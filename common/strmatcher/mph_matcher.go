@@ -1,6 +1,7 @@
 package strmatcher
 
 import (
+	"fmt"
 	"math/bits"
 	"regexp"
 	"runtime"
@@ -95,7 +96,7 @@ func (g *MphMatcherGroup) AddPattern(pattern string, t Type) (uint32, error) {
 			Id: g.Count,
 		})
 	default:
-		panic("Unknown type")
+		return 0, fmt.Errorf("unknown pattern type: %d", t)
 	}
 	return g.Count, nil
 }
