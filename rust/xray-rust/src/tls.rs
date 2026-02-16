@@ -238,6 +238,9 @@ pub(crate) fn install_ktls(
                     std::mem::size_of::<TlsCryptoInfoAesGcm128>() as libc::socklen_t,
                 )
             };
+            info.key.zeroize();
+            info.iv.zeroize();
+            info.salt.zeroize();
             if ret < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -265,6 +268,9 @@ pub(crate) fn install_ktls(
                     std::mem::size_of::<TlsCryptoInfoAesGcm256>() as libc::socklen_t,
                 )
             };
+            info.key.zeroize();
+            info.iv.zeroize();
+            info.salt.zeroize();
             if ret < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -290,6 +296,8 @@ pub(crate) fn install_ktls(
                     std::mem::size_of::<TlsCryptoInfoChacha20Poly1305>() as libc::socklen_t,
                 )
             };
+            info.key.zeroize();
+            info.iv.zeroize();
             if ret < 0 {
                 return Err(std::io::Error::last_os_error());
             }
