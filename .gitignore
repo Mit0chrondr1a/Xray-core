@@ -77,3 +77,6 @@ resources/
 
 # Claude Code local plugins
 .claude-plugin/
+
+# ENV
+.envrc
