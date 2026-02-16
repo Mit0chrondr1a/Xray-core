@@ -30,6 +30,13 @@ type SPSCRingBuffer struct {
 // capacity (rounded up to the next power of 2, minimum 16 bytes).
 // The returned buffer implements io.ReadWriteCloser.
 func NewSPSCRingBuffer(capacity int) *SPSCRingBuffer {
+	if capacity <= 0 {
+		capacity = 16
+	}
+	const maxCapacity = 1 << 30 // 1 GB
+	if capacity > maxCapacity {
+		capacity = maxCapacity
+	}
 	cap := nextPowerOf2(uint64(capacity))
 	if cap < 16 {
 		cap = 16
@@ -132,12 +139,10 @@ func (r *SPSCRingBuffer) Write(data []byte) (int, error) {
 		}
 	}
 
-	// Signal reader only if it is actually waiting.
-	if r.readerWaiting.Load() {
-		r.mu.Lock()
-		r.cond.Signal()
-		r.mu.Unlock()
-	}
+	// Unconditionally signal reader to prevent lost wakeups.
+	r.mu.Lock()
+	r.cond.Signal()
+	r.mu.Unlock()
 
 	return written, nil
 }
@@ -152,12 +157,10 @@ func (r *SPSCRingBuffer) Read(buf []byte) (int, error) {
 	for {
 		n := r.read(buf)
 		if n > 0 {
-			// Signal writer only if it is actually waiting.
-			if r.writerWaiting.Load() {
-				r.mu.Lock()
-				r.cond.Signal()
-				r.mu.Unlock()
-			}
+			// Unconditionally signal writer to prevent lost wakeups.
+			r.mu.Lock()
+			r.cond.Signal()
+			r.mu.Unlock()
 			return n, nil
 		}
 
@@ -201,6 +204,12 @@ func (r *SPSCRingBuffer) Close() error {
 }
 
 func nextPowerOf2(v uint64) uint64 {
+	if v == 0 {
+		return 1
+	}
+	if v > 1<<63 {
+		return 1 << 63
+	}
 	v--
 	v |= v >> 1
 	v |= v >> 2
