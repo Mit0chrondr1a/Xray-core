@@ -101,7 +101,10 @@ pub unsafe extern "C" fn xray_mph_add_pattern(
 ) {
     let table = &mut *table;
     let pattern = slice::from_raw_parts(pattern, pattern_len);
-    let pattern = std::str::from_utf8_unchecked(pattern);
+    let pattern = match std::str::from_utf8(pattern) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     table.add_pattern(pattern, pattern_type);
 }
 
@@ -129,7 +132,10 @@ pub unsafe extern "C" fn xray_mph_match(
 ) -> bool {
     let table = &*table;
     let input = slice::from_raw_parts(input, input_len);
-    let input = std::str::from_utf8_unchecked(input);
+    let input = match std::str::from_utf8(input) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
     table.match_input(input)
 }
 
