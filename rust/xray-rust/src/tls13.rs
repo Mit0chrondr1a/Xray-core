@@ -17,6 +17,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384};
 use x25519_dalek::{PublicKey, StaticSecret};
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ---------------------------------------------------------------------------
@@ -310,6 +311,9 @@ fn send_tls_record(
     let mut record = Vec::with_capacity(5 + data.len());
     record.push(content_type);
     record.extend_from_slice(&[0x03, 0x01]); // legacy TLS 1.0 for compatibility
+    if data.len() > 16384 {
+        return Err(Tls13Error::Protocol(format!("record too large: {}", data.len())));
+    }
     record.extend_from_slice(&(data.len() as u16).to_be_bytes());
     record.extend_from_slice(data);
     stream.write_all(&record)?;
@@ -345,13 +349,20 @@ fn encrypt_tls13_record(
     content_type: u8,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Tls13Error> {
+    if plaintext.len() > 16384 {
+        return Err(Tls13Error::Protocol(format!("plaintext too large for TLS record: {}", plaintext.len())));
+    }
     // Inner plaintext: content + content_type byte
     let mut inner = Vec::with_capacity(plaintext.len() + 1);
     inner.extend_from_slice(plaintext);
     inner.push(content_type);
 
     // AAD is the record header with outer content type 0x17 (application data)
-    let outer_len = (inner.len() + 16) as u16; // +16 for AEAD tag
+    let outer_len_usize = inner.len() + 16; // +16 for AEAD tag
+    if outer_len_usize > u16::MAX as usize {
+        return Err(Tls13Error::Protocol(format!("AAD outer_len overflow: {}", outer_len_usize)));
+    }
+    let outer_len = outer_len_usize as u16;
     let aad = [0x17, 0x03, 0x03, (outer_len >> 8) as u8, outer_len as u8];
 
     aead_encrypt(cipher_suite, key, iv, seq, &aad, &inner)
@@ -577,6 +588,10 @@ pub fn complete_tls13_handshake(
         return Err(Tls13Error::Io(io::Error::last_os_error()));
     }
     let mut stream = unsafe { TcpStream::from_raw_fd(dup_fd) };
+    let handshake_timeout = std::time::Duration::from_secs(30);
+    stream.set_read_timeout(Some(handshake_timeout))?;
+    stream.set_write_timeout(Some(handshake_timeout))?;
+    let handshake_deadline = std::time::Instant::now() + handshake_timeout;
 
     // Step 1: Send ClientHello as TLS record
     send_tls_record(&mut stream, 0x16, client_hello_raw)?;
@@ -595,8 +610,12 @@ pub fn complete_tls13_handshake(
     let alg = HashAlg::from_cipher_suite(cipher_suite);
 
     // Transcript so far: ClientHello + ServerHello
+    const MAX_TRANSCRIPT_SIZE: usize = 256 * 1024; // 256KB — well above any legitimate TLS 1.3 handshake
     let mut transcript = Vec::new();
     transcript.extend_from_slice(client_hello_raw);
+    if transcript.len() + sh_data.len() > MAX_TRANSCRIPT_SIZE {
+        return Err(Tls13Error::Protocol("transcript size limit exceeded".into()));
+    }
     transcript.extend_from_slice(&sh_data);
 
     // Step 3: X25519 ECDH
@@ -649,12 +668,29 @@ pub fn complete_tls13_handshake(
     let mut server_cert_chain = Vec::new();
 
     // Read records until we've seen all handshake messages
+    let mut record_count: usize = 0;
+    let mut ccs_count: usize = 0;
+    const MAX_HANDSHAKE_RECORDS: usize = 64;
     loop {
+        let remaining = handshake_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(Tls13Error::Protocol("handshake timeout exceeded".into()));
+        }
+        stream.set_read_timeout(Some(remaining))?;
         let (ct, record_data) = recv_tls_record(&mut stream)?;
 
         if ct == 0x14 {
-            // ChangeCipherSpec (compatibility) -- ignore
+            // ChangeCipherSpec (compatibility) -- ignore, but cap to prevent flooding
+            ccs_count += 1;
+            if ccs_count > 4 {
+                return Err(Tls13Error::Protocol("too many ChangeCipherSpec records".into()));
+            }
             continue;
+        }
+
+        record_count += 1;
+        if record_count > MAX_HANDSHAKE_RECORDS {
+            return Err(Tls13Error::Protocol("too many records in handshake".into()));
         }
 
         if ct != 0x17 {
@@ -689,6 +725,9 @@ pub fn complete_tls13_handshake(
         // Parse handshake messages
         let msgs = parse_handshake_messages(&inner_data);
         for (msg_type, msg_data) in &msgs {
+            if transcript.len() + msg_data.len() > MAX_TRANSCRIPT_SIZE {
+                return Err(Tls13Error::Protocol("transcript size limit exceeded".into()));
+            }
             match *msg_type {
                 0x08 => {
                     // EncryptedExtensions
@@ -718,7 +757,7 @@ pub fn complete_tls13_handshake(
                         return Err(Tls13Error::Protocol("server Finished too short".into()));
                     }
                     let received = &msg_data[4..4 + expected.len()];
-                    if received != expected.as_slice() {
+                    if !bool::from(received.ct_eq(expected.as_slice())) {
                         return Err(Tls13Error::Crypto(
                             "server Finished verification failed".into(),
                         ));
@@ -761,6 +800,13 @@ pub fn complete_tls13_handshake(
     finished_msg.push(vlen as u8);
     finished_msg.extend_from_slice(&client_verify_data);
 
+    // Enforce deadline and shrink write timeout before sending client Finished
+    let remaining = handshake_deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(Tls13Error::Protocol("handshake timeout exceeded".into()));
+    }
+    stream.set_write_timeout(Some(remaining))?;
+
     // Encrypt and send
     let encrypted = encrypt_tls13_record(
         cipher_suite,
@@ -772,6 +818,9 @@ pub fn complete_tls13_handshake(
     )?;
 
     // Send as application data record
+    if encrypted.len() > 16384 + 256 {
+        return Err(Tls13Error::Protocol(format!("encrypted record too large: {}", encrypted.len())));
+    }
     let outer_len = encrypted.len() as u16;
     let mut record = Vec::with_capacity(5 + encrypted.len());
     record.push(0x17); // application data
@@ -1046,6 +1095,9 @@ fn install_ktls_raw(
                     std::mem::size_of_val(&info) as libc::socklen_t,
                 )
             };
+            info.key.zeroize();
+            info.iv.zeroize();
+            info.salt.zeroize();
             if ret < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1071,6 +1123,9 @@ fn install_ktls_raw(
                     std::mem::size_of_val(&info) as libc::socklen_t,
                 )
             };
+            info.key.zeroize();
+            info.iv.zeroize();
+            info.salt.zeroize();
             if ret < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1094,6 +1149,8 @@ fn install_ktls_raw(
                     std::mem::size_of_val(&info) as libc::socklen_t,
                 )
             };
+            info.key.zeroize();
+            info.iv.zeroize();
             if ret < 0 {
                 return Err(io::Error::last_os_error());
             }
