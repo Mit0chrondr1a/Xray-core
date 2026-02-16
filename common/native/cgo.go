@@ -219,6 +219,10 @@ func EbpfAvailable() bool {
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
 var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 
+// emptyCodeSentinel is a non-null address for empty country-code entries
+// in GeoIP/GeoSite FFI arrays, preventing UB from NULL in from_raw_parts.
+var emptyCodeSentinel byte
+
 // --- TLS Types ---
 
 // TlsConfigHandle is an opaque handle to a Rust TLS config.
@@ -277,6 +281,9 @@ func TlsConfigSetServerName(h *TlsConfigHandle, name string) {
 		return
 	}
 	nameBytes := []byte(name)
+	if len(nameBytes) == 0 {
+		return
+	}
 	C.xray_tls_config_set_server_name(h.ptr, (*C.uint8_t)(unsafe.Pointer(&nameBytes[0])), C.size_t(len(nameBytes)))
 	runtime.KeepAlive(nameBytes)
 	runtime.KeepAlive(h)
@@ -1012,7 +1019,7 @@ func NewVisionUnpadState() *VisionUnpadState {
 // Returns the number of bytes written to out, or an error.
 func VisionPad(data []byte, command byte, uuid []byte, longPadding bool, testseed [4]uint32, out []byte) (int, error) {
 	if len(out) == 0 {
-		return 0, nil
+		return 0, errors.New("native: empty output buffer")
 	}
 	var dataPtr *C.uint8_t
 	if len(data) > 0 {
@@ -1044,8 +1051,8 @@ func VisionPad(data []byte, command byte, uuid []byte, longPadding bool, testsee
 // Returns the number of content bytes written to out, or an error.
 // The state is updated in-place for streaming across multiple calls.
 func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) (int, error) {
-	if state == nil || len(data) == 0 {
-		return 0, errors.New("native: nil state or empty data")
+	if state == nil || len(data) == 0 || len(out) == 0 {
+		return 0, errors.New("native: nil state, empty data, or empty output buffer")
 	}
 	if len(out) == 0 {
 		return 0, nil
@@ -1265,12 +1272,16 @@ func AeadSealTo(h *AeadHandle, nonce, aad, plaintext, dst []byte) (int, error) {
 	if len(plaintext) > 0 {
 		ptPtr = (*C.uint8_t)(unsafe.Pointer(&plaintext[0]))
 	}
+	var dstPtr *C.uint8_t
+	if len(dst) > 0 {
+		dstPtr = (*C.uint8_t)(unsafe.Pointer(&dst[0]))
+	}
 
 	rc := C.xray_aead_seal(ptr,
 		noncePtr, C.size_t(len(nonce)),
 		aadPtr, C.size_t(len(aad)),
 		ptPtr, C.size_t(len(plaintext)),
-		(*C.uint8_t)(unsafe.Pointer(&dst[0])), C.size_t(len(dst)), &outLen)
+		dstPtr, C.size_t(len(dst)), &outLen)
 	runtime.KeepAlive(h)
 	runtime.KeepAlive(nonce)
 	runtime.KeepAlive(aad)
@@ -1311,11 +1322,14 @@ func AeadOpenTo(h *AeadHandle, nonce, aad, ciphertext, dst []byte) (int, error) 
 		return 0, errors.New("native: empty dst buffer")
 	}
 
+	ctPtr := (*C.uint8_t)(unsafe.Pointer(&ciphertext[0]))
+	dstPtr := (*C.uint8_t)(unsafe.Pointer(&dst[0]))
+
 	rc := C.xray_aead_open(ptr,
 		noncePtr, C.size_t(len(nonce)),
 		aadPtr, C.size_t(len(aad)),
-		(*C.uint8_t)(unsafe.Pointer(&ciphertext[0])), C.size_t(len(ciphertext)),
-		(*C.uint8_t)(unsafe.Pointer(&dst[0])), C.size_t(len(dst)), &outLen)
+		ctPtr, C.size_t(len(ciphertext)),
+		dstPtr, C.size_t(len(dst)), &outLen)
 	runtime.KeepAlive(h)
 	runtime.KeepAlive(nonce)
 	runtime.KeepAlive(aad)
@@ -1442,6 +1456,9 @@ func GeoIPLoad(path string, codes []string) ([]*IpSetHandle, error) {
 	}
 
 	pathBytes := []byte(path)
+	if len(pathBytes) == 0 {
+		return nil, errors.New("native: empty file path")
+	}
 
 	// Build arrays of code pointers and lengths.
 	// Pin inner byte slices so cgo allows the Go-pointer-to-Go-pointer pass.
@@ -1453,6 +1470,11 @@ func GeoIPLoad(path string, codes []string) ([]*IpSetHandle, error) {
 	codeBytes := make([][]byte, len(codes))
 	for i, code := range codes {
 		codeBytes[i] = []byte(code)
+		if len(codeBytes[i]) == 0 {
+			pinner.Pin(&emptyCodeSentinel)
+			codePtrs[i] = (*C.uint8_t)(unsafe.Pointer(&emptyCodeSentinel))
+			continue
+		}
 		pinner.Pin(&codeBytes[i][0])
 		codePtrs[i] = (*C.uint8_t)(unsafe.Pointer(&codeBytes[i][0]))
 		codeLens[i] = C.size_t(len(codeBytes[i]))
@@ -1502,6 +1524,9 @@ func GeoSiteLoad(path string, codes []string) ([][]GeoSiteEntry, error) {
 	}
 
 	pathBytes := []byte(path)
+	if len(pathBytes) == 0 {
+		return nil, errors.New("native: empty file path")
+	}
 
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
@@ -1511,6 +1536,11 @@ func GeoSiteLoad(path string, codes []string) ([][]GeoSiteEntry, error) {
 	codeBytes := make([][]byte, len(codes))
 	for i, code := range codes {
 		codeBytes[i] = []byte(code)
+		if len(codeBytes[i]) == 0 {
+			pinner.Pin(&emptyCodeSentinel)
+			codePtrs[i] = (*C.uint8_t)(unsafe.Pointer(&emptyCodeSentinel))
+			continue
+		}
 		pinner.Pin(&codeBytes[i][0])
 		codePtrs[i] = (*C.uint8_t)(unsafe.Pointer(&codeBytes[i][0]))
 		codeLens[i] = C.size_t(len(codeBytes[i]))
@@ -1578,7 +1608,7 @@ func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {
 	defer C.free(unsafe.Pointer(cPath))
 	rc := C.xray_ebpf_setup(cPath, C.uint32_t(maxEntries), C.uint32_t(corkThreshold))
 	if rc != 0 {
-		return errors.New("native: ebpf setup failed")
+		return fmt.Errorf("native: ebpf setup failed (rc=%d)", rc)
 	}
 	return nil
 }
