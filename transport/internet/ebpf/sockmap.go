@@ -99,7 +99,7 @@ type SockPair struct {
 	// BytesForwarded is the total bytes forwarded.
 	BytesForwarded uint64
 	// Active indicates if the pair is actively proxying.
-	Active bool
+	Active atomic.Bool
 	// InboundCrypto is the crypto state of the inbound connection.
 	InboundCrypto CryptoHint
 	// OutboundCrypto is the crypto state of the outbound connection.
@@ -241,7 +241,7 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 		return err
 	}
 	if err := setPolicyEntry(outboundCookie, policy); err != nil {
-		deletePolicyEntry(inboundCookie)
+		_ = deletePolicyEntry(inboundCookie) // best-effort cleanup
 		return err
 	}
 
@@ -250,8 +250,8 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 	if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie); err != nil {
 		m.regFailures.Add(1)
 		m.recordRegistrationAttempt(true)
-		deletePolicyEntry(inboundCookie)
-		deletePolicyEntry(outboundCookie)
+		_ = deletePolicyEntry(inboundCookie)  // best-effort cleanup
+		_ = deletePolicyEntry(outboundCookie) // best-effort cleanup
 		if isSockmapFull(err) {
 			m.fullRejects.Add(1)
 		}
@@ -268,18 +268,19 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 		OutboundConn:   outbound,
 		InboundCookie:  inboundCookie,
 		OutboundCookie: outboundCookie,
-		Active:         true,
 		InboundCrypto:  inboundCrypto,
 		OutboundCrypto: outboundCrypto,
 	}
+	pair.Active.Store(true)
 
-	m.pairs.Store(key, pair)
-
-	// Push to LRU front (most recently used).
+	// Insert LRU entry before pairs.Store so eviction can find the pair
+	// if the map fills between the two operations (M13 fix).
 	m.lruMu.Lock()
 	elem := m.lruList.PushFront(key)
 	m.lruIndex[key] = elem
 	m.lruMu.Unlock()
+
+	m.pairs.Store(key, pair)
 
 	// Update capacity counters.
 	active := m.activePairs.Add(1)
@@ -370,7 +371,7 @@ func (m *SockmapManager) unregisterPairLocked(key SockPairKey) error {
 	}
 
 	pair := v.(*SockPair)
-	pair.Active = false
+	pair.Active.Store(false)
 
 	// Remove from LRU tracking.
 	m.lruMu.Lock()
@@ -391,17 +392,16 @@ func (m *SockmapManager) unregisterPairLocked(key SockPairKey) error {
 	return firstErr
 }
 
-// GetStats returns a snapshot of statistics for a socket pair.
-// The returned SockPair is a copy; callers cannot mutate internal state.
-func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (SockPair, bool) {
+// GetStats returns the socket pair for a connection, if registered.
+func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (*SockPair, bool) {
 	inboundFD, err := getConnFD(inbound)
 	if err != nil {
-		return SockPair{}, false
+		return nil, false
 	}
 
 	outboundFD, err := getConnFD(outbound)
 	if err != nil {
-		return SockPair{}, false
+		return nil, false
 	}
 
 	key := SockPairKey{
@@ -411,9 +411,9 @@ func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (SockPair, bool) {
 
 	v, ok := m.pairs.Load(key)
 	if !ok {
-		return SockPair{}, false
+		return nil, false
 	}
-	return *v.(*SockPair), true
+	return v.(*SockPair), true
 }
 
 // GetSockmapStats returns a snapshot of overall sockmap statistics.
