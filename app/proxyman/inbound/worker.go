@@ -62,6 +62,8 @@ func getTProxyType(s *internet.MemoryStreamConfig) internet.SocketConfig_TProxyM
 
 func (w *tcpWorker) callback(conn stat.Connection) {
 	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+	defer conn.Close()
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
 
@@ -93,8 +95,6 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 				}
 			}
 			if isLoopBack {
-				cancel()
-				conn.Close()
 				errors.LogError(ctx, errors.New("loopback connection detected"))
 				return
 			}
@@ -131,8 +131,6 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 	if err := w.proxy.Process(ctx, net.Network_TCP, conn, w.dispatcher); err != nil {
 		errors.LogInfoInner(ctx, err, "connection ends")
 	}
-	cancel()
-	conn.Close()
 }
 
 func (w *tcpWorker) Proxy() proxy.Inbound {
@@ -147,6 +145,11 @@ func (w *tcpWorker) Start() error {
 		case w.connSemaphore <- struct{}{}:
 			go func() {
 				defer func() { <-w.connSemaphore }()
+				defer func() {
+					if r := recover(); r != nil {
+						errors.LogError(w.ctx, "panic in TCP connection handler: ", r)
+					}
+				}()
 				w.callback(conn)
 			}()
 		default:
