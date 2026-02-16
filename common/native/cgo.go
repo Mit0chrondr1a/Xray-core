@@ -179,6 +179,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"unicode/utf8"
 	"unsafe"
@@ -253,7 +254,7 @@ func (h *TlsConfigHandle) release() {
 }
 
 func TlsConfigSetServerName(h *TlsConfigHandle, name string) {
-	if h == nil {
+	if h == nil || len(name) == 0 {
 		return
 	}
 	nameBytes := []byte(name)
@@ -360,12 +361,14 @@ func TlsConfigSetKeyLogPath(h *TlsConfigHandle, path string) {
 }
 
 func TlsConfigFree(h *TlsConfigHandle) {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return
 	}
 	runtime.SetFinalizer(h, nil)
-	C.xray_tls_config_free(h.ptr)
-	h.ptr = nil
+	ptr := atomic.SwapPointer(&h.ptr, nil)
+	if ptr != nil {
+		C.xray_tls_config_free(ptr)
+	}
 }
 
 // --- TLS Handshake ---
@@ -417,12 +420,14 @@ func TlsKeyUpdate(h *TlsStateHandle) error {
 }
 
 func TlsStateFree(h *TlsStateHandle) {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return
 	}
 	runtime.SetFinalizer(h, nil)
-	C.xray_tls_state_free(h.ptr)
-	h.ptr = nil
+	ptr := atomic.SwapPointer(&h.ptr, nil)
+	if ptr != nil {
+		C.xray_tls_state_free(ptr)
+	}
 }
 
 func (h *TlsStateHandle) release() {
@@ -487,12 +492,14 @@ func RealityConfigSetVersion(h *RealityConfigHandle, x, y, z uint8) {
 }
 
 func RealityConfigFree(h *RealityConfigHandle) {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return
 	}
 	runtime.SetFinalizer(h, nil)
-	C.xray_reality_config_free(h.ptr)
-	h.ptr = nil
+	ptr := atomic.SwapPointer(&h.ptr, nil)
+	if ptr != nil {
+		C.xray_reality_config_free(ptr)
+	}
 }
 
 func RealityConfigSetPrivateKey(h *RealityConfigHandle, key []byte) {
@@ -707,6 +714,9 @@ func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error
 // then zeroes the C-side buffers to prevent secrets from lingering on the stack.
 func extractSecrets(result *TlsResult, cResult *C.struct_xray_tls_result) {
 	if secretLen := int(cResult.secret_len); secretLen > 0 {
+		if secretLen > 48 {
+			secretLen = 48 // cap to C array size
+		}
 		result.TxSecret = C.GoBytes(unsafe.Pointer(&cResult.tx_secret[0]), C.int(secretLen))
 		result.RxSecret = C.GoBytes(unsafe.Pointer(&cResult.rx_secret[0]), C.int(secretLen))
 		// Zero C-side secret buffers after copying to Go.
@@ -722,7 +732,7 @@ func extractSecrets(result *TlsResult, cResult *C.struct_xray_tls_result) {
 
 // extractDrained copies drained plaintext from the C result and frees the Rust buffer.
 func extractDrained(result *TlsResult, cResult *C.struct_xray_tls_result) {
-	if cResult.drained_ptr != nil && cResult.drained_len > 0 {
+	if cResult.drained_ptr != nil && cResult.drained_len > 0 && cResult.drained_len <= 1<<30 {
 		result.DrainedData = C.GoBytes(unsafe.Pointer(cResult.drained_ptr), C.int(cResult.drained_len))
 		C.xray_tls_drained_free(cResult.drained_ptr, C.size_t(cResult.drained_len))
 	}
@@ -815,6 +825,9 @@ func (h *MphHandle) release() {
 
 // MphAddPattern adds a pattern. patternType: 0=Full, 1=Substr, 2=Domain.
 func MphAddPattern(h *MphHandle, pattern string, patternType byte) {
+	if h == nil || h.ptr == nil {
+		return
+	}
 	var p *byte
 	if len(pattern) > 0 {
 		p = unsafe.StringData(pattern)
@@ -831,12 +844,18 @@ func MphAddPattern(h *MphHandle, pattern string, patternType byte) {
 
 // MphBuild builds the MPH table. Must be called after all patterns are added.
 func MphBuild(h *MphHandle) {
+	if h == nil || h.ptr == nil {
+		return
+	}
 	C.xray_mph_build(h.ptr)
 	runtime.KeepAlive(h)
 }
 
 // MphMatch tests if input matches any pattern in the table.
 func MphMatch(h *MphHandle, input string) bool {
+	if h == nil || h.ptr == nil {
+		return false
+	}
 	var p *byte
 	if len(input) > 0 {
 		p = unsafe.StringData(input)
@@ -853,10 +872,13 @@ func MphMatch(h *MphHandle, input string) bool {
 
 // MphFree releases the MPH table.
 func MphFree(h *MphHandle) {
-	if h != nil && h.ptr != nil {
-		runtime.SetFinalizer(h, nil)
-		C.xray_mph_free(h.ptr)
-		h.ptr = nil
+	if h == nil {
+		return
+	}
+	runtime.SetFinalizer(h, nil)
+	ptr := atomic.SwapPointer(&h.ptr, nil)
+	if ptr != nil {
+		C.xray_mph_free(ptr)
 	}
 }
 
@@ -884,7 +906,7 @@ func (h *IpSetHandle) release() {
 
 // IpSetAddPrefix adds a CIDR prefix. ipBytes must be 4 (IPv4) or 16 (IPv6) bytes.
 func IpSetAddPrefix(h *IpSetHandle, ipBytes []byte, prefixBits int) {
-	if len(ipBytes) == 0 {
+	if h == nil || h.ptr == nil || len(ipBytes) == 0 {
 		return
 	}
 	C.xray_ipset_add_prefix(h.ptr,
@@ -896,13 +918,16 @@ func IpSetAddPrefix(h *IpSetHandle, ipBytes []byte, prefixBits int) {
 
 // IpSetBuild finalizes the IP set after all prefixes are added.
 func IpSetBuild(h *IpSetHandle) {
+	if h == nil || h.ptr == nil {
+		return
+	}
 	C.xray_ipset_build(h.ptr)
 	runtime.KeepAlive(h)
 }
 
 // IpSetContains checks whether an IP is in the set.
 func IpSetContains(h *IpSetHandle, ipBytes []byte) bool {
-	if len(ipBytes) == 0 {
+	if h == nil || h.ptr == nil || len(ipBytes) == 0 {
 		return false
 	}
 	result := bool(C.xray_ipset_contains(h.ptr,
@@ -914,6 +939,9 @@ func IpSetContains(h *IpSetHandle, ipBytes []byte) bool {
 
 // IpSetMax4 returns the maximum IPv4 prefix length, or 0xff if empty.
 func IpSetMax4(h *IpSetHandle) uint8 {
+	if h == nil || h.ptr == nil {
+		return 0xff
+	}
 	result := uint8(C.xray_ipset_max4(h.ptr))
 	runtime.KeepAlive(h)
 	return result
@@ -921,6 +949,9 @@ func IpSetMax4(h *IpSetHandle) uint8 {
 
 // IpSetMax6 returns the maximum IPv6 prefix length, or 0xff if empty.
 func IpSetMax6(h *IpSetHandle) uint8 {
+	if h == nil || h.ptr == nil {
+		return 0xff
+	}
 	result := uint8(C.xray_ipset_max6(h.ptr))
 	runtime.KeepAlive(h)
 	return result
@@ -928,10 +959,13 @@ func IpSetMax6(h *IpSetHandle) uint8 {
 
 // IpSetFree releases the IP set.
 func IpSetFree(h *IpSetHandle) {
-	if h != nil && h.ptr != nil {
-		runtime.SetFinalizer(h, nil)
-		C.xray_ipset_free(h.ptr)
-		h.ptr = nil
+	if h == nil {
+		return
+	}
+	runtime.SetFinalizer(h, nil)
+	ptr := atomic.SwapPointer(&h.ptr, nil)
+	if ptr != nil {
+		C.xray_ipset_free(ptr)
 	}
 }
 
@@ -958,6 +992,9 @@ func NewVisionUnpadState() *VisionUnpadState {
 // VisionPad pads a plaintext buffer with Vision framing.
 // Returns the number of bytes written to out, or an error.
 func VisionPad(data []byte, command byte, uuid []byte, longPadding bool, testseed [4]uint32, out []byte) (int, error) {
+	if len(out) == 0 {
+		return 0, nil
+	}
 	var dataPtr *C.uint8_t
 	if len(data) > 0 {
 		dataPtr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
@@ -990,6 +1027,9 @@ func VisionPad(data []byte, command byte, uuid []byte, longPadding bool, testsee
 func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) (int, error) {
 	if state == nil || len(data) == 0 {
 		return 0, errors.New("native: nil state or empty data")
+	}
+	if len(out) == 0 {
+		return 0, nil
 	}
 	var uuidPtr *C.uint8_t
 	var uuidLen C.uint32_t
@@ -1050,10 +1090,14 @@ func AeadNew(algo byte, key []byte) *AeadHandle {
 
 // AeadSeal encrypts and authenticates plaintext.
 func AeadSeal(h *AeadHandle, nonce, aad, plaintext []byte) ([]byte, error) {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return nil, errors.New("native: nil AEAD handle")
 	}
-	overhead := int(C.xray_aead_overhead(h.ptr))
+	ptr := atomic.LoadPointer(&h.ptr)
+	if ptr == nil {
+		return nil, errors.New("native: nil AEAD handle")
+	}
+	overhead := int(C.xray_aead_overhead(ptr))
 	outCap := len(plaintext) + overhead
 	out := make([]byte, outCap)
 	var outLen C.size_t
@@ -1071,7 +1115,7 @@ func AeadSeal(h *AeadHandle, nonce, aad, plaintext []byte) ([]byte, error) {
 		ptPtr = (*C.uint8_t)(unsafe.Pointer(&plaintext[0]))
 	}
 
-	rc := C.xray_aead_seal(h.ptr,
+	rc := C.xray_aead_seal(ptr,
 		noncePtr, C.size_t(len(nonce)),
 		aadPtr, C.size_t(len(aad)),
 		ptPtr, C.size_t(len(plaintext)),
@@ -1089,10 +1133,14 @@ func AeadSeal(h *AeadHandle, nonce, aad, plaintext []byte) ([]byte, error) {
 
 // AeadOpen decrypts and verifies ciphertext.
 func AeadOpen(h *AeadHandle, nonce, aad, ciphertext []byte) ([]byte, error) {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return nil, errors.New("native: nil AEAD handle")
 	}
-	overhead := int(C.xray_aead_overhead(h.ptr))
+	ptr := atomic.LoadPointer(&h.ptr)
+	if ptr == nil {
+		return nil, errors.New("native: nil AEAD handle")
+	}
+	overhead := int(C.xray_aead_overhead(ptr))
 	if len(ciphertext) < overhead {
 		return nil, errors.New("native: ciphertext too short")
 	}
@@ -1109,7 +1157,7 @@ func AeadOpen(h *AeadHandle, nonce, aad, ciphertext []byte) ([]byte, error) {
 		aadPtr = (*C.uint8_t)(unsafe.Pointer(&aad[0]))
 	}
 
-	rc := C.xray_aead_open(h.ptr,
+	rc := C.xray_aead_open(ptr,
 		noncePtr, C.size_t(len(nonce)),
 		aadPtr, C.size_t(len(aad)),
 		(*C.uint8_t)(unsafe.Pointer(&ciphertext[0])), C.size_t(len(ciphertext)),
@@ -1129,8 +1177,15 @@ func AeadOpen(h *AeadHandle, nonce, aad, ciphertext []byte) ([]byte, error) {
 // dst must have len >= len(plaintext)+overhead.
 // Returns the number of bytes written.
 func AeadSealTo(h *AeadHandle, nonce, aad, plaintext, dst []byte) (int, error) {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return 0, errors.New("native: nil AEAD handle")
+	}
+	ptr := atomic.LoadPointer(&h.ptr)
+	if ptr == nil {
+		return 0, errors.New("native: nil AEAD handle")
+	}
+	if len(dst) == 0 {
+		return 0, errors.New("native: empty dst buffer")
 	}
 	var outLen C.size_t
 
@@ -1147,7 +1202,7 @@ func AeadSealTo(h *AeadHandle, nonce, aad, plaintext, dst []byte) (int, error) {
 		ptPtr = (*C.uint8_t)(unsafe.Pointer(&plaintext[0]))
 	}
 
-	rc := C.xray_aead_seal(h.ptr,
+	rc := C.xray_aead_seal(ptr,
 		noncePtr, C.size_t(len(nonce)),
 		aadPtr, C.size_t(len(aad)),
 		ptPtr, C.size_t(len(plaintext)),
@@ -1167,7 +1222,11 @@ func AeadSealTo(h *AeadHandle, nonce, aad, plaintext, dst []byte) (int, error) {
 // dst must have len >= len(ciphertext) (for in-place decryption).
 // Returns the number of plaintext bytes written.
 func AeadOpenTo(h *AeadHandle, nonce, aad, ciphertext, dst []byte) (int, error) {
-	if h == nil || h.ptr == nil {
+	if h == nil {
+		return 0, errors.New("native: nil AEAD handle")
+	}
+	ptr := atomic.LoadPointer(&h.ptr)
+	if ptr == nil {
 		return 0, errors.New("native: nil AEAD handle")
 	}
 	var outLen C.size_t
@@ -1181,7 +1240,14 @@ func AeadOpenTo(h *AeadHandle, nonce, aad, ciphertext, dst []byte) (int, error) 
 		aadPtr = (*C.uint8_t)(unsafe.Pointer(&aad[0]))
 	}
 
-	rc := C.xray_aead_open(h.ptr,
+	if len(ciphertext) == 0 {
+		return 0, errors.New("native: empty ciphertext")
+	}
+	if len(dst) == 0 {
+		return 0, errors.New("native: empty dst buffer")
+	}
+
+	rc := C.xray_aead_open(ptr,
 		noncePtr, C.size_t(len(nonce)),
 		aadPtr, C.size_t(len(aad)),
 		(*C.uint8_t)(unsafe.Pointer(&ciphertext[0])), C.size_t(len(ciphertext)),
@@ -1199,30 +1265,41 @@ func AeadOpenTo(h *AeadHandle, nonce, aad, ciphertext, dst []byte) (int, error) 
 
 // AeadOverhead returns the tag size for this AEAD.
 func AeadOverhead(h *AeadHandle) int {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return 0
 	}
-	result := int(C.xray_aead_overhead(h.ptr))
+	ptr := atomic.LoadPointer(&h.ptr)
+	if ptr == nil {
+		return 0
+	}
+	result := int(C.xray_aead_overhead(ptr))
 	runtime.KeepAlive(h)
 	return result
 }
 
 // AeadNonceSize returns the nonce size for this AEAD.
 func AeadNonceSize(h *AeadHandle) int {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return 0
 	}
-	result := int(C.xray_aead_nonce_size(h.ptr))
+	ptr := atomic.LoadPointer(&h.ptr)
+	if ptr == nil {
+		return 0
+	}
+	result := int(C.xray_aead_nonce_size(ptr))
 	runtime.KeepAlive(h)
 	return result
 }
 
 // AeadFree releases an AEAD handle.
 func AeadFree(h *AeadHandle) {
-	if h != nil && h.ptr != nil {
-		runtime.SetFinalizer(h, nil)
-		C.xray_aead_free(h.ptr)
-		h.ptr = nil
+	if h == nil {
+		return
+	}
+	runtime.SetFinalizer(h, nil)
+	ptr := atomic.SwapPointer(&h.ptr, nil)
+	if ptr != nil {
+		C.xray_aead_free(ptr)
 	}
 }
 
