@@ -216,10 +216,11 @@ const (
 )
 
 type XUDP struct {
-	GlobalID [8]byte
-	Status   uint64
-	Expire   time.Time
-	Mux      *Session
+	GlobalID  [8]byte
+	Status    uint64
+	Expire    time.Time
+	CreatedAt time.Time
+	Mux       *Session
 }
 
 func (x *XUDP) Interrupt() {
@@ -235,24 +236,43 @@ var XUDPManager struct {
 }
 
 // xudpEvictExpiring evicts the oldest expiring XUDP entry.
+// If no Expiring sessions exist, falls back to evicting the oldest Active session.
 // Must be called with XUDPManager.Mutex held.
 func xudpEvictExpiring() bool {
 	var oldestID [8]byte
-	var oldestExpire time.Time
+	var oldestTime time.Time
 	found := false
+
+	// First, try to evict the oldest Expiring session.
 	for id, x := range XUDPManager.Map {
-		if x.Status == Expiring && (!found || x.Expire.Before(oldestExpire)) {
+		if x.Status == Expiring && (!found || x.Expire.Before(oldestTime)) {
 			oldestID = id
-			oldestExpire = x.Expire
+			oldestTime = x.Expire
 			found = true
 		}
 	}
 	if found {
 		XUDPManager.Map[oldestID].Interrupt()
 		delete(XUDPManager.Map, oldestID)
-		errors.LogDebug(context.Background(), "XUDP evict ", oldestID)
+		errors.LogDebug(context.Background(), "XUDP evict expiring ", oldestID)
+		return true
 	}
-	return found
+
+	// Fall back to evicting the oldest Active session (LRU).
+	for id, x := range XUDPManager.Map {
+		if x.Status == Active && (!found || x.CreatedAt.Before(oldestTime)) {
+			oldestID = id
+			oldestTime = x.CreatedAt
+			found = true
+		}
+	}
+	if found {
+		XUDPManager.Map[oldestID].Interrupt()
+		delete(XUDPManager.Map, oldestID)
+		errors.LogDebug(context.Background(), "XUDP evict active ", oldestID)
+		return true
+	}
+	return false
 }
 
 func init() {

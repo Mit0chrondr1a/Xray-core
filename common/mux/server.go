@@ -207,7 +207,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 					return errors.New("XUDP session limit reached")
 				}
 			}
-			x = &XUDP{GlobalID: meta.GlobalID}
+			x = &XUDP{GlobalID: meta.GlobalID, CreatedAt: time.Now()}
 			XUDPManager.Map[meta.GlobalID] = x
 			XUDPManager.Unlock()
 		} else {
