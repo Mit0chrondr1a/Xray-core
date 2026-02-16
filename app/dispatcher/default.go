@@ -304,9 +304,25 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	sniffingRequest := content.SniffingRequest
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled {
-		go d.routedDispatch(ctx, outbound, destination)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errors.LogError(ctx, "panic in dispatcher: ", r)
+					common.Close(outbound.Writer)
+					common.Interrupt(outbound.Reader)
+				}
+			}()
+			d.routedDispatch(ctx, outbound, destination)
+		}()
 	} else {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errors.LogError(ctx, "panic in dispatcher: ", r)
+					common.Close(outbound.Writer)
+					common.Interrupt(outbound.Reader)
+				}
+			}()
 			cReader := &cachedReader{
 				reader: outbound.Reader.(*pipe.Reader),
 			}
