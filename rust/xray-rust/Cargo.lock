@@ -1010,6 +1010,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "sha2",
+ "subtle",
  "webpki-roots 0.26.11",
  "x25519-dalek",
  "zeroize",

@@ -25,6 +25,7 @@ ed25519-dalek = { version = "2", features = ["hazmat"] }
 
 # Security
 zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
 
 # Accelerated matchers + hashing
 blake3 = "1"

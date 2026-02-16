@@ -26,6 +26,7 @@ use rustls::{ServerConfig, ServerConnection};
 use sha2::{Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::tls::{self, TlsState, XrayTlsResult};
@@ -492,12 +493,16 @@ pub fn reality_server_accept(
         )));
     }
 
-    // Validate short_id
+    // Validate short_id (constant-time comparison for defense-in-depth)
     let short_id_trimmed: Vec<u8> = short_id.iter().copied().take_while(|&b| b != 0).collect();
-    if !short_ids
-        .iter()
-        .any(|s| *s == short_id_trimmed || *s == short_id)
-    {
+    let mut short_id_matched = false;
+    for s in short_ids {
+        let trimmed_match: bool =
+            s.len() == short_id_trimmed.len() && s.ct_eq(&short_id_trimmed).into();
+        let full_match: bool = s.len() == short_id.len() && s.ct_eq(&short_id).into();
+        short_id_matched |= trimmed_match || full_match;
+    }
+    if !short_id_matched {
         return Err(RealityError::AuthFailed(
             "short_id not in allowed list".into(),
         ));
@@ -819,11 +824,14 @@ fn reality_server_handshake_full(
     }
 
     let short_id_trimmed: Vec<u8> = short_id.iter().copied().take_while(|&b| b != 0).collect();
-    if !cfg
-        .short_ids
-        .iter()
-        .any(|s| *s == short_id_trimmed || *s == short_id)
-    {
+    let mut short_id_matched = false;
+    for s in &cfg.short_ids {
+        let trimmed_match: bool =
+            s.len() == short_id_trimmed.len() && s.ct_eq(&short_id_trimmed).into();
+        let full_match: bool = s.len() == short_id.len() && s.ct_eq(&short_id).into();
+        short_id_matched |= trimmed_match || full_match;
+    }
+    if !short_id_matched {
         return Err((1, "short_id not in allowed list".into()));
     }
 
