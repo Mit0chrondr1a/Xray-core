@@ -66,13 +66,20 @@ func NewListener(ctx context.Context, address net.Address, port net.Port, stream
 func (l *Listener) handlePackets() {
 	receive := l.hub.Receive()
 	for payload := range receive {
-		l.OnReceive(payload.Payload, payload.Source)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errors.LogError(context.Background(), "panic in kcp packet handler: ", r)
+				}
+			}()
+			l.OnReceive(payload.Payload, payload.Source)
+		}()
 	}
 }
 
 func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
+	defer payload.Release()
 	segments := l.reader.Read(payload.Bytes())
-	payload.Release()
 
 	if len(segments) == 0 {
 		errors.LogInfo(context.Background(), "discarding invalid payload from ", src)
@@ -88,13 +95,17 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
 		Conv:   conv,
 	}
 
-	l.Lock()
-	conn, found := l.sessions[id]
+	// Wrap the locked section so defer Unlock guarantees release even on panic.
+	conn, isNew := func() (*Connection, bool) {
+		l.Lock()
+		defer l.Unlock()
 
-	if !found {
+		conn, found := l.sessions[id]
+		if found {
+			return conn, false
+		}
 		if cmd == CommandTerminate {
-			l.Unlock()
-			return
+			return nil, false
 		}
 		writer := &Writer{
 			id:       id,
@@ -113,10 +124,14 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
 			Conversation: conv,
 		}, writer, writer, l.config)
 		l.sessions[id] = conn
-	}
-	l.Unlock()
+		return conn, true
+	}()
 
-	if !found {
+	if conn == nil {
+		return
+	}
+
+	if isNew {
 		if l.tlsConfig != nil {
 			go l.addTLSConn(conn, id)
 		} else {
