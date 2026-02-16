@@ -43,6 +43,7 @@ type Conn struct {
 var (
 	maxRealitySpiderResponseBytes int64 = 1 * 1024 * 1024
 	maxRealitySpiderPaths               = 4096
+	maxRealitySpiderSNIs                = 256 // max distinct SNI entries in spider map
 	maxSpiderConcurrency                = 4
 	spiderSemaphore                     = make(chan struct{}, 8)  // max 8 concurrent Spider sessions globally
 	spiderThreadSem                     = make(chan struct{}, 16) // max 16 concurrent Spider crawling goroutines globally
@@ -103,8 +104,8 @@ func (c *UConn) HandshakeAddress() net.Address {
 func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if c.Config.Show {
 		localAddr := c.LocalAddr().String()
-		fmt.Printf("REALITY localAddr: %v\tis using X25519MLKEM768 for TLS' communication: %v\n", localAddr, c.HandshakeState.ServerHello.ServerShare.Group == utls.X25519MLKEM768)
-		fmt.Printf("REALITY localAddr: %v\tis using ML-DSA-65 for cert's extra verification: %v\n", localAddr, len(c.Config.Mldsa65Verify) > 0)
+		errors.LogDebug(context.Background(), "REALITY localAddr: ", localAddr, "\tis using X25519MLKEM768 for TLS' communication: ", c.HandshakeState.ServerHello.ServerShare.Group == utls.X25519MLKEM768)
+		errors.LogDebug(context.Background(), "REALITY localAddr: ", localAddr, "\tis using ML-DSA-65 for cert's extra verification: ", len(c.Config.Mldsa65Verify) > 0)
 	}
 	p, _ := reflect.TypeOf(c.Conn).Elem().FieldByName("peerCertificates")
 	certs := *(*([]*x509.Certificate))(unsafe.Pointer(uintptr(unsafe.Pointer(c.Conn)) + p.Offset))
@@ -174,7 +175,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 		copy(hello.SessionId[8:], config.ShortId)
 		if config.Show {
-			fmt.Printf("REALITY localAddr: %v\thello.SessionId[:16]: %v\n", localAddr, hello.SessionId[:16])
+			errors.LogDebug(ctx, "REALITY localAddr: ", localAddr, "\thello.SessionId[:16]: ", hello.SessionId[:16])
 		}
 		publicKey, err := ecdh.X25519().NewPublicKey(config.PublicKey)
 		if err != nil {
@@ -196,7 +197,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		}
 		aead := crypto.NewAesGcm(uConn.AuthKey)
 		if config.Show {
-			fmt.Printf("REALITY localAddr: %v\tuConn.AuthKey[:16]: %v\tAEAD: %T\n", localAddr, uConn.AuthKey[:16], aead)
+			errors.LogDebug(ctx, "REALITY localAddr: ", localAddr, "\tAuthKey derived\tAEAD: ", fmt.Sprintf("%T", aead))
 		}
 		aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
 		copy(hello.Raw[39:], hello.SessionId)
@@ -241,7 +242,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		return nil, err
 	}
 	if config.Show {
-		fmt.Printf("REALITY localAddr: %v\tuConn.Verified: %v\n", localAddr, uConn.Verified)
+		errors.LogDebug(ctx, "REALITY localAddr: ", localAddr, "\tuConn.Verified: ", uConn.Verified)
 	}
 	if !uConn.Verified {
 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
@@ -264,7 +265,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 				Transport: &http2.Transport{
 					DialTLSContext: func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
 						if config.Show {
-							fmt.Printf("REALITY localAddr: %v\tDialTLSContext\n", localAddr)
+							errors.LogDebug(ctx, "REALITY localAddr: ", localAddr, "\tDialTLSContext")
 						}
 						return uConn, nil
 					},
@@ -277,6 +278,11 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 			}
 			paths := maps.maps[uConn.ServerName]
 			if paths == nil {
+				if len(maps.maps) >= maxRealitySpiderSNIs {
+					maps.Unlock()
+					uConn.Close()
+					return
+				}
 				paths = make(map[string]struct{})
 				paths[config.SpiderX] = struct{}{}
 				maps.maps[uConn.ServerName] = paths
@@ -302,7 +308,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 				}
 				req.Header.Set("User-Agent", utils.ChromeUA)
 				if first && config.Show {
-					fmt.Printf("REALITY localAddr: %v\treq.UserAgent(): %v\n", localAddr, req.UserAgent())
+					errors.LogDebug(spiderCtx, "REALITY localAddr: ", localAddr, "\treq.UserAgent(): ", req.UserAgent())
 				}
 				times := 1
 				if !first {
@@ -329,9 +335,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					addSpiderPaths(paths, body, prefix)
 					req.URL.Path = getPathLocked(paths)
 					if config.Show {
-						fmt.Printf("REALITY localAddr: %v\treq.Referer(): %v\n", localAddr, req.Referer())
-						fmt.Printf("REALITY localAddr: %v\tlen(body): %v\n", localAddr, len(body))
-						fmt.Printf("REALITY localAddr: %v\tlen(paths): %v\n", localAddr, len(paths))
+						errors.LogDebug(spiderCtx, "REALITY localAddr: ", localAddr, "\treq.Referer(): ", req.Referer())
+						errors.LogDebug(spiderCtx, "REALITY localAddr: ", localAddr, "\tlen(body): ", len(body))
+						errors.LogDebug(spiderCtx, "REALITY localAddr: ", localAddr, "\tlen(paths): ", len(paths))
 					}
 					maps.Unlock()
 					if !first {
