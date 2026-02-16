@@ -99,12 +99,20 @@ func (s *server) keepAccepting() {
 		if err != nil {
 			return
 		}
-		handledConn, err := s.Handle(conn)
-		if err != nil {
-			errors.LogInfoInner(context.Background(), err, "failed to handle request")
-			continue
-		}
-		s.addConn(handledConn)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errors.LogError(context.Background(), "panic in httpupgrade handler: ", r)
+					_ = conn.Close()
+				}
+			}()
+			handledConn, err := s.Handle(conn)
+			if err != nil {
+				errors.LogInfoInner(context.Background(), err, "failed to handle request")
+				return
+			}
+			s.addConn(handledConn)
+		}()
 	}
 }
 
