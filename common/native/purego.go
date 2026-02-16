@@ -136,6 +136,9 @@ func Blake3Sum256(data []byte) [32]byte {
 
 // Blake3KeyedHash computes a BLAKE3 keyed hash (MAC mode).
 func Blake3KeyedHash(key *[32]byte, data []byte, outLen int) []byte {
+	if outLen <= 0 {
+		return nil
+	}
 	h := blake3.New(outLen, key[:])
 	h.Write(data)
 	return h.Sum(nil)
