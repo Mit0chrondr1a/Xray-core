@@ -91,6 +91,9 @@ func (c *KCPConfig) Build() (proto.Message, error) {
 	if c.ReadBufferSize != nil {
 		size := *c.ReadBufferSize
 		if size > 0 {
+			if size > 2048 {
+				size = 2048
+			}
 			config.ReadBuffer = &kcp.ReadBuffer{Size: size * 1024 * 1024}
 		} else {
 			config.ReadBuffer = &kcp.ReadBuffer{Size: 512 * 1024}
@@ -99,6 +102,9 @@ func (c *KCPConfig) Build() (proto.Message, error) {
 	if c.WriteBufferSize != nil {
 		size := *c.WriteBufferSize
 		if size > 0 {
+			if size > 2048 {
+				size = 2048
+			}
 			config.WriteBuffer = &kcp.WriteBuffer{Size: size * 1024 * 1024}
 		} else {
 			config.WriteBuffer = &kcp.WriteBuffer{Size: 512 * 1024}
