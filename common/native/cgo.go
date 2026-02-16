@@ -4,7 +4,7 @@ package native
 
 /*
 #cgo LDFLAGS: -L${SRCDIR}/../../rust/xray-rust/target/release -lxray_rust
-#cgo linux LDFLAGS: -lm -ldl -lpthread
+#cgo linux LDFLAGS: -lm -lpthread -lunwind
 
 #include <stdint.h>
 #include <stdbool.h>

@@ -72,5 +72,8 @@ resources/
 /rust/xray-rust/target/
 /rust/xray-ebpf/target/
 
+# Task runner checksum cache
+.task/
+
 # Claude Code local plugins
 .claude-plugin/

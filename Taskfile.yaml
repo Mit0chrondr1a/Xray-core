@@ -1,0 +1,268 @@
+version: "3"
+
+vars:
+    # Default Architecture (can be overridden by tasks)
+    GOARCH: '{{.GOARCH | default "amd64"}}'
+
+    # Project Configuration
+    OUT_NAME: xray
+    RUST_LIB_SRC: ./rust/xray-rust
+    EBPF_SRC: ./rust/xray-ebpf
+
+    # Resolve rustup-managed binaries by absolute path.
+    # Homebrew's standalone rust shadows rustup shims on PATH; these vars
+    # bypass PATH entirely so cargo/rustc always use the rustup toolchain
+    # with cross-compilation targets installed.
+    CARGO:
+        sh: echo "$HOME/.cargo/bin/cargo"
+    RUSTC:
+        sh: echo "$HOME/.cargo/bin/rustc"
+
+    # Resolve zig binary once for all tasks.
+    ZIG_BIN:
+        sh: command -v zig
+
+tasks:
+    default:
+        cmds:
+            - task: build
+
+    # ----------------------------------------------------------------------------
+    # SHORTCUTS & MAINTENANCE
+    # ----------------------------------------------------------------------------
+
+    arm64:
+        desc: "Builds Xray for Linux ARM64 (Propagates to Rust/Zig)"
+        cmds:
+            - task: build
+              vars: { GOARCH: "arm64" }
+
+    update:
+        desc: "Updates Go and Rust dependencies to latest"
+        deps: [update-go, update-rust, update-ebpf]
+        cmds:
+            - echo ">> All dependencies updated."
+
+    update-go:
+        internal: true
+        dir: .
+        cmds:
+            - echo ">> Updating Go dependencies..."
+            - go get -u ./...
+            - go mod tidy
+
+    update-rust:
+        internal: true
+        dir: "{{.RUST_LIB_SRC}}"
+        cmds:
+            - echo ">> Updating Rust (Host) dependencies..."
+            - "{{.CARGO}} update"
+
+    update-ebpf:
+        internal: true
+        dir: "{{.EBPF_SRC}}"
+        cmds:
+            - echo ">> Updating Rust (eBPF) dependencies..."
+            - "{{.CARGO}} update"
+
+    update-nightly:
+        desc: "Bump eBPF nightly pin to today's date (may break eBPF build)"
+        dir: "{{.EBPF_SRC}}"
+        cmds:
+            - |
+                CURRENT=$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)"/\1/')
+                NEW="nightly-$(date -u +%Y-%m-%d)"
+                if [ "$CURRENT" = "$NEW" ]; then
+                    echo ">> Already on $CURRENT"
+                    exit 0
+                fi
+                sed -i "s/channel = .*/channel = \"$NEW\"/" rust-toolchain.toml
+                echo ">> Nightly pin: $CURRENT -> $NEW"
+                echo ">> Run 'task build-ebpf' to verify the new nightly works"
+
+    # ----------------------------------------------------------------------------
+    # BUILD PIPELINE
+    # ----------------------------------------------------------------------------
+
+    # rust-toolchain.toml pins nightly, .cargo/config.toml sets target +
+    # build-std + linker. Unset RUSTUP_TOOLCHAIN so rust-toolchain.toml
+    # selects nightly (mise may export RUSTUP_TOOLCHAIN=stable).
+    build-ebpf:
+        dir: "{{.EBPF_SRC}}"
+        env:
+            RUSTC: "{{.RUSTC}}"
+        cmds:
+            - |
+                # Resolve bpf-linker from cargo bin, not Nix PATH (Nix
+                # ships an older version linked against a stale LLVM).
+                BPF_LINKER="$HOME/.cargo/bin/bpf-linker"
+                if [ ! -x "$BPF_LINKER" ]; then
+                    echo ">> bpf-linker not found at $BPF_LINKER, skipping eBPF build"
+                    echo ">> Install: cargo +nightly install bpf-linker"
+                    exit 0
+                fi
+
+                # mise exports RUSTUP_TOOLCHAIN=stable; override it with
+                # the pinned nightly so both cargo AND bpf-linker (which
+                # loads LLVM at runtime via aya-rustc-llvm-proxy) resolve
+                # to the same toolchain.
+                NIGHTLY="$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)"/\1/')"
+                export RUSTUP_TOOLCHAIN="$NIGHTLY"
+                export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="$BPF_LINKER"
+                {{.CARGO}} build --locked --release
+        sources:
+            - src/**/*.rs
+            - Cargo.toml
+            - Cargo.lock
+
+    build-rust:
+        deps: [build-ebpf]
+        dir: "{{.RUST_LIB_SRC}}"
+        preconditions:
+            - sh: command -v {{.CARGO}}
+              msg: "cargo not found — install Rust via https://rustup.rs or run: mise install"
+            - sh: command -v {{.ZIG_BIN}}
+              msg: "zig not found — run: mise install"
+        vars:
+            RUST_TARGET:
+                sh: |
+                    case "{{.GOARCH}}" in
+                      "amd64") echo "x86_64-unknown-linux-musl" ;;
+                      "arm64") echo "aarch64-unknown-linux-musl" ;;
+                      *) echo "unsupported" ;;
+                    esac
+            ZIG_TARGET:
+                sh: |
+                    case "{{.GOARCH}}" in
+                      "amd64") echo "x86_64-linux-musl" ;;
+                      "arm64") echo "aarch64-linux-musl" ;;
+                      *) echo "unsupported" ;;
+                    esac
+            RUST_TARGET_ENV:
+                sh: echo "{{.RUST_TARGET}}" | tr '-' '_'
+            RUST_TARGET_ENV_UPPER:
+                sh: echo "{{.RUST_TARGET}}" | tr '-' '_' | tr 'a-z' 'A-Z'
+            RUSTFLAGS:
+                sh: |
+                    case "{{.GOARCH}}" in
+                      "amd64") echo "-C target-cpu=x86-64-v3" ;;
+                      "arm64") echo "-C target-cpu=cortex-a53" ;;
+                    esac
+        env:
+            RUSTFLAGS: "{{.RUSTFLAGS}}"
+            RUSTC: "{{.RUSTC}}"
+        cmds:
+            - |
+                # --- Sysroot detection (three-tier) ---
+                #   1. Pre-installed musl target in sysroot → use it
+                #   2. Try `rustup target add` → use it
+                #   3. Fall back to RUSTC_BOOTSTRAP=1 -Z build-std=std,panic_abort
+                SYSROOT="$({{.RUSTC}} --print sysroot)"
+                CARGO_BUILD_STD_FLAGS=""
+
+                if [ -d "${SYSROOT}/lib/rustlib/{{.RUST_TARGET}}" ]; then
+                    echo ">> Using pre-built target: {{.RUST_TARGET}}"
+                elif command -v rustup &>/dev/null; then
+                    if rustup target add "{{.RUST_TARGET}}" 2>/dev/null \
+                        && [ -d "${SYSROOT}/lib/rustlib/{{.RUST_TARGET}}" ]; then
+                        echo ">> Installed target via rustup: {{.RUST_TARGET}}"
+                    else
+                        echo ">> Note: rustup cannot provide {{.RUST_TARGET}}, using -Z build-std"
+                        export RUSTC_BOOTSTRAP="${RUSTC_BOOTSTRAP:-1}"
+                        CARGO_BUILD_STD_FLAGS="-Z build-std=std,panic_abort"
+                    fi
+                else
+                    echo ">> Note: rustup not available, using -Z build-std fallback"
+                    export RUSTC_BOOTSTRAP="${RUSTC_BOOTSTRAP:-1}"
+                    CARGO_BUILD_STD_FLAGS="-Z build-std=std,panic_abort"
+                fi
+
+                # --- Zig wrappers for cc-rs ---
+                # cc-rs passes --target=<rust-triple> which zig doesn't parse;
+                # these wrappers strip it and exec zig with -target <zig-triple>.
+                WRAPPER_DIR="$(mktemp -d)"
+                trap 'rm -rf "$WRAPPER_DIR"' EXIT
+
+                for mode in cc c++; do
+                    cat > "${WRAPPER_DIR}/zig-${mode}.sh" <<ZIGEOF
+                #!/usr/bin/env bash
+                set -euo pipefail
+                args=()
+                while [ "\$#" -gt 0 ]; do
+                    case "\$1" in
+                        --target=*) shift ;;
+                        --target)   shift; [ "\$#" -gt 0 ] && shift ;;
+                        *)          args+=("\$1"); shift ;;
+                    esac
+                done
+                exec "{{.ZIG_BIN}}" ${mode} -target "{{.ZIG_TARGET}}" "\${args[@]}"
+                ZIGEOF
+                    chmod +x "${WRAPPER_DIR}/zig-${mode}.sh"
+                done
+
+                export CC_{{.RUST_TARGET_ENV}}="${WRAPPER_DIR}/zig-cc.sh"
+                export CXX_{{.RUST_TARGET_ENV}}="${WRAPPER_DIR}/zig-c++.sh"
+                export CARGO_TARGET_{{.RUST_TARGET_ENV_UPPER}}_LINKER="${WRAPPER_DIR}/zig-cc.sh"
+
+                EBPF_FEATURES=""
+                if [ -f "{{.TASKFILE_DIR}}/{{.EBPF_SRC}}/target/bpfel-unknown-none/release/xray-ebpf" ]; then
+                    EBPF_FEATURES="--features ebpf-bytecode"
+                    echo ">> eBPF bytecode found, enabling ebpf-bytecode feature"
+                else
+                    echo ">> No eBPF bytecode found, building without eBPF support"
+                fi
+
+                # Remove stale shadow copy so a failed build cannot silently
+                # link against outdated code.
+                rm -f target/release/libxray_rust.a
+
+                {{.CARGO}} build ${CARGO_BUILD_STD_FLAGS} --release --locked --target {{.RUST_TARGET}} ${EBPF_FEATURES}
+            - mkdir -p target/release
+            - install -m 644 target/{{.RUST_TARGET}}/release/libxray_rust.a target/release/libxray_rust.a
+
+    build:
+        deps:
+            - task: build-rust
+              vars: { GOARCH: "{{.GOARCH}}" }
+        env:
+            CGO_ENABLED: "1"
+            GOAMD64: '{{if eq .GOARCH "amd64"}}v3{{else}}{{end}}'
+        vars:
+            ZIG_TARGET:
+                sh: |
+                    case "{{.GOARCH}}" in
+                      "amd64") echo "x86_64-linux-musl" ;;
+                      "arm64") echo "aarch64-linux-musl" ;;
+                      *) echo "unsupported" ;;
+                    esac
+            COMMID:
+                sh: git describe --always --dirty 2>/dev/null || echo "dev"
+        cmds:
+            - |
+                export GOARCH="{{.GOARCH}}"
+                export CC="{{.ZIG_BIN}} cc -target {{.ZIG_TARGET}}"
+                export CXX="{{.ZIG_BIN}} c++ -target {{.ZIG_TARGET}}"
+                go build -o {{.OUT_NAME}} \
+                  -trimpath -buildvcs=false \
+                  -pgo=main/default.pgo \
+                  -gcflags="all=-l=4" \
+                  -ldflags "-s -w -buildid= -X github.com/xtls/xray-core/core.build={{.COMMID}} -linkmode external -extldflags '-static -s'" \
+                  ./main
+
+    # Pure-Go static build (no Rust, no zig)
+    build-pure-go:
+        desc: "Pure Go static build (CGO_ENABLED=0, no Rust)"
+        env:
+            CGO_ENABLED: "0"
+            GOAMD64: '{{if eq .GOARCH "amd64"}}v3{{else}}{{end}}'
+        vars:
+            COMMID:
+                sh: git describe --always --dirty 2>/dev/null || echo "dev"
+        cmds:
+            - |
+                go build -o {{.OUT_NAME}} \
+                  -trimpath -buildvcs=false \
+                  -pgo=main/default.pgo \
+                  -gcflags="all=-l=4" \
+                  -ldflags "-s -w -buildid= -X github.com/xtls/xray-core/core.build={{.COMMID}}" \
+                  ./main
