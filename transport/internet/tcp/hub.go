@@ -165,6 +165,12 @@ func (v *Listener) keepAccepting() {
 		}
 		go func(rawConn net.Conn) {
 			defer func() { <-v.connSemaphore }()
+			defer func() {
+				if r := recover(); r != nil {
+					errors.LogError(context.Background(), "panic in TCP listener handler: ", r)
+					_ = rawConn.Close()
+				}
+			}()
 			conn := rawConn
 			if v.tlsConfig != nil {
 				if native.Available() && v.tlsXrayConfig != nil {

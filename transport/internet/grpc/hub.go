@@ -98,6 +98,11 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errors.LogError(ctx, "panic in gRPC server: ", r)
+			}
+		}()
 		var streamListener net.Listener
 		var err error
 		if port == net.Port(0) { // unix

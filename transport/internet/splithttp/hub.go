@@ -484,6 +484,11 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			Handler: handler,
 		}
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errors.LogError(ctx, "panic in XHTTP/3 server: ", r)
+				}
+			}()
 			if err := l.h3server.ServeListener(l.h3listener); err != nil {
 				errors.LogErrorInner(ctx, err, "failed to serve HTTP/3 for XHTTP/3")
 			}
@@ -523,6 +528,11 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			Protocols:         protocols,
 		}
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errors.LogError(ctx, "panic in XHTTP server: ", r)
+				}
+			}()
 			if err := l.server.Serve(l.listener); err != nil {
 				errors.LogErrorInner(ctx, err, "failed to serve HTTP for XHTTP")
 			}
