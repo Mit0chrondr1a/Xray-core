@@ -114,6 +114,8 @@ tasks:
             - src/**/*.rs
             - Cargo.toml
             - Cargo.lock
+        generates:
+            - target/bpfel-unknown-none/release/xray-ebpf
 
     build-rust:
         deps: [build-ebpf]
@@ -248,6 +250,28 @@ tasks:
                   -gcflags="all=-l=4" \
                   -ldflags "-s -w -buildid= -X github.com/xtls/xray-core/core.build={{.COMMID}} -linkmode external -extldflags '-static -s'" \
                   ./main
+            - |
+                echo ""
+                echo "┌──────────────────────────────────────┐"
+                echo "│          Build Summary               │"
+                echo "├──────────────────────────────────────┤"
+
+                SIZE=$(stat -c%s {{.OUT_NAME}} 2>/dev/null || echo 0)
+                SIZE_H=$(awk "BEGIN {if ($SIZE>=1048576) printf \"%.1f MB\", $SIZE/1048576; else printf \"%.0f KB\", $SIZE/1024}")
+                printf "│  %-36s│\n" "Binary: ./{{.OUT_NAME}} ($SIZE_H)"
+                printf "│  %-36s│\n" "Arch:   linux/{{.GOARCH}}"
+                printf "│  %-36s│\n" "Go:     $(go env GOVERSION)"
+                printf "│  %-36s│\n" "Commit: {{.COMMID}}"
+
+                RUST="no"; grep -qaF 'xray_blake3_hash' {{.OUT_NAME}} && RUST="yes"
+                EBPF="no"; grep -qaF 'xray_ebpf_setup' {{.OUT_NAME}} && EBPF="yes"
+                PGO="no"; [ -f main/default.pgo ] && PGO="yes"
+
+                printf "│  %-36s│\n" "CGO:    yes"
+                printf "│  %-36s│\n" "Rust:   $RUST"
+                printf "│  %-36s│\n" "eBPF:   $EBPF"
+                printf "│  %-36s│\n" "PGO:    $PGO"
+                echo "└──────────────────────────────────────┘"
 
     # Pure-Go static build (no Rust, no zig)
     build-pure-go:
@@ -266,3 +290,23 @@ tasks:
                   -gcflags="all=-l=4" \
                   -ldflags "-s -w -buildid= -X github.com/xtls/xray-core/core.build={{.COMMID}}" \
                   ./main
+            - |
+                echo ""
+                echo "┌──────────────────────────────────────┐"
+                echo "│          Build Summary               │"
+                echo "├──────────────────────────────────────┤"
+
+                SIZE=$(stat -c%s {{.OUT_NAME}} 2>/dev/null || echo 0)
+                SIZE_H=$(awk "BEGIN {if ($SIZE>=1048576) printf \"%.1f MB\", $SIZE/1048576; else printf \"%.0f KB\", $SIZE/1024}")
+                printf "│  %-36s│\n" "Binary: ./{{.OUT_NAME}} ($SIZE_H)"
+                printf "│  %-36s│\n" "Arch:   linux/{{.GOARCH}}"
+                printf "│  %-36s│\n" "Go:     $(go env GOVERSION)"
+                printf "│  %-36s│\n" "Commit: {{.COMMID}}"
+
+                PGO="no"; [ -f main/default.pgo ] && PGO="yes"
+
+                printf "│  %-36s│\n" "CGO:    no"
+                printf "│  %-36s│\n" "Rust:   no"
+                printf "│  %-36s│\n" "eBPF:   no"
+                printf "│  %-36s│\n" "PGO:    $PGO"
+                echo "└──────────────────────────────────────┘"
