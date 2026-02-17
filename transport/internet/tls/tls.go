@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"math/big"
 	gonet "net"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,7 +33,7 @@ type Conn struct {
 	ktls         KTLSState
 	isClient     bool
 	capture      *keyCapture
-	writeRecords uint64
+	writeRecords atomic.Uint64
 }
 
 const (
@@ -66,10 +67,14 @@ func (c *Conn) Write(b []byte) (int, error) {
 		n, err := c.Conn.NetConn().Write(b)
 		if err == nil && c.ktls.keyUpdateHandler != nil {
 			records := uint64((n + maxRecordPayload - 1) / maxRecordPayload)
-			c.writeRecords += records
-			if c.writeRecords >= keyUpdateThreshold {
-				c.ktls.keyUpdateHandler.InitiateUpdate()
-				c.writeRecords = 0
+			total := c.writeRecords.Add(records)
+			if total >= keyUpdateThreshold {
+				if c.writeRecords.CompareAndSwap(total, 0) {
+					if err := c.ktls.keyUpdateHandler.InitiateUpdate(); err != nil {
+						c.writeRecords.Add(total) // restore so next writer retries
+						errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
+					}
+				}
 			}
 		}
 		return n, err
@@ -265,7 +270,7 @@ type RustConn struct {
 	version      uint16
 	cipher       uint16
 	serverName   string
-	writeRecords uint64
+	writeRecords atomic.Uint64
 	drainedData  []byte
 	drainedOff   int
 }
@@ -299,10 +304,14 @@ func (c *RustConn) Write(b []byte) (int, error) {
 	n, err := c.rawConn.Write(b)
 	if err == nil && c.ktls.keyUpdateHandler != nil {
 		records := uint64((n + maxRecordPayload - 1) / maxRecordPayload)
-		c.writeRecords += records
-		if c.writeRecords >= keyUpdateThreshold {
-			c.ktls.keyUpdateHandler.InitiateUpdate()
-			c.writeRecords = 0
+		total := c.writeRecords.Add(records)
+		if total >= keyUpdateThreshold {
+			if c.writeRecords.CompareAndSwap(total, 0) {
+				if err := c.ktls.keyUpdateHandler.InitiateUpdate(); err != nil {
+					c.writeRecords.Add(total) // restore so next writer retries
+					errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
+				}
+			}
 		}
 	}
 	return n, err

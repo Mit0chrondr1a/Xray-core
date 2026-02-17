@@ -102,6 +102,9 @@ pub unsafe extern "C" fn xray_mph_add_pattern(
     pattern_type: u8,
 ) {
     ffi_catch_void!({
+        if table.is_null() || pattern.is_null() {
+            return;
+        }
         let table = &mut *table;
         let pattern = slice::from_raw_parts(pattern, pattern_len);
         let pattern = match std::str::from_utf8(pattern) {
@@ -119,6 +122,9 @@ pub unsafe extern "C" fn xray_mph_add_pattern(
 #[no_mangle]
 pub unsafe extern "C" fn xray_mph_build(table: *mut MphTable) {
     ffi_catch_void!({
+        if table.is_null() {
+            return;
+        }
         let table = &mut *table;
         table.build();
     })
@@ -137,6 +143,9 @@ pub unsafe extern "C" fn xray_mph_match(
     input_len: usize,
 ) -> bool {
     ffi_catch_bool!({
+        if table.is_null() || input.is_null() {
+            return false;
+        }
         let table = &*table;
         let input = slice::from_raw_parts(input, input_len);
         let input = match std::str::from_utf8(input) {

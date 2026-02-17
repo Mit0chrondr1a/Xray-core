@@ -102,8 +102,13 @@ func (h *KTLSKeyUpdateHandler) Handle() error {
 
 	// Install new RX key with reset sequence number.
 	if err := setKTLSCryptoInfo(h.fd, TLS_RX, TLS_1_3_VERSION, h.cipherSuiteID, newRxKey, newRxIV, make([]byte, 8)); err != nil {
+		zeroBytes(newRxKey)
+		zeroBytes(newRxIV)
+		zeroBytes(newRxSecret)
 		return fmt.Errorf("ktls: setsockopt TLS_RX: %w", err)
 	}
+	zeroBytes(newRxKey)
+	zeroBytes(newRxIV)
 	old := h.rxSecret
 	h.rxSecret = newRxSecret
 	zeroBytes(old)
@@ -120,8 +125,13 @@ func (h *KTLSKeyUpdateHandler) Handle() error {
 		newTxIV := expandLabel(h.hashFunc, newTxSecret, "iv", nil, 12)
 
 		if err := setKTLSCryptoInfo(h.fd, TLS_TX, TLS_1_3_VERSION, h.cipherSuiteID, newTxKey, newTxIV, make([]byte, 8)); err != nil {
+			zeroBytes(newTxKey)
+			zeroBytes(newTxIV)
+			zeroBytes(newTxSecret)
 			return fmt.Errorf("ktls: setsockopt TLS_TX: %w", err)
 		}
+		zeroBytes(newTxKey)
+		zeroBytes(newTxIV)
 		oldTx := h.txSecret
 		h.txSecret = newTxSecret
 		zeroBytes(oldTx)
@@ -152,8 +162,13 @@ func (h *KTLSKeyUpdateHandler) InitiateUpdate() error {
 	newTxIV := expandLabel(h.hashFunc, newTxSecret, "iv", nil, 12)
 
 	if err := setKTLSCryptoInfo(h.fd, TLS_TX, TLS_1_3_VERSION, h.cipherSuiteID, newTxKey, newTxIV, make([]byte, 8)); err != nil {
+		zeroBytes(newTxKey)
+		zeroBytes(newTxIV)
+		zeroBytes(newTxSecret)
 		return fmt.Errorf("ktls: setsockopt TLS_TX: %w", err)
 	}
+	zeroBytes(newTxKey)
+	zeroBytes(newTxIV)
 	oldTxI := h.txSecret
 	h.txSecret = newTxSecret
 	zeroBytes(oldTxI)

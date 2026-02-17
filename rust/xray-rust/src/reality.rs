@@ -1081,6 +1081,23 @@ pub struct RealityConfig {
     pub(crate) tls_key_pem: Vec<u8>,
 }
 
+impl Drop for RealityConfig {
+    fn drop(&mut self) {
+        if let Some(ref mut key) = self.private_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.server_pubkey {
+            key.zeroize();
+        }
+        self.short_id.zeroize();
+        for sid in &mut self.short_ids {
+            sid.zeroize();
+        }
+        self.tls_key_pem.zeroize();
+        self.mldsa65_sign_key.zeroize();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FFI Exports — Config builder
 // ---------------------------------------------------------------------------
@@ -1593,7 +1610,7 @@ pub extern "C" fn xray_reality_server_handshake(
 pub extern "C" fn xray_reality_state_free(state: *mut c_void) {
     ffi_catch_void!({
         if !state.is_null() {
-            let _ = unsafe { Box::from_raw(state as *mut RealityResult) };
+            let _ = unsafe { Box::from_raw(state as *mut TlsState) };
         }
     })
 }
@@ -1602,7 +1619,7 @@ pub extern "C" fn xray_reality_state_free(state: *mut c_void) {
 pub extern "C" fn xray_reality_server_state_free(state: *mut c_void) {
     ffi_catch_void!({
         if !state.is_null() {
-            let _ = unsafe { Box::from_raw(state as *mut RealityServerResult) };
+            let _ = unsafe { Box::from_raw(state as *mut TlsState) };
         }
     })
 }

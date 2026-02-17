@@ -410,27 +410,7 @@ func TlsHandshake(fd int, cfg *TlsConfigHandle, isClient bool) (*TlsResult, erro
 		errMsg := C.GoString(&cResult.error_msg[0])
 		return nil, errors.New("native TLS handshake: " + errMsg)
 	}
-	result := &TlsResult{
-		KtlsTx:      bool(cResult.ktls_tx),
-		KtlsRx:      bool(cResult.ktls_rx),
-		Version:     uint16(cResult.version),
-		CipherSuite: uint16(cResult.cipher_suite),
-	}
-	// Extract ALPN (null-terminated string in 32-byte buffer)
-	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
-	for i, b := range alpnBytes {
-		if b == 0 {
-			result.ALPN = string(alpnBytes[:i])
-			break
-		}
-	}
-	if cResult.state_handle != nil {
-		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
-		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
-	}
-	extractSecrets(result, &cResult)
-	extractDrained(result, &cResult)
-	return result, nil
+	return extractTlsResult(&cResult), nil
 }
 
 func TlsKeyUpdate(h *TlsStateHandle) error {
@@ -642,26 +622,7 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 		}
 		return nil, errors.New("native REALITY: " + errMsg)
 	}
-	result := &TlsResult{
-		KtlsTx:      bool(cResult.ktls_tx),
-		KtlsRx:      bool(cResult.ktls_rx),
-		Version:     uint16(cResult.version),
-		CipherSuite: uint16(cResult.cipher_suite),
-	}
-	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
-	for i, b := range alpnBytes {
-		if b == 0 {
-			result.ALPN = string(alpnBytes[:i])
-			break
-		}
-	}
-	if cResult.state_handle != nil {
-		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
-		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
-	}
-	extractSecrets(result, &cResult)
-	extractDrained(result, &cResult)
-	return result, nil
+	return extractTlsResult(&cResult), nil
 }
 
 func RealityServerAccept(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
@@ -679,24 +640,7 @@ func RealityServerAccept(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
 		}
 		return nil, errors.New("native REALITY server: " + errMsg)
 	}
-	result := &TlsResult{
-		KtlsTx:      bool(cResult.ktls_tx),
-		KtlsRx:      bool(cResult.ktls_rx),
-		Version:     uint16(cResult.version),
-		CipherSuite: uint16(cResult.cipher_suite),
-	}
-	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
-	for i, b := range alpnBytes {
-		if b == 0 {
-			result.ALPN = string(alpnBytes[:i])
-			break
-		}
-	}
-	if cResult.state_handle != nil {
-		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
-		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
-	}
-	return result, nil
+	return extractTlsResult(&cResult), nil
 }
 
 func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
@@ -714,12 +658,19 @@ func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error
 		}
 		return nil, errors.New("native REALITY server handshake: " + errMsg)
 	}
+	return extractTlsResult(&cResult), nil
+}
+
+// extractTlsResult populates a TlsResult from the C struct, extracting ALPN,
+// state handle, secrets, and drained data. Consolidates duplicated extraction logic.
+func extractTlsResult(cResult *C.struct_xray_tls_result) *TlsResult {
 	result := &TlsResult{
 		KtlsTx:      bool(cResult.ktls_tx),
 		KtlsRx:      bool(cResult.ktls_rx),
 		Version:     uint16(cResult.version),
 		CipherSuite: uint16(cResult.cipher_suite),
 	}
+	// Extract ALPN (null-terminated string in 32-byte buffer)
 	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
 	for i, b := range alpnBytes {
 		if b == 0 {
@@ -731,9 +682,9 @@ func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error
 		result.StateHandle = &TlsStateHandle{ptr: cResult.state_handle}
 		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
-	extractSecrets(result, &cResult)
-	extractDrained(result, &cResult)
-	return result, nil
+	extractSecrets(result, cResult)
+	extractDrained(result, cResult)
+	return result
 }
 
 // extractSecrets copies base traffic secrets from the C result to the Go TlsResult,
@@ -1053,9 +1004,6 @@ func VisionPad(data []byte, command byte, uuid []byte, longPadding bool, testsee
 func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) (int, error) {
 	if state == nil || len(data) == 0 || len(out) == 0 {
 		return 0, errors.New("native: nil state, empty data, or empty output buffer")
-	}
-	if len(out) == 0 {
-		return 0, nil
 	}
 	var uuidPtr *C.uint8_t
 	var uuidLen C.uint32_t

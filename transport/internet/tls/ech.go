@@ -69,6 +69,10 @@ func ApplyECH(c *Config, config *tls.Config) error {
 				}
 			}
 			config.EncryptedClientHelloConfigList = ECHConfig
+			// ECH requires TLS 1.3 minimum (enforced by crypto/tls).
+			if len(config.EncryptedClientHelloConfigList) > 0 && config.MinVersion < tls.VersionTLS13 {
+				config.MinVersion = tls.VersionTLS13
+			}
 		}()
 		// direct base64 config
 		if strings.Contains(c.EchConfigList, "://") {

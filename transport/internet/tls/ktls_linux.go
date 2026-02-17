@@ -232,6 +232,12 @@ type KTLSState struct {
 func TryEnableKTLS(conn *Conn) KTLSState {
 	state := KTLSState{}
 
+	// Ensure captured traffic secrets are always zeroed, regardless of
+	// which return path is taken (early error, partial setup, success).
+	if conn.capture != nil {
+		defer conn.capture.clear()
+	}
+
 	// Get the underlying TCP connection
 	tcpConn, ok := conn.NetConn().(*net.TCPConn)
 	if !ok {
@@ -332,11 +338,6 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 
 	// Zero key material now that it's been handed to the kernel / KeyUpdate handler.
 	keys.zero()
-
-	// Zero captured secrets if we used the capture path.
-	if conn.capture != nil {
-		conn.capture.clear()
-	}
 
 	return state
 }
@@ -711,7 +712,9 @@ func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16
 		if seq != nil {
 			copy(info.RecSeq[:], seq)
 		}
-		return setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
+		err := setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
+		zeroCryptoInfo(unsafe.Pointer(&info), unsafe.Sizeof(info))
+		return err
 
 	case tls.TLS_AES_256_GCM_SHA384,
 		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
@@ -733,7 +736,9 @@ func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16
 		if seq != nil {
 			copy(info.RecSeq[:], seq)
 		}
-		return setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
+		err := setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
+		zeroCryptoInfo(unsafe.Pointer(&info), unsafe.Sizeof(info))
+		return err
 
 	case tls.TLS_CHACHA20_POLY1305_SHA256,
 		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
@@ -752,7 +757,9 @@ func setKTLSCryptoInfo(fd int, direction int, version uint16, cipherSuite uint16
 		if seq != nil {
 			copy(info.RecSeq[:], seq)
 		}
-		return setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
+		err := setKTLSSockopt(fd, direction, unsafe.Pointer(&info), unsafe.Sizeof(info))
+		zeroCryptoInfo(unsafe.Pointer(&info), unsafe.Sizeof(info))
+		return err
 
 	default:
 		return fmt.Errorf("unsupported cipher suite for kTLS: 0x%04x", cipherSuite)
@@ -796,7 +803,9 @@ func getRecordSeq(fd int, direction int, cipherSuiteID uint16) (uint64, error) {
 		return 0, fmt.Errorf("short SOL_TLS getsockopt payload: got %d bytes", size)
 	}
 
-	return binary.BigEndian.Uint64(buf[recSeqOffset : recSeqOffset+8]), nil
+	seq := binary.BigEndian.Uint64(buf[recSeqOffset : recSeqOffset+8])
+	zeroBytes(buf) // zero full crypto_info (contains key material from kernel)
+	return seq, nil
 }
 
 // zeroBytes overwrites b with zeroes.
@@ -804,6 +813,14 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// zeroCryptoInfo zeroes a stack-allocated crypto info struct after setsockopt
+// copies it to kernel space, preventing key material from lingering on the stack.
+//
+//go:noinline
+func zeroCryptoInfo(ptr unsafe.Pointer, size uintptr) {
+	zeroBytes(unsafe.Slice((*byte)(ptr), size))
 }
 
 // KTLSSupported checks if kernel TLS is available.

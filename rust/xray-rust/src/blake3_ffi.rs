@@ -14,11 +14,25 @@ pub unsafe extern "C" fn xray_blake3_derive_key(
     key_len: usize,
 ) {
     ffi_catch_void!({
-        if out_len == 0 {
+        if out_len == 0 || out.is_null() {
             return;
         }
-        let ctx = if ctx_len == 0 { &[] } else { slice::from_raw_parts(ctx, ctx_len) };
-        let key = if key_len == 0 { &[] } else { slice::from_raw_parts(key, key_len) };
+        let ctx = if ctx_len == 0 {
+            &[]
+        } else {
+            if ctx.is_null() {
+                return;
+            }
+            slice::from_raw_parts(ctx, ctx_len)
+        };
+        let key = if key_len == 0 {
+            &[]
+        } else {
+            if key.is_null() {
+                return;
+            }
+            slice::from_raw_parts(key, key_len)
+        };
         let out = slice::from_raw_parts_mut(out, out_len);
         let Ok(ctx_str) = std::str::from_utf8(ctx) else {
             out.fill(0);
@@ -49,6 +63,9 @@ pub unsafe extern "C" fn xray_blake3_sum256(
         let data = if data_len == 0 {
             &[]
         } else {
+            if data.is_null() {
+                return;
+            }
             slice::from_raw_parts(data, data_len)
         };
         let out = slice::from_raw_parts_mut(out, 32);
@@ -71,7 +88,7 @@ pub unsafe extern "C" fn xray_blake3_keyed_hash(
     data_len: usize,
 ) {
     ffi_catch_void!({
-        if out_len == 0 || key.is_null() {
+        if out_len == 0 || out.is_null() || key.is_null() {
             return;
         }
         let key_slice = slice::from_raw_parts(key, 32);
@@ -79,6 +96,9 @@ pub unsafe extern "C" fn xray_blake3_keyed_hash(
         let data = if data_len == 0 {
             &[]
         } else {
+            if data.is_null() {
+                return;
+            }
             slice::from_raw_parts(data, data_len)
         };
         let out = slice::from_raw_parts_mut(out, out_len);
