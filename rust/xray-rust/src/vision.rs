@@ -51,6 +51,7 @@ pub unsafe extern "C" fn xray_vision_pad(
     out_buf: *mut u8,
     out_cap: u32,
 ) -> i32 {
+    ffi_catch_i32!({
     if out_buf.is_null() || testseed.is_null() {
         return -1; // FFI_ERR_NULL
     }
@@ -115,6 +116,7 @@ pub unsafe extern "C" fn xray_vision_pad(
     }
 
     pos as i32
+    })
 }
 
 /// Clamp padding to fit within buffer constraints.
@@ -188,6 +190,7 @@ pub unsafe extern "C" fn xray_vision_unpad(
     out_buf: *mut u8,
     out_cap: u32,
 ) -> i32 {
+    ffi_catch_i32!({
     if data.is_null() || state.is_null() || out_buf.is_null() {
         return -1;
     }
@@ -283,6 +286,7 @@ pub unsafe extern "C" fn xray_vision_unpad(
     }
 
     out_pos as i32
+    })
 }
 
 // --- TLS Filtering ---
@@ -327,6 +331,7 @@ pub unsafe extern "C" fn xray_vision_filter_tls(
     data_len: u32,
     state: *mut VisionFilterState,
 ) -> i32 {
+    ffi_catch_i32!({
     if data.is_null() || state.is_null() || data_len == 0 {
         return 0;
     }
@@ -382,6 +387,7 @@ pub unsafe extern "C" fn xray_vision_filter_tls(
     }
 
     0 // continue filtering
+    })
 }
 
 /// Search for a subsequence (needle) within a byte slice (haystack).
@@ -405,6 +411,7 @@ pub unsafe extern "C" fn xray_vision_is_complete_record(
     data: *const u8,
     data_len: u32,
 ) -> i32 {
+    ffi_catch_i32!({
     if data.is_null() || data_len == 0 {
         return 0;
     }
@@ -457,6 +464,7 @@ pub unsafe extern "C" fn xray_vision_is_complete_record(
     } else {
         0
     }
+    })
 }
 
 #[cfg(test)]
