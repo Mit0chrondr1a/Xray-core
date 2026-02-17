@@ -33,8 +33,6 @@ type worker interface {
 	Proxy() proxy.Inbound
 }
 
-const maxTCPConnections = 65536
-
 type tcpWorker struct {
 	address         net.Address
 	port            net.Port
@@ -138,9 +136,10 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 }
 
 func (w *tcpWorker) Start() error {
-	w.connSemaphore = make(chan struct{}, maxTCPConnections)
+	w.connSemaphore = make(chan struct{}, getMaxConnections())
 	ctx := context.Background()
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
+		// Fast path: try non-blocking acquire first (zero allocation).
 		select {
 		case w.connSemaphore <- struct{}{}:
 			go func() {
@@ -152,8 +151,43 @@ func (w *tcpWorker) Start() error {
 				}()
 				w.callback(conn)
 			}()
+			return
 		default:
-			errors.LogWarning(w.ctx, "TCP connection limit reached, rejecting connection from ", conn.RemoteAddr())
+		}
+		// Slow path: semaphore full, wait with timeout.
+		timer := time.NewTimer(getQueueTimeout())
+		select {
+		case w.connSemaphore <- struct{}{}:
+			timer.Stop()
+			go func() {
+				defer func() { <-w.connSemaphore }()
+				defer func() {
+					if r := recover(); r != nil {
+						errors.LogError(w.ctx, "panic in TCP connection handler: ", r)
+					}
+				}()
+				w.callback(conn)
+			}()
+		case <-timer.C:
+			// Final non-blocking attempt before rejecting (avoids select race
+			// where both timer and semaphore are ready simultaneously).
+			select {
+			case w.connSemaphore <- struct{}{}:
+				go func() {
+					defer func() { <-w.connSemaphore }()
+					defer func() {
+						if r := recover(); r != nil {
+							errors.LogError(w.ctx, "panic in TCP connection handler: ", r)
+						}
+					}()
+					w.callback(conn)
+				}()
+				return
+			default:
+			}
+			errors.LogWarning(w.ctx, "TCP connection queue timeout (active: ",
+				len(w.connSemaphore), "/", cap(w.connSemaphore),
+				"), rejecting from ", conn.RemoteAddr())
 			conn.Close()
 		}
 	})
@@ -272,8 +306,6 @@ type connID struct {
 	dest net.Destination
 }
 
-const maxUDPSessions = 16384
-
 type udpWorker struct {
 	sync.RWMutex
 
@@ -359,13 +391,28 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 	if !existing {
 		common.Must(w.checker.Start())
 
+		// Fast path: try non-blocking acquire first (zero allocation).
 		select {
 		case w.sessionSemaphore <- struct{}{}:
 		default:
-			errors.LogWarning(w.ctx, "UDP session limit reached, dropping new session from ", source)
-			conn.Close()
-			w.removeConn(id)
-			return
+			// Slow path: semaphore full, wait with timeout.
+			timer := time.NewTimer(getQueueTimeout())
+			select {
+			case w.sessionSemaphore <- struct{}{}:
+				timer.Stop()
+			case <-timer.C:
+				// Final non-blocking attempt before rejecting.
+				select {
+				case w.sessionSemaphore <- struct{}{}:
+				default:
+					errors.LogWarning(w.ctx, "UDP session queue timeout (active: ",
+						len(w.sessionSemaphore), "/", cap(w.sessionSemaphore),
+						"), dropping new session from ", source)
+					conn.Close()
+					w.removeConn(id)
+					return
+				}
+			}
 		}
 
 		go func() {
@@ -459,7 +506,7 @@ func (w *udpWorker) clean() error {
 
 func (w *udpWorker) Start() error {
 	w.activeConn = make(map[connID]*udpConn, 16)
-	w.sessionSemaphore = make(chan struct{}, maxUDPSessions)
+	w.sessionSemaphore = make(chan struct{}, getMaxUDPSessions())
 	ctx := context.Background()
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
 	if err != nil {
