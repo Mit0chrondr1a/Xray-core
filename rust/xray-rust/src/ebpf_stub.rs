@@ -16,12 +16,12 @@ pub unsafe extern "C" fn xray_ebpf_setup(
     _max_entries: u32,
     _cork_threshold: u32,
 ) -> i32 {
-    -libc::ENOTSUP
+    ffi_catch_i32!({ -libc::ENOTSUP })
 }
 
 #[no_mangle]
 pub extern "C" fn xray_ebpf_teardown() -> i32 {
-    -libc::ENOTSUP
+    ffi_catch_i32!({ -libc::ENOTSUP })
 }
 
 #[no_mangle]
@@ -32,10 +32,10 @@ pub extern "C" fn xray_ebpf_register_pair(
     _outbound_cookie: u64,
     _policy_flags: u32,
 ) -> i32 {
-    -libc::ENOTSUP
+    ffi_catch_i32!({ -libc::ENOTSUP })
 }
 
 #[no_mangle]
 pub extern "C" fn xray_ebpf_unregister_pair(_inbound_cookie: u64, _outbound_cookie: u64) -> i32 {
-    -libc::ENOTSUP
+    ffi_catch_i32!({ -libc::ENOTSUP })
 }

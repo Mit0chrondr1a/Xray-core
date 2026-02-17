@@ -366,26 +366,30 @@ pub unsafe extern "C" fn xray_ebpf_setup(
     max_entries: u32,
     cork_threshold: u32,
 ) -> i32 {
-    if pin_path.is_null() {
-        return -1;
-    }
-    let path = match CStr::from_ptr(pin_path).to_str() {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    match setup_sockmap_impl(path, max_entries, cork_threshold) {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
+    ffi_catch_i32!({
+        if pin_path.is_null() {
+            return -1;
+        }
+        let path = match CStr::from_ptr(pin_path).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        match setup_sockmap_impl(path, max_entries, cork_threshold) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    })
 }
 
 /// Tear down eBPF programs and unpin maps.
 #[no_mangle]
 pub extern "C" fn xray_ebpf_teardown() -> i32 {
-    match teardown_impl() {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
+    ffi_catch_i32!({
+        match teardown_impl() {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    })
 }
 
 /// Register a socket pair for bidirectional forwarding.
@@ -400,11 +404,13 @@ pub extern "C" fn xray_ebpf_register_pair(
     outbound_cookie: u64,
     policy_flags: u32,
 ) -> i32 {
-    match register_pair_impl(inbound_fd, outbound_fd, inbound_cookie, outbound_cookie, policy_flags)
-    {
-        Ok(()) => 0,
-        Err(e) => neg_errno(&e),
-    }
+    ffi_catch_i32!({
+        match register_pair_impl(inbound_fd, outbound_fd, inbound_cookie, outbound_cookie, policy_flags)
+        {
+            Ok(()) => 0,
+            Err(e) => neg_errno(&e),
+        }
+    })
 }
 
 /// Unregister a socket pair.
@@ -413,8 +419,10 @@ pub extern "C" fn xray_ebpf_unregister_pair(
     inbound_cookie: u64,
     outbound_cookie: u64,
 ) -> i32 {
-    match unregister_pair_impl(inbound_cookie, outbound_cookie) {
-        Ok(()) => 0,
-        Err(e) => neg_errno(&e),
-    }
+    ffi_catch_i32!({
+        match unregister_pair_impl(inbound_cookie, outbound_cookie) {
+            Ok(()) => 0,
+            Err(e) => neg_errno(&e),
+        }
+    })
 }
