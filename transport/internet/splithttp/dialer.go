@@ -405,7 +405,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	// code relies on this behavior. Subtract 1 so that together with
 	// uploadWriter wrapper, exact size limits can be enforced
 	// uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize - 1))
-	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize - buf.Size))
+	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize-buf.Size), pipe.WithSPSC())
 
 	conn.writer = uploadWriter{
 		uploadPipeWriter,
