@@ -1002,7 +1002,9 @@ pub extern "C" fn xray_tls13_handshake(
 /// Kept for backward compatibility with Go callers.
 #[no_mangle]
 pub extern "C" fn xray_tls13_state_free(_state: *mut std::ffi::c_void) {
-    // No-op: all data is now copied inline into XrayTls13Result.
+    ffi_catch_void!({
+        // No-op: all data is now copied inline into XrayTls13Result.
+    })
 }
 
 /// Install kTLS using application traffic secrets directly.
