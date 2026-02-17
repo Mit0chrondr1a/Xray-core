@@ -19,11 +19,19 @@ pub const FFI_ERR_PANIC: i32 = -99;
 // ---------------------------------------------------------------------------
 
 /// Wrap an FFI body that returns `i32`. On panic returns `FFI_ERR_PANIC` (-99).
+///
+/// **Note:** `return` inside the block exits the closure, not the outer function.
+/// The macro must be the tail expression of the enclosing function.
 macro_rules! ffi_catch_i32 {
     ($body:block) => {{
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
             Ok(v) => v,
-            Err(_) => $crate::ffi::FFI_ERR_PANIC,
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().copied()
+                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                eprintln!("xray-rust FFI panic (i32): {}", msg.unwrap_or("unknown"));
+                $crate::ffi::FFI_ERR_PANIC
+            }
         }
     }};
 }
@@ -33,15 +41,39 @@ macro_rules! ffi_catch_ptr {
     ($body:block) => {{
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
             Ok(v) => v,
-            Err(_) => std::ptr::null_mut(),
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().copied()
+                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                eprintln!("xray-rust FFI panic (ptr): {}", msg.unwrap_or("unknown"));
+                std::ptr::null_mut()
+            }
         }
     }};
 }
 
-/// Wrap a void FFI body. On panic the error is silently absorbed.
+/// Wrap an FFI body that returns `bool`. On panic returns `false`.
+macro_rules! ffi_catch_bool {
+    ($body:block) => {{
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().copied()
+                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                eprintln!("xray-rust FFI panic (bool): {}", msg.unwrap_or("unknown"));
+                false
+            }
+        }
+    }};
+}
+
+/// Wrap a void FFI body. On panic the error is logged to stderr.
 macro_rules! ffi_catch_void {
     ($body:block) => {{
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body));
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            let msg = e.downcast_ref::<&str>().copied()
+                .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+            eprintln!("xray-rust FFI panic (void): {}", msg.unwrap_or("unknown"));
+        }
     }};
 }
 
@@ -109,6 +141,18 @@ mod tests {
     fn test_ffi_catch_ptr_panic() {
         let p: *mut u8 = ffi_catch_ptr!({ panic!("boom") });
         assert!(p.is_null());
+    }
+
+    #[test]
+    fn test_ffi_catch_bool_ok() {
+        let r: bool = ffi_catch_bool!({ true });
+        assert!(r);
+    }
+
+    #[test]
+    fn test_ffi_catch_bool_panic() {
+        let r: bool = ffi_catch_bool!({ panic!("boom") });
+        assert!(!r);
     }
 
     #[test]
