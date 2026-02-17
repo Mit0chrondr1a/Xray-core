@@ -80,3 +80,6 @@ resources/
 
 # ENV
 .envrc
+
+# Deploy
+Taskfile.local.yml

@@ -14,6 +14,7 @@ GOARCH = "amd64"
 
 # Rust via rustup backend — installs musl cross-compilation targets + rust-src
 rust = { version = "stable", targets = "x86_64-unknown-linux-musl,aarch64-unknown-linux-musl", components = "rust-src" }
+task = "latest"
 
 [settings]
 experimental = true
