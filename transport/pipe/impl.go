@@ -23,6 +23,7 @@ const (
 type pipeOption struct {
 	limit           int32 // maximum buffer size in bytes
 	discardOverflow bool
+	useSPSC         bool
 }
 
 func (o *pipeOption) isFull(curSize int32) bool {

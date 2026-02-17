@@ -1,48 +1,40 @@
 package pipe
 
 import (
-	"io"
 	"sync"
 	"sync/atomic"
+
+	"github.com/xtls/xray-core/common/buf"
 )
 
-// SPSCRingBuffer is a lock-free single-producer single-consumer ring buffer.
-// It provides high-throughput byte transfer between exactly one writer goroutine
-// and one reader goroutine without mutex contention. For general-purpose pipes
-// that transfer buf.MultiBuffer, use pipe.New instead.
-type SPSCRingBuffer struct {
-	buffer   []byte
+// SPSCSlotRing is a lock-free single-producer single-consumer ring buffer
+// that stores buf.MultiBuffer values directly in slots, achieving zero-copy
+// transfer between exactly one writer goroutine and one reader goroutine.
+type SPSCSlotRing struct {
+	slots    []buf.MultiBuffer
+	writePos atomic.Uint64
+	_pad1    [56]byte // cache line isolation
+	readPos  atomic.Uint64
+	_pad2    [56]byte // cache line isolation
 	capacity uint64
 	mask     uint64
-	writePos atomic.Uint64
-	_pad1    [56]byte // cache line padding
-	readPos  atomic.Uint64
-	_pad2    [56]byte // cache line padding
 
-	mu             sync.Mutex
-	cond           *sync.Cond
-	closed         atomic.Bool
-	readerWaiting  atomic.Bool
-	writerWaiting  atomic.Bool
+	mu            sync.Mutex
+	cond          *sync.Cond
+	closed        atomic.Bool
+	readerWaiting atomic.Bool
+	writerWaiting atomic.Bool
 }
 
-// NewSPSCRingBuffer creates a new lock-free SPSC ring buffer with the given
-// capacity (rounded up to the next power of 2, minimum 16 bytes).
-// The returned buffer implements io.ReadWriteCloser.
-func NewSPSCRingBuffer(capacity int) *SPSCRingBuffer {
-	if capacity <= 0 {
-		capacity = 16
+// NewSPSCSlotRing creates a new lock-free SPSC slot ring with the given
+// number of slots (rounded up to the next power of 2, minimum 4).
+func NewSPSCSlotRing(slots int) *SPSCSlotRing {
+	if slots < 4 {
+		slots = 4
 	}
-	const maxCapacity = 1 << 30 // 1 GB
-	if capacity > maxCapacity {
-		capacity = maxCapacity
-	}
-	cap := nextPowerOf2(uint64(capacity))
-	if cap < 16 {
-		cap = 16
-	}
-	r := &SPSCRingBuffer{
-		buffer:   make([]byte, cap),
+	cap := nextPowerOf2(uint64(slots))
+	r := &SPSCSlotRing{
+		slots:    make([]buf.MultiBuffer, cap),
 		capacity: cap,
 		mask:     cap - 1,
 	}
@@ -50,127 +42,73 @@ func NewSPSCRingBuffer(capacity int) *SPSCRingBuffer {
 	return r
 }
 
-// write copies data into the ring buffer without blocking.
-// Returns the number of bytes written (may be less than len(data) if the buffer is full).
-func (r *SPSCRingBuffer) write(data []byte) int {
+// TryWrite stores a MultiBuffer in the next slot. Returns false if full.
+// Only one goroutine should call TryWrite at a time.
+func (r *SPSCSlotRing) TryWrite(mb buf.MultiBuffer) bool {
 	wp := r.writePos.Load()
 	rp := r.readPos.Load()
-
-	available := r.capacity - (wp - rp)
-	toWrite := uint64(len(data))
-	if toWrite > available {
-		toWrite = available
+	if wp-rp >= r.capacity {
+		return false
 	}
-	if toWrite == 0 {
-		return 0
-	}
-
-	start := wp & r.mask
-	firstChunk := r.capacity - start
-	if firstChunk > toWrite {
-		firstChunk = toWrite
-	}
-
-	copy(r.buffer[start:start+firstChunk], data[:firstChunk])
-	if secondChunk := toWrite - firstChunk; secondChunk > 0 {
-		copy(r.buffer[:secondChunk], data[firstChunk:firstChunk+secondChunk])
-	}
-
-	r.writePos.Store(wp + toWrite)
-	return int(toWrite)
+	r.slots[wp&r.mask] = mb
+	r.writePos.Store(wp + 1)
+	return true
 }
 
-// read copies data from the ring buffer without blocking.
-// Returns the number of bytes read (may be less than len(buf) if the buffer is empty).
-func (r *SPSCRingBuffer) read(buf []byte) int {
+// TryRead retrieves a MultiBuffer from the next slot. Returns nil, false if empty.
+// Only one goroutine should call TryRead at a time.
+func (r *SPSCSlotRing) TryRead() (buf.MultiBuffer, bool) {
 	rp := r.readPos.Load()
 	wp := r.writePos.Load()
-
-	available := wp - rp
-	toRead := uint64(len(buf))
-	if toRead > available {
-		toRead = available
+	if rp >= wp {
+		return nil, false
 	}
-	if toRead == 0 {
-		return 0
-	}
-
-	start := rp & r.mask
-	firstChunk := r.capacity - start
-	if firstChunk > toRead {
-		firstChunk = toRead
-	}
-
-	copy(buf[:firstChunk], r.buffer[start:start+firstChunk])
-	if secondChunk := toRead - firstChunk; secondChunk > 0 {
-		copy(buf[firstChunk:firstChunk+secondChunk], r.buffer[:secondChunk])
-	}
-
-	r.readPos.Store(rp + toRead)
-	return int(toRead)
+	idx := rp & r.mask
+	mb := r.slots[idx]
+	r.slots[idx] = nil // help GC
+	r.readPos.Store(rp + 1)
+	return mb, true
 }
 
-// Write implements io.Writer. It blocks until all data is written or the
-// buffer is closed. Only one goroutine should call Write at a time.
-func (r *SPSCRingBuffer) Write(data []byte) (int, error) {
-	if len(data) == 0 {
-		return 0, nil
-	}
-
-	written := 0
-	for written < len(data) {
-		if r.closed.Load() {
-			return written, io.ErrClosedPipe
-		}
-
-		n := r.write(data[written:])
-		written += n
-
-		if written < len(data) {
-			// Buffer full, wake reader and wait for drain.
-			r.mu.Lock()
-			r.cond.Signal()
-			if !r.closed.Load() && r.AvailableWrite() == 0 {
-				r.writerWaiting.Store(true)
-				r.cond.Wait()
-				r.writerWaiting.Store(false)
-			}
-			r.mu.Unlock()
-		}
-	}
-
-	// Unconditionally signal reader to prevent lost wakeups.
-	r.mu.Lock()
-	r.cond.Signal()
-	r.mu.Unlock()
-
-	return written, nil
-}
-
-// Read implements io.Reader. It blocks until data is available or the buffer
-// is closed. Only one goroutine should call Read at a time.
-func (r *SPSCRingBuffer) Read(buf []byte) (int, error) {
-	if len(buf) == 0 {
-		return 0, nil
-	}
-
+// Write stores a MultiBuffer, blocking until space is available or the ring is closed.
+func (r *SPSCSlotRing) Write(mb buf.MultiBuffer) bool {
 	for {
-		n := r.read(buf)
-		if n > 0 {
-			// Unconditionally signal writer to prevent lost wakeups.
+		if r.closed.Load() {
+			return false
+		}
+		if r.TryWrite(mb) {
 			r.mu.Lock()
 			r.cond.Signal()
 			r.mu.Unlock()
-			return n, nil
+			return true
 		}
-
-		if r.closed.Load() {
-			return 0, io.EOF
-		}
-
-		// No data, wait for writer.
+		// Ring full, wake reader and wait.
 		r.mu.Lock()
-		if r.AvailableRead() == 0 && !r.closed.Load() {
+		r.cond.Signal()
+		if !r.closed.Load() && r.Available() == 0 {
+			r.writerWaiting.Store(true)
+			r.cond.Wait()
+			r.writerWaiting.Store(false)
+		}
+		r.mu.Unlock()
+	}
+}
+
+// Read retrieves a MultiBuffer, blocking until data is available or the ring is closed.
+func (r *SPSCSlotRing) Read() (buf.MultiBuffer, bool) {
+	for {
+		mb, ok := r.TryRead()
+		if ok {
+			r.mu.Lock()
+			r.cond.Signal()
+			r.mu.Unlock()
+			return mb, true
+		}
+		if r.closed.Load() {
+			return nil, false
+		}
+		r.mu.Lock()
+		if r.Len() == 0 && !r.closed.Load() {
 			r.readerWaiting.Store(true)
 			r.cond.Wait()
 			r.readerWaiting.Store(false)
@@ -179,23 +117,20 @@ func (r *SPSCRingBuffer) Read(buf []byte) (int, error) {
 	}
 }
 
-// AvailableRead returns the number of bytes available to read.
-func (r *SPSCRingBuffer) AvailableRead() int {
+// Len returns the number of slots currently occupied.
+func (r *SPSCSlotRing) Len() int {
 	wp := r.writePos.Load()
 	rp := r.readPos.Load()
 	return int(wp - rp)
 }
 
-// AvailableWrite returns the number of bytes available to write.
-func (r *SPSCRingBuffer) AvailableWrite() int {
-	wp := r.writePos.Load()
-	rp := r.readPos.Load()
-	return int(r.capacity - (wp - rp))
+// Available returns the number of free slots.
+func (r *SPSCSlotRing) Available() int {
+	return int(r.capacity) - r.Len()
 }
 
-// Close marks the buffer as closed. Subsequent writes return io.ErrClosedPipe.
-// Subsequent reads return any buffered data, then io.EOF.
-func (r *SPSCRingBuffer) Close() error {
+// Close marks the ring as closed and wakes all waiters.
+func (r *SPSCSlotRing) Close() error {
 	r.closed.Store(true)
 	r.mu.Lock()
 	r.cond.Broadcast()

@@ -10,7 +10,7 @@ import (
 )
 
 func TestSPSCPipeBasicWriteRead(t *testing.T) {
-	reader, writer := NewSPSC(4096)
+	reader, writer := NewSPSC(16)
 
 	b := buf.New()
 	b.WriteString("hello spsc pipe")
@@ -31,7 +31,7 @@ func TestSPSCPipeBasicWriteRead(t *testing.T) {
 }
 
 func TestSPSCPipeCloseWriterCausesEOF(t *testing.T) {
-	reader, writer := NewSPSC(4096)
+	reader, writer := NewSPSC(16)
 
 	writer.Close()
 
@@ -42,7 +42,7 @@ func TestSPSCPipeCloseWriterCausesEOF(t *testing.T) {
 }
 
 func TestSPSCPipeInterrupt(t *testing.T) {
-	reader, writer := NewSPSC(4096)
+	reader, writer := NewSPSC(16)
 
 	// Write some data.
 	b := buf.New()
@@ -70,7 +70,7 @@ func TestSPSCPipeInterrupt(t *testing.T) {
 }
 
 func TestSPSCPipeWriteAfterClose(t *testing.T) {
-	_, writer := NewSPSC(4096)
+	_, writer := NewSPSC(16)
 	writer.Close()
 
 	b := buf.New()
@@ -82,7 +82,7 @@ func TestSPSCPipeWriteAfterClose(t *testing.T) {
 }
 
 func TestSPSCPipeEmptyWrite(t *testing.T) {
-	_, writer := NewSPSC(4096)
+	_, writer := NewSPSC(16)
 	// Writing empty MultiBuffer should be a no-op.
 	err := writer.WriteMultiBuffer(buf.MultiBuffer{})
 	if err != nil {
@@ -92,7 +92,7 @@ func TestSPSCPipeEmptyWrite(t *testing.T) {
 }
 
 func TestSPSCPipeTimeout(t *testing.T) {
-	reader, _ := NewSPSC(4096)
+	reader, _ := NewSPSC(16)
 	_, err := reader.ReadMultiBufferTimeout(50 * time.Millisecond)
 	if err != buf.ErrReadTimeout {
 		t.Fatalf("expected ErrReadTimeout, got %v", err)
@@ -100,7 +100,7 @@ func TestSPSCPipeTimeout(t *testing.T) {
 }
 
 func TestSPSCPipeLargeTransfer(t *testing.T) {
-	reader, writer := NewSPSC(1024) // small ring
+	reader, writer := NewSPSC(8) // small ring
 
 	const numBufs = 100
 	done := make(chan int64, 1)
@@ -146,7 +146,7 @@ func TestSPSCPipeLargeTransfer(t *testing.T) {
 }
 
 func TestSPSCPipeLen(t *testing.T) {
-	_, writer := NewSPSC(4096)
+	_, writer := NewSPSC(16)
 
 	b := buf.New()
 	b.WriteString("12345")
@@ -157,6 +157,27 @@ func TestSPSCPipeLen(t *testing.T) {
 	if l != 5 {
 		t.Fatalf("Len()=%d, want 5", l)
 	}
+
+	writer.Close()
+}
+
+func TestSPSCPipeWithSPSCOption(t *testing.T) {
+	reader, writer := New(WithSizeLimit(8192), WithSPSC())
+
+	b := buf.New()
+	b.WriteString("via WithSPSC option")
+	if err := writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+		t.Fatalf("WriteMultiBuffer: %v", err)
+	}
+
+	mb, err := reader.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer: %v", err)
+	}
+	if s := mb.String(); s != "via WithSPSC option" {
+		t.Fatalf("read data mismatch: got %q", s)
+	}
+	buf.ReleaseMulti(mb)
 
 	writer.Close()
 }

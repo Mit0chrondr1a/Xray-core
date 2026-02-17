@@ -44,6 +44,14 @@ func DiscardOverflow() Option {
 	}
 }
 
+// WithSPSC returns an Option to use a lock-free SPSC slot ring instead of a
+// mutex-based pipe. Only safe when exactly one goroutine writes and one reads.
+func WithSPSC() Option {
+	return func(opt *pipeOption) {
+		opt.useSPSC = true
+	}
+}
+
 // OptionsFromContext returns a list of Options from context.
 func OptionsFromContext(ctx context.Context) []Option {
 	var opt []Option
@@ -60,18 +68,30 @@ func OptionsFromContext(ctx context.Context) []Option {
 
 // New creates a new Reader and Writer that connects to each other.
 func New(opts ...Option) (*Reader, *Writer) {
+	opt := pipeOption{limit: -1}
+	for _, o := range opts {
+		o(&opt)
+	}
+
+	if opt.useSPSC {
+		// Derive slot count from size limit. Each slot holds one MultiBuffer
+		// which typically contains one buf.Buffer (buf.Size bytes).
+		slots := 64
+		if opt.limit > 0 {
+			slots = int(opt.limit/int32(buf.Size)) + 1
+			if slots < 16 {
+				slots = 16
+			}
+		}
+		return NewSPSC(slots)
+	}
+
 	p := &pipe{
 		readSignal:  signal.NewNotifier(),
 		writeSignal: signal.NewNotifier(),
 		done:        done.New(),
 		errChan:     make(chan error, 1),
-		option: pipeOption{
-			limit: -1,
-		},
-	}
-
-	for _, opt := range opts {
-		opt(&(p.option))
+		option:      opt,
 	}
 
 	return &Reader{
@@ -83,14 +103,14 @@ func New(opts ...Option) (*Reader, *Writer) {
 }
 
 // NewSPSC creates a new SPSC (single-producer single-consumer) pipe pair.
-// This variant uses a lock-free ring buffer and is suitable for flows
+// This variant uses a lock-free slot ring and is suitable for flows
 // where exactly one goroutine writes and one goroutine reads.
-// The capacity parameter specifies the ring buffer size in bytes
-// (rounded up to the next power of 2, minimum 16 bytes).
-func NewSPSC(capacity int) (*Reader, *Writer) {
+// The slots parameter specifies the number of MultiBuffer slots in the ring
+// (rounded up to the next power of 2, minimum 4).
+func NewSPSC(slots int) (*Reader, *Writer) {
 	errChan := make(chan error, 1)
 	p := &spscPipe{
-		ring:        NewSPSCRingBuffer(capacity),
+		ring:        NewSPSCSlotRing(slots),
 		readSignal:  signal.NewNotifier(),
 		writeSignal: signal.NewNotifier(),
 		done:        done.New(),

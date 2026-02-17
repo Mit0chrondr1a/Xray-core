@@ -1,151 +1,139 @@
 package pipe
 
 import (
-	"bytes"
-	"io"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/xtls/xray-core/common/buf"
 )
 
-// --- SPSCRingBuffer Unit Tests ---
+// --- SPSCSlotRing Unit Tests ---
 
-func TestNewSPSCRingBufferMinCapacity(t *testing.T) {
-	r := NewSPSCRingBuffer(0)
-	if r.capacity < 16 {
-		t.Fatalf("expected capacity >= 16, got %d", r.capacity)
+func TestNewSPSCSlotRingMinCapacity(t *testing.T) {
+	r := NewSPSCSlotRing(0)
+	if r.capacity < 4 {
+		t.Fatalf("expected capacity >= 4, got %d", r.capacity)
 	}
 }
 
-func TestNewSPSCRingBufferPowerOfTwo(t *testing.T) {
+func TestNewSPSCSlotRingPowerOfTwo(t *testing.T) {
 	tests := []struct {
 		input    int
 		expected uint64
 	}{
-		{1, 16},   // clamped to 16
-		{15, 16},  // clamped to 16
-		{16, 16},  // exact
-		{17, 32},  // next power of 2
-		{100, 128},
-		{256, 256},
-		{1000, 1024},
+		{1, 4},   // clamped to 4
+		{3, 4},   // clamped to 4
+		{4, 4},   // exact
+		{5, 8},   // next power of 2
+		{9, 16},  // next power of 2
+		{16, 16}, // exact
+		{17, 32},
 	}
 	for _, tt := range tests {
-		r := NewSPSCRingBuffer(tt.input)
+		r := NewSPSCSlotRing(tt.input)
 		if r.capacity != tt.expected {
-			t.Errorf("NewSPSCRingBuffer(%d): capacity=%d, want %d", tt.input, r.capacity, tt.expected)
+			t.Errorf("NewSPSCSlotRing(%d): capacity=%d, want %d", tt.input, r.capacity, tt.expected)
 		}
 	}
 }
 
-func TestSPSCRingBufferWriteReadBasic(t *testing.T) {
-	r := NewSPSCRingBuffer(64)
-	data := []byte("hello, world!")
-	n := r.write(data)
-	if n != len(data) {
-		t.Fatalf("write: n=%d, want %d", n, len(data))
+func TestSPSCSlotRingWriteReadBasic(t *testing.T) {
+	r := NewSPSCSlotRing(8)
+
+	b := buf.New()
+	b.WriteString("hello slot ring")
+	mb := buf.MultiBuffer{b}
+
+	if !r.TryWrite(mb) {
+		t.Fatal("TryWrite failed on empty ring")
 	}
-	if r.AvailableRead() != len(data) {
-		t.Fatalf("AvailableRead()=%d, want %d", r.AvailableRead(), len(data))
+	if r.Len() != 1 {
+		t.Fatalf("Len()=%d, want 1", r.Len())
 	}
 
-	buf := make([]byte, 64)
-	n = r.read(buf)
-	if n != len(data) {
-		t.Fatalf("read: n=%d, want %d", n, len(data))
+	got, ok := r.TryRead()
+	if !ok {
+		t.Fatal("TryRead failed")
 	}
-	if !bytes.Equal(buf[:n], data) {
-		t.Fatalf("read data mismatch: got %q, want %q", buf[:n], data)
+	if got.String() != "hello slot ring" {
+		t.Fatalf("read data mismatch: got %q", got.String())
 	}
-	if r.AvailableRead() != 0 {
-		t.Fatalf("AvailableRead()=%d after drain, want 0", r.AvailableRead())
+	buf.ReleaseMulti(got)
+	if r.Len() != 0 {
+		t.Fatalf("Len()=%d after drain, want 0", r.Len())
 	}
 }
 
-func TestSPSCRingBufferWrapAround(t *testing.T) {
-	r := NewSPSCRingBuffer(16) // capacity=16
-	// Write 12 bytes to get near the end.
-	data1 := bytes.Repeat([]byte("A"), 12)
-	n := r.write(data1)
-	if n != 12 {
-		t.Fatalf("write1: n=%d, want 12", n)
-	}
-	// Read 12 to advance readPos.
-	buf := make([]byte, 16)
-	n = r.read(buf)
-	if n != 12 {
-		t.Fatalf("read1: n=%d, want 12", n)
+func TestSPSCSlotRingFull(t *testing.T) {
+	r := NewSPSCSlotRing(4) // capacity=4
+
+	for i := 0; i < 4; i++ {
+		b := buf.New()
+		b.WriteString("x")
+		if !r.TryWrite(buf.MultiBuffer{b}) {
+			t.Fatalf("TryWrite %d failed", i)
+		}
 	}
 
-	// Now write 10 bytes -- should wrap around.
-	data2 := []byte("0123456789")
-	n = r.write(data2)
-	if n != 10 {
-		t.Fatalf("wrap write: n=%d, want 10", n)
+	if r.Available() != 0 {
+		t.Fatalf("Available()=%d, want 0", r.Available())
 	}
 
-	readBuf := make([]byte, 16)
-	n = r.read(readBuf)
-	if n != 10 {
-		t.Fatalf("wrap read: n=%d, want 10", n)
+	// Write on full ring should return false.
+	b := buf.New()
+	b.WriteString("overflow")
+	if r.TryWrite(buf.MultiBuffer{b}) {
+		t.Fatal("TryWrite succeeded on full ring")
 	}
-	if !bytes.Equal(readBuf[:n], data2) {
-		t.Fatalf("wrap read data mismatch: got %q, want %q", readBuf[:n], data2)
+	b.Release()
+
+	// Drain all
+	for i := 0; i < 4; i++ {
+		mb, ok := r.TryRead()
+		if !ok {
+			t.Fatalf("TryRead %d failed", i)
+		}
+		buf.ReleaseMulti(mb)
 	}
 }
 
-func TestSPSCRingBufferFull(t *testing.T) {
-	r := NewSPSCRingBuffer(16) // capacity=16
-	data := bytes.Repeat([]byte("F"), 16)
-	n := r.write(data)
-	if n != 16 {
-		t.Fatalf("full write: n=%d, want 16", n)
-	}
-	if r.AvailableWrite() != 0 {
-		t.Fatalf("AvailableWrite()=%d after full, want 0", r.AvailableWrite())
-	}
-	// Write more should return 0.
-	n = r.write([]byte("X"))
-	if n != 0 {
-		t.Fatalf("write on full buffer: n=%d, want 0", n)
+func TestSPSCSlotRingEmpty(t *testing.T) {
+	r := NewSPSCSlotRing(4)
+	_, ok := r.TryRead()
+	if ok {
+		t.Fatal("TryRead succeeded on empty ring")
 	}
 }
 
-func TestSPSCRingBufferEmpty(t *testing.T) {
-	r := NewSPSCRingBuffer(16)
-	buf := make([]byte, 16)
-	n := r.read(buf)
-	if n != 0 {
-		t.Fatalf("read on empty: n=%d, want 0", n)
+func TestSPSCSlotRingBlockingWrite(t *testing.T) {
+	r := NewSPSCSlotRing(4)
+
+	// Fill ring.
+	for i := 0; i < 4; i++ {
+		b := buf.New()
+		b.WriteString("fill")
+		r.TryWrite(buf.MultiBuffer{b})
 	}
-}
 
-func TestSPSCRingBufferBlockingWrite(t *testing.T) {
-	r := NewSPSCRingBuffer(16)
-	// Fill buffer.
-	data := bytes.Repeat([]byte("X"), 16)
-	r.write(data)
-
-	// Blocking Write should eventually complete when reader drains.
-	done := make(chan int)
+	// Blocking Write should complete when reader drains.
+	done := make(chan bool, 1)
 	go func() {
-		n, err := r.Write([]byte("hello"))
-		if err != nil {
-			t.Errorf("blocking Write: %v", err)
-		}
-		done <- n
+		b := buf.New()
+		b.WriteString("blocked")
+		ok := r.Write(buf.MultiBuffer{b})
+		done <- ok
 	}()
 
-	// Let the writer block briefly.
 	time.Sleep(10 * time.Millisecond)
-	// Drain the buffer.
-	buf := make([]byte, 16)
-	r.Read(buf)
+	// Drain one slot.
+	mb, _ := r.Read()
+	buf.ReleaseMulti(mb)
 
 	select {
-	case n := <-done:
-		if n != 5 {
-			t.Fatalf("blocking Write: n=%d, want 5", n)
+	case ok := <-done:
+		if !ok {
+			t.Fatal("blocking Write returned false")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocking Write timed out")
@@ -153,26 +141,29 @@ func TestSPSCRingBufferBlockingWrite(t *testing.T) {
 	r.Close()
 }
 
-func TestSPSCRingBufferBlockingRead(t *testing.T) {
-	r := NewSPSCRingBuffer(16)
+func TestSPSCSlotRingBlockingRead(t *testing.T) {
+	r := NewSPSCSlotRing(4)
 
-	done := make(chan int)
+	done := make(chan string, 1)
 	go func() {
-		buf := make([]byte, 5)
-		n, err := r.Read(buf)
-		if err != nil {
-			t.Errorf("blocking Read: %v", err)
+		mb, ok := r.Read()
+		if !ok {
+			done <- ""
+			return
 		}
-		done <- n
+		done <- mb.String()
+		buf.ReleaseMulti(mb)
 	}()
 
 	time.Sleep(10 * time.Millisecond)
-	r.Write([]byte("hello"))
+	b := buf.New()
+	b.WriteString("wakeup")
+	r.Write(buf.MultiBuffer{b})
 
 	select {
-	case n := <-done:
-		if n != 5 {
-			t.Fatalf("blocking Read: n=%d, want 5", n)
+	case s := <-done:
+		if s != "wakeup" {
+			t.Fatalf("blocking Read: got %q, want %q", s, "wakeup")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocking Read timed out")
@@ -180,63 +171,41 @@ func TestSPSCRingBufferBlockingRead(t *testing.T) {
 	r.Close()
 }
 
-func TestSPSCRingBufferCloseWrite(t *testing.T) {
-	r := NewSPSCRingBuffer(16)
+func TestSPSCSlotRingCloseRead(t *testing.T) {
+	r := NewSPSCSlotRing(4)
 	r.Close()
-	_, err := r.Write([]byte("hello"))
-	if err != io.ErrClosedPipe {
-		t.Fatalf("Write after Close: got %v, want io.ErrClosedPipe", err)
+	_, ok := r.TryRead()
+	if ok {
+		t.Fatal("TryRead succeeded after Close on empty ring")
 	}
 }
 
-func TestSPSCRingBufferCloseRead(t *testing.T) {
-	r := NewSPSCRingBuffer(16)
+func TestSPSCSlotRingCloseReadDrainFirst(t *testing.T) {
+	r := NewSPSCSlotRing(4)
+	b := buf.New()
+	b.WriteString("drain")
+	r.TryWrite(buf.MultiBuffer{b})
 	r.Close()
-	buf := make([]byte, 16)
-	_, err := r.Read(buf)
-	if err != io.EOF {
-		t.Fatalf("Read after Close: got %v, want io.EOF", err)
+
+	mb, ok := r.TryRead()
+	if !ok {
+		t.Fatal("TryRead failed for buffered data after Close")
+	}
+	if mb.String() != "drain" {
+		t.Fatalf("read data: got %q, want %q", mb.String(), "drain")
+	}
+	buf.ReleaseMulti(mb)
+
+	// Next read should fail.
+	_, ok = r.TryRead()
+	if ok {
+		t.Fatal("second TryRead succeeded after Close+drain")
 	}
 }
 
-func TestSPSCRingBufferCloseReadDrainFirst(t *testing.T) {
-	r := NewSPSCRingBuffer(16)
-	r.write([]byte("drain"))
-	r.Close()
-	buf := make([]byte, 16)
-	n, err := r.Read(buf)
-	if err != nil {
-		t.Fatalf("Read of buffered data after Close: %v", err)
-	}
-	if n != 5 || string(buf[:n]) != "drain" {
-		t.Fatalf("Read: n=%d data=%q, want 5 'drain'", n, buf[:n])
-	}
-	// Next read should return EOF.
-	_, err = r.Read(buf)
-	if err != io.EOF {
-		t.Fatalf("second Read after Close: got %v, want io.EOF", err)
-	}
-}
-
-func TestSPSCRingBufferEmptyReadWrite(t *testing.T) {
-	r := NewSPSCRingBuffer(16)
-	n, err := r.Write(nil)
-	if n != 0 || err != nil {
-		t.Fatalf("Write(nil): n=%d err=%v", n, err)
-	}
-	buf := make([]byte, 0)
-	n, err = r.Read(buf)
-	if n != 0 || err != nil {
-		t.Fatalf("Read(empty): n=%d err=%v", n, err)
-	}
-	r.Close()
-}
-
-// --- Concurrency: Single Producer Single Consumer ---
-
-func TestSPSCRingBufferConcurrentTransfer(t *testing.T) {
-	const totalBytes = 1 << 20 // 1 MiB
-	r := NewSPSCRingBuffer(4096)
+func TestSPSCSlotRingConcurrentTransfer(t *testing.T) {
+	const totalItems = 10000
+	r := NewSPSCSlotRing(64)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -244,16 +213,10 @@ func TestSPSCRingBufferConcurrentTransfer(t *testing.T) {
 	// Producer
 	go func() {
 		defer wg.Done()
-		data := bytes.Repeat([]byte("P"), 1024)
-		remaining := totalBytes
-		for remaining > 0 {
-			toWrite := min(1024, remaining)
-			n, err := r.Write(data[:toWrite])
-			if err != nil {
-				t.Errorf("producer Write: %v", err)
-				return
-			}
-			remaining -= n
+		for i := 0; i < totalItems; i++ {
+			b := buf.New()
+			b.WriteString("P")
+			r.Write(buf.MultiBuffer{b})
 		}
 		r.Close()
 	}()
@@ -262,23 +225,29 @@ func TestSPSCRingBufferConcurrentTransfer(t *testing.T) {
 	var totalRead int
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 2048)
 		for {
-			n, err := r.Read(buf)
-			totalRead += n
-			if err == io.EOF {
+			mb, ok := r.Read()
+			if !ok {
 				return
 			}
-			if err != nil {
-				t.Errorf("consumer Read: %v", err)
-				return
-			}
+			totalRead += len(mb)
+			buf.ReleaseMulti(mb)
 		}
 	}()
 
 	wg.Wait()
-	if totalRead != totalBytes {
-		t.Fatalf("transferred %d bytes, want %d", totalRead, totalBytes)
+	if totalRead != totalItems {
+		t.Fatalf("transferred %d items, want %d", totalRead, totalItems)
+	}
+}
+
+func TestSPSCSlotRingDoubleClose(t *testing.T) {
+	r := NewSPSCSlotRing(4)
+	if err := r.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 
@@ -307,87 +276,5 @@ func TestNextPowerOf2(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("nextPowerOf2(%d)=%d, want %d", tt.input, got, tt.expected)
 		}
-	}
-}
-
-// --- Edge Cases ---
-
-func TestSPSCRingBufferNegativeCapacity(t *testing.T) {
-	// After the fix, negative capacity is clamped to minimum (16 bytes).
-	rb := NewSPSCRingBuffer(-1)
-	if rb.capacity != 16 {
-		t.Fatalf("negative capacity: got capacity=%d, want 16", rb.capacity)
-	}
-	// Buffer should be fully functional.
-	n := rb.write([]byte("test"))
-	if n != 4 {
-		t.Fatalf("write on clamped buffer: n=%d, want 4", n)
-	}
-}
-
-func TestSPSCRingBufferWritePartialThenClose(t *testing.T) {
-	// Write some data, close, then read. Should get data then EOF.
-	r := NewSPSCRingBuffer(64)
-	data := []byte("partial data")
-	n, err := r.Write(data)
-	if err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if n != len(data) {
-		t.Fatalf("Write: n=%d, want %d", n, len(data))
-	}
-	r.Close()
-
-	readBuf := make([]byte, 64)
-	n, err = r.Read(readBuf)
-	if err != nil {
-		t.Fatalf("Read after close: %v", err)
-	}
-	if n != len(data) || !bytes.Equal(readBuf[:n], data) {
-		t.Fatalf("Read data: got %q, want %q", readBuf[:n], data)
-	}
-
-	// Next read should return EOF.
-	_, err = r.Read(readBuf)
-	if err != io.EOF {
-		t.Fatalf("second Read: got %v, want io.EOF", err)
-	}
-}
-
-func TestSPSCRingBufferAvailableReadWrite(t *testing.T) {
-	r := NewSPSCRingBuffer(32)
-	if r.AvailableRead() != 0 {
-		t.Fatalf("initial AvailableRead=%d, want 0", r.AvailableRead())
-	}
-	if r.AvailableWrite() != 32 {
-		t.Fatalf("initial AvailableWrite=%d, want 32", r.AvailableWrite())
-	}
-
-	r.write([]byte("12345678")) // 8 bytes
-	if r.AvailableRead() != 8 {
-		t.Fatalf("after write 8: AvailableRead=%d, want 8", r.AvailableRead())
-	}
-	if r.AvailableWrite() != 24 {
-		t.Fatalf("after write 8: AvailableWrite=%d, want 24", r.AvailableWrite())
-	}
-
-	buf := make([]byte, 4)
-	r.read(buf)
-	if r.AvailableRead() != 4 {
-		t.Fatalf("after read 4: AvailableRead=%d, want 4", r.AvailableRead())
-	}
-	if r.AvailableWrite() != 28 {
-		t.Fatalf("after read 4: AvailableWrite=%d, want 28", r.AvailableWrite())
-	}
-	r.Close()
-}
-
-func TestSPSCRingBufferDoubleClose(t *testing.T) {
-	r := NewSPSCRingBuffer(16)
-	if err := r.Close(); err != nil {
-		t.Fatalf("first Close: %v", err)
-	}
-	if err := r.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
 	}
 }
