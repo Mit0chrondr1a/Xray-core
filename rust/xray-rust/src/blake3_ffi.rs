@@ -13,21 +13,23 @@ pub unsafe extern "C" fn xray_blake3_derive_key(
     key: *const u8,
     key_len: usize,
 ) {
-    if out_len == 0 {
-        return;
-    }
-    let ctx = if ctx_len == 0 { &[] } else { slice::from_raw_parts(ctx, ctx_len) };
-    let key = if key_len == 0 { &[] } else { slice::from_raw_parts(key, key_len) };
-    let out = slice::from_raw_parts_mut(out, out_len);
-    let Ok(ctx_str) = std::str::from_utf8(ctx) else {
-        out.fill(0);
-        return;
-    };
+    ffi_catch_void!({
+        if out_len == 0 {
+            return;
+        }
+        let ctx = if ctx_len == 0 { &[] } else { slice::from_raw_parts(ctx, ctx_len) };
+        let key = if key_len == 0 { &[] } else { slice::from_raw_parts(key, key_len) };
+        let out = slice::from_raw_parts_mut(out, out_len);
+        let Ok(ctx_str) = std::str::from_utf8(ctx) else {
+            out.fill(0);
+            return;
+        };
 
-    let mut hasher = blake3::Hasher::new_derive_key(ctx_str);
-    hasher.update(key);
-    let mut output = hasher.finalize_xof();
-    output.fill(out);
+        let mut hasher = blake3::Hasher::new_derive_key(ctx_str);
+        hasher.update(key);
+        let mut output = hasher.finalize_xof();
+        output.fill(out);
+    })
 }
 
 /// Compute BLAKE3 hash of data, producing a 32-byte digest.
@@ -40,18 +42,20 @@ pub unsafe extern "C" fn xray_blake3_sum256(
     data: *const u8,
     data_len: usize,
 ) {
-    if out.is_null() {
-        return;
-    }
-    let data = if data_len == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(data, data_len)
-    };
-    let out = slice::from_raw_parts_mut(out, 32);
+    ffi_catch_void!({
+        if out.is_null() {
+            return;
+        }
+        let data = if data_len == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(data, data_len)
+        };
+        let out = slice::from_raw_parts_mut(out, 32);
 
-    let hash = blake3::hash(data);
-    out.copy_from_slice(hash.as_bytes());
+        let hash = blake3::hash(data);
+        out.copy_from_slice(hash.as_bytes());
+    })
 }
 
 /// Compute BLAKE3 keyed hash (MAC mode) with a 32-byte key.
@@ -66,20 +70,22 @@ pub unsafe extern "C" fn xray_blake3_keyed_hash(
     data: *const u8,
     data_len: usize,
 ) {
-    if out_len == 0 || key.is_null() {
-        return;
-    }
-    let key_slice = slice::from_raw_parts(key, 32);
-    let key: [u8; 32] = key_slice.try_into().unwrap();
-    let data = if data_len == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(data, data_len)
-    };
-    let out = slice::from_raw_parts_mut(out, out_len);
+    ffi_catch_void!({
+        if out_len == 0 || key.is_null() {
+            return;
+        }
+        let key_slice = slice::from_raw_parts(key, 32);
+        let key: [u8; 32] = key_slice.try_into().unwrap();
+        let data = if data_len == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(data, data_len)
+        };
+        let out = slice::from_raw_parts_mut(out, out_len);
 
-    let mut hasher = blake3::Hasher::new_keyed(&key);
-    hasher.update(data);
-    let mut output = hasher.finalize_xof();
-    output.fill(out);
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(data);
+        let mut output = hasher.finalize_xof();
+        output.fill(out);
+    })
 }
