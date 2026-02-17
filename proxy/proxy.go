@@ -400,22 +400,16 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return w.Writer.WriteMultiBuffer(mb)
 }
 
-// IsCompleteRecord Is complete tls data record
+// IsCompleteRecord checks if the MultiBuffer contains complete TLS application
+// data records. Scans across buffer segments in-place without copying.
 func IsCompleteRecord(buffer buf.MultiBuffer) bool {
-	b := make([]byte, buffer.Len())
-	if buffer.Copy(b) != int(buffer.Len()) {
-		return false
-	}
-	var headerLen int = 5
-	var recordLen int
+	s := newMultiBufferScanner(buffer)
+	headerLen := 5
+	recordLen := 0
 
-	totalLen := len(b)
-	i := 0
-	for i < totalLen {
-		// record header: 0x17 0x3 0x3 + 2 bytes length
+	for s.remaining() > 0 {
 		if headerLen > 0 {
-			data := b[i]
-			i++
+			data := s.readByte()
 			switch headerLen {
 			case 5:
 				if data != 0x17 {
@@ -436,22 +430,85 @@ func IsCompleteRecord(buffer buf.MultiBuffer) bool {
 			}
 			headerLen--
 		} else if recordLen > 0 {
-			remaining := totalLen - i
-			if remaining < recordLen {
+			if s.remaining() < recordLen {
 				return false
-			} else {
-				i += recordLen
-				recordLen = 0
-				headerLen = 5
 			}
+			s.skip(recordLen)
+			recordLen = 0
+			headerLen = 5
 		} else {
 			return false
 		}
 	}
-	if headerLen == 5 && recordLen == 0 {
-		return true
+	return headerLen == 5 && recordLen == 0
+}
+
+// multiBufferScanner walks a MultiBuffer's segments without copying.
+type multiBufferScanner struct {
+	mb     buf.MultiBuffer
+	bufIdx int   // current buffer index
+	offset int32 // offset within current buffer
+	total  int   // total remaining bytes
+}
+
+func newMultiBufferScanner(mb buf.MultiBuffer) multiBufferScanner {
+	total := 0
+	for _, b := range mb {
+		if b != nil {
+			total += int(b.Len())
+		}
 	}
-	return false
+	s := multiBufferScanner{mb: mb, total: total}
+	s.advance() // skip nil/empty leading buffers
+	return s
+}
+
+// advance moves past nil/empty buffers.
+func (s *multiBufferScanner) advance() {
+	for s.bufIdx < len(s.mb) {
+		b := s.mb[s.bufIdx]
+		if b != nil && s.offset < b.Len() {
+			return
+		}
+		s.bufIdx++
+		s.offset = 0
+	}
+}
+
+func (s *multiBufferScanner) remaining() int {
+	return s.total
+}
+
+func (s *multiBufferScanner) readByte() byte {
+	if s.bufIdx >= len(s.mb) {
+		return 0
+	}
+	b := s.mb[s.bufIdx]
+	val := b.Byte(s.offset)
+	s.offset++
+	s.total--
+	if s.offset >= b.Len() {
+		s.bufIdx++
+		s.offset = 0
+		s.advance()
+	}
+	return val
+}
+
+func (s *multiBufferScanner) skip(n int) {
+	s.total -= n
+	for n > 0 && s.bufIdx < len(s.mb) {
+		b := s.mb[s.bufIdx]
+		avail := int(b.Len() - s.offset)
+		if avail > n {
+			s.offset += int32(n)
+			return
+		}
+		n -= avail
+		s.bufIdx++
+		s.offset = 0
+		s.advance()
+	}
 }
 
 // ReshapeMultiBuffer prepare multi buffer for padding structure (max 21 bytes)
@@ -517,7 +574,12 @@ func xtlsPaddingRust(b *buf.Buffer, command byte, userUUID *[]byte, longPadding 
 	var seeds [4]uint32
 	copy(seeds[:], testseed)
 
-	outBuf := buf.New()
+	var outBuf *buf.Buffer
+	if arena := buf.ArenaFromContext(ctx); arena != nil {
+		outBuf = arena.NewBuffer()
+	} else {
+		outBuf = buf.New()
+	}
 	// Extend to full capacity to get a writable slice, then resize after.
 	outBytes := outBuf.Extend(buf.Size)
 
@@ -566,7 +628,12 @@ func xtlsPaddingGoFallback(b *buf.Buffer, command byte, userUUID *[]byte, longPa
 	if paddingLen > buf.Size-21-contentLen {
 		paddingLen = buf.Size - 21 - contentLen
 	}
-	newbuffer := buf.New()
+	var newbuffer *buf.Buffer
+	if arena := buf.ArenaFromContext(ctx); arena != nil {
+		newbuffer = arena.NewBuffer()
+	} else {
+		newbuffer = buf.New()
+	}
 	if userUUID != nil {
 		newbuffer.Write(*userUUID)
 		*userUUID = nil
@@ -608,7 +675,12 @@ func XtlsUnpadding(b *buf.Buffer, s *TrafficState, isUplink bool, ctx context.Co
 			return b
 		}
 	}
-	newbuffer := buf.New()
+	var newbuffer *buf.Buffer
+	if arena := buf.ArenaFromContext(ctx); arena != nil {
+		newbuffer = arena.NewBuffer()
+	} else {
+		newbuffer = buf.New()
+	}
 	for b.Len() > 0 {
 		if *remainingCommand > 0 {
 			data, err := b.ReadByte()

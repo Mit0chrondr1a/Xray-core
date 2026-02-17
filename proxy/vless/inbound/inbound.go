@@ -606,6 +606,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 
 	trafficState := proxy.NewTrafficState(userSentID)
+	// Create arena for Vision padding phase buf.New() calls (~8 packets).
+	// After padding, Vision enters kernel splice mode with no further allocations.
+	if requestAddons.Flow == vless.XRV {
+		arena := buf.NewArena(8 * buf.Size)
+		ctx = buf.ContextWithArena(ctx, arena)
+		defer arena.Close()
+	}
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
 	if requestAddons.Flow == vless.XRV {
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, ctx, connection, input, rawInput, nil)
