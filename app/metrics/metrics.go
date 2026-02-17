@@ -128,7 +128,14 @@ func (p *MetricsHandler) Start() error {
 			return err
 		}
 		p.tcpListener = TCPlistener
-		p.tcpServer = &http.Server{Handler: p.mux}
+		p.tcpServer = &http.Server{
+			Handler:           p.mux,
+			ReadHeaderTimeout: 4 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      60 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    1 << 20,
+		}
 		errors.LogInfo(context.Background(), "Metrics server listening on ", p.listen)
 
 		go func() {
@@ -143,7 +150,14 @@ func (p *MetricsHandler) Start() error {
 		done:   done.New(),
 	}
 
-	p.outboundServer = &http.Server{Handler: p.mux}
+	p.outboundServer = &http.Server{
+		Handler:           p.mux,
+		ReadHeaderTimeout: 4 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	go func() {
 		if err := p.outboundServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			errors.LogErrorInner(context.Background(), err, "failed to start metrics server")
