@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	goreality "github.com/xtls/reality"
@@ -20,11 +21,12 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
-// maxConcurrentConns is the maximum number of concurrent connection-handling
-// goroutines per TCP listener.  This prevents unbounded goroutine growth
-// during a connection flood while remaining generous for high-throughput
-// proxy workloads.
-const maxConcurrentConns = 32768
+// maxConcurrentHandshakes is the maximum number of concurrent TLS/REALITY
+// handshakes per TCP listener. Once the handshake completes, the semaphore
+// is released so it only gates CPU-intensive handshake work, not session
+// lifetime. The worker-level semaphore in app/proxyman/inbound gates total
+// concurrent sessions.
+const maxConcurrentHandshakes = 32768
 
 // Listener is an internet.Listener that listens for TCP connections.
 type Listener struct {
@@ -75,7 +77,7 @@ func extractIP(addr net.Addr) net.IP {
 func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
 	l := &Listener{
 		addConn:       handler,
-		connSemaphore: make(chan struct{}, maxConcurrentConns),
+		connSemaphore: make(chan struct{}, maxConcurrentHandshakes),
 	}
 	tcpSettings := streamSettings.ProtocolSettings.(*Config)
 	l.config = tcpSettings
@@ -159,19 +161,29 @@ func (v *Listener) keepAccepting() {
 		select {
 		case v.connSemaphore <- struct{}{}:
 		default:
-			errors.LogWarning(context.Background(), "TCP connection limit reached (", maxConcurrentConns, "), rejecting connection from ", conn.RemoteAddr())
+			errors.LogWarning(context.Background(), "TCP connection limit reached (", maxConcurrentHandshakes, "), rejecting connection from ", conn.RemoteAddr())
 			_ = conn.Close()
 			continue
 		}
 		go func(rawConn net.Conn) {
-			defer func() { <-v.connSemaphore }()
+			var handshakeReleased atomic.Bool
+			releaseHandshake := func() {
+				if handshakeReleased.CompareAndSwap(false, true) {
+					<-v.connSemaphore
+				}
+			}
+			defer releaseHandshake()
+			// conn tracks the current connection — starts as rawConn, may be
+			// reassigned to a TLS/REALITY wrapper during handshake. Declared
+			// before the panic handler so the closure captures the variable
+			// (not the initial value), ensuring we close the correct object.
+			conn := rawConn
 			defer func() {
 				if r := recover(); r != nil {
 					errors.LogError(context.Background(), "panic in TCP listener handler: ", r)
-					_ = rawConn.Close()
+					_ = conn.Close()
 				}
 			}()
-			conn := rawConn
 			if v.tlsConfig != nil {
 				if native.Available() && v.tlsXrayConfig != nil {
 					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
@@ -191,23 +203,25 @@ func (v *Listener) keepAccepting() {
 					conn = rustConn
 				} else {
 					tlsConn := tls.Server(conn, v.tlsConfig)
-					if err := tlsConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+					// Reassign conn immediately so the panic handler's defer
+					// closes the TLS wrapper (not just rawConn) on panic.
+					conn = tlsConn
+					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 						errors.LogWarningInner(context.Background(), err, "failed to set TLS handshake deadline on accepted connection")
-						_ = tlsConn.Close()
+						_ = conn.Close()
 						return
 					}
 					hsCtx, cancel := context.WithTimeout(context.Background(), tlsHandshakeTimeout)
-					hsErr := tlsConn.(*tls.Conn).HandshakeAndEnableKTLS(hsCtx)
+					hsErr := conn.(*tls.Conn).HandshakeAndEnableKTLS(hsCtx)
 					cancel()
-					if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+					if err := conn.SetDeadline(time.Time{}); err != nil {
 						errors.LogWarningInner(context.Background(), err, "failed to clear TLS handshake deadline on accepted connection")
 					}
 					if hsErr != nil {
 						errors.LogWarningInner(context.Background(), hsErr, "failed TLS handshake on accepted connection")
-						_ = tlsConn.Close()
+						_ = conn.Close()
 						return
 					}
-					conn = tlsConn
 				}
 			} else if v.realityConfig != nil {
 				rustDone := false
@@ -260,6 +274,12 @@ func (v *Listener) keepAccepting() {
 					conn = realityConn
 				}
 			}
+
+			// Release handshake semaphore BEFORE session begins.
+			// The semaphore now gates concurrent TLS handshakes (CPU-intensive),
+			// not session lifetime. The worker semaphore gates total sessions.
+			releaseHandshake()
+
 			if v.authConfig != nil {
 				conn = v.authConfig.Server(conn)
 			}
