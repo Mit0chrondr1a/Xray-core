@@ -59,7 +59,7 @@ func ApplyECH(c *Config, config *tls.Config) error {
 		case "":
 			ECHForceQuery = "none" // default to none
 		default:
-			panic("Invalid ECHForceQuery: " + c.EchForceQuery)
+			return errors.New("invalid ECHForceQuery value: ", c.EchForceQuery, " (must be \"none\", \"half\", or \"full\")")
 		}
 		defer func() {
 			// if failed to get ECHConfig, use an invalid one to make connection fail

@@ -80,18 +80,18 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 	return errors.New("failed to parse name server: ", string(data))
 }
 
-func toDomainMatchingType(t router.Domain_Type) dns.DomainMatchingType {
+func toDomainMatchingType(t router.Domain_Type) (dns.DomainMatchingType, error) {
 	switch t {
 	case router.Domain_Domain:
-		return dns.DomainMatchingType_Subdomain
+		return dns.DomainMatchingType_Subdomain, nil
 	case router.Domain_Full:
-		return dns.DomainMatchingType_Full
+		return dns.DomainMatchingType_Full, nil
 	case router.Domain_Plain:
-		return dns.DomainMatchingType_Keyword
+		return dns.DomainMatchingType_Keyword, nil
 	case router.Domain_Regex:
-		return dns.DomainMatchingType_Regex
+		return dns.DomainMatchingType_Regex, nil
 	default:
-		panic("unknown domain type")
+		return 0, errors.New("unknown domain type: ", t)
 	}
 }
 
@@ -110,8 +110,12 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 		}
 
 		for _, pd := range parsedDomain {
+			matchType, err := toDomainMatchingType(pd.Type)
+			if err != nil {
+				return nil, err
+			}
 			domains = append(domains, &dns.NameServer_PriorityDomain{
-				Type:   toDomainMatchingType(pd.Type),
+				Type:   matchType,
 				Domain: pd.Value,
 			})
 		}

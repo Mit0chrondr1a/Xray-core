@@ -1,6 +1,7 @@
 package json
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -126,7 +127,7 @@ func (v *Reader) Read(b []byte) (int, error) {
 				v.state = StateMultilineComment
 			}
 		default:
-			panic("Unknown state.")
+			return 0, fmt.Errorf("json reader: unknown parser state %d", v.state)
 		}
 	}
 	return len(p), nil
