@@ -30,16 +30,18 @@ var _ Interface = (*Conn)(nil)
 
 type Conn struct {
 	*tls.Conn
-	ktls         KTLSState
-	isClient     bool
-	capture      *keyCapture
-	writeRecords atomic.Uint64
+	ktls             KTLSState
+	isClient         bool
+	capture          *keyCapture
+	writeRecords     atomic.Uint64
+	rotationFailures atomic.Uint32
 }
 
 const (
-	tlsCloseTimeout    = 250 * time.Millisecond
-	maxRecordPayload   = 16384    // TLS max record payload size
-	keyUpdateThreshold = 1 << 24  // ~16.7M records, conservative limit below AES-GCM 2^24.5
+	tlsCloseTimeout      = 250 * time.Millisecond
+	maxRecordPayload     = 16384    // TLS max record payload size
+	keyUpdateThreshold   = 1 << 24  // ~16.7M records, conservative limit below AES-GCM 2^24.5
+	maxRotationFailures  = 3        // close connection after this many consecutive kTLS key rotation failures
 )
 
 // Read overrides tls.Conn.Read. When kTLS RX is active, reads bypass the
@@ -72,7 +74,14 @@ func (c *Conn) Write(b []byte) (int, error) {
 				if c.writeRecords.CompareAndSwap(total, 0) {
 					if err := c.ktls.keyUpdateHandler.InitiateUpdate(); err != nil {
 						c.writeRecords.Add(total) // restore so next writer retries
-						errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
+						if c.rotationFailures.Add(1) >= maxRotationFailures {
+							errors.LogError(context.Background(), "ktls: TX key rotation failed ", maxRotationFailures, " times, closing connection: ", err)
+							c.Conn.NetConn().Close()
+						} else {
+							errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
+						}
+					} else {
+						c.rotationFailures.Store(0)
 					}
 				}
 			}
@@ -263,16 +272,17 @@ func GeneraticUClient(c net.Conn, config *tls.Config) *utls.UConn {
 // The kernel handles TLS encryption/decryption via kTLS, so Read/Write go directly
 // to the underlying connection.
 type RustConn struct {
-	rawConn      net.Conn
-	state        *native.TlsStateHandle
-	ktls         KTLSState
-	alpn         string
-	version      uint16
-	cipher       uint16
-	serverName   string
-	writeRecords atomic.Uint64
-	drainedData  []byte
-	drainedOff   int
+	rawConn          net.Conn
+	state            *native.TlsStateHandle
+	ktls             KTLSState
+	alpn             string
+	version          uint16
+	cipher           uint16
+	serverName       string
+	writeRecords     atomic.Uint64
+	rotationFailures atomic.Uint32
+	drainedData      []byte
+	drainedOff       int
 }
 
 var _ Interface = (*RustConn)(nil)
@@ -309,7 +319,14 @@ func (c *RustConn) Write(b []byte) (int, error) {
 			if c.writeRecords.CompareAndSwap(total, 0) {
 				if err := c.ktls.keyUpdateHandler.InitiateUpdate(); err != nil {
 					c.writeRecords.Add(total) // restore so next writer retries
-					errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
+					if c.rotationFailures.Add(1) >= maxRotationFailures {
+						errors.LogError(context.Background(), "ktls: TX key rotation failed ", maxRotationFailures, " times, closing connection: ", err)
+						c.rawConn.Close()
+					} else {
+						errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
+					}
+				} else {
+					c.rotationFailures.Store(0)
 				}
 			}
 		}
