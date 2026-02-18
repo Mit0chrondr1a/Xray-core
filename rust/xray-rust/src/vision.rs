@@ -163,6 +163,9 @@ pub struct VisionUnpadState {
     pub current_command: i32,   // init: 0
 }
 
+// Compile-time struct size assertion: Go and C sides must agree on layout.
+const _: () = assert!(core::mem::size_of::<VisionUnpadState>() == 16);
+
 /// Remove Vision padding and extract content.
 ///
 /// # Arguments

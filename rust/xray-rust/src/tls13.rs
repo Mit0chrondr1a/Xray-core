@@ -934,14 +934,14 @@ pub extern "C" fn xray_tls13_handshake(
     cert_buf_cap: usize,
     out: *mut XrayTls13Result,
 ) -> i32 {
-    if out.is_null() { return -1; }
-    if client_hello_ptr.is_null() || ecdh_privkey_ptr.is_null() {
-        let out = unsafe { &mut *out };
-        *out = XrayTls13Result::new();
-        out.set_error(-1, "null input pointer");
-        return -1;
-    }
     ffi_catch_i32!({
+        if out.is_null() { return -1; }
+        if client_hello_ptr.is_null() || ecdh_privkey_ptr.is_null() {
+            let out = unsafe { &mut *out };
+            *out = XrayTls13Result::new();
+            out.set_error(-1, "null input pointer");
+            return -1;
+        }
         let out = unsafe { &mut *out };
         *out = XrayTls13Result::new();
 
@@ -1021,13 +1021,13 @@ pub extern "C" fn xray_tls13_install_ktls(
     out_ktls_tx: *mut bool,
     out_ktls_rx: *mut bool,
 ) -> i32 {
-    if out_ktls_tx.is_null() || out_ktls_rx.is_null() {
-        return -1;
-    }
-    if client_secret_ptr.is_null() || server_secret_ptr.is_null() {
-        return -1;
-    }
     ffi_catch_i32!({
+        if out_ktls_tx.is_null() || out_ktls_rx.is_null() {
+            return -1;
+        }
+        if client_secret_ptr.is_null() || server_secret_ptr.is_null() {
+            return -1;
+        }
         let client_secret = unsafe { std::slice::from_raw_parts(client_secret_ptr, client_secret_len) };
         let server_secret = unsafe { std::slice::from_raw_parts(server_secret_ptr, server_secret_len) };
         let cs = cipher_suite;

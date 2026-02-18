@@ -1182,14 +1182,14 @@ pub extern "C" fn xray_tls_handshake(
     _is_client: bool,
     out: *mut XrayTlsResult,
 ) -> i32 {
-    if out.is_null() { return -1; }
-    if cfg.is_null() {
-        let out = unsafe { &mut *out };
-        *out = XrayTlsResult::new();
-        out.set_error(-1, "null config pointer");
-        return -1;
-    }
     ffi_catch_i32!({
+        if out.is_null() { return -1; }
+        if cfg.is_null() {
+            let out = unsafe { &mut *out };
+            *out = XrayTlsResult::new();
+            out.set_error(-1, "null config pointer");
+            return -1;
+        }
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
 

@@ -1408,14 +1408,14 @@ pub extern "C" fn xray_reality_client_connect(
     cfg: *const RealityConfig,
     out: *mut XrayTlsResult,
 ) -> i32 {
-    if out.is_null() { return -1; }
-    if cfg.is_null() || client_hello_ptr.is_null() || ecdh_privkey_ptr.is_null() {
-        let out = unsafe { &mut *out };
-        *out = XrayTlsResult::new();
-        out.set_error(-1, "null input pointer");
-        return -1;
-    }
     ffi_catch_i32!({
+        if out.is_null() { return -1; }
+        if cfg.is_null() || client_hello_ptr.is_null() || ecdh_privkey_ptr.is_null() {
+            let out = unsafe { &mut *out };
+            *out = XrayTlsResult::new();
+            out.set_error(-1, "null input pointer");
+            return -1;
+        }
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
 
@@ -1500,14 +1500,14 @@ pub extern "C" fn xray_reality_server_accept(
     cfg: *const RealityConfig,
     out: *mut XrayTlsResult,
 ) -> i32 {
-    if out.is_null() { return -1; }
-    if cfg.is_null() {
-        let out = unsafe { &mut *out };
-        *out = XrayTlsResult::new();
-        out.set_error(-1, "null config pointer");
-        return -1;
-    }
     ffi_catch_i32!({
+        if out.is_null() { return -1; }
+        if cfg.is_null() {
+            let out = unsafe { &mut *out };
+            *out = XrayTlsResult::new();
+            out.set_error(-1, "null config pointer");
+            return -1;
+        }
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
 
@@ -1559,14 +1559,14 @@ pub extern "C" fn xray_reality_server_handshake(
     cfg: *const RealityConfig,
     out: *mut XrayTlsResult,
 ) -> i32 {
-    if out.is_null() { return -1; }
-    if cfg.is_null() {
-        let out = unsafe { &mut *out };
-        *out = XrayTlsResult::new();
-        out.set_error(-1, "null config pointer");
-        return -1;
-    }
     ffi_catch_i32!({
+        if out.is_null() { return -1; }
+        if cfg.is_null() {
+            let out = unsafe { &mut *out };
+            *out = XrayTlsResult::new();
+            out.set_error(-1, "null config pointer");
+            return -1;
+        }
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
         let cfg = unsafe { &*cfg };
