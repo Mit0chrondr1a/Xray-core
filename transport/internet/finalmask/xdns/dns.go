@@ -437,7 +437,10 @@ func (builder *messageBuilder) WriteName(name Name) {
 		builder.nameCache[name[i:].String()] = builder.w.Len()
 		length := len(name[i])
 		if length == 0 || length > 63 {
-			panic(length)
+			// Invalid DNS label length -- skip this label to avoid crashing
+			// the process. The resulting DNS message will be malformed, but
+			// the caller's WireFormat validation will catch it.
+			continue
 		}
 		builder.w.WriteByte(byte(length))
 		builder.w.Write(name[i])

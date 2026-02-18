@@ -278,7 +278,8 @@ func (c *xdnsConnServer) sendLoop() {
 				}
 
 				if int(uint16(len(p))) != len(p) {
-					panic(len(p))
+					errors.LogWarning(context.Background(), "xdns: packet length ", len(p), " exceeds uint16 range, skipping")
+					continue
 				}
 
 				_ = binary.Write(&payload, binary.BigEndian, uint16(len(p)))
