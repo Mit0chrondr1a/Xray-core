@@ -6,7 +6,6 @@ package splithttp
 import (
 	"container/heap"
 	"io"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -41,19 +40,30 @@ func NewUploadQueue(maxPackets int) *uploadQueue {
 
 func (h *uploadQueue) Push(p Packet) error {
 	h.writeCloseMutex.Lock()
-	defer h.writeCloseMutex.Unlock()
 
 	if h.closed.Load() {
+		h.writeCloseMutex.Unlock()
 		return errors.New("packet queue closed")
 	}
 	if h.nomore {
+		h.writeCloseMutex.Unlock()
 		return errors.New("h.reader already exists")
 	}
 	if p.Reader != nil {
 		h.nomore = true
 	}
-	h.pushedPackets <- p
-	return nil
+	// Release the mutex BEFORE the channel send to prevent deadlock.
+	// If the channel is full, a blocking send while holding the mutex would
+	// prevent Close() from ever acquiring the mutex and draining the channel.
+	h.writeCloseMutex.Unlock()
+
+	select {
+	case h.pushedPackets <- p:
+		return nil
+	default:
+		// Channel is full -- backpressure. Non-blocking to avoid deadlock.
+		return errors.New("packet queue is full")
+	}
 }
 
 func (h *uploadQueue) Close() error {
@@ -62,8 +72,11 @@ func (h *uploadQueue) Close() error {
 
 	if !h.closed.Load() {
 		h.closed.Store(true)
-		runtime.Gosched() // hope Read() gets the packet
-	f:
+		// Drain any buffered packets from the channel before closing it.
+		// Push() releases the mutex before sending (non-blocking select), so
+		// there is no deadlock risk here. We drain in a loop to collect any
+		// packets that were enqueued before we set closed=true.
+	drain:
 		for {
 			select {
 			case p := <-h.pushedPackets:
@@ -74,7 +87,7 @@ func (h *uploadQueue) Close() error {
 					h.reader = p.Reader
 				}
 			default:
-				break f
+				break drain
 			}
 		}
 		close(h.pushedPackets)
@@ -85,6 +98,9 @@ func (h *uploadQueue) Close() error {
 	return nil
 }
 
+// Read reassembles packets in sequence order. It is NOT goroutine-safe:
+// exactly one goroutine (the GET handler) must call Read for a given session.
+// This single-reader invariant is guaranteed by the XHTTP protocol design.
 func (h *uploadQueue) Read(b []byte) (int, error) {
 	if h.reader != nil {
 		return h.reader.Read(b)

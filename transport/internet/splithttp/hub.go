@@ -224,6 +224,11 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 				referrer := request.Header.Get("Referer")
 				if referrer != "" && scStreamUpServerSecs.To > 0 {
 					go func() {
+						defer func() {
+							if r := recover(); r != nil {
+								errors.LogError(context.Background(), "panic in XHTTP SSE padding goroutine: ", r)
+							}
+						}()
 						for {
 							_, err := httpSC.Write(bytes.Repeat([]byte{'X'}, int(h.config.GetNormalizedXPaddingBytes().rand())))
 							if err != nil {
@@ -360,7 +365,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		}
 
 		writer.WriteHeader(http.StatusOK)
-		writer.(http.Flusher).Flush()
+		if f, ok := writer.(http.Flusher); ok {
+			f.Flush()
+		}
 
 		httpSC := &httpServerConn{
 			Instance:       done.New(),
@@ -407,7 +414,9 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
 	}
 	n, err := c.ResponseWriter.Write(b)
 	if err == nil {
-		c.ResponseWriter.(http.Flusher).Flush()
+		if f, ok := c.ResponseWriter.(http.Flusher); ok {
+			f.Flush()
+		}
 	}
 	return n, err
 }
