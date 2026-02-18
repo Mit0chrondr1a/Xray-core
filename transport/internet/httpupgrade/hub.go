@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -32,6 +33,8 @@ func (s *server) Addr() net.Addr {
 }
 
 func (s *server) Handle(conn net.Conn) (stat.Connection, error) {
+	// Set a read deadline to prevent slowloris attacks on the HTTP upgrade handshake
+	conn.SetReadDeadline(time.Now().Add(4 * time.Second))
 	connReader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(connReader)
 	if err != nil {
@@ -70,6 +73,8 @@ func (s *server) Handle(conn net.Conn) (stat.Connection, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	// Clear the read deadline after successful upgrade handshake
+	conn.SetReadDeadline(time.Time{})
 
 	var forwardedAddrs []net.Address
 	if s.socketSettings != nil && len(s.socketSettings.TrustedXForwardedFor) > 0 {

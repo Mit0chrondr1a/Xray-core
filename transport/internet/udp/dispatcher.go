@@ -34,7 +34,7 @@ func (c *connEntry) Close() error {
 
 func (c *connEntry) terminate() {
 	if c.closed {
-		panic("terminate called more than once")
+		return // already terminated; ignore duplicate call
 	}
 	c.closed = true
 	c.cancel()

@@ -20,8 +20,17 @@ const (
 
 var (
 	maxUDPPayload     = 1280 - 40 - 8
-	maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload)
+	maxEncodedPayload int
 )
+
+func init() {
+	var err error
+	maxEncodedPayload, err = computeMaxEncodedPayload(maxUDPPayload)
+	if err != nil {
+		maxEncodedPayload = 0
+		errors.LogError(context.Background(), "xdns: failed to compute max encoded payload: ", err)
+	}
+}
 
 func clientIDToAddr(clientID [8]byte) *net.UDPAddr {
 	ip := make(net.IP, 16)
@@ -492,7 +501,7 @@ func responseFor(query *Message, domain Name) (*Message, []byte) {
 	return resp, payload
 }
 
-func computeMaxEncodedPayload(limit int) int {
+func computeMaxEncodedPayload(limit int) (int, error) {
 	maxLengthName, err := NewName([][]byte{
 		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
 		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
@@ -500,7 +509,7 @@ func computeMaxEncodedPayload(limit int) int {
 		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
 	})
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
 	{
 		n := 0
@@ -509,7 +518,7 @@ func computeMaxEncodedPayload(limit int) int {
 		}
 		n += 1
 		if n != 255 {
-			panic("computeMaxEncodedPayload n != 255")
+			return 0, errors.New("computeMaxEncodedPayload: expected n=255, got ", n)
 		}
 	}
 
@@ -555,7 +564,7 @@ func computeMaxEncodedPayload(limit int) int {
 		resp.Answer[0].Data = EncodeRDataTXT(make([]byte, mid))
 		buf, err := resp.WireFormat()
 		if err != nil {
-			panic(err)
+			return 0, err
 		}
 		if len(buf) <= limit {
 			low = mid
@@ -564,5 +573,5 @@ func computeMaxEncodedPayload(limit int) int {
 		}
 	}
 
-	return low
+	return low, nil
 }

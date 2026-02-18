@@ -37,7 +37,7 @@ var logHandler syncHandler
 // RegisterHandler registers a new handler as current log handler. Previous registered handler will be discarded.
 func RegisterHandler(handler Handler) {
 	if handler == nil {
-		panic("Log handler is nil")
+		return // silently ignore nil handler rather than crashing the process
 	}
 	logHandler.Set(handler)
 }

@@ -3,6 +3,7 @@ package tls
 import (
 	"context"
 	gotls "crypto/tls"
+	"fmt"
 	"net"
 	"net/url"
 	"strconv"
@@ -87,9 +88,9 @@ func (c *grpcUtls) ClientHandshake(ctx context.Context, authority string, rawCon
 	return conn, tlsInfo, nil
 }
 
-// ServerHandshake will always panic. We don't support running uTLS as server.
-func (c *grpcUtls) ServerHandshake(net.Conn) (net.Conn, credentials.AuthInfo, error) {
-	panic("not available!")
+// ServerHandshake is not supported for uTLS (client-only). Returns an error.
+func (c *grpcUtls) ServerHandshake(conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	return nil, nil, fmt.Errorf("uTLS server handshake is not supported")
 }
 
 func (c *grpcUtls) Clone() credentials.TransportCredentials {

@@ -269,7 +269,7 @@ func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]b
 			return nil, 0, err
 		}
 		defer resp.Body.Close()
-		respBody, err := io.ReadAll(resp.Body)
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16)) // 64KB cap for DNS response
 		if err != nil {
 			return nil, 0, err
 		}

@@ -50,9 +50,8 @@ func SubContextFromMuxInbound(ctx context.Context) context.Context {
 	newContent := Content{}
 	if content != nil {
 		newContent = *content
-		if content.Attributes != nil {
-			panic("content.Attributes != nil")
-		}
+		// Clear attributes for sub-context; do not inherit mux parent's attributes
+		newContent.Attributes = nil
 	}
 	return ContextWithContent(ContextWithOutbounds(ctx, newOutbounds), &newContent)
 }

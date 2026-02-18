@@ -150,6 +150,9 @@ func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSet
 			socketSettings: streamSettings.SocketSettings,
 		},
 		ReadHeaderTimeout: time.Second * 4,
+		ReadTimeout:       time.Second * 15,
+		WriteTimeout:      time.Second * 60,
+		IdleTimeout:       time.Second * 120,
 		MaxHeaderBytes:    8192,
 	}
 

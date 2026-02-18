@@ -76,7 +76,7 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		}
 		defer resp.Body.Close()
 
-		issuerBytes, errC := io.ReadAll(resp.Body)
+		issuerBytes, errC := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB cap
 		if errC != nil {
 			return nil, errors.New(errC)
 		}
@@ -100,7 +100,7 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		return nil, errors.New(err)
 	}
 	defer req.Body.Close()
-	ocspResBytes, err := io.ReadAll(req.Body)
+	ocspResBytes, err := io.ReadAll(io.LimitReader(req.Body, 1<<20)) // 1MB cap
 	if err != nil {
 		return nil, errors.New(err)
 	}

@@ -357,7 +357,7 @@ func (r *RandCarrier) verifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509
 			CAs = x509.NewCertPool()
 			CAs.AddCert(verifiedCert)
 		default:
-			panic("impossible pinnedPeerCertSha256 verify result")
+			return errors.New("unexpected pinnedPeerCertSha256 verify result: ", verifyResult)
 		}
 	}
 
