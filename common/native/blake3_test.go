@@ -36,6 +36,25 @@ func TestVisionFilterStateLayout(t *testing.T) {
 	}
 }
 
+func TestVisionUnpadStateLayout(t *testing.T) {
+	var s VisionUnpadState
+	if got := unsafe.Sizeof(s); got != 16 {
+		t.Fatalf("VisionUnpadState size = %d, want 16", got)
+	}
+	if got := unsafe.Offsetof(s.RemainingCommand); got != 0 {
+		t.Fatalf("RemainingCommand offset = %d, want 0", got)
+	}
+	if got := unsafe.Offsetof(s.RemainingContent); got != 4 {
+		t.Fatalf("RemainingContent offset = %d, want 4", got)
+	}
+	if got := unsafe.Offsetof(s.RemainingPadding); got != 8 {
+		t.Fatalf("RemainingPadding offset = %d, want 8", got)
+	}
+	if got := unsafe.Offsetof(s.CurrentCommand); got != 12 {
+		t.Fatalf("CurrentCommand offset = %d, want 12", got)
+	}
+}
+
 func TestBlake3DeriveKeyInvalidUTF8Context(t *testing.T) {
 	ctx := string([]byte{0xff, 0xfe, 'x'})
 	key := []byte("test-key-material")

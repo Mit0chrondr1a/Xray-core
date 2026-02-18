@@ -882,8 +882,14 @@ func (h *IpSetHandle) release() {
 }
 
 // IpSetAddPrefix adds a CIDR prefix. ipBytes must be 4 (IPv4) or 16 (IPv6) bytes.
+// prefixBits must be 0-32 for IPv4 or 0-128 for IPv6.
 func IpSetAddPrefix(h *IpSetHandle, ipBytes []byte, prefixBits int) {
 	if h == nil || h.ptr == nil || len(ipBytes) == 0 {
+		return
+	}
+	// Guard against silent truncation: Go int -> C uint8_t.
+	// Max valid prefix is 128 (IPv6). Reject out-of-range values before the cast.
+	if prefixBits < 0 || prefixBits > 128 {
 		return
 	}
 	C.xray_ipset_add_prefix(h.ptr,
