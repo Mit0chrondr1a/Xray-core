@@ -45,6 +45,7 @@ type httpSession struct {
 	// after the client connects, this becomes "done" and the session lives as
 	// long as the GET request.
 	isFullyConnected *done.Instance
+	reaperTimer      *time.Timer
 }
 
 func (h *requestHandler) upsertSession(sessionId string) *httpSession {
@@ -70,19 +71,12 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 
 	h.sessions.Store(sessionId, s)
 
-	shouldReap := done.New()
-	go func() {
-		time.Sleep(30 * time.Second)
-		shouldReap.Close()
-	}()
-	go func() {
-		select {
-		case <-shouldReap.Wait():
+	s.reaperTimer = time.AfterFunc(30*time.Second, func() {
+		if !s.isFullyConnected.Done() {
 			h.sessions.Delete(sessionId)
 			s.uploadQueue.Close()
-		case <-s.isFullyConnected.Wait():
 		}
-	}()
+	})
 
 	return s
 }
@@ -346,6 +340,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if sessionId != "" {
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
+			if currentSession.reaperTimer != nil {
+				currentSession.reaperTimer.Stop()
+			}
 			currentSession.isFullyConnected.Close()
 			defer h.sessions.Delete(sessionId)
 		}
