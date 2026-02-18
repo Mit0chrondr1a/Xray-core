@@ -626,7 +626,14 @@ func (w *dsWorker) Port() net.Port {
 func (w *dsWorker) Start() error {
 	ctx := context.Background()
 	hub, err := internet.ListenUnix(ctx, w.address, w.stream, func(conn stat.Connection) {
-		go w.callback(conn)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errors.LogError(w.ctx, "panic in Unix domain socket connection handler: ", r)
+				}
+			}()
+			w.callback(conn)
+		}()
 	})
 	if err != nil {
 		return errors.New("failed to listen Unix Domain Socket on ", w.address).AtWarning().Base(err)

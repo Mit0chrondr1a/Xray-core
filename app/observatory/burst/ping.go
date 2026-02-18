@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/routing"
@@ -55,7 +56,7 @@ func newHTTPClient(ctxv context.Context, dispatcher routing.Dispatcher, handler 
 // MeasureDelay returns the delay time of the request to dest
 func (s *pingClient) MeasureDelay(httpMethod string) (time.Duration, error) {
 	if s.httpClient == nil {
-		panic("pingClient not initialized")
+		return rttFailed, errors.New("pingClient not initialized")
 	}
 
 	req, err := http.NewRequest(httpMethod, s.destination, nil)

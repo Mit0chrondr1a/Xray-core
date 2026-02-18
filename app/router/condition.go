@@ -151,7 +151,8 @@ func (m *IPMatcher) Apply(ctx routing.Context) bool {
 	case MatcherAsType_Target:
 		ips = ctx.GetTargetIPs()
 	default:
-		panic("unk asType")
+		errors.LogWarning(context.Background(), "IPMatcher: unknown asType ", m.asType, ", returning no match")
+		return false
 	}
 
 	return m.matcher.AnyMatch(ips)
@@ -182,7 +183,8 @@ func (v *PortMatcher) Apply(ctx routing.Context) bool {
 	case MatcherAsType_VlessRoute:
 		return v.port.Contains(ctx.GetVlessRoute())
 	default:
-		panic("unk asType")
+		errors.LogWarning(context.Background(), "PortMatcher: unknown asType ", v.asType, ", returning no match")
+		return false
 	}
 }
 
