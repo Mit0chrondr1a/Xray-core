@@ -92,7 +92,15 @@ pub unsafe extern "C" fn xray_blake3_keyed_hash(
             return;
         }
         let key_slice = slice::from_raw_parts(key, 32);
-        let key: [u8; 32] = key_slice.try_into().unwrap();
+        let key: [u8; 32] = match key_slice.try_into() {
+            Ok(k) => k,
+            Err(_) => {
+                // Key length mismatch -- zero output and return safely.
+                let out = slice::from_raw_parts_mut(out, out_len);
+                out.fill(0);
+                return;
+            }
+        };
         let data = if data_len == 0 {
             &[]
         } else {

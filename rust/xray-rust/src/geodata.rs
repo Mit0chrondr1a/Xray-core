@@ -400,6 +400,9 @@ pub unsafe extern "C" fn xray_geoip_load(
         if codes.is_null() || code_lens.is_null() {
             return crate::ffi::FFI_ERR_NULL;
         }
+        if num_codes > 65536 {
+            return crate::ffi::FFI_ERR_APP;
+        }
 
         // Parse path
         let path_bytes = slice::from_raw_parts(path, path_len);
@@ -432,8 +435,10 @@ pub unsafe extern "C" fn xray_geoip_load(
         let mut ipsets = parse_geoip_list(&mmap, &code_list);
 
         // Build result array in requested order
-        let handles_layout =
-            std::alloc::Layout::array::<*mut IpSet>(num_codes).unwrap();
+        let handles_layout = match std::alloc::Layout::array::<*mut IpSet>(num_codes) {
+            Ok(l) => l,
+            Err(_) => return crate::ffi::FFI_ERR_APP,
+        };
         let handles_ptr = std::alloc::alloc(handles_layout) as *mut *mut IpSet;
         if handles_ptr.is_null() {
             return crate::ffi::FFI_ERR_APP;
@@ -535,6 +540,9 @@ pub unsafe extern "C" fn xray_geosite_load(
         if codes.is_null() || code_lens.is_null() {
             return crate::ffi::FFI_ERR_NULL;
         }
+        if num_codes > 65536 {
+            return crate::ffi::FFI_ERR_APP;
+        }
 
         let path_bytes = slice::from_raw_parts(path, path_len);
         let path_str = match std::str::from_utf8(path_bytes) {
@@ -572,8 +580,13 @@ pub unsafe extern "C" fn xray_geosite_load(
         let owned_data_ref = &*owned_data_ptr;
 
         // Build result arrays
-        let entries_layout =
-            std::alloc::Layout::array::<GeoSiteCodeResult>(num_codes).unwrap();
+        let entries_layout = match std::alloc::Layout::array::<GeoSiteCodeResult>(num_codes) {
+            Ok(l) => l,
+            Err(_) => {
+                drop(Box::from_raw(owned_data_ptr));
+                return crate::ffi::FFI_ERR_APP;
+            }
+        };
         let entries_ptr = std::alloc::alloc(entries_layout) as *mut GeoSiteCodeResult;
         if entries_ptr.is_null() {
             drop(Box::from_raw(owned_data_ptr));
@@ -588,8 +601,23 @@ pub unsafe extern "C" fn xray_geosite_load(
                 continue;
             }
 
-            let domain_layout =
-                std::alloc::Layout::array::<GeoSiteDomain>(domains.len()).unwrap();
+            let domain_layout = match std::alloc::Layout::array::<GeoSiteDomain>(domains.len()) {
+                Ok(l) => l,
+                Err(_) => {
+                    for j in 0..i {
+                        let prev = &*entries_ptr.add(j);
+                        if !prev.domains.is_null() {
+                            let prev_layout =
+                                std::alloc::Layout::array::<GeoSiteDomain>(prev.domain_count)
+                                    .unwrap();
+                            std::alloc::dealloc(prev.domains as *mut u8, prev_layout);
+                        }
+                    }
+                    std::alloc::dealloc(entries_ptr as *mut u8, entries_layout);
+                    drop(Box::from_raw(owned_data_ptr));
+                    return crate::ffi::FFI_ERR_APP;
+                }
+            };
             let domain_ptr = std::alloc::alloc(domain_layout) as *mut GeoSiteDomain;
             if domain_ptr.is_null() {
                 // Cleanup previously allocated
