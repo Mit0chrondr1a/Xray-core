@@ -99,7 +99,7 @@ func (s *routingServer) TestRoute(ctx context.Context, request *TestRouteRequest
 		return nil, err
 	}
 	if request.PublishResult && s.routingStats != nil {
-		ctx, _ := context.WithTimeout(context.Background(), 4*time.Second) //nolint:lostcancel // context bounds async publish; canceling immediately would abort in-flight goroutine
+		ctx, _ := context.WithTimeout(context.Background(), 4*time.Second) //nolint:lostcancel
 		s.routingStats.Publish(ctx, route)
 	}
 	return AsProtobufMessage(request.FieldSelectors)(route), nil

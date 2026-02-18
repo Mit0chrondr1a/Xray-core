@@ -49,7 +49,7 @@ func init() {
 				baseKeyMu.Unlock()
 				return
 			}
-			panic(platform.XUDPBaseKey + ": invalid value (BaseKey must be 32 bytes): " + raw + " len " + strconv.Itoa(len(decoded)))
+			errors.LogError(context.Background(), platform.XUDPBaseKey+": invalid value (BaseKey must be 32 bytes): "+raw+" len "+strconv.Itoa(len(decoded))+"; keeping random default key")
 		}
 	}()
 }

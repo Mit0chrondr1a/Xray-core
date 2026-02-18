@@ -122,9 +122,16 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	dataPlacement := c.transportConfig.GetNormalizedUplinkDataPlacement()
 
 	if dataPlacement != PlacementBody {
-		data, err := io.ReadAll(body)
+		maxPost := int64(c.transportConfig.GetNormalizedScMaxEachPostBytes().To)
+		if maxPost <= 0 {
+			maxPost = 1 << 20 // 1 MiB default
+		}
+		data, err := io.ReadAll(io.LimitReader(body, maxPost+1))
 		if err != nil {
 			return err
+		}
+		if int64(len(data)) > maxPost {
+			return errors.New("post packet data exceeds scMaxEachPostBytes limit")
 		}
 		encodedData = base64.RawURLEncoding.EncodeToString(data)
 		body = nil

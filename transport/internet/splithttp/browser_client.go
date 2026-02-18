@@ -16,7 +16,7 @@ type BrowserDialerClient struct {
 }
 
 func (c *BrowserDialerClient) IsClosed() bool {
-	panic("not implemented yet")
+	return false // Browser dialer does not track connection state
 }
 
 func (c *BrowserDialerClient) OpenStream(ctx context.Context, url string, _ string, body io.Reader, uploadOnly bool) (io.ReadCloser, net.Addr, net.Addr, error) {
@@ -56,10 +56,17 @@ func (c *BrowserDialerClient) OpenStream(ctx context.Context, url string, _ stri
 	return websocket.NewConnection(conn, dummyAddr, nil, 0), conn.RemoteAddr(), conn.LocalAddr(), nil
 }
 
+// maxBrowserPostBytes is the maximum body size for browser dialer POST requests.
+// This prevents memory exhaustion from oversized request bodies.
+const maxBrowserPostBytes = 32 * 1024 * 1024 // 32 MiB
+
 func (c *BrowserDialerClient) PostPacket(ctx context.Context, url string, _ string, _ string, body io.Reader, contentLength int64) error {
-	bytes, err := io.ReadAll(body)
+	bytes, err := io.ReadAll(io.LimitReader(body, maxBrowserPostBytes+1))
 	if err != nil {
 		return err
+	}
+	if int64(len(bytes)) > maxBrowserPostBytes {
+		return errors.New("browser dialer: POST body exceeds maximum size")
 	}
 
 	header := c.transportConfig.GetRequestHeader()
