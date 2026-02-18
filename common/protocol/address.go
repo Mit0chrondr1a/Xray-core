@@ -224,7 +224,7 @@ func (p *addressParser) readAddress(b *buf.Buffer, reader io.Reader) (net.Addres
 		}
 		return net.DomainAddress(domain), nil
 	default:
-		panic("impossible case")
+		return nil, errors.New("unknown address family")
 	}
 }
 
@@ -255,7 +255,7 @@ func (p *addressParser) writeAddress(writer io.Writer, address net.Address) erro
 			return err
 		}
 	default:
-		panic("Unknown family type.")
+		return errors.New("unknown address family")
 	}
 
 	return nil
