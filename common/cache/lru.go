@@ -72,8 +72,13 @@ func (l *lru) Put(key, value interface{}) {
 	e := &lruElement{key, value}
 	if v, ok := l.keyToElement.Load(key); ok {
 		element := v.(*list.Element)
+		oldValue := element.Value.(*lruElement).value
 		element.Value = e
 		l.doubleLinkedlist.MoveToFront(element)
+		if oldValue != value {
+			l.valueToElement.Delete(oldValue)
+			l.valueToElement.Store(value, element)
+		}
 	} else {
 		element := l.doubleLinkedlist.PushFront(e)
 		l.keyToElement.Store(key, element)
