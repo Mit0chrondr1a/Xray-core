@@ -401,16 +401,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	maxUploadSize := scMaxEachPostBytes.rand()
-	// WithSizeLimit(0) will still allow single bytes to pass, and a lot of
-	// code relies on this behavior. Subtract 1 so that together with
-	// uploadWriter wrapper, exact size limits can be enforced
-	// uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize - 1))
-	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize-buf.Size), pipe.WithSPSC())
-
-	conn.writer = uploadWriter{
-		uploadPipeWriter,
-		maxUploadSize,
-	}
+	uploadPipeReader, uploadPipeWriter := newUploadPipe(maxUploadSize)
+	conn.writer = uploadPipeWriter
 
 	go func() {
 		var seq int64
@@ -485,6 +477,17 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 type uploadWriter struct {
 	*pipe.Writer
 	maxLen int32
+}
+
+func newUploadPipe(maxUploadSize int32) (*pipe.Reader, uploadWriter) {
+	// Keep this path on the mutex pipe. Packet-up throughput depends on
+	// ReadMultiBuffer batching multiple writes into larger POST bodies.
+	// SPSC delivers one slot per read and fragments uploads on hot paths.
+	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize - buf.Size))
+	return uploadPipeReader, uploadWriter{
+		Writer: uploadPipeWriter,
+		maxLen: maxUploadSize,
+	}
 }
 
 func (w uploadWriter) Write(b []byte) (int, error) {

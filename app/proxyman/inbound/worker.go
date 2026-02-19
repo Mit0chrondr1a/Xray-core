@@ -45,8 +45,8 @@ type tcpWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	hub              internet.Listener
-	connSemaphore    chan struct{}
+	hub           internet.Listener
+	connSemaphore chan struct{}
 
 	ctx context.Context
 }
@@ -329,20 +329,22 @@ type udpWorker struct {
 }
 
 func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
-	// Fast path: check existing connection under read lock.
 	w.RLock()
+	defer w.RUnlock()
+
 	if conn, found := w.activeConn[id]; found && !conn.done.Done() {
 		conn.updateActivity()
-		w.RUnlock()
 		return conn, true
 	}
-	w.RUnlock()
 
-	// Slow path: create new connection under write lock.
+	return nil, false
+}
+
+func (w *udpWorker) createConnection(id connID) (*udpConn, bool) {
 	w.Lock()
 	defer w.Unlock()
 
-	// Double-check after acquiring write lock.
+	// Re-check after acquiring write lock to avoid duplicate session creation.
 	if conn, found := w.activeConn[id]; found && !conn.done.Done() {
 		conn.updateActivity()
 		return conn, true
@@ -373,6 +375,35 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 	return conn, false
 }
 
+func (w *udpWorker) acquireSessionSlot(source net.Destination) bool {
+	// Fast path: try non-blocking acquire first (zero allocation).
+	select {
+	case w.sessionSemaphore <- struct{}{}:
+		return true
+	default:
+	}
+
+	// Slow path: semaphore full, wait with timeout.
+	timer := time.NewTimer(getQueueTimeout())
+	defer timer.Stop()
+
+	select {
+	case w.sessionSemaphore <- struct{}{}:
+		return true
+	case <-timer.C:
+		// Final non-blocking attempt before rejecting.
+		select {
+		case w.sessionSemaphore <- struct{}{}:
+			return true
+		default:
+			errors.LogWarning(w.ctx, "UDP session queue timeout (active: ",
+				len(w.sessionSemaphore), "/", cap(w.sessionSemaphore),
+				"), dropping new session from ", source)
+			return false
+		}
+	}
+}
+
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
 	id := connID{
 		src: source,
@@ -383,86 +414,81 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		}
 		b.UDP = &originalDest
 	}
-	conn, existing := w.getConnection(id)
+	if conn, existing := w.getConnection(id); existing {
+		// payload will be discarded when pipe is full.
+		_ = conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+		return
+	}
 
-	// payload will be discarded in pipe is full.
-	conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+	if !w.acquireSessionSlot(source) {
+		b.Release()
+		return
+	}
 
-	if !existing {
-		common.Must(w.checker.Start())
+	conn, existing := w.createConnection(id)
+	if existing {
+		<-w.sessionSemaphore
+		_ = conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+		return
+	}
 
-		// Fast path: try non-blocking acquire first (zero allocation).
-		select {
-		case w.sessionSemaphore <- struct{}{}:
-		default:
-			// Slow path: semaphore full, wait with timeout.
-			timer := time.NewTimer(getQueueTimeout())
-			select {
-			case w.sessionSemaphore <- struct{}{}:
-				timer.Stop()
-			case <-timer.C:
-				// Final non-blocking attempt before rejecting.
-				select {
-				case w.sessionSemaphore <- struct{}{}:
-				default:
-					errors.LogWarning(w.ctx, "UDP session queue timeout (active: ",
-						len(w.sessionSemaphore), "/", cap(w.sessionSemaphore),
-						"), dropping new session from ", source)
-					conn.Close()
-					w.removeConn(id)
-					return
-				}
+	common.Must(w.checker.Start())
+
+	// First packet must be enqueued only after admission is granted.
+	if err := conn.writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+		<-w.sessionSemaphore
+		conn.Close()
+		w.removeConn(id)
+		return
+	}
+
+	go func() {
+		defer func() { <-w.sessionSemaphore }()
+
+		ctx, cancel := context.WithCancel(w.ctx)
+		conn.cancel = cancel
+		sid := session.NewID()
+		ctx = c.ContextWithID(ctx, sid)
+
+		outbounds := []*session.Outbound{{}}
+		if originalDest.IsValid() {
+			outbounds[0].Target = originalDest
+		}
+		ctx = session.ContextWithOutbounds(ctx, outbounds)
+		local := net.DestinationFromAddr(w.hub.Addr())
+		if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
+			if source.Address.Family().IsIPv4() {
+				local.Address = net.AnyIP
+			} else if source.Address.Family().IsIPv6() {
+				local.Address = net.AnyIPv6
 			}
 		}
 
-		go func() {
-			defer func() { <-w.sessionSemaphore }()
-
-			ctx, cancel := context.WithCancel(w.ctx)
-			conn.cancel = cancel
-			sid := session.NewID()
-			ctx = c.ContextWithID(ctx, sid)
-
-			outbounds := []*session.Outbound{{}}
-			if originalDest.IsValid() {
-				outbounds[0].Target = originalDest
-			}
-			ctx = session.ContextWithOutbounds(ctx, outbounds)
-			local := net.DestinationFromAddr(w.hub.Addr())
-			if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
-				if source.Address.Family().IsIPv4() {
-					local.Address = net.AnyIP
-				} else if source.Address.Family().IsIPv6() {
-					local.Address = net.AnyIPv6
-				}
-			}
-
-			ctx = session.ContextWithInbound(ctx, &session.Inbound{
-				Source:  source,
-				Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
-				Gateway: net.UDPDestination(w.address, w.port),
-				Tag:     w.tag,
-			})
-			content := new(session.Content)
-			if w.sniffingConfig != nil {
-				content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
-				content.SniffingRequest.OverrideDestinationForProtocol = w.sniffingConfig.DestinationOverride
-				content.SniffingRequest.ExcludeForDomain = w.sniffingConfig.DomainsExcluded
-				content.SniffingRequest.MetadataOnly = w.sniffingConfig.MetadataOnly
-				content.SniffingRequest.RouteOnly = w.sniffingConfig.RouteOnly
-			}
-			ctx = session.ContextWithContent(ctx, content)
-			if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-				errors.LogInfoInner(ctx, err, "connection ends")
-			}
-			conn.Close()
-			// conn not removed by checker TODO may be lock worker here is better
-			if !conn.inactive.Load() {
-				conn.setInactive()
-				w.removeConn(id)
-			}
-		}()
-	}
+		ctx = session.ContextWithInbound(ctx, &session.Inbound{
+			Source:  source,
+			Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
+			Gateway: net.UDPDestination(w.address, w.port),
+			Tag:     w.tag,
+		})
+		content := new(session.Content)
+		if w.sniffingConfig != nil {
+			content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
+			content.SniffingRequest.OverrideDestinationForProtocol = w.sniffingConfig.DestinationOverride
+			content.SniffingRequest.ExcludeForDomain = w.sniffingConfig.DomainsExcluded
+			content.SniffingRequest.MetadataOnly = w.sniffingConfig.MetadataOnly
+			content.SniffingRequest.RouteOnly = w.sniffingConfig.RouteOnly
+		}
+		ctx = session.ContextWithContent(ctx, content)
+		if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
+			errors.LogInfoInner(ctx, err, "connection ends")
+		}
+		conn.Close()
+		// conn not removed by checker TODO may be lock worker here is better
+		if !conn.inactive.Load() {
+			conn.setInactive()
+			w.removeConn(id)
+		}
+	}()
 }
 
 func (w *udpWorker) removeConn(id connID) {

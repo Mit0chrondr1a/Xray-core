@@ -21,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/main/commands/base"
+	"google.golang.org/protobuf/proto"
 )
 
 var cmdRun = &base.Command{
@@ -76,7 +77,15 @@ func executeRun(cmd *base.Command, args []string) {
 	}
 
 	printVersion()
-	server, err := startXray()
+	activeConfig, err := loadXrayConfig()
+	if err != nil {
+		fmt.Println("Failed to start:", err)
+		// Configuration error. Exit with a special value to prevent systemd from restarting.
+		os.Exit(23)
+	}
+	activeConfig = cloneXrayConfig(activeConfig)
+
+	server, err := newXrayServer(cloneXrayConfig(activeConfig))
 	if err != nil {
 		fmt.Println("Failed to start:", err)
 		// Configuration error. Exit with a special value to prevent systemd from restarting.
@@ -111,19 +120,46 @@ func executeRun(cmd *base.Command, args []string) {
 
 		if sig == syscall.SIGHUP {
 			errors.LogInfo(context.Background(), "received SIGHUP, reloading configuration...")
-			newServer, err := startXray()
+			newConfig, err := loadXrayConfig()
 			if err != nil {
 				errors.LogWarning(context.Background(), "failed to reload config: ", err, "; keeping current server")
 				continue
 			}
-			if err := newServer.Start(); err != nil {
-				errors.LogWarning(context.Background(), "failed to start new server: ", err, "; keeping current server")
-				newServer.Close()
+
+			oldServer := server
+			if err := oldServer.Close(); err != nil {
+				errors.LogWarning(context.Background(), "failed to stop current server: ", err, "; keeping current server")
 				continue
 			}
-			oldServer := server
+
+			newServer, err := newXrayServer(cloneXrayConfig(newConfig))
+			if err == nil {
+				err = newServer.Start()
+			}
+
+			if err != nil {
+				errors.LogWarning(context.Background(), "failed to start new server: ", err, "; rolling back to previous config")
+				if newServer != nil {
+					newServer.Close()
+				}
+
+				rollbackServer, rollbackErr := newXrayServer(cloneXrayConfig(activeConfig))
+				if rollbackErr != nil {
+					errors.LogError(context.Background(), "rollback failed to build previous server: ", rollbackErr, "; exiting")
+					os.Exit(1)
+				}
+				if rollbackErr = rollbackServer.Start(); rollbackErr != nil {
+					errors.LogError(context.Background(), "rollback failed to start previous server: ", rollbackErr, "; exiting")
+					rollbackServer.Close()
+					os.Exit(1)
+				}
+				server = rollbackServer
+				errors.LogWarning(context.Background(), "rollback succeeded; previous configuration restored")
+				continue
+			}
+
 			server = newServer
-			oldServer.Close()
+			activeConfig = cloneXrayConfig(newConfig)
 			runtime.GC()
 			errors.LogInfo(context.Background(), "configuration reloaded successfully")
 			continue
@@ -194,42 +230,49 @@ func getRegepxByFormat() string {
 	}
 }
 
-func readConfDir(dirPath string) error {
+func readConfDir(dirPath string) (cmdarg.Arg, error) {
 	confs, err := os.ReadDir(dirPath)
 	if err != nil {
-		return fmt.Errorf("failed to read confdir %q: %w", dirPath, err)
+		return nil, fmt.Errorf("failed to read confdir %q: %w", dirPath, err)
 	}
+	confFiles := make(cmdarg.Arg, 0, len(confs))
 	for _, f := range confs {
 		matched, err := regexp.MatchString(getRegepxByFormat(), f.Name())
 		if err != nil {
-			return fmt.Errorf("failed to match config file pattern for %q: %w", f.Name(), err)
+			return nil, fmt.Errorf("failed to match config file pattern for %q: %w", f.Name(), err)
 		}
 		if matched {
-			configFiles.Set(path.Join(dirPath, f.Name()))
+			confFiles = append(confFiles, path.Join(dirPath, f.Name()))
 		}
 	}
-	return nil
+	return confFiles, nil
 }
 
 func getConfigFilePath(verbose bool) (cmdarg.Arg, error) {
+	files := append(cmdarg.Arg(nil), configFiles...)
+
 	if dirExists(configDir) {
 		if verbose {
 			log.Println("Using confdir from arg:", configDir)
 		}
-		if err := readConfDir(configDir); err != nil {
+		confFiles, err := readConfDir(configDir)
+		if err != nil {
 			return nil, err
 		}
+		files = append(files, confFiles...)
 	} else if envConfDir := platform.GetConfDirPath(); dirExists(envConfDir) {
 		if verbose {
 			log.Println("Using confdir from env:", envConfDir)
 		}
-		if err := readConfDir(envConfDir); err != nil {
+		confFiles, err := readConfDir(envConfDir)
+		if err != nil {
 			return nil, err
 		}
+		files = append(files, confFiles...)
 	}
 
-	if len(configFiles) > 0 {
-		return configFiles, nil
+	if len(files) > 0 {
+		return files, nil
 	}
 
 	if workingDir, err := os.Getwd(); err == nil {
@@ -266,19 +309,31 @@ func getConfigFormat() string {
 	return f
 }
 
-func startXray() (core.Server, error) {
+func loadXrayConfig() (*core.Config, error) {
 	configFiles, err := getConfigFilePath(true)
 	if err != nil {
 		return nil, errors.New("failed to resolve config file path").Base(err)
 	}
 
-	// config, err := core.LoadConfig(getConfigFormat(), configFiles[0], configFiles)
-
 	c, err := core.LoadConfig(getConfigFormat(), configFiles)
 	if err != nil {
 		return nil, errors.New("failed to load config files: [", configFiles.String(), "]").Base(err)
 	}
+	return c, nil
+}
 
+func cloneXrayConfig(c *core.Config) *core.Config {
+	if c == nil {
+		return nil
+	}
+	cloned, ok := proto.Clone(c).(*core.Config)
+	if !ok {
+		return nil
+	}
+	return cloned
+}
+
+func newXrayServer(c *core.Config) (core.Server, error) {
 	server, err := core.New(c)
 	if err != nil {
 		return nil, errors.New("failed to create server").Base(err)
