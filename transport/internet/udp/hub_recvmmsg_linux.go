@@ -4,6 +4,7 @@ package udp
 
 import (
 	"context"
+	"time"
 	"unsafe"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -87,6 +88,7 @@ func (h *Hub) startBatch() {
 		oobBufs[i] = make([]byte, oobBufSize)
 	}
 
+	var consecutiveFailures int
 	for {
 		// Prepare buffers for batch receive
 		for i := 0; i < batchSize; i++ {
@@ -113,14 +115,21 @@ func (h *Hub) startBatch() {
 		// Batch receive
 		n, err := h.recvBatch(msgs, iovecs, buffers, oobBufs)
 		if err != nil {
-			errors.LogInfoInner(context.Background(), err, "recvmmsg failed, falling back to single read")
 			// Release unused buffers
 			for i := 0; i < batchSize; i++ {
 				buffers[i].Release()
 			}
-			h.startSingle(false)
-			return
+			consecutiveFailures++
+			if consecutiveFailures >= 3 {
+				errors.LogInfoInner(context.Background(), err, "recvmmsg failed 3 times, falling back to single read")
+				h.startSingle(false)
+				return
+			}
+			errors.LogDebug(context.Background(), "recvmmsg failed (", consecutiveFailures, "/3), retrying: ", err)
+			time.Sleep(time.Duration(1<<uint(consecutiveFailures)) * time.Millisecond)
+			continue
 		}
+		consecutiveFailures = 0
 
 		// Process received packets
 		for i := 0; i < n; i++ {

@@ -210,7 +210,9 @@ s:
 		}
 	case packet = <-c.cache:
 	}
-	return copy(p, packet.Payload.Bytes()), &net.UDPAddr{
+	n := copy(p, packet.Payload.Bytes())
+	packet.Payload.Release()
+	return n, &net.UDPAddr{
 		IP:   packet.Source.Address.IP(),
 		Port: int(packet.Source.Port),
 	}, nil
