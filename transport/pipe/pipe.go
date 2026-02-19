@@ -74,16 +74,23 @@ func New(opts ...Option) (*Reader, *Writer) {
 	}
 
 	if opt.useSPSC {
-		// Derive slot count from size limit. Each slot holds one MultiBuffer
-		// which typically contains one buf.Buffer (buf.Size bytes).
-		slots := 64
-		if opt.limit > 0 {
-			slots = int(opt.limit/int32(buf.Size)) + 1
-			if slots < 16 {
-				slots = 16
+		// The SPSC slot ring does not support discardOverflow (it blocks
+		// when full instead of discarding). Fall back to mutex-based pipe
+		// when both options are requested to avoid silent behavior change.
+		if opt.discardOverflow {
+			opt.useSPSC = false
+		} else {
+			// Derive slot count from size limit. Each slot holds one MultiBuffer
+			// which typically contains one buf.Buffer (buf.Size bytes).
+			slots := 64
+			if opt.limit > 0 {
+				slots = int(opt.limit/int32(buf.Size)) + 1
+				if slots < 16 {
+					slots = 16
+				}
 			}
+			return NewSPSC(slots)
 		}
-		return NewSPSC(slots)
 	}
 
 	p := &pipe{
