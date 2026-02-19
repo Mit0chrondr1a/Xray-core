@@ -132,7 +132,7 @@ func (p *MetricsHandler) Start() error {
 			Handler:           p.mux,
 			ReadHeaderTimeout: 4 * time.Second,
 			ReadTimeout:       15 * time.Second,
-			WriteTimeout:      60 * time.Second,
+			WriteTimeout:      300 * time.Second,
 			IdleTimeout:       120 * time.Second,
 			MaxHeaderBytes:    1 << 20,
 		}
@@ -154,7 +154,7 @@ func (p *MetricsHandler) Start() error {
 		Handler:           p.mux,
 		ReadHeaderTimeout: 4 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      300 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
