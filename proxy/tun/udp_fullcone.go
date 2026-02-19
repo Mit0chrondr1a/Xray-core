@@ -8,11 +8,14 @@ import (
 	"github.com/xtls/xray-core/common/net"
 )
 
+const defaultUDPFullConeMaxConns = 4096
+
 // sub-handler specifically for udp connections under main handler
 type udpConnectionHandler struct {
 	sync.Mutex
 
 	udpConns map[net.Destination]*udpConn
+	maxConns int
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -21,6 +24,7 @@ type udpConnectionHandler struct {
 func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Destination), writePacket func(data []byte, src net.Destination, dst net.Destination) error) *udpConnectionHandler {
 	handler := &udpConnectionHandler{
 		udpConns:         make(map[net.Destination]*udpConn),
+		maxConns:         defaultUDPFullConeMaxConns,
 		handleConnection: handleConnection,
 		writePacket:      writePacket,
 	}
@@ -34,6 +38,10 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	u.Lock()
 	conn, found := u.udpConns[src]
 	if !found {
+		if u.maxConns > 0 && len(u.udpConns) >= u.maxConns {
+			u.Unlock()
+			return true
+		}
 		egress := make(chan []byte, 16)
 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
 		u.udpConns[src] = conn
