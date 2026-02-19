@@ -21,21 +21,74 @@ func TestUploadQueue_Push_WhenClosed_ReturnsError(t *testing.T) {
 	}
 }
 
-func TestUploadQueue_Push_WhenFull_ReturnsError(t *testing.T) {
+func TestUploadQueue_Push_WhenFull_BlocksUntilDrained(t *testing.T) {
 	q := NewUploadQueue(2)
-	// Fill the channel
-	err := q.Push(Packet{Payload: []byte("a"), Seq: 0})
-	if err != nil {
+	// Fill the queue
+	if err := q.Push(Packet{Payload: []byte("a"), Seq: 0}); err != nil {
 		t.Fatal("first push failed:", err)
 	}
-	err = q.Push(Packet{Payload: []byte("b"), Seq: 1})
-	if err != nil {
+	if err := q.Push(Packet{Payload: []byte("b"), Seq: 1}); err != nil {
 		t.Fatal("second push failed:", err)
 	}
-	// Third push should fail (non-blocking, channel full)
-	err = q.Push(Packet{Payload: []byte("c"), Seq: 2})
-	if err == nil {
-		t.Fatal("expected error when queue is full, got nil")
+
+	// Third push should block until a Read frees space
+	pushed := make(chan error, 1)
+	go func() {
+		pushed <- q.Push(Packet{Payload: []byte("c"), Seq: 2})
+	}()
+
+	// Verify push is blocking
+	select {
+	case <-pushed:
+		t.Fatal("push should have blocked when queue is full")
+	case <-time.After(50 * time.Millisecond):
+		// Good — push is blocking
+	}
+
+	// Read to free a slot
+	buf := make([]byte, 10)
+	n, err := q.Read(buf)
+	if err != nil {
+		t.Fatal("read error:", err)
+	}
+	if string(buf[:n]) != "a" {
+		t.Fatalf("expected 'a', got %q", string(buf[:n]))
+	}
+
+	// Now push should complete
+	select {
+	case err := <-pushed:
+		if err != nil {
+			t.Fatal("push after drain failed:", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("push did not unblock after read")
+	}
+}
+
+func TestUploadQueue_Push_WhenFull_UnblocksOnClose(t *testing.T) {
+	q := NewUploadQueue(1)
+	if err := q.Push(Packet{Payload: []byte("a"), Seq: 0}); err != nil {
+		t.Fatal("first push failed:", err)
+	}
+
+	// Second push should block
+	pushed := make(chan error, 1)
+	go func() {
+		pushed <- q.Push(Packet{Payload: []byte("b"), Seq: 1})
+	}()
+
+	// Close should unblock the waiting pusher
+	time.Sleep(20 * time.Millisecond)
+	q.Close()
+
+	select {
+	case err := <-pushed:
+		if err == nil {
+			t.Fatal("expected error from push after close, got nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("push did not unblock after close")
 	}
 }
 
@@ -187,17 +240,17 @@ func TestUploadQueue_Read_WithReaderPacket_DelegatesToReader(t *testing.T) {
 
 // --- Close behavior ---
 
-func TestUploadQueue_Close_DrainsBufferedPackets(t *testing.T) {
+func TestUploadQueue_Close_LeavesBufferedPackets(t *testing.T) {
 	q := NewUploadQueue(10)
 	q.Push(Packet{Payload: []byte("buffered"), Seq: 0})
-	// Close should drain but not panic
+	// Close should not panic (heap is GC'd)
 	err := q.Close()
 	if err != nil {
 		t.Fatal("close error:", err)
 	}
 }
 
-func TestUploadQueue_Close_DrainsReaderPackets(t *testing.T) {
+func TestUploadQueue_Close_ClosesReader(t *testing.T) {
 	closed := false
 	r := &trackingCloser{
 		Reader: bytes.NewReader([]byte("stream")),
@@ -238,7 +291,7 @@ func TestUploadQueue_Read_AfterClose_ReturnsEOF(t *testing.T) {
 	}
 }
 
-func TestUploadQueue_Read_ChannelClosedMidRead_ReturnsEOF(t *testing.T) {
+func TestUploadQueue_Read_ClosedMidWait_ReturnsEOF(t *testing.T) {
 	q := NewUploadQueue(10)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
@@ -247,16 +300,13 @@ func TestUploadQueue_Read_ChannelClosedMidRead_ReturnsEOF(t *testing.T) {
 	buf := make([]byte, 10)
 	_, err := q.Read(buf)
 	if err != io.EOF {
-		t.Fatalf("expected io.EOF after channel close, got %v", err)
+		t.Fatalf("expected io.EOF after close, got %v", err)
 	}
 }
 
-// --- Concurrency: Push/Close race (H3 fix validation) ---
+// --- Concurrency: Push/Close race ---
 
 func TestUploadQueue_ConcurrentPushClose_NoDeadlock(t *testing.T) {
-	// This test validates the H3 fix: Push releasing mutex before channel send.
-	// Before the fix, concurrent Push calls filling the channel would deadlock
-	// Close() because Push held the mutex during the blocking send.
 	for trial := 0; trial < 50; trial++ {
 		q := NewUploadQueue(2) // small buffer to trigger backpressure fast
 		var wg sync.WaitGroup
@@ -270,7 +320,7 @@ func TestUploadQueue_ConcurrentPushClose_NoDeadlock(t *testing.T) {
 			}(uint64(i))
 		}
 
-		// Close concurrently -- must not deadlock
+		// Close concurrently — must not deadlock
 		done := make(chan struct{})
 		go func() {
 			time.Sleep(time.Millisecond)
@@ -320,45 +370,67 @@ func TestUploadQueue_Read_ZeroLengthBuffer(t *testing.T) {
 	}
 }
 
-// --- State: queue too large ---
+// --- Backpressure: push blocks, read unblocks ---
 
-func TestUploadQueue_Read_QueueTooLarge_ReturnsError(t *testing.T) {
-	// maxPackets=2, channel capacity=2, heap overflow check is len(heap) > 2.
-	// Flow: push seq 10, 20 (skipping 0). Read() gets seq 10, pushes to heap.
-	// heap=[10], blocks on channel, gets seq 20, pushes to heap. heap=[10,20].
-	// Loop: pop 10 (seq 10 > nextSeq 0), check len(heap)=1 <= 2, push back,
-	//   block on channel again. We need more packets.
-	//
-	// Use maxPackets=2, push 4 out-of-order packets via goroutine to feed channel.
-	q := NewUploadQueue(2)
+func TestUploadQueue_Backpressure_PushReadFlow(t *testing.T) {
+	// Use maxPackets=3 so the queue can hold buffered out-of-order packets
+	// without hitting the overflow check, but still test backpressure.
+	q := NewUploadQueue(3)
 
+	// Fill queue with in-order packets
+	q.Push(Packet{Payload: []byte("a"), Seq: 0})
+	q.Push(Packet{Payload: []byte("b"), Seq: 1})
+	q.Push(Packet{Payload: []byte("c"), Seq: 2})
+
+	// Next push should block (queue full)
+	pushed := make(chan error, 1)
 	go func() {
-		// Push packets out of order, skipping seq 0 so heap grows.
-		// Channel cap=2, non-blocking push may fail for some, that's OK.
-		for i := uint64(1); i <= 10; i++ {
-			q.Push(Packet{Payload: []byte("x"), Seq: i})
-			time.Sleep(time.Millisecond) // pace to let reader consume from channel
-		}
-		// Eventually close so the reader doesn't hang
-		time.Sleep(100 * time.Millisecond)
-		q.Close()
+		pushed <- q.Push(Packet{Payload: []byte("d"), Seq: 3})
 	}()
 
-	buf := make([]byte, 100)
-	// Read will accumulate out-of-order packets in heap until overflow
-	foundError := false
-	for i := 0; i < 20; i++ {
-		_, err := q.Read(buf)
+	// Verify push is blocking
+	select {
+	case <-pushed:
+		t.Fatal("push should have blocked when queue is full")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Read to free slots and unblock the pusher
+	buf := make([]byte, 10)
+	for i := 0; i < 4; i++ {
+		n, err := q.Read(buf)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			foundError = true
-			break
+			t.Fatalf("read %d error: %v", i, err)
+		}
+		if n == 0 {
+			t.Fatalf("read %d returned 0 bytes", i)
 		}
 	}
-	if !foundError {
-		t.Skip("could not trigger queue overflow in this run (race-dependent)")
+
+	// Blocked pusher should have completed
+	select {
+	case err := <-pushed:
+		if err != nil {
+			t.Fatal("push after drain failed:", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pusher did not unblock after reads")
+	}
+}
+
+// --- Overflow: full heap of out-of-order packets ---
+
+func TestUploadQueue_Read_HeapFullOutOfOrder_ReturnsError(t *testing.T) {
+	q := NewUploadQueue(2)
+	// Push seq 1 and 2, skipping seq 0
+	q.Push(Packet{Payload: []byte("b"), Seq: 1})
+	q.Push(Packet{Payload: []byte("c"), Seq: 2})
+
+	// Read: heap is full, no deliverable packet (need seq 0) → error
+	buf := make([]byte, 10)
+	_, err := q.Read(buf)
+	if err == nil {
+		t.Fatal("expected error when heap is full with out-of-order packets")
 	}
 }
 

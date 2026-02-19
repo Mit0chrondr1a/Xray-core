@@ -1,13 +1,16 @@
 package splithttp
 
-// upload_queue is a specialized priorityqueue + channel to reorder generic
-// packets by a sequence number
+// upload_queue is a specialized priorityqueue with condvar-based blocking
+// to reorder generic packets by a sequence number.
+//
+// Design inspired by SPSCSlotRing (transport/pipe/ring_spsc.go): uses
+// sync.Mutex + sync.Cond + closed flag + Broadcast() on close. This avoids
+// the channel-based deadlock/panic/drop pathologies of the previous design.
 
 import (
 	"container/heap"
 	"io"
 	"sync"
-	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/errors"
 )
@@ -19,79 +22,62 @@ type Packet struct {
 }
 
 type uploadQueue struct {
-	reader          io.ReadCloser
-	nomore          bool
-	pushedPackets   chan Packet
-	writeCloseMutex sync.Mutex
-	heap            uploadHeap
-	nextSeq         uint64
-	closed          atomic.Bool
-	maxPackets      int
+	mu         sync.Mutex
+	cond       *sync.Cond
+	reader     io.ReadCloser
+	nomore     bool
+	heap       uploadHeap
+	nextSeq    uint64
+	closed     bool
+	maxPackets int
 }
 
 func NewUploadQueue(maxPackets int) *uploadQueue {
-	return &uploadQueue{
-		pushedPackets: make(chan Packet, maxPackets),
-		heap:          uploadHeap{},
-		nextSeq:       0,
-		maxPackets:    maxPackets,
+	q := &uploadQueue{
+		heap:       uploadHeap{},
+		maxPackets: maxPackets,
 	}
+	q.cond = sync.NewCond(&q.mu)
+	return q
 }
 
 func (h *uploadQueue) Push(p Packet) error {
-	h.writeCloseMutex.Lock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
-	if h.closed.Load() {
-		h.writeCloseMutex.Unlock()
-		return errors.New("packet queue closed")
-	}
-	if h.nomore {
-		h.writeCloseMutex.Unlock()
-		return errors.New("h.reader already exists")
-	}
-	if p.Reader != nil {
-		h.nomore = true
-	}
-	// Release the mutex BEFORE the channel send to prevent deadlock.
-	// If the channel is full, a blocking send while holding the mutex would
-	// prevent Close() from ever acquiring the mutex and draining the channel.
-	h.writeCloseMutex.Unlock()
-
-	select {
-	case h.pushedPackets <- p:
-		return nil
-	default:
-		// Channel is full -- backpressure. Non-blocking to avoid deadlock.
-		return errors.New("packet queue is full")
+	for {
+		if h.closed {
+			return errors.New("packet queue closed")
+		}
+		if h.nomore {
+			return errors.New("h.reader already exists")
+		}
+		if p.Reader != nil {
+			h.nomore = true
+			h.reader = p.Reader
+			h.cond.Broadcast()
+			return nil
+		}
+		if h.heap.Len() < h.maxPackets {
+			heap.Push(&h.heap, p)
+			h.cond.Signal()
+			return nil
+		}
+		// Heap full — block until reader drains or queue closes
+		h.cond.Wait()
 	}
 }
 
 func (h *uploadQueue) Close() error {
-	h.writeCloseMutex.Lock()
-	defer h.writeCloseMutex.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
-	if !h.closed.Load() {
-		h.closed.Store(true)
-		// Drain any buffered packets from the channel before closing it.
-		// Push() releases the mutex before sending (non-blocking select), so
-		// there is no deadlock risk here. We drain in a loop to collect any
-		// packets that were enqueued before we set closed=true.
-	drain:
-		for {
-			select {
-			case p := <-h.pushedPackets:
-				if p.Reader != nil {
-					if h.reader != nil {
-						h.reader.Close()
-					}
-					h.reader = p.Reader
-				}
-			default:
-				break drain
-			}
-		}
-		close(h.pushedPackets)
+	if h.closed {
+		return nil
 	}
+	h.closed = true
+	h.cond.Broadcast()
+
 	if h.reader != nil {
 		return h.reader.Close()
 	}
@@ -102,63 +88,57 @@ func (h *uploadQueue) Close() error {
 // exactly one goroutine (the GET handler) must call Read for a given session.
 // This single-reader invariant is guaranteed by the XHTTP protocol design.
 func (h *uploadQueue) Read(b []byte) (int, error) {
-	if h.reader != nil {
-		return h.reader.Read(b)
-	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
-	if h.closed.Load() {
-		return 0, io.EOF
-	}
-
-	if len(h.heap) == 0 {
-		packet, more := <-h.pushedPackets
-		if !more {
-			return 0, io.EOF
+	for {
+		// Stream-up mode: delegate to HTTP body reader
+		if h.reader != nil {
+			reader := h.reader
+			h.mu.Unlock()
+			n, err := reader.Read(b)
+			h.mu.Lock()
+			return n, err
 		}
-		if packet.Reader != nil {
-			h.reader = packet.Reader
-			return h.reader.Read(b)
-		}
-		heap.Push(&h.heap, packet)
-	}
 
-	for len(h.heap) > 0 {
-		packet := heap.Pop(&h.heap).(Packet)
-		n := 0
-
-		if packet.Seq == h.nextSeq {
-			copy(b, packet.Payload)
-			n = min(len(b), len(packet.Payload))
-
-			if n < len(packet.Payload) {
-				// partial read
-				packet.Payload = packet.Payload[n:]
-				heap.Push(&h.heap, packet)
+		// Deliver next in-order packet
+		if h.heap.Len() > 0 && h.heap[0].Seq == h.nextSeq {
+			pkt := heap.Pop(&h.heap).(Packet)
+			n := copy(b, pkt.Payload)
+			if n < len(pkt.Payload) {
+				// Partial read: re-push remainder with same Seq
+				pkt.Payload = pkt.Payload[n:]
+				heap.Push(&h.heap, pkt)
 			} else {
-				h.nextSeq = packet.Seq + 1
+				// Fully consumed: advance sequence and free a slot
+				h.nextSeq++
+				h.cond.Signal()
 			}
-
 			return n, nil
 		}
 
-		// misordered packet
-		if packet.Seq > h.nextSeq {
-			if len(h.heap) > h.maxPackets {
-				// the "reassembly buffer" is too large, and we want to
-				// constrain memory usage somehow. let's tear down the
-				// connection, and hope the application retries.
-				return 0, errors.New("packet queue is too large")
-			}
-			heap.Push(&h.heap, packet)
-			packet2, more := <-h.pushedPackets
-			if !more {
-				return 0, io.EOF
-			}
-			heap.Push(&h.heap, packet2)
+		// Discard stale packets (Seq < nextSeq)
+		if h.heap.Len() > 0 && h.heap[0].Seq < h.nextSeq {
+			heap.Pop(&h.heap)
+			h.cond.Signal()
+			continue
 		}
-	}
 
-	return 0, nil
+		// Heap full of out-of-order packets with a sequence gap.
+		// The pusher holding the needed sequence can't push because
+		// all slots are occupied. Tear down rather than deadlock.
+		if h.heap.Len() >= h.maxPackets {
+			return 0, errors.New("packet queue is too large")
+		}
+
+		// Queue closed, nothing deliverable
+		if h.closed {
+			return 0, io.EOF
+		}
+
+		// Block waiting for new packets or close
+		h.cond.Wait()
+	}
 }
 
 // heap code directly taken from https://pkg.go.dev/container/heap
