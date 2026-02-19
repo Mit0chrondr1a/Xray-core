@@ -28,6 +28,8 @@ var (
 	apiJSON          bool
 )
 
+const maxAPIInputSize int64 = 16 << 20 // 16MiB
+
 func setSharedFlags(cmd *base.Command) {
 	cmd.Flag.StringVar(&apiServerAddrPtr, "s", "127.0.0.1:8080", "")
 	cmd.Flag.StringVar(&apiServerAddrPtr, "server", "127.0.0.1:8080", "")
@@ -57,7 +59,7 @@ func loadArg(arg string) (out io.Reader, err error) {
 		data, err = fetchHTTPContent(arg)
 
 	case arg == "stdin:":
-		data, err = io.ReadAll(io.LimitReader(os.Stdin, 16<<20)) // 16MB cap
+		data, err = readAllWithLimit(os.Stdin, maxAPIInputSize, "stdin input")
 
 	default:
 		data, err = os.ReadFile(arg)
@@ -68,6 +70,22 @@ func loadArg(arg string) (out io.Reader, err error) {
 	}
 	out = bytes.NewBuffer(data)
 	return
+}
+
+func readAllWithLimit(r io.Reader, limit int64, source string) ([]byte, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("invalid read limit: %d", limit)
+	}
+
+	content, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) > limit {
+		return nil, fmt.Errorf("%s too large: maximum %d bytes", source, limit)
+	}
+
+	return content, nil
 }
 
 // fetchHTTPContent dials https for remote content
@@ -98,7 +116,7 @@ func fetchHTTPContent(target string) ([]byte, error) {
 		return nil, fmt.Errorf("unexpected HTTP status code: %d", resp.StatusCode)
 	}
 
-	content, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20)) // 16MB cap
+	content, err := readAllWithLimit(resp.Body, maxAPIInputSize, "HTTP response")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read HTTP response: %w", err)
 	}
