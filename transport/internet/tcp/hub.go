@@ -251,13 +251,19 @@ func (v *Listener) keepAccepting() {
 								_ = conn.Close()
 								return
 							}
-							if !stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
+							if stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
+								if bl := getRealityBlacklist(); bl != nil {
+									bl.RecordFailure(extractIP(conn.RemoteAddr()))
+								}
+								errors.LogInfo(context.Background(), "Rust REALITY auth failed")
+								_ = conn.Close()
+								return
+							}
+							if rustErr != nil {
 								errors.LogWarningInner(context.Background(), rustErr, "Rust REALITY server handshake failed")
 								_ = conn.Close()
 								return
 							}
-							// Auth failed in Rust path; fall through to Go REALITY.
-							// Record blacklist failure only after the final auth outcome.
 						}
 					}
 				}
