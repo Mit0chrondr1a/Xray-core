@@ -4,6 +4,7 @@ package tls
 
 import (
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -15,6 +16,9 @@ const (
 	// rxWarningRatio is the fraction of keyUpdateThreshold at which we log
 	// a warning about the peer's RX record sequence approaching the limit.
 	rxWarningRatio = 3.0 / 4.0
+	// maxTransientErrors is the number of consecutive transient getsockopt
+	// errors before the monitor gives up (to handle EINTR/EAGAIN bursts).
+	maxTransientErrors = 3
 )
 
 // KeyUpdateMonitor reads exact TLS record sequence numbers from the kernel
@@ -59,12 +63,22 @@ func (m *KeyUpdateMonitor) Stop() {
 	m.once.Do(func() { close(m.stopCh) })
 }
 
+// isTransientSockoptError returns true for errors that may resolve on retry
+// (e.g., interrupted system call, resource temporarily unavailable).
+func isTransientSockoptError(err error) bool {
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno == syscall.EINTR || errno == syscall.EAGAIN
+	}
+	return false
+}
+
 func (m *KeyUpdateMonitor) run() {
 	cs := m.handler.CipherSuiteID()
 	interval := maxPollInterval
 	var prevTxSeq uint64
 	prevTime := time.Now()
 	rxWarned := false
+	transientErrors := 0
 
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
@@ -79,12 +93,20 @@ func (m *KeyUpdateMonitor) run() {
 		// TX: exact record count from kernel
 		txSeq, err := getRecordSeq(m.fd, TLS_TX, cs)
 		if err != nil {
-			return // socket likely closed
+			if isTransientSockoptError(err) && transientErrors < maxTransientErrors {
+				transientErrors++
+				timer.Reset(minPollInterval)
+				continue
+			}
+			errors.LogWarning(nil, "kTLS monitor: getRecordSeq(TX) failed, stopping: ", err)
+			return
 		}
+		transientErrors = 0
 
 		if txSeq >= keyUpdateThreshold {
 			if err := m.handler.InitiateUpdate(); err != nil {
-				return // socket likely closed
+				errors.LogWarning(nil, "kTLS monitor: proactive key rotation failed, stopping: ", err)
+				return
 			}
 			// After InitiateUpdate, the kernel has new keys with rec_seq=0.
 			prevTxSeq = 0
