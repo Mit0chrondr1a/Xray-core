@@ -137,8 +137,14 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 			salt = quicSaltOld
 		}
 		initialSecret := hkdf.Extract(crypto.SHA256.New, destConnID, salt)
-		secret := hkdfExpandLabel(crypto.SHA256, initialSecret, []byte{}, "client in", crypto.SHA256.Size())
-		hpKey := hkdfExpandLabel(initialSuite.Hash, secret, []byte{}, "quic hp", initialSuite.KeyLen)
+		secret, err := hkdfExpandLabel(crypto.SHA256, initialSecret, []byte{}, "client in", crypto.SHA256.Size())
+		if err != nil {
+			return nil, err
+		}
+		hpKey, err := hkdfExpandLabel(initialSuite.Hash, secret, []byte{}, "quic hp", initialSuite.KeyLen)
+		if err != nil {
+			return nil, err
+		}
 		block, err := aes.NewCipher(hpKey)
 		if err != nil {
 			return nil, err
@@ -153,8 +159,14 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 			b[hdrLen+i] ^= mask[i+1]
 		}
 
-		key := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic key", 16)
-		iv := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic iv", 12)
+		key, err := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic key", 16)
+		if err != nil {
+			return nil, err
+		}
+		iv, err := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic iv", 12)
+		if err != nil {
+			return nil, err
+		}
 		cipher := AEADAESGCMTLS13(key, iv)
 
 		nonce := cache.Extend(int32(cipher.NonceSize()))
@@ -266,7 +278,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 	return nil, protocol.ErrProtoNeedMoreData
 }
 
-func hkdfExpandLabel(hash crypto.Hash, secret, context []byte, label string, length int) []byte {
+func hkdfExpandLabel(hash crypto.Hash, secret, context []byte, label string, length int) ([]byte, error) {
 	b := make([]byte, 3, 3+6+len(label)+1+len(context))
 	binary.BigEndian.PutUint16(b, uint16(length))
 	b[2] = uint8(6 + len(label))
@@ -279,7 +291,7 @@ func hkdfExpandLabel(hash crypto.Hash, secret, context []byte, label string, len
 	out := make([]byte, length)
 	n, err := hkdf.Expand(hash.New, secret, b).Read(out)
 	if err != nil || n != length {
-		panic("quic: HKDF-Expand-Label invocation failed unexpectedly")
+		return nil, errors.New("quic: HKDF-Expand-Label invocation failed")
 	}
-	return out
+	return out, nil
 }

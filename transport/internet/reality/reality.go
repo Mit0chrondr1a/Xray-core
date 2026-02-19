@@ -107,8 +107,25 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 		errors.LogDebug(context.Background(), "REALITY localAddr: ", localAddr, "\tis using X25519MLKEM768 for TLS' communication: ", c.HandshakeState.ServerHello.ServerShare.Group == utls.X25519MLKEM768)
 		errors.LogDebug(context.Background(), "REALITY localAddr: ", localAddr, "\tis using ML-DSA-65 for cert's extra verification: ", len(c.Config.Mldsa65Verify) > 0)
 	}
-	p, _ := reflect.TypeOf(c.Conn).Elem().FieldByName("peerCertificates")
-	certs := *(*([]*x509.Certificate))(unsafe.Pointer(uintptr(unsafe.Pointer(c.Conn)) + p.Offset))
+	// Access the private peerCertificates field via unsafe+reflect.
+	// This is fragile: any utls version that reorders fields will break the offset.
+	// Tested against utls v0.0.12+ (github.com/refraction-networking/utls).
+	// The recover() guard prevents silent memory corruption if the layout changes.
+	certs, certsOk := func() (certs []*x509.Certificate, ok bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				errors.LogError(context.Background(), "REALITY: failed to access peerCertificates via unsafe (utls layout changed?): ", r)
+			}
+		}()
+		p, found := reflect.TypeOf(c.Conn).Elem().FieldByName("peerCertificates")
+		if !found {
+			return nil, false
+		}
+		return *(*([]*x509.Certificate))(unsafe.Pointer(uintptr(unsafe.Pointer(c.Conn)) + p.Offset)), true
+	}()
+	if !certsOk || len(certs) == 0 {
+		return errors.New("REALITY: unable to extract peer certificates")
+	}
 	if pub, ok := certs[0].PublicKey.(ed25519.PublicKey); ok {
 		h := hmac.New(sha512.New, c.AuthKey)
 		h.Write(pub)

@@ -341,8 +341,8 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 
 	requestDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-		if buf.Copy(clientReader, link.Writer, buf.UpdateActivity(timer)) != nil {
-			return errors.New("failed to transfer request").Base(err)
+		if copyErr := buf.Copy(clientReader, link.Writer, buf.UpdateActivity(timer)); copyErr != nil {
+			return errors.New("failed to transfer request").Base(copyErr)
 		}
 		return nil
 	}
