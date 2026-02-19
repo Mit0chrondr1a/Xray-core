@@ -128,8 +128,7 @@ func executeRun(cmd *base.Command, args []string) {
 
 			oldServer := server
 			if err := oldServer.Close(); err != nil {
-				errors.LogWarning(context.Background(), "failed to stop current server: ", err, "; keeping current server")
-				continue
+				errors.LogWarning(context.Background(), "failed to stop current server cleanly: ", err, "; continuing reload with recovery")
 			}
 
 			newServer, err := newXrayServer(cloneXrayConfig(newConfig))
