@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -318,13 +320,21 @@ type AttributeMatcher struct {
 
 // Match implements attributes matching.
 func (m *AttributeMatcher) Match(attrs map[string]string) bool {
-	// header keys are case insensitive most likely. So we do a convert
-	httpHeaders := make(map[string]string)
-	for key, value := range attrs {
-		httpHeaders[strings.ToLower(key)] = value
-	}
+	// Most attribute keys are already normalized; only build a folded-key view
+	// on demand when an exact lookup misses.
+	var foldedHeaders map[string]string
 	for key, regex := range m.configuredKeys {
-		if a, ok := httpHeaders[key]; !ok || !regex.MatchString(a) {
+		a, ok := attrs[key]
+		if !ok {
+			if foldedHeaders == nil {
+				foldedHeaders = make(map[string]string, len(attrs))
+				for headerKey, value := range attrs {
+					foldedHeaders[strings.ToLower(headerKey)] = value
+				}
+			}
+			a, ok = foldedHeaders[key]
+		}
+		if !ok || !regex.MatchString(a) {
 			return false
 		}
 	}
@@ -345,6 +355,106 @@ type ProcessNameMatcher struct {
 	AbsPaths      []string
 	Folders       []string
 	MatchXraySelf bool
+
+	cacheMu sync.Mutex
+	cache   [processLookupCacheSize]processLookupEntry
+}
+
+const (
+	processLookupCacheSize = 256
+	processLookupCacheTTL  = 2 * time.Second
+)
+
+type processLookupKey struct {
+	network net.Network
+	port    net.Port
+	ip      [16]byte
+	ipLen   uint8
+}
+
+type processLookupEntry struct {
+	key       processLookupKey
+	expiresAt int64
+	pid       int
+	name      string
+	absPath   string
+	valid     bool
+}
+
+var findProcess = net.FindProcess
+
+func makeProcessLookupKey(network net.Network, ip net.IP, port net.Port) (processLookupKey, bool) {
+	var key processLookupKey
+	key.network = network
+	key.port = port
+	if ip4 := ip.To4(); ip4 != nil {
+		key.ipLen = 4
+		copy(key.ip[:], ip4)
+		return key, true
+	}
+	if ip16 := ip.To16(); ip16 != nil {
+		key.ipLen = 16
+		copy(key.ip[:], ip16)
+		return key, true
+	}
+	return processLookupKey{}, false
+}
+
+func processLookupCacheIndex(key processLookupKey) int {
+	h := uint32(key.network)<<24 ^ uint32(key.port)<<8 ^ uint32(key.ipLen)
+	for i := 0; i < int(key.ipLen); i++ {
+		h ^= uint32(key.ip[i])
+		h *= 16777619
+	}
+	return int(h % processLookupCacheSize)
+}
+
+func (m *ProcessNameMatcher) loadProcessCache(key processLookupKey, now int64) (int, string, string, bool) {
+	idx := processLookupCacheIndex(key)
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+
+	entry := m.cache[idx]
+	if !entry.valid || entry.key != key {
+		return 0, "", "", false
+	}
+	if entry.expiresAt <= now {
+		m.cache[idx] = processLookupEntry{}
+		return 0, "", "", false
+	}
+	return entry.pid, entry.name, entry.absPath, true
+}
+
+func (m *ProcessNameMatcher) storeProcessCache(key processLookupKey, pid int, name, absPath string, now int64) {
+	idx := processLookupCacheIndex(key)
+	m.cacheMu.Lock()
+	m.cache[idx] = processLookupEntry{
+		key:       key,
+		expiresAt: now + int64(processLookupCacheTTL),
+		pid:       pid,
+		name:      name,
+		absPath:   absPath,
+		valid:     true,
+	}
+	m.cacheMu.Unlock()
+}
+
+func (m *ProcessNameMatcher) matches(pid int, name, absPath string) bool {
+	if m.MatchXraySelf && pid == os.Getpid() {
+		return true
+	}
+	if slices.Contains(m.ProcessNames, name) {
+		return true
+	}
+	if slices.Contains(m.AbsPaths, absPath) {
+		return true
+	}
+	for _, f := range m.Folders {
+		if strings.HasPrefix(absPath, f) {
+			return true
+		}
+	}
+	return false
 }
 
 func NewProcessNameMatcher(names []string) *ProcessNameMatcher {
@@ -389,46 +499,47 @@ func NewProcessNameMatcher(names []string) *ProcessNameMatcher {
 }
 
 func (m *ProcessNameMatcher) Apply(ctx routing.Context) bool {
-	if len(ctx.GetSourceIPs()) == 0 {
+	sourceIPs := ctx.GetSourceIPs()
+	if len(sourceIPs) == 0 {
 		return false
 	}
-	srcPort := ctx.GetSourcePort().String()
-	srcIP := ctx.GetSourceIPs()[0].String()
-	var network string
+	sourceIP := sourceIPs[0]
+	sourcePort := ctx.GetSourcePort()
+	network := ctx.GetNetwork()
+
+	address := net.IPAddress(sourceIP)
+	if address == nil {
+		return false
+	}
+
+	var src net.Destination
 	switch ctx.GetNetwork() {
 	case net.Network_TCP:
-		network = "tcp"
+		src = net.TCPDestination(address, sourcePort)
 	case net.Network_UDP:
-		network = "udp"
+		src = net.UDPDestination(address, sourcePort)
 	default:
 		return false
 	}
-	src, err := net.ParseDestination(strings.Join([]string{network, srcIP, srcPort}, ":"))
-	if err != nil {
+
+	key, ok := makeProcessLookupKey(network, sourceIP, sourcePort)
+	if !ok {
 		return false
 	}
-	pid, name, absPath, err := net.FindProcess(src)
+
+	now := time.Now().UnixNano()
+	if pid, name, absPath, hit := m.loadProcessCache(key, now); hit {
+		return m.matches(pid, name, absPath)
+	}
+
+	pid, name, absPath, err := findProcess(src)
 	if err != nil {
 		if err != net.ErrNotLocal {
 			errors.LogError(context.Background(), "Unables to find local process name: ", err)
 		}
 		return false
 	}
-	if m.MatchXraySelf {
-		if pid == os.Getpid() {
-			return true
-		}
-	}
-	if slices.Contains(m.ProcessNames, name) {
-		return true
-	}
-	if slices.Contains(m.AbsPaths, absPath) {
-		return true
-	}
-	for _, f := range m.Folders {
-		if strings.HasPrefix(absPath, f) {
-			return true
-		}
-	}
-	return false
+
+	m.storeProcessCache(key, pid, name, absPath, now)
+	return m.matches(pid, name, absPath)
 }
