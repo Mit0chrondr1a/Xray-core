@@ -111,3 +111,56 @@ func TestHttpServerConn_DoubleClose_NoPanic(t *testing.T) {
 	// Second close should not panic
 	sc.Close()
 }
+
+func TestRequestHandler_ReleaseSession_DecrementsOnlyOnce(t *testing.T) {
+	h := &requestHandler{}
+	sessionID := "session-1"
+	session := &httpSession{
+		uploadQueue:      NewUploadQueue(1),
+		isFullyConnected: done.New(),
+	}
+	h.sessions.Store(sessionID, session)
+	h.sessionCount.Store(1)
+
+	h.releaseSession(sessionID, session)
+	h.releaseSession(sessionID, session)
+
+	if got := h.sessionCount.Load(); got != 0 {
+		t.Fatalf("expected sessionCount to be 0, got %d", got)
+	}
+	if _, ok := h.sessions.Load(sessionID); ok {
+		t.Fatal("expected session to be removed from sessions map")
+	}
+	if err := session.uploadQueue.Push(Packet{Payload: []byte("x"), Seq: 0}); err == nil {
+		t.Fatal("expected upload queue to be closed")
+	}
+}
+
+func TestRequestHandler_ReleaseSession_StaleCleanupDoesNotDeleteNewSession(t *testing.T) {
+	h := &requestHandler{}
+	sessionID := "session-1"
+	stale := &httpSession{
+		uploadQueue:      NewUploadQueue(1),
+		isFullyConnected: done.New(),
+	}
+	current := &httpSession{
+		uploadQueue:      NewUploadQueue(1),
+		isFullyConnected: done.New(),
+	}
+
+	h.sessions.Store(sessionID, current)
+	h.sessionCount.Store(2) // stale + current
+
+	h.releaseSession(sessionID, stale)
+
+	loaded, ok := h.sessions.Load(sessionID)
+	if !ok {
+		t.Fatal("expected current session to remain in sessions map")
+	}
+	if loaded.(*httpSession) != current {
+		t.Fatal("expected stale cleanup to keep current session")
+	}
+	if got := h.sessionCount.Load(); got != 1 {
+		t.Fatalf("expected sessionCount to decrement to 1, got %d", got)
+	}
+}

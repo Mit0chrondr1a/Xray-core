@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -27,6 +28,8 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
+const maxConcurrentSessions = 8192
+
 type requestHandler struct {
 	config         *Config
 	host           string
@@ -34,6 +37,7 @@ type requestHandler struct {
 	ln             *Listener
 	sessionMu      *sync.Mutex
 	sessions       sync.Map
+	sessionCount   atomic.Int64
 	localAddr      net.Addr
 	socketSettings *internet.SocketConfig
 }
@@ -46,6 +50,17 @@ type httpSession struct {
 	// long as the GET request.
 	isFullyConnected *done.Instance
 	reaperTimer      *time.Timer
+	released         atomic.Bool
+}
+
+func (h *requestHandler) releaseSession(sessionId string, session *httpSession) {
+	if !session.released.CompareAndSwap(false, true) {
+		return
+	}
+
+	h.sessions.CompareAndDelete(sessionId, session)
+	h.sessionCount.Add(-1)
+	_ = session.uploadQueue.Close()
 }
 
 func (h *requestHandler) upsertSession(sessionId string) *httpSession {
@@ -64,17 +79,21 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 		return currentSessionAny.(*httpSession)
 	}
 
+	if h.sessionCount.Load() >= maxConcurrentSessions {
+		return nil
+	}
+
 	s := &httpSession{
 		uploadQueue:      NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
 		isFullyConnected: done.New(),
 	}
 
 	h.sessions.Store(sessionId, s)
+	h.sessionCount.Add(1)
 
 	s.reaperTimer = time.AfterFunc(30*time.Second, func() {
 		if !s.isFullyConnected.Done() {
-			h.sessions.Delete(sessionId)
-			s.uploadQueue.Close()
+			h.releaseSession(sessionId, s)
 		}
 	})
 
@@ -175,6 +194,11 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	var currentSession *httpSession
 	if sessionId != "" {
 		currentSession = h.upsertSession(sessionId)
+		if currentSession == nil {
+			errors.LogWarning(context.Background(), "XHTTP session limit reached (", maxConcurrentSessions, ")")
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 	}
 	scMaxEachPostBytes := int(h.ln.config.GetNormalizedScMaxEachPostBytes().To)
 	uplinkHTTPMethod := h.config.GetNormalizedUplinkHTTPMethod()
@@ -345,11 +369,13 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if sessionId != "" {
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
+			currentSession.isFullyConnected.Close()
 			if currentSession.reaperTimer != nil {
 				currentSession.reaperTimer.Stop()
 			}
-			currentSession.isFullyConnected.Close()
-			defer h.sessions.Delete(sessionId)
+			defer func() {
+				h.releaseSession(sessionId, currentSession)
+			}()
 		}
 
 		// magic header instructs nginx + apache to not buffer response body

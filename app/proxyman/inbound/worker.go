@@ -571,13 +571,16 @@ type dsWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	hub internet.Listener
+	hub           internet.Listener
+	connSemaphore chan struct{}
 
 	ctx context.Context
 }
 
 func (w *dsWorker) callback(conn stat.Connection) {
 	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+	defer conn.Close()
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
 
@@ -609,10 +612,6 @@ func (w *dsWorker) callback(conn stat.Connection) {
 	if err := w.proxy.Process(ctx, net.Network_UNIX, conn, w.dispatcher); err != nil {
 		errors.LogInfoInner(ctx, err, "connection ends")
 	}
-	cancel()
-	if err := conn.Close(); err != nil {
-		errors.LogInfoInner(ctx, err, "failed to close connection")
-	}
 }
 
 func (w *dsWorker) Proxy() proxy.Inbound {
@@ -624,16 +623,25 @@ func (w *dsWorker) Port() net.Port {
 }
 
 func (w *dsWorker) Start() error {
+	w.connSemaphore = make(chan struct{}, getMaxConnections())
 	ctx := context.Background()
 	hub, err := internet.ListenUnix(ctx, w.address, w.stream, func(conn stat.Connection) {
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					errors.LogError(w.ctx, "panic in Unix domain socket connection handler: ", r)
-				}
+		select {
+		case w.connSemaphore <- struct{}{}:
+			go func() {
+				defer func() { <-w.connSemaphore }()
+				defer func() {
+					if r := recover(); r != nil {
+						errors.LogError(w.ctx, "panic in Unix domain socket connection handler: ", r)
+					}
+				}()
+				w.callback(conn)
 			}()
-			w.callback(conn)
-		}()
+		default:
+			errors.LogWarning(w.ctx, "Unix domain socket connection limit reached (",
+				cap(w.connSemaphore), "), rejecting from ", conn.RemoteAddr())
+			conn.Close()
+		}
 	})
 	if err != nil {
 		return errors.New("failed to listen Unix Domain Socket on ", w.address).AtWarning().Base(err)
