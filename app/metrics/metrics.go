@@ -123,6 +123,11 @@ func (p *MetricsHandler) Start() error {
 
 	// direct listen a port if listen is set
 	if p.listen != "" {
+		if host, _, err := net.SplitHostPort(p.listen); err == nil {
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				errors.LogWarning(context.Background(), "Metrics server listening on all interfaces (", p.listen, ") — consider binding to 127.0.0.1 to prevent remote access to pprof/heap data")
+			}
+		}
 		TCPlistener, err := net.Listen("tcp", p.listen)
 		if err != nil {
 			return err
