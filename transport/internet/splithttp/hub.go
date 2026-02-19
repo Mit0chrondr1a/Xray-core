@@ -28,8 +28,6 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
-const maxConcurrentSessions = 8192
-
 type requestHandler struct {
 	config         *Config
 	host           string
@@ -38,6 +36,7 @@ type requestHandler struct {
 	sessionMu      *sync.Mutex
 	sessions       sync.Map
 	sessionCount   atomic.Int64
+	maxSessions    int64
 	localAddr      net.Addr
 	socketSettings *internet.SocketConfig
 }
@@ -79,7 +78,11 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 		return currentSessionAny.(*httpSession)
 	}
 
-	if h.sessionCount.Load() >= maxConcurrentSessions {
+	maxSessions := h.maxSessions
+	if maxSessions <= 0 {
+		maxSessions = getMaxConcurrentSessions()
+	}
+	if h.sessionCount.Load() >= maxSessions {
 		return nil
 	}
 
@@ -195,7 +198,11 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	if sessionId != "" {
 		currentSession = h.upsertSession(sessionId)
 		if currentSession == nil {
-			errors.LogWarning(context.Background(), "XHTTP session limit reached (", maxConcurrentSessions, ")")
+			maxSessions := h.maxSessions
+			if maxSessions <= 0 {
+				maxSessions = getMaxConcurrentSessions()
+			}
+			errors.LogWarning(context.Background(), "XHTTP session limit reached (", maxSessions, ")")
 			writer.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -481,6 +488,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		ln:             l,
 		sessionMu:      &sync.Mutex{},
 		sessions:       sync.Map{},
+		maxSessions:    getMaxConcurrentSessions(),
 		socketSettings: streamSettings.SocketSettings,
 	}
 	tlsConfig := getTLSConfig(streamSettings)
