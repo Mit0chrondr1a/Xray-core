@@ -135,6 +135,20 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 	return w.proxy
 }
 
+// launchHandler starts a goroutine that runs the connection callback with
+// panic recovery and semaphore release.
+func (w *tcpWorker) launchHandler(conn stat.Connection) {
+	go func() {
+		defer func() { <-w.connSemaphore }()
+		defer func() {
+			if r := recover(); r != nil {
+				errors.LogError(w.ctx, "panic in TCP connection handler: ", r)
+			}
+		}()
+		w.callback(conn)
+	}()
+}
+
 func (w *tcpWorker) Start() error {
 	w.connSemaphore = make(chan struct{}, getMaxConnections())
 	ctx := context.Background()
@@ -142,15 +156,7 @@ func (w *tcpWorker) Start() error {
 		// Fast path: try non-blocking acquire first (zero allocation).
 		select {
 		case w.connSemaphore <- struct{}{}:
-			go func() {
-				defer func() { <-w.connSemaphore }()
-				defer func() {
-					if r := recover(); r != nil {
-						errors.LogError(w.ctx, "panic in TCP connection handler: ", r)
-					}
-				}()
-				w.callback(conn)
-			}()
+			w.launchHandler(conn)
 			return
 		default:
 		}
@@ -159,29 +165,13 @@ func (w *tcpWorker) Start() error {
 		select {
 		case w.connSemaphore <- struct{}{}:
 			timer.Stop()
-			go func() {
-				defer func() { <-w.connSemaphore }()
-				defer func() {
-					if r := recover(); r != nil {
-						errors.LogError(w.ctx, "panic in TCP connection handler: ", r)
-					}
-				}()
-				w.callback(conn)
-			}()
+			w.launchHandler(conn)
 		case <-timer.C:
 			// Final non-blocking attempt before rejecting (avoids select race
 			// where both timer and semaphore are ready simultaneously).
 			select {
 			case w.connSemaphore <- struct{}{}:
-				go func() {
-					defer func() { <-w.connSemaphore }()
-					defer func() {
-						if r := recover(); r != nil {
-							errors.LogError(w.ctx, "panic in TCP connection handler: ", r)
-						}
-					}()
-					w.callback(conn)
-				}()
+				w.launchHandler(conn)
 				return
 			default:
 			}
@@ -539,7 +529,7 @@ func (w *udpWorker) Start() error {
 		return err
 	}
 
-	w.cone, _ = w.ctx.Value("cone").(bool)
+	w.cone = c.ConeFromContext(w.ctx)
 
 	w.checker = &task.Periodic{
 		Interval: time.Minute,

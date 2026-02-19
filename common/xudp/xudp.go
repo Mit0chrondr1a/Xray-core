@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform"
@@ -55,7 +56,7 @@ func init() {
 }
 
 func GetGlobalID(ctx context.Context) (globalID [8]byte) {
-	if cone := ctx.Value("cone"); cone == nil || !cone.(bool) { // cone is nil only in some unit tests
+	if !c.ConeFromContext(ctx) {
 		return
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.Network == net.Network_UDP &&

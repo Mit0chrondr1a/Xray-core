@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
+	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/serial"
@@ -256,7 +257,7 @@ func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
 }
 
 func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
-	server.ctx = context.WithValue(server.ctx, "cone",
+	server.ctx = c.ContextWithCone(server.ctx,
 		platform.NewEnvFlag(platform.UseCone).GetValue(func() string { return "" }) != "true")
 	bindOCSPTickerOwners(server, config)
 

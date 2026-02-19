@@ -83,7 +83,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	handler := &Handler{
 		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		cone:          ctx.Value("cone").(bool),
+		cone:          xctx.ConeFromContext(ctx),
 	}
 
 	a := handler.server.User.Account.(*vless.MemoryAccount)

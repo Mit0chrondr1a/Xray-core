@@ -9,6 +9,7 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
@@ -59,7 +60,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	server := &Server{
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		validator:     validator,
-		cone:          ctx.Value("cone").(bool),
+		cone:          c.ConeFromContext(ctx),
 	}
 
 	if config.Fallbacks != nil {
