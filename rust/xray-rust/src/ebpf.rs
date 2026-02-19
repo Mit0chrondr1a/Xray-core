@@ -58,6 +58,31 @@ struct EbpfState {
     pin_path: String,
 }
 
+/// eBPF setup error codes returned to Go via FFI.
+///
+/// * `-1` — generic / unknown error
+/// * `-2` — permission denied (EPERM / EACCES)
+/// * `-3` — missing kernel feature (no eBPF bytecode, missing program/map)
+/// * `-4` — program/map load failure
+const EBPF_ERR_GENERIC: i32 = -1;
+const EBPF_ERR_PERMISSION: i32 = -2;
+const EBPF_ERR_MISSING_FEATURE: i32 = -3;
+const EBPF_ERR_LOAD_FAILURE: i32 = -4;
+
+/// Classify an error string into an FFI error code.
+fn classify_ebpf_error(err: &str) -> i32 {
+    let lower = err.to_lowercase();
+    if lower.contains("permission") || lower.contains("eperm") || lower.contains("eacces") || lower.contains("operation not permitted") {
+        EBPF_ERR_PERMISSION
+    } else if lower.contains("missing") || lower.contains("not compiled") || lower.contains("not found") {
+        EBPF_ERR_MISSING_FEATURE
+    } else if lower.contains("load") || lower.contains("attach") || lower.contains("pin") {
+        EBPF_ERR_LOAD_FAILURE
+    } else {
+        EBPF_ERR_GENERIC
+    }
+}
+
 /// Set up eBPF sockmap with pinned maps.
 ///
 /// # Arguments
@@ -66,7 +91,8 @@ struct EbpfState {
 /// * `cork_threshold` — SK_MSG cork threshold in bytes (default 1400)
 ///
 /// # Returns
-/// 0 on success, negative error code on failure.
+/// 0 on success, negative error code on failure:
+/// `-1` generic, `-2` permission, `-3` missing feature, `-4` load failure.
 fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -> Result<(), String> {
     let mut guard = EBPF_STATE.lock().map_err(|e| format!("lock: {e}"))?;
     if guard.is_some() {
@@ -372,11 +398,14 @@ pub unsafe extern "C" fn xray_ebpf_setup(
         }
         let path = match CStr::from_ptr(pin_path).to_str() {
             Ok(s) => s,
-            Err(_) => return -1,
+            Err(_) => return EBPF_ERR_GENERIC,
         };
         match setup_sockmap_impl(path, max_entries, cork_threshold) {
             Ok(()) => 0,
-            Err(_) => -1,
+            Err(e) => {
+                eprintln!("xray_ebpf_setup: {e}");
+                classify_ebpf_error(&e)
+            }
         }
     })
 }

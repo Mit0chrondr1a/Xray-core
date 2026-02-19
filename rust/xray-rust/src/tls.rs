@@ -1297,6 +1297,7 @@ pub extern "C" fn xray_tls_key_update(state: *mut TlsState) -> i32 {
         // current application traffic secret. This is a placeholder that
         // will be implemented when the Go side sends KeyUpdate signals.
         // For now, kTLS in kernel 6.x handles KeyUpdate transparently.
+        eprintln!("xray_tls_key_update: stub — key rotation not performed (requires kernel ≥6.3 for transparent kTLS KeyUpdate)");
         0
     })
 }

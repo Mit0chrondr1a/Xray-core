@@ -1562,9 +1562,23 @@ func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {
 	defer C.free(unsafe.Pointer(cPath))
 	rc := C.xray_ebpf_setup(cPath, C.uint32_t(maxEntries), C.uint32_t(corkThreshold))
 	if rc != 0 {
-		return fmt.Errorf("native: ebpf setup failed (rc=%d)", rc)
+		return fmt.Errorf("native: ebpf setup failed: %s (rc=%d)", ebpfSetupErrorDetail(rc), rc)
 	}
 	return nil
+}
+
+// ebpfSetupErrorDetail maps Rust eBPF setup error codes to human-readable descriptions.
+func ebpfSetupErrorDetail(rc C.int32_t) string {
+	switch rc {
+	case -2:
+		return "permission denied (need CAP_BPF / CAP_NET_ADMIN)"
+	case -3:
+		return "missing kernel feature or eBPF bytecode not compiled"
+	case -4:
+		return "BPF program/map load or attach failure"
+	default:
+		return "unknown error"
+	}
 }
 
 // EbpfTeardown tears down eBPF programs and unpins maps.
