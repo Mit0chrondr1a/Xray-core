@@ -97,9 +97,10 @@ tasks:
                 # ships an older version linked against a stale LLVM).
                 BPF_LINKER="$HOME/.cargo/bin/bpf-linker"
                 if [ ! -x "$BPF_LINKER" ]; then
-                    echo ">> bpf-linker not found at $BPF_LINKER, skipping eBPF build"
+                    echo ">> bpf-linker not found at $BPF_LINKER, cannot build required eBPF artifact"
                     echo ">> Install: cargo +nightly install bpf-linker"
-                    exit 0
+                    echo ">> Use 'task build-pure-go' if you intentionally want a build without Rust/eBPF"
+                    exit 1
                 fi
 
                 # mise exports RUSTUP_TOOLCHAIN=stable; override it with
