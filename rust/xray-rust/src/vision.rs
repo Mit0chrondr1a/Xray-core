@@ -12,6 +12,8 @@
 //!   [contentLen_lo (1)][padLen_hi (1)][padLen_lo (1)][content (contentLen)]
 //!   [random padding (padLen)]
 
+use std::cell::RefCell;
+
 /// Maximum buffer size (matches Go buf.Size = 8192).
 const BUF_SIZE: i32 = 8192;
 
@@ -20,6 +22,63 @@ const HEADER_SIZE: i32 = 5;
 
 /// Maximum overhead including UUID prefix: 16 + 5 = 21 bytes.
 const MAX_OVERHEAD: i32 = 21;
+
+/// Per-thread random cache size used to amortize getrandom syscalls.
+const RNG_CACHE_SIZE: usize = 4096;
+
+struct RandomCache {
+    buf: [u8; RNG_CACHE_SIZE],
+    pos: usize,
+    len: usize,
+}
+
+impl RandomCache {
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; RNG_CACHE_SIZE],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn refill(&mut self) -> bool {
+        if getrandom::fill(&mut self.buf).is_err() {
+            self.pos = 0;
+            self.len = 0;
+            return false;
+        }
+        self.pos = 0;
+        self.len = self.buf.len();
+        true
+    }
+
+    fn take(&mut self, out: &mut [u8]) -> bool {
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.pos == self.len && !self.refill() {
+                return false;
+            }
+            let available = self.len - self.pos;
+            let n = core::cmp::min(available, out.len() - written);
+            out[written..written + n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            self.pos += n;
+            written += n;
+        }
+        true
+    }
+
+    fn next_u64(&mut self) -> Option<u64> {
+        let mut buf = [0u8; 8];
+        if !self.take(&mut buf) {
+            return None;
+        }
+        Some(u64::from_le_bytes(buf))
+    }
+}
+
+thread_local! {
+    static RNG_CACHE: RefCell<RandomCache> = RefCell::new(RandomCache::new());
+}
 
 // --- Padding ---
 
@@ -110,8 +169,7 @@ pub unsafe extern "C" fn xray_vision_pad(
     // Write random padding.
     if padding_len > 0 {
         let padding_slice = &mut out[pos..pos + padding_len as usize];
-        // Fill with random bytes for padding (best-effort; zeros are acceptable fallback).
-        let _ = getrandom::fill(padding_slice);
+        fill_random(padding_slice);
         pos += padding_len as usize;
     }
 
@@ -133,19 +191,38 @@ fn clamp_padding(mut padding: i32, content_len: i32) -> i32 {
 }
 
 /// Generate a random value in [0, upper_bound) using CSPRNG.
-/// Matches Go's crypto/rand.Int behavior.
+/// Values are pulled from a thread-local random cache to reduce syscall overhead.
 fn csprng_range(upper_bound: i64) -> i64 {
     if upper_bound <= 1 {
         return 0;
     }
 
-    let mut buf = [0u8; 8];
-    if getrandom::fill(&mut buf).is_err() {
+    let val = RNG_CACHE.with(|cache| cache.borrow_mut().next_u64());
+    let Some(val) = val else {
         return 0;
-    }
-    let val = u64::from_le_bytes(buf) >> 1; // ensure positive
+    };
+
+    let val = val >> 1; // ensure positive
     // Simple modulo — for our use case (small ranges) bias is negligible.
     (val % upper_bound as u64) as i64
+}
+
+fn fill_random(out: &mut [u8]) {
+    if out.is_empty() {
+        return;
+    }
+
+    // Large writes are uncommon and are fine to satisfy directly.
+    if out.len() > RNG_CACHE_SIZE {
+        let _ = getrandom::fill(out);
+        return;
+    }
+
+    let ok = RNG_CACHE.with(|cache| cache.borrow_mut().take(out));
+    if !ok {
+        // Keep behavior best-effort: if RNG fails, fallback to zeros.
+        out.fill(0);
+    }
 }
 
 // --- Unpadding ---
