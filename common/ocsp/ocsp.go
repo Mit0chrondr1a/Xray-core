@@ -7,11 +7,18 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/platform/filesystem"
 	"golang.org/x/crypto/ocsp"
 )
+
+// ocspHTTPClient is a shared HTTP client with timeouts for OCSP requests,
+// preventing indefinite hangs when OCSP/issuer servers are unresponsive.
+var ocspHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+}
 
 func GetOCSPForFile(path string) ([]byte, error) {
 	return filesystem.ReadFile(path)
@@ -42,8 +49,11 @@ func GetOCSPStapling(cert [][]byte, path string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		newFile.Write(ocspData)
-		defer newFile.Close()
+		_, writeErr := newFile.Write(ocspData)
+		newFile.Close()
+		if writeErr != nil {
+			return nil, writeErr
+		}
 	}
 	return ocspData, nil
 }
@@ -70,7 +80,7 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		if len(issuedCert.IssuingCertificateURL) == 0 {
 			return nil, errors.New("no issuing certificate URL")
 		}
-		resp, errC := http.Get(issuedCert.IssuingCertificateURL[0])
+		resp, errC := ocspHTTPClient.Get(issuedCert.IssuingCertificateURL[0])
 		if errC != nil {
 			return nil, errors.New("no issuing certificate URL")
 		}
@@ -95,7 +105,7 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		return nil, err
 	}
 	reader := bytes.NewReader(ocspReq)
-	req, err := http.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
+	req, err := ocspHTTPClient.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
 	if err != nil {
 		return nil, errors.New(err)
 	}
