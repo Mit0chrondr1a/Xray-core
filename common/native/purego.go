@@ -242,7 +242,7 @@ func AeadSealTo(*AeadHandle, []byte, []byte, []byte, []byte) (int, error)    { r
 func AeadOpenTo(*AeadHandle, []byte, []byte, []byte, []byte) (int, error)    { return 0, errNotAvailable }
 func AeadOverhead(*AeadHandle) int                                           { return 0 }
 func AeadNonceSize(*AeadHandle) int                                          { return 0 }
-func AeadFree(*AeadHandle)                                                   {}
+func aeadFree(*AeadHandle)                                                   {}
 
 // --- VMess AEAD Header Stubs ---
 

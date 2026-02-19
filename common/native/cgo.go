@@ -206,6 +206,12 @@ import (
 	"lukechampine.com/blake3"
 )
 
+func init() {
+	if got, want := unsafe.Sizeof(VisionFilterState{}), VisionFilterStateSizeC(); got != want {
+		panic("native: VisionFilterState size mismatch: Go=" + fmt.Sprint(got) + " C=" + fmt.Sprint(want))
+	}
+}
+
 // Available reports whether the native Rust implementations are linked.
 func Available() bool {
 	return true
@@ -1093,7 +1099,7 @@ type AeadHandle struct {
 }
 
 func (h *AeadHandle) release() {
-	AeadFree(h)
+	aeadFree(h)
 }
 
 // AeadNew creates a new AEAD handle for the given algorithm and key.
@@ -1323,8 +1329,9 @@ func AeadNonceSize(h *AeadHandle) int {
 	return result
 }
 
-// AeadFree releases an AEAD handle.
-func AeadFree(h *AeadHandle) {
+// aeadFree releases an AEAD handle. Unexported to prevent use-after-free
+// races — cleanup is driven solely by the GC finalizer on AeadHandle.
+func aeadFree(h *AeadHandle) {
 	if h == nil {
 		return
 	}
