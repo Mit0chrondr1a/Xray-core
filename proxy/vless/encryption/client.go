@@ -175,6 +175,9 @@ func (i *ClientInstance) Handshake(conn net.Conn) (*CommonConn, error) {
 	c.UnitedKey = append(pfsKey, nfsKey...)
 	c.AEAD = NewAEAD(pfsPublicKey, c.UnitedKey, c.UseAES)
 	c.PeerAEAD = NewAEAD(encryptedPfsPublicKey[:1088+32], c.UnitedKey, c.UseAES)
+	clear(mlkem768Key)
+	clear(x25519Key)
+	clear(nfsKey)
 
 	encryptedTicket := make([]byte, 32)
 	if _, err := io.ReadFull(conn, encryptedTicket); err != nil {
@@ -188,9 +191,11 @@ func (i *ClientInstance) Handshake(conn net.Conn) (*CommonConn, error) {
 	if i.Seconds > 0 && seconds > 0 {
 		i.RWLock.Lock()
 		i.Expire = time.Now().Add(time.Duration(seconds) * time.Second)
-		i.PfsKey = pfsKey
+		i.PfsKey = pfsKey // ownership transferred
 		i.Ticket = encryptedTicket[:16]
 		i.RWLock.Unlock()
+	} else {
+		clear(pfsKey)
 	}
 
 	encryptedLength := make([]byte, 18)

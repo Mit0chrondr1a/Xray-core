@@ -52,18 +52,18 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 	outBytes := OutBytesPool.Get().([]byte)
 	defer OutBytesPool.Put(outBytes)
 	for n := 0; n < len(b); {
-		b := b[n:]
-		if len(b) > 8192 {
-			b = b[:8192] // for avoiding another copy() in peer's Read()
+		chunk := b[n:]
+		if len(chunk) > 8192 {
+			chunk = chunk[:8192] // for avoiding another copy() in peer's Read()
 		}
-		n += len(b)
-		headerAndData := outBytes[:5+len(b)+16]
-		EncodeHeader(headerAndData, len(b)+16)
+		n += len(chunk)
+		headerAndData := outBytes[:5+len(chunk)+16]
+		EncodeHeader(headerAndData, len(chunk)+16)
 		max := false
 		if subtle.ConstantTimeCompare(c.AEAD.Nonce[:], MaxNonce) == 1 {
 			max = true
 		}
-		c.AEAD.Seal(headerAndData[:5], nil, b, headerAndData[:5])
+		c.AEAD.Seal(headerAndData[:5], nil, chunk, headerAndData[:5])
 		if max {
 			c.AEAD = NewAEAD(headerAndData, c.UnitedKey, c.UseAES)
 		}

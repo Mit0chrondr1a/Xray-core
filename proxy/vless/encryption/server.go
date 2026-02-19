@@ -6,7 +6,6 @@ import (
 	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/subtle"
-	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -35,9 +34,36 @@ type ServerInstance struct {
 
 	RWLock   sync.RWMutex
 	Closed   bool
-	Lasts    map[int64][16]byte
-	Tickets  [][16]byte
+	Lasts    map[int64][][16]byte
 	Sessions map[[16]byte]*ServerSession
+}
+
+func (i *ServerInstance) storeSession(ticket [16]byte, pfsKey []byte, nowUnix int64) bool {
+	ticketSeconds := int64(DecodeLength(ticket[:2]))
+	if ticketSeconds <= 0 {
+		clear(pfsKey)
+		return false
+	}
+
+	i.RWLock.Lock()
+	// Keep retention aligned with the ticket lifetime encoded for clients.
+	expiryMinute := (nowUnix+ticketSeconds)/60 + 2
+	i.Lasts[expiryMinute] = append(i.Lasts[expiryMinute], ticket)
+	i.Sessions[ticket] = &ServerSession{PfsKey: pfsKey} // ownership transferred
+	i.RWLock.Unlock()
+	return true
+}
+
+func (i *ServerInstance) evictExpiredSessionsLocked(nowMinute int64) {
+	for expiryMinute, tickets := range i.Lasts {
+		if expiryMinute > nowMinute {
+			continue
+		}
+		for _, ticket := range tickets {
+			delete(i.Sessions, ticket)
+		}
+		delete(i.Lasts, expiryMinute)
+	}
 }
 
 func (i *ServerInstance) Init(nfsSKeysBytes [][]byte, xorMode uint32, secondsFrom, secondsTo int64, padding string) (err error) {
@@ -76,8 +102,7 @@ func (i *ServerInstance) Init(nfsSKeysBytes [][]byte, xorMode uint32, secondsFro
 		return
 	}
 	if i.SecondsFrom > 0 || i.SecondsTo > 0 {
-		i.Lasts = make(map[int64][16]byte)
-		i.Tickets = make([][16]byte, 0, 1024)
+		i.Lasts = make(map[int64][][16]byte)
 		i.Sessions = make(map[[16]byte]*ServerSession)
 		go func() {
 			for {
@@ -87,19 +112,7 @@ func (i *ServerInstance) Init(nfsSKeysBytes [][]byte, xorMode uint32, secondsFro
 					i.RWLock.Unlock()
 					return
 				}
-				minute := time.Now().Unix() / 60
-				last := i.Lasts[minute]
-				delete(i.Lasts, minute)
-				delete(i.Lasts, minute-1) // for insurance
-				if last != [16]byte{} {
-					for j, ticket := range i.Tickets {
-						delete(i.Sessions, ticket)
-						if ticket == last {
-							i.Tickets = i.Tickets[j+1:]
-							break
-						}
-					}
-				}
+				i.evictExpiredSessionsLocked(time.Now().Unix() / 60)
 				i.RWLock.Unlock()
 			}
 		}()
@@ -169,7 +182,7 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 		lastCTR = NewCTR(nfsKey, iv)
 		lastCTR.XORKeyStream(relays, relays[:32])
 		if subtle.ConstantTimeCompare(relays[:32], i.Hash32s[j+1][:]) != 1 {
-			return nil, errors.New("unexpected hash32: ", fmt.Sprintf("%v", relays[:32]))
+			return nil, errors.New("unexpected relay hash")
 		}
 		relays = relays[32:]
 	}
@@ -265,6 +278,9 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 	c.UnitedKey = append(pfsKey, nfsKey...)
 	c.AEAD = NewAEAD(pfsPublicKey, c.UnitedKey, c.UseAES)
 	c.PeerAEAD = NewAEAD(encryptedPfsPublicKey[:1184+32], c.UnitedKey, c.UseAES)
+	clear(mlkem768Key)
+	clear(x25519Key)
+	clear(nfsKey)
 
 	ticket := [16]byte{}
 	rand.Read(ticket[:])
@@ -276,11 +292,9 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 	}
 	copy(ticket[:], EncodeLength(int(seconds)))
 	if seconds > 0 {
-		i.RWLock.Lock()
-		i.Lasts[(time.Now().Unix()+max(i.SecondsFrom, i.SecondsTo))/60+2] = ticket
-		i.Tickets = append(i.Tickets, ticket)
-		i.Sessions[ticket] = &ServerSession{PfsKey: pfsKey}
-		i.RWLock.Unlock()
+		i.storeSession(ticket, pfsKey, time.Now().Unix())
+	} else {
+		clear(pfsKey)
 	}
 
 	pfsKeyExchangeLength := 1088 + 32 + 16
