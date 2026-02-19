@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,24 +29,100 @@ var globalSessionCache = tls.NewLRUClientSessionCache(getTLSCacheSize())
 // ocspTickerRegistry tracks active OCSP ticker goroutines for cancellation.
 var ocspTickerRegistry struct {
 	sync.Mutex
-	stopFuncs []func()
+	stopFuncsByOwner map[any][]func()
+	configOwners     map[*Config]any
 }
 
 // StopAllOcspTickers cancels all active OCSP ticker goroutines.
 // Call this during config reload or shutdown to prevent goroutine leaks.
 func StopAllOcspTickers() {
+	var stopFuncs []func()
+
 	ocspTickerRegistry.Lock()
-	defer ocspTickerRegistry.Unlock()
-	for _, stop := range ocspTickerRegistry.stopFuncs {
+	for _, stops := range ocspTickerRegistry.stopFuncsByOwner {
+		stopFuncs = append(stopFuncs, stops...)
+	}
+	ocspTickerRegistry.stopFuncsByOwner = nil
+	ocspTickerRegistry.configOwners = nil
+	ocspTickerRegistry.Unlock()
+
+	for _, stop := range stopFuncs {
 		stop()
 	}
-	ocspTickerRegistry.stopFuncs = nil
 }
 
-func registerOcspTicker(stop func()) {
+func normalizeOcspOwner(owner any) any {
+	if owner == nil {
+		return nil
+	}
+	if !reflect.TypeOf(owner).Comparable() {
+		return nil
+	}
+	return owner
+}
+
+// StopOcspTickersForOwner cancels all OCSP ticker goroutines owned by owner.
+func StopOcspTickersForOwner(owner any) {
+	owner = normalizeOcspOwner(owner)
+	if owner == nil {
+		return
+	}
+
+	ocspTickerRegistry.Lock()
+	stopFuncs := append([]func(){}, ocspTickerRegistry.stopFuncsByOwner[owner]...)
+	delete(ocspTickerRegistry.stopFuncsByOwner, owner)
+	for cfg, cfgOwner := range ocspTickerRegistry.configOwners {
+		if cfgOwner == owner {
+			delete(ocspTickerRegistry.configOwners, cfg)
+		}
+	}
+	ocspTickerRegistry.Unlock()
+
+	for _, stop := range stopFuncs {
+		stop()
+	}
+}
+
+// BindOcspTickerOwner associates a TLS config object with an owner identity.
+// Tickers created from this config are later stopped via StopOcspTickersForOwner.
+func BindOcspTickerOwner(owner any, cfg *Config) {
+	owner = normalizeOcspOwner(owner)
+	if owner == nil || cfg == nil {
+		return
+	}
+
 	ocspTickerRegistry.Lock()
 	defer ocspTickerRegistry.Unlock()
-	ocspTickerRegistry.stopFuncs = append(ocspTickerRegistry.stopFuncs, stop)
+	if ocspTickerRegistry.configOwners == nil {
+		ocspTickerRegistry.configOwners = make(map[*Config]any)
+	}
+	ocspTickerRegistry.configOwners[cfg] = owner
+}
+
+func ocspTickerOwner(cfg *Config) any {
+	ocspTickerRegistry.Lock()
+	defer ocspTickerRegistry.Unlock()
+	if owner, found := ocspTickerRegistry.configOwners[cfg]; found {
+		return owner
+	}
+	return cfg
+}
+
+func registerOcspTicker(owner any, stop func()) {
+	if stop == nil {
+		return
+	}
+	owner = normalizeOcspOwner(owner)
+	if owner == nil {
+		return
+	}
+
+	ocspTickerRegistry.Lock()
+	defer ocspTickerRegistry.Unlock()
+	if ocspTickerRegistry.stopFuncsByOwner == nil {
+		ocspTickerRegistry.stopFuncsByOwner = make(map[any][]func())
+	}
+	ocspTickerRegistry.stopFuncsByOwner[owner] = append(ocspTickerRegistry.stopFuncsByOwner[owner], stop)
 }
 
 func getTLSCacheSize() int {
@@ -83,6 +160,7 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 // Returns atomic pointers so hot-reload can swap certs without races.
 func (c *Config) BuildCertificates() []*atomic.Pointer[tls.Certificate] {
 	certs := make([]*atomic.Pointer[tls.Certificate], 0, len(c.Certificate))
+	owner := ocspTickerOwner(c)
 	for _, entry := range c.Certificate {
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
@@ -108,7 +186,7 @@ func (c *Config) BuildCertificates() []*atomic.Pointer[tls.Certificate] {
 			continue
 		}
 		certPtr := certs[len(certs)-1]
-		registerOcspTicker(setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
+		registerOcspTicker(owner, setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
 			cert := certPtr.Load()
 			if isReloaded {
 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
@@ -210,10 +288,11 @@ func issueCertificate(rawCA *Certificate, domain string) (*tls.Certificate, erro
 
 func (c *Config) getCustomCA() []*Certificate {
 	certs := make([]*Certificate, 0, len(c.Certificate))
+	owner := ocspTickerOwner(c)
 	for _, certificate := range c.Certificate {
 		if certificate.Usage == Certificate_AUTHORITY_ISSUE {
 			certs = append(certs, certificate)
-			registerOcspTicker(setupOcspTicker(certificate, func(isReloaded, isOcspstapling bool) {}))
+			registerOcspTicker(owner, setupOcspTicker(certificate, func(isReloaded, isOcspstapling bool) {}))
 		}
 	}
 	return certs
