@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet"
 	internettls "github.com/xtls/xray-core/transport/internet/tls"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Server is an instance of Xray. At any time, there must be at most one Server instance running.
@@ -104,6 +105,58 @@ type Instance struct {
 	resolveLock                sync.Mutex
 
 	ctx context.Context
+}
+
+var runningInstanceCount atomic.Int32
+
+func bindOCSPTickerOwners(owner any, config *Config) {
+	if owner == nil || config == nil {
+		return
+	}
+
+	var walk func(protoreflect.Message)
+	walk = func(msg protoreflect.Message) {
+		if !msg.IsValid() {
+			return
+		}
+
+		if tlsConfig, ok := msg.Interface().(*internettls.Config); ok {
+			internettls.BindOcspTickerOwner(owner, tlsConfig)
+		}
+
+		fields := msg.Descriptor().Fields()
+		for i := 0; i < fields.Len(); i++ {
+			fd := fields.Get(i)
+			if fd.Kind() != protoreflect.MessageKind && fd.Kind() != protoreflect.GroupKind {
+				continue
+			}
+
+			if fd.IsList() {
+				list := msg.Get(fd).List()
+				for j := 0; j < list.Len(); j++ {
+					walk(list.Get(j).Message())
+				}
+				continue
+			}
+
+			if fd.IsMap() {
+				if fd.MapValue().Kind() != protoreflect.MessageKind && fd.MapValue().Kind() != protoreflect.GroupKind {
+					continue
+				}
+				msg.Get(fd).Map().Range(func(_ protoreflect.MapKey, value protoreflect.Value) bool {
+					walk(value.Message())
+					return true
+				})
+				continue
+			}
+
+			if msg.Has(fd) {
+				walk(msg.Get(fd).Message())
+			}
+		}
+	}
+
+	walk(config.ProtoReflect())
 }
 
 // Instance state
@@ -205,6 +258,7 @@ func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
 func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
 	server.ctx = context.WithValue(server.ctx, "cone",
 		platform.NewEnvFlag(platform.UseCone).GetValue(func() string { return "" }) != "true")
+	bindOCSPTickerOwners(server, config)
 
 	for _, appSettings := range config.App {
 		settings, err := appSettings.GetInstance()
@@ -275,17 +329,20 @@ func (s *Instance) Close() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
-	s.running.Store(false)
-	// Ensure cached TLS keylog descriptors are released on all close paths.
-	defer internettls.CloseMasterKeyLogWriters()
-	// Stop all OCSP ticker goroutines to prevent leaks on config reload.
-	defer internettls.StopAllOcspTickers()
+	wasRunning := s.running.Swap(false)
 
 	var errs []interface{}
 	for _, f := range s.features {
 		if err := f.Close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	internettls.StopOcspTickersForOwner(s)
+	if wasRunning && runningInstanceCount.Add(-1) == 0 {
+		internettls.StopAllOcspTickers()
+		// Keylog writer cache is process-global. Only clear it when the last
+		// running instance exits to avoid disrupting other live instances.
+		internettls.CloseMasterKeyLogWriters()
 	}
 	if len(errs) > 0 {
 		return errors.New("failed to close all features").Base(errors.New(serial.Concat(errs...)))
@@ -406,6 +463,7 @@ func (s *Instance) Start() error {
 	defer s.statusLock.Unlock()
 
 	s.running.Store(true)
+	runningInstanceCount.Add(1)
 	var started []features.Feature
 	for _, f := range s.features {
 		if err := f.Start(); err != nil {
@@ -414,6 +472,11 @@ func (s *Instance) Start() error {
 				started[i].Close()
 			}
 			s.running.Store(false)
+			internettls.StopOcspTickersForOwner(s)
+			if runningInstanceCount.Add(-1) == 0 {
+				internettls.StopAllOcspTickers()
+				internettls.CloseMasterKeyLogWriters()
+			}
 			return err
 		}
 		started = append(started, f)
