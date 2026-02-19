@@ -26,6 +26,8 @@ import (
 
 var globalSessionCache = tls.NewLRUClientSessionCache(getTLSCacheSize())
 
+var allowInsecureWarningOnce sync.Once
+
 // ocspTickerRegistry tracks active OCSP ticker goroutines for cancellation.
 var ocspTickerRegistry struct {
 	sync.Mutex
@@ -503,6 +505,12 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 			RootCAs:                root,
 			SessionTicketsDisabled: true,
 		}
+	}
+
+	if c.AllowInsecure {
+		allowInsecureWarningOnce.Do(func() {
+			errors.LogWarning(context.Background(), "TLS AllowInsecure is enabled - certificate validation is disabled")
+		})
 	}
 
 	randCarrier := &RandCarrier{

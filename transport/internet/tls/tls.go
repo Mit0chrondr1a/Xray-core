@@ -67,24 +67,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 func (c *Conn) Write(b []byte) (int, error) {
 	if c.ktls.TxReady {
 		n, err := c.Conn.NetConn().Write(b)
-		if err == nil && c.ktls.keyUpdateHandler != nil {
-			records := uint64((n + maxRecordPayload - 1) / maxRecordPayload)
-			total := c.writeRecords.Add(records)
-			if total >= keyUpdateThreshold {
-				if c.writeRecords.CompareAndSwap(total, 0) {
-					if err := c.ktls.keyUpdateHandler.InitiateUpdate(); err != nil {
-						c.writeRecords.Add(total) // restore so next writer retries
-						if c.rotationFailures.Add(1) >= maxRotationFailures {
-							errors.LogError(context.Background(), "ktls: TX key rotation failed ", maxRotationFailures, " times, closing connection: ", err)
-							c.Conn.NetConn().Close()
-						} else {
-							errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
-						}
-					} else {
-						c.rotationFailures.Store(0)
-					}
-				}
-			}
+		if err == nil {
+			ktlsAfterWrite(n, c.ktls.keyUpdateHandler, &c.writeRecords, &c.rotationFailures, func() error {
+				return c.Conn.NetConn().Close()
+			})
 		}
 		return n, err
 	}
@@ -268,6 +254,33 @@ func GeneraticUClient(c net.Conn, config *tls.Config) *utls.UConn {
 	return utls.UClient(c, copyConfig(config), utls.HelloChrome_Auto)
 }
 
+// ktlsAfterWrite handles key rotation bookkeeping after a successful kTLS write.
+// Both Conn and RustConn delegate to this to avoid duplicating the rotation logic.
+func ktlsAfterWrite(n int, handler *KTLSKeyUpdateHandler, writeRecords *atomic.Uint64, rotationFailures *atomic.Uint32, closeConn func() error) {
+	if handler == nil {
+		return
+	}
+	records := uint64((n + maxRecordPayload - 1) / maxRecordPayload)
+	total := writeRecords.Add(records)
+	if total >= keyUpdateThreshold {
+		if writeRecords.CompareAndSwap(total, 0) {
+			if err := handler.InitiateUpdate(); err != nil {
+				writeRecords.Add(total) // restore so next writer retries
+				if rotationFailures.Add(1) >= maxRotationFailures {
+					errors.LogError(context.Background(), "ktls: TX key rotation failed ", maxRotationFailures, " times, closing connection: ", err)
+					if cerr := closeConn(); cerr != nil {
+						errors.LogWarning(context.Background(), "ktls: failed to close connection after key exhaustion: ", cerr)
+					}
+				} else {
+					errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
+				}
+			} else {
+				rotationFailures.Store(0)
+			}
+		}
+	}
+}
+
 // RustConn wraps a raw TCP connection after Rust-side rustls handshake + kTLS setup.
 // The kernel handles TLS encryption/decryption via kTLS, so Read/Write go directly
 // to the underlying connection.
@@ -312,24 +325,8 @@ func (c *RustConn) Read(b []byte) (int, error) {
 
 func (c *RustConn) Write(b []byte) (int, error) {
 	n, err := c.rawConn.Write(b)
-	if err == nil && c.ktls.keyUpdateHandler != nil {
-		records := uint64((n + maxRecordPayload - 1) / maxRecordPayload)
-		total := c.writeRecords.Add(records)
-		if total >= keyUpdateThreshold {
-			if c.writeRecords.CompareAndSwap(total, 0) {
-				if err := c.ktls.keyUpdateHandler.InitiateUpdate(); err != nil {
-					c.writeRecords.Add(total) // restore so next writer retries
-					if c.rotationFailures.Add(1) >= maxRotationFailures {
-						errors.LogError(context.Background(), "ktls: TX key rotation failed ", maxRotationFailures, " times, closing connection: ", err)
-						c.rawConn.Close()
-					} else {
-						errors.LogWarning(context.Background(), "ktls: TX key rotation failed: ", err)
-					}
-				} else {
-					c.rotationFailures.Store(0)
-				}
-			}
-		}
+	if err == nil {
+		ktlsAfterWrite(n, c.ktls.keyUpdateHandler, &c.writeRecords, &c.rotationFailures, c.rawConn.Close)
 	}
 	return n, err
 }
