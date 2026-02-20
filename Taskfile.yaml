@@ -20,7 +20,7 @@ vars:
 
     # Resolve zig binary once for all tasks.
     ZIG_BIN:
-        sh: command -v zig
+        sh: command -v zig || true
 
 tasks:
     default:
@@ -44,7 +44,6 @@ tasks:
             - echo ">> All dependencies updated."
 
     update-go:
-        internal: true
         dir: .
         cmds:
             - echo ">> Updating Go dependencies..."
@@ -52,14 +51,12 @@ tasks:
             - go mod tidy
 
     update-rust:
-        internal: true
         dir: "{{.RUST_LIB_SRC}}"
         cmds:
             - echo ">> Updating Rust (Host) dependencies..."
             - "{{.CARGO}} update"
 
     update-ebpf:
-        internal: true
         dir: "{{.EBPF_SRC}}"
         cmds:
             - echo ">> Updating Rust (eBPF) dependencies..."
@@ -84,11 +81,17 @@ tasks:
     # BUILD PIPELINE
     # ----------------------------------------------------------------------------
 
-    # rust-toolchain.toml pins nightly, .cargo/config.toml sets target +
-    # build-std + linker. Unset RUSTUP_TOOLCHAIN so rust-toolchain.toml
-    # selects nightly (mise may export RUSTUP_TOOLCHAIN=stable).
+    # rust-toolchain.toml pins nightly and .cargo/config.toml sets target +
+    # build-std + linker. We explicitly export the pinned nightly so mise's
+    # global RUSTUP_TOOLCHAIN=stable cannot cause a stale/mismatched eBPF build.
     build-ebpf:
         dir: "{{.EBPF_SRC}}"
+        method: checksum
+        preconditions:
+            - sh: test -x "{{.CARGO}}"
+              msg: "cargo not found at {{.CARGO}} — install Rust via https://rustup.rs or run: mise install"
+            - sh: test -x "{{.RUSTC}}"
+              msg: "rustc not found at {{.RUSTC}} — install Rust via https://rustup.rs or run: mise install"
         env:
             RUSTC: "{{.RUSTC}}"
         cmds:
@@ -115,6 +118,8 @@ tasks:
             - src/**/*.rs
             - Cargo.toml
             - Cargo.lock
+            - rust-toolchain.toml
+            - .cargo/config.toml
         generates:
             - target/bpfel-unknown-none/release/xray-ebpf
 
@@ -122,10 +127,14 @@ tasks:
         deps: [build-ebpf]
         dir: "{{.RUST_LIB_SRC}}"
         preconditions:
-            - sh: command -v {{.CARGO}}
+            - sh: test -x "{{.CARGO}}"
               msg: "cargo not found — install Rust via https://rustup.rs or run: mise install"
-            - sh: command -v {{.ZIG_BIN}}
+            - sh: test -x "{{.RUSTC}}"
+              msg: "rustc not found — install Rust via https://rustup.rs or run: mise install"
+            - sh: test -n "{{.ZIG_BIN}}"
               msg: "zig not found — run: mise install"
+            - sh: '[ "{{.RUST_TARGET}}" != "unsupported" ]'
+              msg: "unsupported GOARCH={{.GOARCH}} (supported: amd64, arm64)"
         vars:
             RUST_TARGET:
                 sh: |
@@ -227,6 +236,11 @@ tasks:
         deps:
             - task: build-rust
               vars: { GOARCH: "{{.GOARCH}}" }
+        preconditions:
+            - sh: test -n "{{.ZIG_BIN}}"
+              msg: "zig not found — run: mise install"
+            - sh: '[ "{{.ZIG_TARGET}}" != "unsupported" ]'
+              msg: "unsupported GOARCH={{.GOARCH}} (supported: amd64, arm64)"
         env:
             CGO_ENABLED: "1"
             GOAMD64: '{{if eq .GOARCH "amd64"}}v3{{else}}{{end}}'
@@ -245,6 +259,7 @@ tasks:
                 export GOARCH="{{.GOARCH}}"
                 export CC="{{.ZIG_BIN}} cc -target {{.ZIG_TARGET}}"
                 export CXX="{{.ZIG_BIN}} c++ -target {{.ZIG_TARGET}}"
+                rm -f {{.OUT_NAME}}
                 go build -o {{.OUT_NAME}} \
                   -trimpath -buildvcs=false \
                   -pgo=main/default.pgo \
@@ -285,6 +300,7 @@ tasks:
                 sh: git describe --always --dirty 2>/dev/null || echo "dev"
         cmds:
             - |
+                rm -f {{.OUT_NAME}}
                 go build -o {{.OUT_NAME}} \
                   -trimpath -buildvcs=false \
                   -pgo=main/default.pgo \
