@@ -34,3 +34,8 @@ func KTLSSupported() bool {
 func NativeFullKTLSSupported() bool {
 	return false
 }
+
+// NativeFullKTLSSupportedForTLSConfig returns false on non-Linux platforms.
+func NativeFullKTLSSupportedForTLSConfig(*Config) bool {
+	return false
+}

@@ -185,7 +185,7 @@ func (v *Listener) keepAccepting() {
 				}
 			}()
 			if v.tlsConfig != nil {
-				if native.Available() && v.tlsXrayConfig != nil {
+				if native.Available() && v.tlsXrayConfig != nil && tls.NativeFullKTLSSupportedForTLSConfig(v.tlsXrayConfig) {
 					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 						errors.LogWarningInner(context.Background(), err, "failed to set Rust TLS handshake deadline on accepted connection")
 						_ = conn.Close()

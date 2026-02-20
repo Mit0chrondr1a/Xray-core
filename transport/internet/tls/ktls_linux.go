@@ -347,6 +347,7 @@ var (
 	ktlsSupportOK   bool
 	fullKTLSOnce    sync.Once
 	fullKTLSOK      bool
+	ktlsProbeCache  sync.Map
 )
 
 func kernelKTLSSupportedCached() bool {
@@ -368,7 +369,7 @@ func NativeFullKTLSSupported() bool {
 			tls.TLS_AES_256_GCM_SHA384,
 			tls.TLS_CHACHA20_POLY1305_SHA256,
 		} {
-			if !probeFullKTLSForTLS13Suite(suite) {
+			if !probeFullKTLSForSuiteCached(TLS_1_3_VERSION, suite) {
 				return
 			}
 		}
@@ -377,8 +378,93 @@ func NativeFullKTLSSupported() bool {
 	return fullKTLSOK
 }
 
-func probeFullKTLSForTLS13Suite(cipherSuite uint16) bool {
-	keyLen, ok := tls13KTLSKeyLen(cipherSuite)
+// NativeFullKTLSSupportedForTLSConfig reports whether native Rust TLS can be
+// safely used for this server TLS config without risking handshake-time hard
+// failures due to missing full bidirectional kTLS support.
+func NativeFullKTLSSupportedForTLSConfig(config *Config) bool {
+	if !kernelKTLSSupportedCached() {
+		return false
+	}
+	tls12Enabled, tls13Enabled := nativeTLSConfigVersions(config)
+
+	if tls12Enabled {
+		for _, suite := range []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		} {
+			if !probeFullKTLSForSuiteCached(TLS_1_2_VERSION, suite) {
+				return false
+			}
+		}
+	}
+	if tls13Enabled {
+		for _, suite := range []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+		} {
+			if !probeFullKTLSForSuiteCached(TLS_1_3_VERSION, suite) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+type ktlsProbeResult struct {
+	once sync.Once
+	ok   bool
+}
+
+func probeFullKTLSForSuiteCached(version uint16, cipherSuite uint16) bool {
+	key := uint32(version)<<16 | uint32(cipherSuite)
+	v, _ := ktlsProbeCache.LoadOrStore(key, &ktlsProbeResult{})
+	entry := v.(*ktlsProbeResult)
+	entry.once.Do(func() {
+		entry.ok = probeFullKTLSForSuite(version, cipherSuite)
+	})
+	return entry.ok
+}
+
+func nativeTLSConfigVersions(config *Config) (tls12Enabled bool, tls13Enabled bool) {
+	lo := uint16(tls.VersionTLS12)
+	hi := uint16(tls.VersionTLS13)
+	if config != nil {
+		if v, ok := parseNativeTLSVersion(config.MinVersion); ok {
+			lo = v
+		}
+		if v, ok := parseNativeTLSVersion(config.MaxVersion); ok {
+			hi = v
+		}
+	}
+	tls12Enabled = lo <= tls.VersionTLS12 && hi >= tls.VersionTLS12
+	tls13Enabled = lo <= tls.VersionTLS13 && hi >= tls.VersionTLS13
+	// Keep consistent with Rust build_protocol_versions(): if the configured
+	// range maps to no supported versions, native TLS falls back to TLS 1.3.
+	if !tls12Enabled && !tls13Enabled {
+		tls13Enabled = true
+	}
+	return
+}
+
+func parseNativeTLSVersion(v string) (uint16, bool) {
+	switch v {
+	case "1.0":
+		return tls.VersionTLS10, true
+	case "1.1":
+		return tls.VersionTLS11, true
+	case "1.2":
+		return tls.VersionTLS12, true
+	case "1.3":
+		return tls.VersionTLS13, true
+	default:
+		return 0, false
+	}
+}
+
+func probeFullKTLSForSuite(version uint16, cipherSuite uint16) bool {
+	keyLen, ok := ktlsKeyLen(cipherSuite)
 	if !ok {
 		return false
 	}
@@ -435,8 +521,8 @@ func probeFullKTLSForTLS13Suite(cipherSuite uint16) bool {
 		key := make([]byte, keyLen)
 		iv := make([]byte, 12)
 		seq := make([]byte, 8)
-		txErr = setKTLSCryptoInfo(intFD, TLS_TX, TLS_1_3_VERSION, cipherSuite, key, iv, seq)
-		rxErr = setKTLSCryptoInfo(intFD, TLS_RX, TLS_1_3_VERSION, cipherSuite, key, iv, seq)
+		txErr = setKTLSCryptoInfo(intFD, TLS_TX, version, cipherSuite, key, iv, seq)
+		rxErr = setKTLSCryptoInfo(intFD, TLS_RX, version, cipherSuite, key, iv, seq)
 	}); err != nil {
 		return false
 	}
@@ -444,11 +530,18 @@ func probeFullKTLSForTLS13Suite(cipherSuite uint16) bool {
 	return txErr == nil && rxErr == nil
 }
 
-func tls13KTLSKeyLen(cipherSuite uint16) (int, bool) {
+func ktlsKeyLen(cipherSuite uint16) (int, bool) {
 	switch cipherSuite {
-	case tls.TLS_AES_128_GCM_SHA256:
+	case tls.TLS_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:
 		return 16, true
-	case tls.TLS_AES_256_GCM_SHA384, tls.TLS_CHACHA20_POLY1305_SHA256:
+	case tls.TLS_AES_256_GCM_SHA384,
+		tls.TLS_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:
 		return 32, true
 	default:
 		return 0, false
