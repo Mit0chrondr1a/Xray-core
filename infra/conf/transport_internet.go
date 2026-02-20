@@ -828,20 +828,20 @@ type LimitFallback struct {
 }
 
 type REALITYConfig struct {
-	MasterKeyLog string          `json:"masterKeyLog"`
-	Show         bool            `json:"show"`
-	Target       json.RawMessage `json:"target"`
-	Dest         json.RawMessage `json:"dest"`
-	Type         string          `json:"type"`
-	Xver         uint64          `json:"xver"`
-	ServerNames  []string        `json:"serverNames"`
-	PrivateKey   string          `json:"privateKey"`
-	MinClientVer string          `json:"minClientVer"`
-	MaxClientVer string          `json:"maxClientVer"`
-	MaxTimeDiff  uint64          `json:"maxTimeDiff"`
-	ShortIds     []string        `json:"shortIds"`
-	Mldsa65Seed      string `json:"mldsa65Seed"`
-	KeyRotationHours uint32 `json:"keyRotationHours"`
+	MasterKeyLog     string          `json:"masterKeyLog"`
+	Show             bool            `json:"show"`
+	Target           json.RawMessage `json:"target"`
+	Dest             json.RawMessage `json:"dest"`
+	Type             string          `json:"type"`
+	Xver             uint64          `json:"xver"`
+	ServerNames      []string        `json:"serverNames"`
+	PrivateKey       string          `json:"privateKey"`
+	MinClientVer     string          `json:"minClientVer"`
+	MaxClientVer     string          `json:"maxClientVer"`
+	MaxTimeDiff      uint64          `json:"maxTimeDiff"`
+	ShortIds         []string        `json:"shortIds"`
+	Mldsa65Seed      string          `json:"mldsa65Seed"`
+	KeyRotationHours uint32          `json:"keyRotationHours"`
 
 	LimitFallbackUpload   LimitFallback `json:"limitFallbackUpload"`
 	LimitFallbackDownload LimitFallback `json:"limitFallbackDownload"`
