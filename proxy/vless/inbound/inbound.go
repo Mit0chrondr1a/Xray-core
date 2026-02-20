@@ -616,23 +616,28 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 
 	trafficState := proxy.NewTrafficState(userSentID)
-	// Create arena for Vision padding phase buf.New() calls (~8 packets).
-	// After padding, Vision enters kernel splice mode with no further allocations.
+	visionReaderCtx := ctx
+	visionWriterCtx := ctx
+	// Vision uplink/downlink processing can run concurrently, so each direction
+	// needs its own arena because buf.Arena is not thread-safe.
 	if requestAddons.Flow == vless.XRV {
-		arena := buf.NewArena(8 * buf.Size)
-		ctx = buf.ContextWithArena(ctx, arena)
-		defer arena.Close()
+		readerArena := buf.NewArena(8 * buf.Size)
+		writerArena := buf.NewArena(8 * buf.Size)
+		visionReaderCtx = buf.ContextWithArena(ctx, readerArena)
+		visionWriterCtx = buf.ContextWithArena(ctx, writerArena)
+		defer readerArena.Close()
+		defer writerArena.Close()
 	}
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
 	if requestAddons.Flow == vless.XRV {
-		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, ctx, connection, input, rawInput, nil)
+		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, connection, input, rawInput, nil)
 	}
 
 	bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))
 	if err := encoding.EncodeResponseHeader(bufferWriter, request, responseAddons); err != nil {
 		return errors.New("failed to encode response header").Base(err).AtWarning()
 	}
-	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, ctx, connection, nil)
+	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, visionWriterCtx, connection, nil)
 	bufferWriter.SetFlushNext()
 
 	if request.Command == protocol.RequestCommandRvs {
