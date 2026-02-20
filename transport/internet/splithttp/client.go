@@ -276,27 +276,51 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 type WaitReadCloser struct {
 	Wait chan struct{}
 	io.ReadCloser
-	once sync.Once
+	mu     sync.Mutex
+	closed bool
+	once   sync.Once
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		if rc != nil {
+			_ = rc.Close()
+		}
+		w.once.Do(func() { close(w.Wait) })
+		return
+	}
 	w.ReadCloser = rc
+	w.mu.Unlock()
 	w.once.Do(func() { close(w.Wait) })
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	if w.ReadCloser == nil {
-		if <-w.Wait; w.ReadCloser == nil {
+	w.mu.Lock()
+	rc := w.ReadCloser
+	w.mu.Unlock()
+	if rc == nil {
+		<-w.Wait
+		w.mu.Lock()
+		rc = w.ReadCloser
+		w.mu.Unlock()
+		if rc == nil {
 			return 0, io.ErrClosedPipe
 		}
 	}
-	return w.ReadCloser.Read(b)
+	return rc.Read(b)
 }
 
 func (w *WaitReadCloser) Close() error {
-	if w.ReadCloser != nil {
-		return w.ReadCloser.Close()
-	}
+	w.mu.Lock()
+	w.closed = true
+	rc := w.ReadCloser
+	w.ReadCloser = nil
+	w.mu.Unlock()
 	w.once.Do(func() { close(w.Wait) })
+	if rc != nil {
+		return rc.Close()
+	}
 	return nil
 }
