@@ -29,7 +29,7 @@ require (
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
 	google.golang.org/grpc v1.79.1
 	google.golang.org/protobuf v1.36.11
-	gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0
+	gvisor.dev/gvisor v0.0.0-20260220230033-eb261c6145d1
 	h12.io/socks v1.0.3
 	lukechampine.com/blake3 v1.4.1
 )
@@ -52,3 +52,5 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace gvisor.dev/gvisor => gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0
