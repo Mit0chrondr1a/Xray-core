@@ -902,6 +902,8 @@ func getRecordSeq(fd int, direction int, cipherSuiteID uint16) (uint64, error) {
 }
 
 // zeroBytes overwrites b with zeroes.
+//
+//go:noinline
 func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0

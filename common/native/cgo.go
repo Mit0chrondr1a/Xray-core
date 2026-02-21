@@ -255,6 +255,8 @@ type TlsResult struct {
 }
 
 // ZeroSecrets zeroes the traffic secret fields after they have been copied.
+//
+//go:noinline
 func (r *TlsResult) ZeroSecrets() {
 	for i := range r.TxSecret {
 		r.TxSecret[i] = 0
