@@ -182,6 +182,8 @@ func (h *KTLSKeyUpdateHandler) Close() {
 	defer h.mu.Unlock()
 	zeroBytes(h.rxSecret)
 	zeroBytes(h.txSecret)
+	h.rxSecret = nil
+	h.txSecret = nil
 }
 
 // expandLabel implements HKDF-Expand-Label from RFC 8446 Section 7.1.
