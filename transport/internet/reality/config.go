@@ -1,9 +1,9 @@
 package reality
 
 import (
-	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/subtle"
 	"io"
 	"net"
 	"sync"
@@ -203,10 +203,10 @@ func (kr *KeyRotator) TryAuth(clientPubKeyBytes []byte, serverPubKeyBytes ...[]b
 	}
 
 	if len(serverPub) > 0 {
-		if kr.current != nil && bytes.Equal(serverPub, kr.current.PublicKey) {
+		if kr.current != nil && len(serverPub) == len(kr.current.PublicKey) && subtle.ConstantTimeCompare(serverPub, kr.current.PublicKey) == 1 {
 			return tryPair(kr.current)
 		}
-		if kr.previous != nil && bytes.Equal(serverPub, kr.previous.PublicKey) {
+		if kr.previous != nil && len(serverPub) == len(kr.previous.PublicKey) && subtle.ConstantTimeCompare(serverPub, kr.previous.PublicKey) == 1 {
 			return tryPair(kr.previous)
 		}
 		return nil, false
