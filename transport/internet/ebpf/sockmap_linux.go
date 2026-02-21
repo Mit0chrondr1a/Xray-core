@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -180,9 +182,47 @@ const skSkbMapFDPlaceholder = 0
 // skSkbPolicyFDPlaceholder is the policy map fd placeholder in the verdict bytecode.
 const skSkbPolicyFDPlaceholder = 1
 
+// readSysctl reads an integer value from a /proc/sys sysctl path.
+func readSysctl(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
+// checkBPFSysctls logs advisory warnings about kernel BPF security settings.
+// Called once per sockmap lifecycle; never blocks setup.
+func checkBPFSysctls() {
+	ctx := context.Background()
+
+	if val, err := readSysctl("/proc/sys/kernel/unprivileged_bpf_disabled"); err == nil {
+		if val < 1 {
+			xerrors.LogWarning(ctx, "kernel.unprivileged_bpf_disabled=", val,
+				" — unprivileged users can load BPF programs; consider setting to 1 or 2")
+		}
+	}
+
+	if val, err := readSysctl("/proc/sys/net/core/bpf_jit_harden"); err == nil {
+		if val < 1 {
+			xerrors.LogInfo(ctx, "net.core.bpf_jit_harden=", val,
+				" — BPF JIT hardening is disabled; consider setting to 1 or 2")
+		}
+	}
+}
+
 // setupSockmapImpl creates the SOCKHASH, LRU policy map, and sk_skb programs.
 // Preferred attach is SOCKHASH; kernels that do not support sk_skb-on-SOCKHASH
 // fall back to a dedicated SOCKMAP attach map while still redirecting via SOCKHASH.
+//
+// Dual-path lifecycle: When CGO is enabled and the Rust staticlib includes eBPF
+// bytecode (native.EbpfAvailable() == true), the Rust/Aya loader in
+// common/native/cgo.go → rust/xray-rust/src/ebpf.rs is the primary path. It
+// handles program loading, Aya-managed map pinning, and SK_MSG attachment.
+// This Go-native path serves as the fallback for non-CGO builds or when the
+// Rust crate is compiled without the ebpf-bytecode feature. Both paths share
+// the same pin directory layout (/sys/fs/bpf/xray/) and policy map schema,
+// but only one should be active per process at a time.
 func setupSockmapImpl(config SockmapConfig) error {
 	// Create SOCKHASH map for cookie→socket redirect.
 	hashFD, err := createBPFMap(
@@ -312,6 +352,9 @@ func setupSockmapImpl(config SockmapConfig) error {
 		sockmapAttachNext.Store(0)
 	}
 	currentState.Store(newState)
+
+	// Advisory sysctl checks (runs once per sockmap lifecycle, never blocks setup)
+	checkBPFSysctls()
 
 	// Drop excess capabilities (defense-in-depth, non-fatal)
 	if config.DropCapabilities {

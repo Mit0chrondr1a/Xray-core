@@ -73,6 +73,9 @@ func TestDefaultSockmapConfig(t *testing.T) {
 	if cfg.PinPath != "/sys/fs/bpf/xray/" {
 		t.Fatalf("PinPath=%q, want /sys/fs/bpf/xray/", cfg.PinPath)
 	}
+	if !cfg.DropCapabilities {
+		t.Fatal("DropCapabilities should default to true")
+	}
 }
 
 func TestDefaultRoutingCacheConfig(t *testing.T) {

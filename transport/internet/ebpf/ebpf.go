@@ -168,8 +168,9 @@ func DefaultXDPConfig() XDPConfig {
 // DefaultSockmapConfig returns the default sockmap configuration.
 func DefaultSockmapConfig() SockmapConfig {
 	return SockmapConfig{
-		MaxEntries: 65536,
-		PinPath:    "/sys/fs/bpf/xray/",
+		MaxEntries:       65536,
+		PinPath:          "/sys/fs/bpf/xray/",
+		DropCapabilities: true,
 	}
 }
 
