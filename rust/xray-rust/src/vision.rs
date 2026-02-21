@@ -13,6 +13,7 @@
 //!   [random padding (padLen)]
 
 use std::cell::RefCell;
+use std::sync::Once;
 
 /// Maximum buffer size (matches Go buf.Size = 8192).
 const BUF_SIZE: i32 = 8192;
@@ -78,6 +79,15 @@ impl RandomCache {
 
 thread_local! {
     static RNG_CACHE: RefCell<RandomCache> = RefCell::new(RandomCache::new());
+}
+
+static RNG_FAILURE_WARN_ONCE: Once = Once::new();
+
+#[inline]
+fn warn_rng_failure_once() {
+    RNG_FAILURE_WARN_ONCE.call_once(|| {
+        eprintln!("xray_vision: getrandom failed, padding fill degraded to zeros");
+    });
 }
 
 // --- Padding ---
@@ -214,13 +224,17 @@ fn fill_random(out: &mut [u8]) {
 
     // Large writes are uncommon and are fine to satisfy directly.
     if out.len() > RNG_CACHE_SIZE {
-        let _ = getrandom::fill(out);
+        if getrandom::fill(out).is_err() {
+            warn_rng_failure_once();
+            out.fill(0);
+        }
         return;
     }
 
     let ok = RNG_CACHE.with(|cache| cache.borrow_mut().take(out));
     if !ok {
-        // Keep behavior best-effort: if RNG fails, fallback to zeros.
+        // RNG failure: padding becomes predictable (all zeros). Warn once per process.
+        warn_rng_failure_once();
         out.fill(0);
     }
 }
