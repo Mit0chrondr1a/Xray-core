@@ -303,7 +303,7 @@ tasks:
                 rm -f {{.OUT_NAME}}
                 go build -o {{.OUT_NAME}} \
                   -trimpath -buildvcs=false \
-                  -pgo=main/default.pgo \
+                  -pgo=auto \
                   -gcflags="all=-l=4" \
                   -ldflags "-s -w -buildid= -X github.com/xtls/xray-core/core.build={{.COMMID}}" \
                   ./main
