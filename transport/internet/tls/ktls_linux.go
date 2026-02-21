@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +21,8 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+var extractKeysVersionWarnOnce sync.Once
 
 const (
 	SOL_TLS = 282
@@ -565,9 +569,21 @@ func (k *tlsKeys) zero() {
 	zeroBytes(k.rxSecret)
 }
 
+// maxTestedGoVersion is the newest Go version against which reflective key
+// extraction has been verified. Bump after confirming crypto/tls internals
+// are unchanged in a new Go release.
+const maxTestedGoVersion = "go1.25"
+
 // extractTLSKeys extracts TLS keys from a tls.Conn using reflection.
 // This is necessarily fragile and depends on Go's internal tls.Conn structure.
 func extractTLSKeys(conn *tls.Conn) (*tlsKeys, error) {
+	if !strings.HasPrefix(runtime.Version(), maxTestedGoVersion) {
+		// Log once per new Go version so operators know reflection may break.
+		extractKeysVersionWarnOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "ktls: extractTLSKeys tested up to %s, running %s — monitor for failures\n",
+				maxTestedGoVersion, runtime.Version())
+		})
+	}
 	// Access the unexported fields via reflection
 	connVal := reflect.ValueOf(conn).Elem()
 
