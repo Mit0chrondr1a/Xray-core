@@ -93,6 +93,11 @@ fn classify_ebpf_error(err: &str) -> i32 {
 /// # Returns
 /// 0 on success, negative error code on failure:
 /// `-1` generic, `-2` permission, `-3` missing feature, `-4` load failure.
+// NOTE: `max_entries` and `cork_threshold` are accepted for FFI compatibility
+// but not yet wired to the Aya loader. Aya uses map sizes baked into the eBPF
+// bytecode. cork_threshold should be passed to the SK_MSG program via a BPF
+// array map in a future revision. See Go-native path in sockmap_linux.go for
+// the runtime-configurable equivalent.
 fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -> Result<(), String> {
     let mut guard = EBPF_STATE.lock().map_err(|e| format!("lock: {e}"))?;
     if guard.is_some() {
