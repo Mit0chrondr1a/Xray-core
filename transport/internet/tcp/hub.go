@@ -46,6 +46,18 @@ const tlsHandshakeTimeout = 8 * time.Second
 var (
 	realityBlacklist     *ebpf.BlacklistManager
 	realityBlacklistOnce sync.Once
+
+	getRealityBlacklistFn = getRealityBlacklist
+	realityServerFn       = reality.Server
+	doRustRealityServerFn = func(v *Listener, fd int) (*native.TlsResult, error) {
+		return v.doRustRealityServer(fd)
+	}
+	useNativeRealityServerFn = func(v *Listener) bool {
+		return native.Available() &&
+			tls.NativeFullKTLSSupported() &&
+			v.realityXrayConfig != nil &&
+			len(v.realityXrayConfig.Mldsa65Seed) == 0
+	}
 )
 
 // getRealityBlacklist returns the global REALITY auth blacklist manager,
@@ -167,17 +179,26 @@ func (v *Listener) keepAccepting() {
 		}
 		go func(rawConn net.Conn) {
 			var handshakeReleased atomic.Bool
+			var realityFailureRecorded atomic.Bool
 			releaseHandshake := func() {
 				if handshakeReleased.CompareAndSwap(false, true) {
 					<-v.connSemaphore
 				}
 			}
-			defer releaseHandshake()
 			// conn tracks the current connection — starts as rawConn, may be
 			// reassigned to a TLS/REALITY wrapper during handshake. Declared
 			// before the panic handler so the closure captures the variable
 			// (not the initial value), ensuring we close the correct object.
 			conn := rawConn
+			recordRealityFailureOnce := func() {
+				if !realityFailureRecorded.CompareAndSwap(false, true) {
+					return
+				}
+				if bl := getRealityBlacklistFn(); bl != nil {
+					bl.RecordFailure(extractIP(conn.RemoteAddr()))
+				}
+			}
+			defer releaseHandshake()
 			defer func() {
 				if r := recover(); r != nil {
 					errors.LogError(context.Background(), "panic in TCP listener handler: ", r)
@@ -225,7 +246,7 @@ func (v *Listener) keepAccepting() {
 				}
 			} else if v.realityConfig != nil {
 				rustDone := false
-				if native.Available() && tls.NativeFullKTLSSupported() && v.realityXrayConfig != nil && len(v.realityXrayConfig.Mldsa65Seed) == 0 {
+				if useNativeRealityServerFn(v) {
 					fd, fdErr := tls.ExtractFd(conn)
 					if fdErr == nil {
 						if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
@@ -233,12 +254,18 @@ func (v *Listener) keepAccepting() {
 							_ = conn.Close()
 							return
 						}
-						rustResult, rustErr := v.doRustRealityServer(fd)
+						rustResult, rustErr := doRustRealityServerFn(v, fd)
 						if err := conn.SetDeadline(time.Time{}); err != nil {
 							errors.LogWarningInner(context.Background(), err, "failed to clear REALITY handshake deadline")
 						}
 						if rustErr == nil && rustResult.KtlsTx && rustResult.KtlsRx {
-							conn = tls.NewRustConn(conn, rustResult, "")
+							rustConn, wrapErr := tls.NewRustConnChecked(conn, rustResult, "")
+							if wrapErr != nil {
+								errors.LogWarningInner(context.Background(), wrapErr, "Rust REALITY handshake succeeded but native kTLS session init failed")
+								_ = conn.Close()
+								return
+							}
+							conn = rustConn
 							rustDone = true
 						} else {
 							if rustResult != nil && rustResult.StateHandle != nil {
@@ -252,14 +279,11 @@ func (v *Listener) keepAccepting() {
 								return
 							}
 							if stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
-								if bl := getRealityBlacklist(); bl != nil {
-									bl.RecordFailure(extractIP(conn.RemoteAddr()))
-								}
-								errors.LogInfo(context.Background(), "Rust REALITY auth failed")
-								_ = conn.Close()
-								return
-							}
-							if rustErr != nil {
+								recordRealityFailureOnce()
+								errors.LogInfo(context.Background(), "Rust REALITY auth failed, falling back to camouflage")
+								// Fall through — MSG_PEEK left socket data unconsumed,
+								// Go reality.Server() will read it and handle spider crawl.
+							} else {
 								errors.LogWarningInner(context.Background(), rustErr, "Rust REALITY server handshake failed")
 								_ = conn.Close()
 								return
@@ -268,11 +292,17 @@ func (v *Listener) keepAccepting() {
 					}
 				}
 				if !rustDone {
-					realityConn, serveErr := reality.Server(conn, v.realityConfig)
+					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+						errors.LogWarningInner(context.Background(), err, "failed to set REALITY fallback handshake deadline")
+						_ = conn.Close()
+						return
+					}
+					realityConn, serveErr := realityServerFn(conn, v.realityConfig)
+					if err := conn.SetDeadline(time.Time{}); err != nil {
+						errors.LogWarningInner(context.Background(), err, "failed to clear REALITY fallback handshake deadline")
+					}
 					if serveErr != nil {
-						if bl := getRealityBlacklist(); bl != nil {
-							bl.RecordFailure(extractIP(conn.RemoteAddr()))
-						}
+						recordRealityFailureOnce()
 						errors.LogInfo(context.Background(), serveErr.Error())
 						_ = conn.Close()
 						return

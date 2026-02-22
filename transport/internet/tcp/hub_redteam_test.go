@@ -1,14 +1,16 @@
 package tcp
 
 import (
-	stderrors "errors"
 	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/native"
+	"github.com/xtls/xray-core/transport/internet/ebpf"
+	xrayreality "github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -254,25 +256,86 @@ func TestVuln_CWE_362_FdReuseAfterClose(t *testing.T) {
 }
 
 func TestVuln_CWE_252_RealityAuthFallbackSocketState(t *testing.T) {
-	classify := func(rustErr error, ktlsComplete bool) (closeConn bool, fallbackToGoReality bool) {
-		if rustErr == nil && ktlsComplete {
-			return false, false
-		}
-		if rustErr == nil {
-			return true, false
-		}
-		if stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
-			return true, false
-		}
-		return true, false
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	authErr := fmt.Errorf("wrapped: %w", native.ErrRealityAuthFailed)
-	closeConn, fallback := classify(authErr, false)
-	if !closeConn {
-		t.Fatal("auth failure must close connection")
+	oldGetRealityBlacklistFn := getRealityBlacklistFn
+	oldRealityServerFn := realityServerFn
+	oldDoRustRealityServerFn := doRustRealityServerFn
+	oldUseNativeRealityServerFn := useNativeRealityServerFn
+	defer func() {
+		_ = ln.Close()
+		getRealityBlacklistFn = oldGetRealityBlacklistFn
+		realityServerFn = oldRealityServerFn
+		doRustRealityServerFn = oldDoRustRealityServerFn
+		useNativeRealityServerFn = oldUseNativeRealityServerFn
+	}()
+
+	cfg := ebpf.DefaultBlacklistConfig()
+	cfg.FailThreshold = 2
+	cfg.FailWindow = time.Minute
+	cfg.BanDuration = time.Minute
+	cfg.CleanupInterval = time.Hour
+	blacklist := ebpf.NewBlacklistManager(cfg)
+
+	getRealityBlacklistFn = func() *ebpf.BlacklistManager { return blacklist }
+	useNativeRealityServerFn = func(*Listener) bool { return true }
+
+	var fallbackCalls atomic.Int32
+	var addConnCalls atomic.Int32
+	doRustRealityServerFn = func(*Listener, int) (*native.TlsResult, error) {
+		return nil, fmt.Errorf("wrapped rust auth failure: %w", native.ErrRealityAuthFailed)
 	}
-	if fallback {
-		t.Fatal("auth failure must not fallback to Go REALITY")
+	realityServerFn = func(net.Conn, *goreality.Config) (net.Conn, error) {
+		fallbackCalls.Add(1)
+		return nil, fmt.Errorf("go REALITY auth failed")
+	}
+
+	v := &Listener{
+		listener:          ln,
+		connSemaphore:     make(chan struct{}, 1),
+		realityConfig:     &goreality.Config{},
+		realityXrayConfig: &xrayreality.Config{},
+		addConn: func(stat.Connection) {
+			addConnCalls.Add(1)
+		},
+	}
+	go v.keepAccepting()
+
+	dialAndWaitFallback := func(want int32) {
+		client, dialErr := net.Dial("tcp", ln.Addr().String())
+		if dialErr != nil {
+			t.Fatal(dialErr)
+		}
+		defer client.Close()
+
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if fallbackCalls.Load() >= want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for REALITY fallback call #%d (got %d)", want, fallbackCalls.Load())
+	}
+
+	ip := net.ParseIP("127.0.0.1")
+
+	// Probe #1: Rust auth fails and falls back to Go REALITY once.
+	dialAndWaitFallback(1)
+	if blacklist.IsBanned(ip) {
+		t.Fatal("IP banned after one failed probe; expected a single blacklist record per probe")
+	}
+
+	// Probe #2: should accumulate one more failure and hit threshold=2.
+	dialAndWaitFallback(2)
+	if !blacklist.IsBanned(ip) {
+		t.Fatal("IP not banned after two failed probes; expected one blacklist record per probe")
+	}
+
+	if got := addConnCalls.Load(); got != 0 {
+		t.Fatalf("addConn called unexpectedly on failed handshakes: %d", got)
 	}
 }
