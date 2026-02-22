@@ -6,6 +6,17 @@
 //!
 //! Scope: TLS 1.3 only, X25519, AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305,
 //! no PSK, no 0-RTT, no client auth.
+//!
+//! ## Security Model
+//!
+//! This engine is ONLY safe when used with REALITY authentication.
+//! It intentionally skips CertificateVerify validation because REALITY
+//! provides its own authentication via ECDH-derived HMAC on the server
+//! certificate. The handshake Finished messages provide implicit binding
+//! between the certificate and the ECDH shared secret.
+//!
+//! DO NOT use this engine for standard TLS 1.3 connections — it would
+//! be vulnerable to certificate forgery without CertificateVerify.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -74,12 +85,13 @@ impl HashAlg {
         }
     }
 
-    fn from_cipher_suite(cs: u16) -> Self {
+    fn from_cipher_suite(cs: u16) -> Result<Self, Tls13Error> {
         match cs {
-            0x1301 => HashAlg::Sha256, // TLS_AES_128_GCM_SHA256
-            0x1303 => HashAlg::Sha256, // TLS_CHACHA20_POLY1305_SHA256
-            0x1302 => HashAlg::Sha384, // TLS_AES_256_GCM_SHA384
-            _ => HashAlg::Sha256,
+            0x1301 | 0x1303 => Ok(HashAlg::Sha256), // TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256
+            0x1302 => Ok(HashAlg::Sha384),           // TLS_AES_256_GCM_SHA384
+            _ => Err(Tls13Error::Protocol(format!(
+                "unsupported cipher suite: 0x{:04x}", cs
+            ))),
         }
     }
 }
@@ -289,12 +301,14 @@ fn aead_encrypt(
     }
 }
 
-fn key_length(cipher_suite: u16) -> usize {
+fn key_length(cipher_suite: u16) -> Result<usize, Tls13Error> {
     match cipher_suite {
-        0x1301 => 16, // AES-128-GCM
-        0x1302 => 32, // AES-256-GCM
-        0x1303 => 32, // ChaCha20-Poly1305
-        _ => 16,
+        0x1301 => Ok(16), // AES-128-GCM
+        0x1302 => Ok(32), // AES-256-GCM
+        0x1303 => Ok(32), // ChaCha20-Poly1305
+        _ => Err(Tls13Error::Protocol(format!(
+            "unsupported cipher suite for key derivation: 0x{:04x}", cipher_suite
+        ))),
     }
 }
 
@@ -444,9 +458,10 @@ fn parse_server_hello(data: &[u8]) -> Result<ServerHello, Tls13Error> {
     let ext_len = u16::from_be_bytes([body[ext_pos], body[ext_pos + 1]]) as usize;
     let ext_data = &body[ext_pos + 2..];
 
-    // Parse extensions to find key_share (0x0033)
+    // Parse extensions to find key_share (0x0033) and supported_versions (0x002b)
     let mut server_pubkey = [0u8; 32];
     let mut found_key_share = false;
+    let mut found_supported_version = false;
     let mut epos = 0;
     while epos + 4 <= ext_data.len().min(ext_len) {
         let etype = u16::from_be_bytes([ext_data[epos], ext_data[epos + 1]]);
@@ -468,9 +483,23 @@ fn parse_server_hello(data: &[u8]) -> Result<ServerHello, Tls13Error> {
                     found_key_share = true;
                 }
             }
+        } else if etype == 0x002b {
+            // supported_versions (RFC 8446 Section 4.2.1): selected version (2 bytes)
+            if elen == 2 {
+                let ver = u16::from_be_bytes([ext_data[epos], ext_data[epos + 1]]);
+                if ver == 0x0304 {
+                    found_supported_version = true;
+                }
+            }
         }
 
         epos += elen;
+    }
+
+    if !found_supported_version {
+        return Err(Tls13Error::Protocol(
+            "ServerHello missing supported_versions extension with TLS 1.3 (0x0304)".into(),
+        ));
     }
 
     if !found_key_share {
@@ -607,7 +636,7 @@ pub fn complete_tls13_handshake(
 
     let server_hello = parse_server_hello(&sh_data)?;
     let cipher_suite = server_hello.cipher_suite;
-    let alg = HashAlg::from_cipher_suite(cipher_suite);
+    let alg = HashAlg::from_cipher_suite(cipher_suite)?;
 
     // Transcript so far: ClientHello + ServerHello
     const MAX_TRANSCRIPT_SIZE: usize = 256 * 1024; // 256KB — well above any legitimate TLS 1.3 handshake
@@ -655,9 +684,9 @@ pub fn complete_tls13_handshake(
     )?;
 
     // Derive handshake traffic keys
-    let s_hs_key = hkdf_expand_label(alg, &server_hs_secret, "key", &[], key_length(cipher_suite))?;
+    let s_hs_key = hkdf_expand_label(alg, &server_hs_secret, "key", &[], key_length(cipher_suite)?)?;
     let s_hs_iv = hkdf_expand_label(alg, &server_hs_secret, "iv", &[], 12)?;
-    let c_hs_key = hkdf_expand_label(alg, &client_hs_secret, "key", &[], key_length(cipher_suite))?;
+    let c_hs_key = hkdf_expand_label(alg, &client_hs_secret, "key", &[], key_length(cipher_suite)?)?;
     let c_hs_iv = hkdf_expand_label(alg, &client_hs_secret, "iv", &[], 12)?;
 
     // Step 5-6: Read encrypted handshake messages
@@ -739,7 +768,25 @@ pub fn complete_tls13_handshake(
                     transcript.extend_from_slice(msg_data);
                 }
                 0x0f => {
-                    // CertificateVerify (we don't verify -- REALITY handles this)
+                    // CertificateVerify: intentionally NOT validated.
+                    //
+                    // In standard TLS 1.3 (RFC 8446 Section 4.4.3), CertificateVerify
+                    // proves the server holds the private key for the certificate.
+                    // We skip this because:
+                    //
+                    // 1. REALITY does not use X.509 certificate chains. The server
+                    //    generates a self-signed Ed25519 cert where the "signature"
+                    //    is HMAC-SHA512(auth_key, ed25519_pubkey). This is verified
+                    //    by reality_client_connect() after the handshake completes.
+                    //
+                    // 2. The server Finished message (verified below at msg_type 0x14)
+                    //    is HMAC(finished_key, transcript_hash), where finished_key
+                    //    derives from server_hs_secret, which derives from the X25519
+                    //    shared secret. An active MITM cannot forge this without the
+                    //    server's ECDH private key, providing implicit authentication.
+                    //
+                    // 3. The CertificateVerify data bytes ARE included in the transcript
+                    //    hash (next line), so they still bind to the Finished value.
                     transcript.extend_from_slice(msg_data);
                 }
                 0x14 => {
@@ -906,11 +953,11 @@ impl XrayTls13Result {
 pub(crate) fn install_ktls_from_tls13_state(fd: i32, state: &Tls13State) -> (bool, bool) {
     let inner = || -> Result<(bool, bool), Tls13Error> {
         let cs = state.cipher_suite;
-        let alg = HashAlg::from_cipher_suite(cs);
+        let alg = HashAlg::from_cipher_suite(cs)?;
 
-        let tx_key = hkdf_expand_label(alg, &state.client_app_secret, "key", &[], key_length(cs))?;
+        let tx_key = hkdf_expand_label(alg, &state.client_app_secret, "key", &[], key_length(cs)?)?;
         let tx_iv = hkdf_expand_label(alg, &state.client_app_secret, "iv", &[], 12)?;
-        let rx_key = hkdf_expand_label(alg, &state.server_app_secret, "key", &[], key_length(cs))?;
+        let rx_key = hkdf_expand_label(alg, &state.server_app_secret, "key", &[], key_length(cs)?)?;
         let rx_iv = hkdf_expand_label(alg, &state.server_app_secret, "iv", &[], 12)?;
 
         if crate::tls::setup_ulp_pub(fd).is_err() {
@@ -1031,12 +1078,12 @@ pub extern "C" fn xray_tls13_install_ktls(
         let client_secret = unsafe { std::slice::from_raw_parts(client_secret_ptr, client_secret_len) };
         let server_secret = unsafe { std::slice::from_raw_parts(server_secret_ptr, server_secret_len) };
         let cs = cipher_suite;
-        let alg = HashAlg::from_cipher_suite(cs);
 
         let inner = || -> Result<(bool, bool), Tls13Error> {
-            let tx_key = hkdf_expand_label(alg, client_secret, "key", &[], key_length(cs))?;
+            let alg = HashAlg::from_cipher_suite(cs)?;
+            let tx_key = hkdf_expand_label(alg, client_secret, "key", &[], key_length(cs)?)?;
             let tx_iv = hkdf_expand_label(alg, client_secret, "iv", &[], 12)?;
-            let rx_key = hkdf_expand_label(alg, server_secret, "key", &[], key_length(cs))?;
+            let rx_key = hkdf_expand_label(alg, server_secret, "key", &[], key_length(cs)?)?;
             let rx_iv = hkdf_expand_label(alg, server_secret, "iv", &[], 12)?;
 
             // ULP setup
