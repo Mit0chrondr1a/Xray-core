@@ -38,10 +38,10 @@ type Conn struct {
 }
 
 const (
-	tlsCloseTimeout      = 250 * time.Millisecond
-	maxRecordPayload     = 16384    // TLS max record payload size
-	keyUpdateThreshold   = 1 << 24  // ~16.7M records, conservative limit below AES-GCM 2^24.5
-	maxRotationFailures  = 3        // close connection after this many consecutive kTLS key rotation failures
+	tlsCloseTimeout     = 250 * time.Millisecond
+	maxRecordPayload    = 16384   // TLS max record payload size
+	keyUpdateThreshold  = 1 << 24 // ~16.7M records, conservative limit below AES-GCM 2^24.5
+	maxRotationFailures = 3       // close connection after this many consecutive kTLS key rotation failures
 )
 
 // Read overrides tls.Conn.Read. When kTLS RX is active, reads bypass the
@@ -288,6 +288,7 @@ type RustConn struct {
 	rawConn          net.Conn
 	state            *native.TlsStateHandle
 	ktls             KTLSState
+	initErr          error
 	alpn             string
 	version          uint16
 	cipher           uint16
@@ -301,6 +302,12 @@ type RustConn struct {
 var _ Interface = (*RustConn)(nil)
 
 func (c *RustConn) Read(b []byte) (int, error) {
+	if c.initErr != nil {
+		return 0, c.initErr
+	}
+	if c.rawConn == nil {
+		return 0, errors.New("tls: RustConn is closed")
+	}
 	// Serve any drained plaintext from the handshake first
 	if c.drainedOff < len(c.drainedData) {
 		n := copy(b, c.drainedData[c.drainedOff:])
@@ -311,6 +318,7 @@ func (c *RustConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 	if c.ktls.RxReady {
+		// Full kTLS RX path — kernel decrypts.
 		n, err := c.rawConn.Read(b)
 		if err != nil && isKeyExpired(err) && c.ktls.keyUpdateHandler != nil {
 			if herr := c.ktls.keyUpdateHandler.Handle(); herr != nil {
@@ -324,6 +332,12 @@ func (c *RustConn) Read(b []byte) (int, error) {
 }
 
 func (c *RustConn) Write(b []byte) (int, error) {
+	if c.initErr != nil {
+		return 0, c.initErr
+	}
+	if c.rawConn == nil {
+		return 0, errors.New("tls: RustConn is closed")
+	}
 	n, err := c.rawConn.Write(b)
 	if err == nil {
 		ktlsAfterWrite(n, c.ktls.keyUpdateHandler, &c.writeRecords, &c.rotationFailures, c.rawConn.Close)
@@ -332,24 +346,63 @@ func (c *RustConn) Write(b []byte) (int, error) {
 }
 
 func (c *RustConn) Close() error {
+	var err error
+	if c.rawConn != nil {
+		err = c.rawConn.Close()
+		c.rawConn = nil
+	}
 	if c.ktls.keyUpdateHandler != nil {
 		c.ktls.keyUpdateHandler.Close()
+		c.ktls.keyUpdateHandler = nil
 	}
 	if c.state != nil {
 		native.TlsStateFree(c.state)
 		c.state = nil
 	}
-	return c.rawConn.Close()
+	// Zero drainedData (may contain handshake plaintext).
+	for i := range c.drainedData {
+		c.drainedData[i] = 0
+	}
+	c.drainedData = nil
+	return err
 }
 
-func (c *RustConn) NetConn() gonet.Conn                        { return c.rawConn }
-func (c *RustConn) LocalAddr() gonet.Addr                      { return c.rawConn.LocalAddr() }
-func (c *RustConn) RemoteAddr() gonet.Addr                     { return c.rawConn.RemoteAddr() }
-func (c *RustConn) SetDeadline(t time.Time) error              { return c.rawConn.SetDeadline(t) }
-func (c *RustConn) SetReadDeadline(t time.Time) error          { return c.rawConn.SetReadDeadline(t) }
-func (c *RustConn) SetWriteDeadline(t time.Time) error         { return c.rawConn.SetWriteDeadline(t) }
-func (c *RustConn) HandshakeContext(ctx context.Context) error { return nil }
+func (c *RustConn) NetConn() gonet.Conn { return c.rawConn }
+func (c *RustConn) LocalAddr() gonet.Addr {
+	if c.rawConn == nil {
+		return nil
+	}
+	return c.rawConn.LocalAddr()
+}
+func (c *RustConn) RemoteAddr() gonet.Addr {
+	if c.rawConn == nil {
+		return nil
+	}
+	return c.rawConn.RemoteAddr()
+}
+func (c *RustConn) SetDeadline(t time.Time) error {
+	if c.rawConn == nil {
+		return errors.New("tls: RustConn is closed")
+	}
+	return c.rawConn.SetDeadline(t)
+}
+func (c *RustConn) SetReadDeadline(t time.Time) error {
+	if c.rawConn == nil {
+		return errors.New("tls: RustConn is closed")
+	}
+	return c.rawConn.SetReadDeadline(t)
+}
+func (c *RustConn) SetWriteDeadline(t time.Time) error {
+	if c.rawConn == nil {
+		return errors.New("tls: RustConn is closed")
+	}
+	return c.rawConn.SetWriteDeadline(t)
+}
+func (c *RustConn) HandshakeContext(ctx context.Context) error { return c.initErr }
 func (c *RustConn) VerifyHostname(host string) error {
+	if c.initErr != nil {
+		return c.initErr
+	}
 	if c.serverName == "" {
 		return errors.New("tls: RustConn: no server name was set during handshake")
 	}
@@ -387,31 +440,89 @@ func (c *RustConn) KTLSKeyUpdateHandler() *KTLSKeyUpdateHandler {
 // NewRustConn creates a RustConn from native handshake results.
 // Used by the REALITY package to construct a RustConn from Rust handshake output.
 func NewRustConn(rawConn net.Conn, result *native.TlsResult, serverName string) *RustConn {
+	rc, err := NewRustConnChecked(rawConn, result, serverName)
+	if err != nil {
+		return &RustConn{
+			rawConn: rawConn,
+			initErr: err,
+		}
+	}
+	return rc
+}
+
+func cleanupFailedRustConn(rc *RustConn) {
+	if rc == nil {
+		return
+	}
+	if rc.ktls.keyUpdateHandler != nil {
+		rc.ktls.keyUpdateHandler.Close()
+		rc.ktls.keyUpdateHandler = nil
+	}
+	if rc.state != nil {
+		native.TlsStateFree(rc.state)
+		rc.state = nil
+	}
+	for i := range rc.drainedData {
+		rc.drainedData[i] = 0
+	}
+	rc.drainedData = nil
+}
+
+// NewRustConnChecked creates a RustConn and returns an error when native
+// handshake/kTLS invariants are not met.
+func NewRustConnChecked(rawConn net.Conn, result *native.TlsResult, serverName string) (*RustConn, error) {
+	if result == nil {
+		if rawConn != nil {
+			_ = rawConn.Close()
+		}
+		return nil, errors.New("tls: native RustConn init: nil handshake result")
+	}
+	defer result.ZeroSecrets()
+
+	if rawConn == nil {
+		if result.StateHandle != nil {
+			native.TlsStateFree(result.StateHandle)
+			result.StateHandle = nil
+		}
+		return nil, errors.New("tls: native RustConn init: nil raw connection")
+	}
+
+	stateHandle := result.StateHandle
+	result.StateHandle = nil
+
 	rc := &RustConn{
 		rawConn:     rawConn,
-		state:       result.StateHandle,
+		state:       stateHandle,
 		alpn:        result.ALPN,
 		version:     result.Version,
 		cipher:      result.CipherSuite,
 		serverName:  serverName,
 		drainedData: result.DrainedData,
 		ktls: KTLSState{
-			Enabled: result.KtlsTx || result.KtlsRx,
+			Enabled: result.KtlsTx && result.KtlsRx,
 			TxReady: result.KtlsTx,
 			RxReady: result.KtlsRx,
 		},
 	}
+
+	fail := func(err error) (*RustConn, error) {
+		cleanupFailedRustConn(rc)
+		_ = rawConn.Close()
+		return nil, err
+	}
+
+	if !result.KtlsTx || !result.KtlsRx {
+		return fail(errors.New("tls: native RustConn init: full kTLS offload required (tx=", result.KtlsTx, " rx=", result.KtlsRx, ")"))
+	}
+
 	// Create KeyUpdate handler if base traffic secrets are available (TLS 1.3)
 	if len(result.TxSecret) > 0 && result.Version == 0x0304 {
 		if fd, err := ExtractFd(rawConn); err == nil {
-			rc.ktls.keyUpdateHandler = newKTLSKeyUpdateHandler(
-				fd, result.CipherSuite, result.RxSecret, result.TxSecret,
-			)
+			rc.ktls.keyUpdateHandler = newKTLSKeyUpdateHandler(fd, result.CipherSuite, result.RxSecret, result.TxSecret)
 		}
 	}
-	// Zero secrets in the result after they've been copied into the handler.
-	result.ZeroSecrets()
-	return rc
+
+	return rc, nil
 }
 
 // configToNative translates an Xray TLS Config to a native Rust TLS config handle.
@@ -530,7 +641,7 @@ func ExtractFd(conn gonet.Conn) (int, error) {
 	return fd, nil
 }
 
-func ensureNativeFullKTLS(result *native.TlsResult) error {
+func validateNativeKTLS(result *native.TlsResult) error {
 	if result == nil {
 		return errors.New("native TLS handshake returned nil result")
 	}
@@ -562,7 +673,7 @@ func RustClient(c net.Conn, config *Config, dest net.Destination) (net.Conn, err
 	if err != nil {
 		return nil, errors.New("native TLS client handshake failed: ").Base(err)
 	}
-	if err := ensureNativeFullKTLS(result); err != nil {
+	if err := validateNativeKTLS(result); err != nil {
 		return nil, errors.New("native TLS client handshake failed: ").Base(err)
 	}
 
@@ -571,7 +682,11 @@ func RustClient(c net.Conn, config *Config, dest net.Destination) (net.Conn, err
 		serverName = dest.Address.Domain()
 	}
 
-	return NewRustConn(c, result, serverName), nil
+	rc, err := NewRustConnChecked(c, result, serverName)
+	if err != nil {
+		return nil, errors.New("native TLS client handshake failed: ").Base(err)
+	}
+	return rc, nil
 }
 
 // RustServer performs a TLS server handshake using the Rust rustls library
@@ -592,11 +707,15 @@ func RustServer(c net.Conn, config *Config) (net.Conn, error) {
 	if err != nil {
 		return nil, errors.New("native TLS server handshake failed: ").Base(err)
 	}
-	if err := ensureNativeFullKTLS(result); err != nil {
+	if err := validateNativeKTLS(result); err != nil {
 		return nil, errors.New("native TLS server handshake failed: ").Base(err)
 	}
 
-	return NewRustConn(c, result, ""), nil
+	rc, err := NewRustConnChecked(c, result, "")
+	if err != nil {
+		return nil, errors.New("native TLS server handshake failed: ").Base(err)
+	}
+	return rc, nil
 }
 
 func copyConfig(c *tls.Config) *utls.Config {
