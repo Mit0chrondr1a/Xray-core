@@ -3,6 +3,7 @@
 package tls
 
 import (
+	"context"
 	"crypto"
 	"crypto/tls"
 	"encoding/binary"
@@ -19,6 +20,7 @@ import (
 	"time"
 	"unsafe"
 
+	xerrors "github.com/xtls/xray-core/common/errors"
 	"golang.org/x/sys/unix"
 )
 
@@ -302,11 +304,15 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 
 	// Perform all kTLS setup in a single Control call to minimize
 	// runtime fd-lock acquisitions (3 → 1).
+	var setupErr error
+	var txErr error
+	var rxErr error
 	if err := rawConn.Control(func(fd uintptr) {
 		intFD := int(fd)
 
 		// Set TCP_ULP to "tls"
 		if err := syscall.SetsockoptString(intFD, syscall.SOL_TCP, unix.TCP_ULP, "tls"); err != nil {
+			setupErr = fmt.Errorf("setsockopt TCP_ULP=tls: %w", err)
 			return
 		}
 
@@ -315,17 +321,24 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 		// Configure TX (send direction)
 		if err := setKTLSCryptoInfo(intFD, TLS_TX, tlsVersion, cs.CipherSuite, keys.txKey, keys.txIV, keys.txSeq); err == nil {
 			state.TxReady = true
+		} else {
+			txErr = err
 		}
 
 		// Configure RX (receive direction)
 		if err := setKTLSCryptoInfo(intFD, TLS_RX, tlsVersion, cs.CipherSuite, keys.rxKey, keys.rxIV, keys.rxSeq); err == nil {
 			state.RxReady = true
+		} else {
+			rxErr = err
 		}
 
 		// Only report as enabled if at least one direction succeeded.
 		// ULP installation alone is a no-op without crypto info.
 		if !state.TxReady && !state.RxReady {
 			state.Enabled = false
+			if setupErr == nil && txErr != nil && rxErr != nil {
+				setupErr = fmt.Errorf("kTLS TX+RX setup failed (tx=%v, rx=%v)", txErr, rxErr)
+			}
 		}
 
 		// For TLS 1.3 with RX offload, create a KeyUpdate handler so we can
@@ -338,6 +351,25 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 	}); err != nil {
 		keys.zero()
 		return state
+	}
+
+	if setupErr != nil {
+		xerrors.LogWarning(
+			context.Background(),
+			"ktls: setup failed version=", cs.Version,
+			" cipherSuite=0x", fmt.Sprintf("%04x", cs.CipherSuite),
+			": ", setupErr,
+		)
+	} else if txErr != nil || rxErr != nil {
+		xerrors.LogWarning(
+			context.Background(),
+			"ktls: partial setup version=", cs.Version,
+			" cipherSuite=0x", fmt.Sprintf("%04x", cs.CipherSuite),
+			" txReady=", state.TxReady,
+			" rxReady=", state.RxReady,
+			" txErr=", txErr,
+			" rxErr=", rxErr,
+		)
 	}
 
 	// Zero key material now that it's been handed to the kernel / KeyUpdate handler.

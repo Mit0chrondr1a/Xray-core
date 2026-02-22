@@ -238,7 +238,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					result, rustErr := native.RealityClientConnect(fd, uConn.HandshakeState.Hello.Raw, ecdhe.Bytes(), realityCfg)
 					if rustErr == nil {
 						if result != nil && result.KtlsTx && result.KtlsRx {
-							return tls.NewRustConn(c, result, uConn.ServerName), nil
+							return tls.NewRustConnChecked(c, result, uConn.ServerName)
 						}
 						// Handshake succeeded but kTLS incomplete — socket data
 						// already consumed by Rust TLS engine, Go/uTLS fallback
