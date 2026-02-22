@@ -324,7 +324,10 @@ pub fn reality_client_connect(
     }
     client_hello_raw[39..71].copy_from_slice(&encrypted);
 
-    // Complete TLS 1.3 handshake
+    // Complete the TLS 1.3 handshake. tls13::complete_tls13_handshake()
+    // skips CertificateVerify — REALITY relies on the HMAC-based cert
+    // verification below (verify_reality_cert_hmac) and the Finished
+    // message's implicit binding to the ECDH shared secret instead.
     let tls_state = tls13::complete_tls13_handshake(fd, client_hello_raw, ecdh_privkey)?;
 
     // Verify REALITY certificate: the server's cert must have an Ed25519 public
@@ -839,6 +842,9 @@ fn reality_server_handshake_full(
     // The peeked ClientHello is still in the kernel buffer; rustls will read
     // it normally (consuming it) as the first step of the TLS handshake.
 
+    // Hash the peeked record for TOCTOU verification after rustls consumes it.
+    let peek_hash = ring::digest::digest(&ring::digest::SHA256, &peek_buf);
+
     // Step 3: Generate REALITY certificate.
     let rng = SystemRandom::new();
     let pkcs8_doc =
@@ -881,6 +887,16 @@ fn reality_server_handshake_full(
     // Drive handshake record-by-record
     drive_handshake!(&mut conn, &mut reader)
         .map_err(|e| (2i32, format!("handshake: {}", e)))?;
+
+    // TOCTOU verification: ensure the first record rustls consumed matches
+    // what we peeked during auth validation.
+    let consumed_hash = reader.first_record_hash().ok_or_else(|| {
+        (2i32, "TOCTOU: no record consumed by rustls".to_string())
+    })?;
+    if consumed_hash != peek_hash.as_ref() {
+        drop(reader);
+        return Err((2, "TOCTOU: consumed ClientHello differs from peeked data".into()));
+    }
 
     // Drain any plaintext rustls buffered (should be empty with RecordReader)
     let drained = tls::drain_plaintext(&mut conn);
