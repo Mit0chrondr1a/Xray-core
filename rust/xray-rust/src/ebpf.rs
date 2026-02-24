@@ -19,7 +19,7 @@ use aya::{
 use std::ffi::{c_char, CStr};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 /// Align macro for include_bytes (ensures eBPF bytecode is properly aligned).
 #[cfg(feature = "ebpf-bytecode")]
@@ -44,8 +44,11 @@ static EBPF_BYTECODE: &[u8] = include_bytes_aligned!(
 );
 
 /// Global state for the loaded eBPF programs and maps.
-/// Protected by a mutex since setup/teardown are infrequent operations.
-static EBPF_STATE: Mutex<Option<EbpfState>> = Mutex::new(None);
+/// RwLock allows concurrent register/unregister (read lock) while
+/// setup/teardown (write lock) get exclusive access. This prevents
+/// fd TOCTOU races where teardown could close fds while register
+/// is using them, without serializing concurrent registrations.
+static EBPF_STATE: RwLock<Option<EbpfState>> = RwLock::new(None);
 
 struct EbpfState {
     /// Aya Ebpf handle — keeps programs loaded as long as it lives.
@@ -99,7 +102,10 @@ fn classify_ebpf_error(err: &str) -> i32 {
 // array map in a future revision. See Go-native path in sockmap_linux.go for
 // the runtime-configurable equivalent.
 fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -> Result<(), String> {
-    let mut guard = EBPF_STATE.lock().map_err(|e| format!("lock: {e}"))?;
+    let mut guard = EBPF_STATE.write().unwrap_or_else(|e| {
+        eprintln!("xray-rust eBPF: recovering poisoned write lock");
+        e.into_inner()
+    });
     if guard.is_some() {
         return Err("eBPF already initialized".into());
     }
@@ -225,7 +231,10 @@ fn set_pin_permissions(pin_dir: &Path) {
 
 /// Tear down eBPF programs and unpin maps.
 fn teardown_impl() -> Result<(), String> {
-    let mut guard = EBPF_STATE.lock().map_err(|e| format!("lock: {e}"))?;
+    let mut guard = EBPF_STATE.write().unwrap_or_else(|e| {
+        eprintln!("xray-rust eBPF: recovering poisoned write lock in teardown");
+        e.into_inner()
+    });
     if let Some(state) = guard.take() {
         // Unpin maps (best-effort).
         let pin_dir = Path::new(&state.pin_path);
@@ -245,9 +254,16 @@ fn register_pair_impl(
     outbound_cookie: u64,
     policy_flags: u32,
 ) -> std::io::Result<()> {
+    // Read lock allows concurrent registrations while preventing teardown
+    // from closing fds. BPF map operations are kernel-atomic so concurrent
+    // register calls on different socket pairs are safe.
+    // Recover from poison to avoid permanent failure after a panic in another thread.
     let guard = EBPF_STATE
-        .lock()
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EDEADLK))?;
+        .read()
+        .unwrap_or_else(|e| {
+            eprintln!("xray-rust eBPF: recovering poisoned read lock in register");
+            e.into_inner()
+        });
     let state = guard
         .as_ref()
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENODEV))?;
@@ -278,8 +294,11 @@ fn register_pair_impl(
 /// Unregister a socket pair.
 fn unregister_pair_impl(inbound_cookie: u64, outbound_cookie: u64) -> std::io::Result<()> {
     let guard = EBPF_STATE
-        .lock()
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EDEADLK))?;
+        .read()
+        .unwrap_or_else(|e| {
+            eprintln!("xray-rust eBPF: recovering poisoned read lock in unregister");
+            e.into_inner()
+        });
     let state = guard
         .as_ref()
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENODEV))?;
