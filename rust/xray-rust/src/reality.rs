@@ -693,6 +693,11 @@ fn is_leap(y: u64) -> bool {
 /// Peek at N bytes from a socket using MSG_PEEK (non-consuming).
 /// Blocks until all bytes are available or an error occurs.
 fn peek_exact(fd: i32, buf: &mut [u8]) -> io::Result<()> {
+    // Limit retries to prevent slow-loris attacks holding threads indefinitely.
+    // At 100us per retry, 100_000 retries = ~10 seconds — well within the
+    // caller's 30-second handshake timeout but prevents unbounded spinning.
+    const MAX_RETRIES: u32 = 100_000;
+    let mut retries: u32 = 0;
     loop {
         let n = unsafe {
             libc::recv(
@@ -713,7 +718,15 @@ fn peek_exact(fd: i32, buf: &mut [u8]) -> io::Result<()> {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
         }
         if (n as usize) < buf.len() {
-            // MSG_PEEK|MSG_WAITALL may return short on some kernels; retry
+            retries += 1;
+            if retries >= MAX_RETRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("peek_exact: short read after {} retries ({}/{} bytes)", retries, n, buf.len()),
+                ));
+            }
+            // MSG_PEEK|MSG_WAITALL may return short on some kernels; sleep briefly and retry
+            std::thread::sleep(std::time::Duration::from_micros(100));
             continue;
         }
         return Ok(());
