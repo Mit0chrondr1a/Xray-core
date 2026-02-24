@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"io"
 	"math/big"
+	"reflect"
 	"runtime"
 	"strconv"
 	"time"
@@ -953,36 +954,62 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 	reader := buf.NewReader(readerForBuf)
 	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+		errors.LogDebug(ctx, "CopyRawConn fallback to readv: unsupported OS ", runtime.GOOS)
+		return readV(ctx, reader, writer, timer, readCounter)
+	}
+	if readerConn == nil || writerConn == nil {
+		errors.LogDebug(ctx, "CopyRawConn fallback to readv: nil raw conn(s) readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn))
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
 	tc, ok := writerConn.(*net.TCPConn)
-	if !ok || readerConn == nil || writerConn == nil {
+	if !ok {
+		errors.LogDebug(ctx, "CopyRawConn fallback to readv: writer is not *net.TCPConn (writerType=", connTypeName(writerConn), ")")
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
 	inbound := session.InboundFromContext(ctx)
-	if inbound == nil || inbound.CanSpliceCopy == 3 {
+	if inbound == nil {
+		errors.LogDebug(ctx, "CopyRawConn fallback to readv: missing inbound metadata")
+		return readV(ctx, reader, writer, timer, readCounter)
+	}
+	if inbound.CanSpliceCopy == 3 {
+		errors.LogDebug(ctx, "CopyRawConn fallback to readv: inbound.CanSpliceCopy=3")
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
+		errors.LogDebug(ctx, "CopyRawConn fallback to readv: no outbound metadata")
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
-	for _, ob := range outbounds {
+	for i, ob := range outbounds {
 		if ob.CanSpliceCopy == 3 {
+			errors.LogDebug(ctx, "CopyRawConn fallback to readv: outbounds[", i, "].CanSpliceCopy=3")
 			return readV(ctx, reader, writer, timer, readCounter)
 		}
 	}
 
+	loggedUserspaceLoop := false
 	for {
 		var splice = inbound.CanSpliceCopy == 1
-		for _, ob := range outbounds {
+		firstNonSpliceOutbound := -1
+		firstNonSpliceValue := 0
+		for i, ob := range outbounds {
 			if ob.CanSpliceCopy != 1 {
 				splice = false
+				if firstNonSpliceOutbound == -1 {
+					firstNonSpliceOutbound = i
+					firstNonSpliceValue = ob.CanSpliceCopy
+				}
 			}
 		}
 		if splice {
 			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
-			if mgr := ebpf.GlobalSockmapManager(); mgr != nil && !mgr.ShouldFallbackToSplice() && ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
+			if mgr := ebpf.GlobalSockmapManager(); mgr == nil {
+				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: manager unavailable")
+			} else if mgr.ShouldFallbackToSplice() {
+				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: contention fallback active")
+			} else if !ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
+				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), " writerCrypto=", int(writerCrypto), " readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+			} else {
 				if err := mgr.RegisterPairWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto); err == nil {
 					errors.LogDebug(ctx, "CopyRawConn sockmap (crypto: reader=", int(readerCrypto), " writer=", int(writerCrypto), ")")
 					writerMonitor := startKeyUpdateMonitor(writerConn, writerHandler)
@@ -1008,8 +1035,8 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				} else {
 					errors.LogDebugInner(ctx, err, "CopyRawConn sockmap register failed, falling back to splice")
 				}
-				// Fall through to splice on sockmap failure
 			}
+			// Fall through to splice on sockmap failure
 
 			errors.LogDebug(ctx, "CopyRawConn splice")
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
@@ -1042,6 +1069,14 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 			return nil
 		}
+		if !loggedUserspaceLoop {
+			if inbound.CanSpliceCopy != 1 {
+				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: inbound.CanSpliceCopy=", inbound.CanSpliceCopy)
+			} else {
+				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: outbounds[", firstNonSpliceOutbound, "].CanSpliceCopy=", firstNonSpliceValue)
+			}
+			loggedUserspaceLoop = true
+		}
 		buffer, err := reader.ReadMultiBuffer()
 		if !buffer.IsEmpty() {
 			if readCounter != nil {
@@ -1059,6 +1094,13 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			return err
 		}
 	}
+}
+
+func connTypeName(conn net.Conn) string {
+	if conn == nil {
+		return "<nil>"
+	}
+	return reflect.TypeOf(conn).String()
 }
 
 func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer signal.ActivityUpdater, readCounter stats.Counter) error {
