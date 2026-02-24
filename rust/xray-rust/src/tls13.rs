@@ -183,121 +183,84 @@ fn derive_secret(alg: HashAlg, secret: &[u8], label: &str, transcript_hash: &[u8
 // AEAD encryption/decryption
 // ---------------------------------------------------------------------------
 
-fn make_nonce(iv: &[u8], seq: u64) -> Vec<u8> {
-    let mut nonce = iv.to_vec();
+fn make_nonce(iv: &[u8], seq: u64) -> [u8; 12] {
+    assert_eq!(iv.len(), 12, "TLS 1.3 IV must be 12 bytes, got {}", iv.len());
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(iv);
     let seq_bytes = seq.to_be_bytes();
-    let offset = nonce.len() - 8;
     for i in 0..8 {
-        nonce[offset + i] ^= seq_bytes[i];
+        nonce[4 + i] ^= seq_bytes[i];
     }
     nonce
 }
 
-fn aead_decrypt(
-    cipher_suite: u16,
-    key: &[u8],
-    iv: &[u8],
-    seq: u64,
-    aad: &[u8],
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, Tls13Error> {
-    let nonce = make_nonce(iv, seq);
-
-    match cipher_suite {
-        0x1301 => {
-            let cipher = Aes128Gcm::new_from_slice(key)
-                .map_err(|e| Tls13Error::Crypto(format!("aes128gcm: {}", e)))?;
-            let aead_nonce = aes_gcm::Nonce::from_slice(&nonce);
-            let payload = aes_gcm::aead::Payload {
-                msg: ciphertext,
-                aad,
-            };
-            cipher
-                .decrypt(aead_nonce, payload)
-                .map_err(|e| Tls13Error::Crypto(format!("aes128gcm decrypt: {}", e)))
-        }
-        0x1302 => {
-            let cipher = Aes256Gcm::new_from_slice(key)
-                .map_err(|e| Tls13Error::Crypto(format!("aes256gcm: {}", e)))?;
-            let aead_nonce = aes_gcm::Nonce::from_slice(&nonce);
-            let payload = aes_gcm::aead::Payload {
-                msg: ciphertext,
-                aad,
-            };
-            cipher
-                .decrypt(aead_nonce, payload)
-                .map_err(|e| Tls13Error::Crypto(format!("aes256gcm decrypt: {}", e)))
-        }
-        0x1303 => {
-            let cipher = ChaCha20Poly1305::new_from_slice(key)
-                .map_err(|e| Tls13Error::Crypto(format!("chacha20: {}", e)))?;
-            let aead_nonce = chacha20poly1305::Nonce::from_slice(&nonce);
-            let payload = chacha20poly1305::aead::Payload {
-                msg: ciphertext,
-                aad,
-            };
-            cipher
-                .decrypt(aead_nonce, payload)
-                .map_err(|e| Tls13Error::Crypto(format!("chacha20 decrypt: {}", e)))
-        }
-        _ => Err(Tls13Error::Protocol(format!(
-            "unsupported cipher: 0x{:04x}",
-            cipher_suite
-        ))),
-    }
+/// Pre-constructed AEAD cipher to avoid per-record key schedule computation.
+/// Constructed once per key derivation and reused across all records with that key.
+enum CachedCipher {
+    Aes128(Aes128Gcm),
+    Aes256(Aes256Gcm),
+    ChaCha(ChaCha20Poly1305),
 }
 
-fn aead_encrypt(
-    cipher_suite: u16,
-    key: &[u8],
-    iv: &[u8],
-    seq: u64,
-    aad: &[u8],
-    plaintext: &[u8],
-) -> Result<Vec<u8>, Tls13Error> {
-    let nonce = make_nonce(iv, seq);
+impl CachedCipher {
+    fn new(cipher_suite: u16, key: &[u8]) -> Result<Self, Tls13Error> {
+        match cipher_suite {
+            0x1301 => Ok(CachedCipher::Aes128(
+                Aes128Gcm::new_from_slice(key)
+                    .map_err(|e| Tls13Error::Crypto(format!("aes128gcm: {}", e)))?
+            )),
+            0x1302 => Ok(CachedCipher::Aes256(
+                Aes256Gcm::new_from_slice(key)
+                    .map_err(|e| Tls13Error::Crypto(format!("aes256gcm: {}", e)))?
+            )),
+            0x1303 => Ok(CachedCipher::ChaCha(
+                ChaCha20Poly1305::new_from_slice(key)
+                    .map_err(|e| Tls13Error::Crypto(format!("chacha20: {}", e)))?
+            )),
+            _ => Err(Tls13Error::Protocol(format!("unsupported cipher: 0x{:04x}", cipher_suite))),
+        }
+    }
 
-    match cipher_suite {
-        0x1301 => {
-            let cipher = Aes128Gcm::new_from_slice(key)
-                .map_err(|e| Tls13Error::Crypto(format!("aes128gcm: {}", e)))?;
-            let aead_nonce = aes_gcm::Nonce::from_slice(&nonce);
-            let payload = aes_gcm::aead::Payload {
-                msg: plaintext,
-                aad,
-            };
-            cipher
-                .encrypt(aead_nonce, payload)
-                .map_err(|e| Tls13Error::Crypto(format!("aes128gcm encrypt: {}", e)))
+    fn decrypt(&self, iv: &[u8], seq: u64, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Tls13Error> {
+        let nonce = make_nonce(iv, seq);
+        match self {
+            CachedCipher::Aes128(c) => {
+                let payload = aes_gcm::aead::Payload { msg: ciphertext, aad };
+                c.decrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
+                    .map_err(|e| Tls13Error::Crypto(format!("aes128gcm decrypt: {}", e)))
+            }
+            CachedCipher::Aes256(c) => {
+                let payload = aes_gcm::aead::Payload { msg: ciphertext, aad };
+                c.decrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
+                    .map_err(|e| Tls13Error::Crypto(format!("aes256gcm decrypt: {}", e)))
+            }
+            CachedCipher::ChaCha(c) => {
+                let payload = chacha20poly1305::aead::Payload { msg: ciphertext, aad };
+                c.decrypt(chacha20poly1305::Nonce::from_slice(&nonce), payload)
+                    .map_err(|e| Tls13Error::Crypto(format!("chacha20 decrypt: {}", e)))
+            }
         }
-        0x1302 => {
-            let cipher = Aes256Gcm::new_from_slice(key)
-                .map_err(|e| Tls13Error::Crypto(format!("aes256gcm: {}", e)))?;
-            let aead_nonce = aes_gcm::Nonce::from_slice(&nonce);
-            let payload = aes_gcm::aead::Payload {
-                msg: plaintext,
-                aad,
-            };
-            cipher
-                .encrypt(aead_nonce, payload)
-                .map_err(|e| Tls13Error::Crypto(format!("aes256gcm encrypt: {}", e)))
+    }
+
+    fn encrypt(&self, iv: &[u8], seq: u64, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Tls13Error> {
+        let nonce = make_nonce(iv, seq);
+        match self {
+            CachedCipher::Aes128(c) => {
+                let payload = aes_gcm::aead::Payload { msg: plaintext, aad };
+                c.encrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
+                    .map_err(|e| Tls13Error::Crypto(format!("aes128gcm encrypt: {}", e)))
+            }
+            CachedCipher::Aes256(c) => {
+                let payload = aes_gcm::aead::Payload { msg: plaintext, aad };
+                c.encrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
+                    .map_err(|e| Tls13Error::Crypto(format!("aes256gcm encrypt: {}", e)))
+            }
+            CachedCipher::ChaCha(c) => {
+                let payload = chacha20poly1305::aead::Payload { msg: plaintext, aad };
+                c.encrypt(chacha20poly1305::Nonce::from_slice(&nonce), payload)
+                    .map_err(|e| Tls13Error::Crypto(format!("chacha20 encrypt: {}", e)))
+            }
         }
-        0x1303 => {
-            let cipher = ChaCha20Poly1305::new_from_slice(key)
-                .map_err(|e| Tls13Error::Crypto(format!("chacha20: {}", e)))?;
-            let aead_nonce = chacha20poly1305::Nonce::from_slice(&nonce);
-            let payload = chacha20poly1305::aead::Payload {
-                msg: plaintext,
-                aad,
-            };
-            cipher
-                .encrypt(aead_nonce, payload)
-                .map_err(|e| Tls13Error::Crypto(format!("chacha20 encrypt: {}", e)))
-        }
-        _ => Err(Tls13Error::Protocol(format!(
-            "unsupported cipher: 0x{:04x}",
-            cipher_suite
-        ))),
     }
 }
 
@@ -356,8 +319,7 @@ fn recv_tls_record(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Tls13Error> 
 }
 
 fn encrypt_tls13_record(
-    cipher_suite: u16,
-    key: &[u8],
+    cipher: &CachedCipher,
     iv: &[u8],
     seq: u64,
     content_type: u8,
@@ -379,18 +341,17 @@ fn encrypt_tls13_record(
     let outer_len = outer_len_usize as u16;
     let aad = [0x17, 0x03, 0x03, (outer_len >> 8) as u8, outer_len as u8];
 
-    aead_encrypt(cipher_suite, key, iv, seq, &aad, &inner)
+    cipher.encrypt(iv, seq, &aad, &inner)
 }
 
 fn decrypt_tls13_record(
-    cipher_suite: u16,
-    key: &[u8],
+    cipher: &CachedCipher,
     iv: &[u8],
     seq: u64,
     ciphertext: &[u8],
     record_header: &[u8; 5],
 ) -> Result<(u8, Vec<u8>), Tls13Error> {
-    let plaintext = aead_decrypt(cipher_suite, key, iv, seq, record_header, ciphertext)?;
+    let plaintext = cipher.decrypt(iv, seq, record_header, ciphertext)?;
 
     // Find real content type (last non-zero byte)
     let mut ct_idx = plaintext.len();
@@ -640,7 +601,7 @@ pub fn complete_tls13_handshake(
 
     // Transcript so far: ClientHello + ServerHello
     const MAX_TRANSCRIPT_SIZE: usize = 256 * 1024; // 256KB — well above any legitimate TLS 1.3 handshake
-    let mut transcript = Vec::new();
+    let mut transcript = Vec::with_capacity(client_hello_raw.len() + sh_data.len() + 8192);
     transcript.extend_from_slice(client_hello_raw);
     if transcript.len() + sh_data.len() > MAX_TRANSCRIPT_SIZE {
         return Err(Tls13Error::Protocol("transcript size limit exceeded".into()));
@@ -683,11 +644,13 @@ pub fn complete_tls13_handshake(
         &transcript_hash_ch_sh,
     )?;
 
-    // Derive handshake traffic keys
+    // Derive handshake traffic keys and pre-construct AEAD ciphers (once per key)
     let s_hs_key = hkdf_expand_label(alg, &server_hs_secret, "key", &[], key_length(cipher_suite)?)?;
     let s_hs_iv = hkdf_expand_label(alg, &server_hs_secret, "iv", &[], 12)?;
     let c_hs_key = hkdf_expand_label(alg, &client_hs_secret, "key", &[], key_length(cipher_suite)?)?;
     let c_hs_iv = hkdf_expand_label(alg, &client_hs_secret, "iv", &[], 12)?;
+    let s_hs_cipher = CachedCipher::new(cipher_suite, &s_hs_key)?;
+    let c_hs_cipher = CachedCipher::new(cipher_suite, &c_hs_key)?;
 
     // Step 5-6: Read encrypted handshake messages
     // Server sends: EncryptedExtensions, Certificate, CertificateVerify, Finished
@@ -735,8 +698,7 @@ pub fn complete_tls13_handshake(
 
         // Decrypt
         let (inner_ct, inner_data) = decrypt_tls13_record(
-            cipher_suite,
-            &s_hs_key,
+            &s_hs_cipher,
             &s_hs_iv,
             server_hs_seq,
             &record_data,
@@ -856,8 +818,7 @@ pub fn complete_tls13_handshake(
 
     // Encrypt and send
     let encrypted = encrypt_tls13_record(
-        cipher_suite,
-        &c_hs_key,
+        &c_hs_cipher,
         &c_hs_iv,
         0,    // client handshake seq starts at 0
         0x16, // handshake content type

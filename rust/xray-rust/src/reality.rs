@@ -20,7 +20,6 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection};
 use sha2::{Sha256, Sha512};
@@ -858,7 +857,7 @@ fn reality_server_handshake_full(
         .map_err(|e| (2, format!("cert gen: {}", e)))?;
 
     // Step 4: Build rustls ServerConfig with the REALITY cert
-    let provider = Arc::new(default_provider());
+    let provider = tls::cached_provider();
     let cert = CertificateDer::from(cert_der);
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_doc.as_ref().to_vec()));
 

@@ -7,6 +7,16 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+
+/// Cached CryptoProvider to avoid reconstructing algorithm tables per handshake.
+static DEFAULT_PROVIDER: std::sync::OnceLock<Arc<rustls::crypto::CryptoProvider>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn cached_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    DEFAULT_PROVIDER
+        .get_or_init(|| Arc::new(default_provider()))
+        .clone()
+}
 use rustls::{
     ClientConfig, ClientConnection, ConnectionTrafficSecrets, ServerConfig, ServerConnection,
 };
@@ -761,7 +771,7 @@ fn do_handshake(
     String,
 > {
     let versions = build_protocol_versions(cfg.min_version, cfg.max_version);
-    let provider = Arc::new(default_provider());
+    let provider = cached_provider();
 
     if cfg.is_server {
         // --- Server path ---
