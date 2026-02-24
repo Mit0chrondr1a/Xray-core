@@ -258,6 +258,11 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		return nil, err
 	}
+	// Zero auth key — no longer needed after handshake verification
+	for i := range uConn.AuthKey {
+		uConn.AuthKey[i] = 0
+	}
+	uConn.AuthKey = nil
 	if config.Show {
 		errors.LogDebug(ctx, "REALITY localAddr: ", localAddr, "\tuConn.Verified: ", uConn.Verified)
 	}
