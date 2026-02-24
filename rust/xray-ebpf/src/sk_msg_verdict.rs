@@ -55,7 +55,7 @@ fn try_sk_msg(ctx: &SkMsgContext) -> Result<u32, ()> {
 
     let policy = match unsafe { POLICY_MAP.get(&cookie) } {
         Some(flags) => *flags,
-        None => POLICY_ALLOW_REDIRECT,
+        None => 0, // deny-by-default; require explicit policy entry
     };
 
     if policy & POLICY_ALLOW_REDIRECT == 0 {
