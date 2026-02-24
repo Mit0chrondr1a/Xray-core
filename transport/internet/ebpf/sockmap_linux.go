@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"context"
 	stdErrors "errors"
 	"fmt"
@@ -254,7 +255,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 	// Build and load sk_skb stream parser
 	parserInsns := buildSKSkbParserProgram()
 	parserBytecode := encodeBPFInsns(parserInsns)
-	parserFD, err := loadSKSkbProgram(parserBytecode, 0, 0, "xray_skb_parse")
+	parserFD, err := loadSKSkbProgram(parserBytecode, 0, 0, "xray_skb_parse", bpfSkSkbStreamParser)
 	if err != nil {
 		syscall.Close(hashFD)
 		syscall.Close(policyFD)
@@ -264,7 +265,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 	// Build and load sk_skb stream verdict
 	verdictInsns := buildSKSkbVerdictProgram()
 	verdictBytecode := encodeBPFInsns(verdictInsns)
-	verdictFD, err := loadSKSkbProgram(verdictBytecode, hashFD, policyFD, "xray_skb_vrdt")
+	verdictFD, err := loadSKSkbProgram(verdictBytecode, hashFD, policyFD, "xray_skb_vrdt", bpfSkSkbStreamVerdict)
 	if err != nil {
 		syscall.Close(parserFD)
 		syscall.Close(hashFD)
@@ -586,7 +587,12 @@ func releaseSockmapAttachSlot(fd int) (uint32, bool) {
 }
 
 // loadSKSkbProgram loads an sk_skb BPF program with optional map fd relocation.
-func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) (int, error) {
+const (
+	bpfSkSkbStreamParser  = 4
+	bpfSkSkbStreamVerdict = 5
+)
+
+func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string, expectedAttachType uint32) (int, error) {
 	// Patch map fd placeholders with actual map fds (no-op if no matching LD_IMM64 in insns)
 	patchMapFD(insns, skSkbMapFDPlaceholder, int32(sockhashMapFD))
 	patchMapFD(insns, skSkbPolicyFDPlaceholder, int32(polMapFD))
@@ -594,21 +600,24 @@ func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) 
 	license := []byte("GPL\x00")
 
 	attr := struct {
-		progType    uint32
-		insnCnt     uint32
-		insns       uint64
-		license     uint64
-		logLevel    uint32
-		logSize     uint32
-		logBuf      uint64
-		kernVersion uint32
-		progFlags   uint32
-		progName    [16]byte
+		progType           uint32
+		insnCnt            uint32
+		insns              uint64
+		license            uint64
+		logLevel           uint32
+		logSize            uint32
+		logBuf             uint64
+		kernVersion        uint32
+		progFlags          uint32
+		progName           [16]byte
+		progIfIndex        uint32
+		expectedAttachType uint32
 	}{
-		progType: 23, // BPF_PROG_TYPE_SK_SKB
-		insnCnt:  uint32(len(insns)),
-		insns:    uint64(uintptr(unsafe.Pointer(&insns[0]))),
-		license:  uint64(uintptr(unsafe.Pointer(&license[0]))),
+		progType:           bpfProgTypeSKSkb,
+		insnCnt:            uint32(len(insns)),
+		insns:              uint64(uintptr(unsafe.Pointer(&insns[0]))),
+		license:            uint64(uintptr(unsafe.Pointer(&license[0]))),
+		expectedAttachType: expectedAttachType,
 	}
 
 	copy(attr.progName[:], name)
@@ -638,7 +647,19 @@ func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) 
 		unsafe.Sizeof(attr),
 	)
 	if errno != 0 {
-		return -1, fmt.Errorf("BPF_PROG_LOAD %s: %w", name, errno)
+		if idx := bytes.IndexByte(logBuf, 0); idx >= 0 {
+			logBuf = logBuf[:idx]
+		}
+		verifier := strings.TrimSpace(string(logBuf))
+		// Truncate verifier output to avoid leaking excessive kernel internals.
+		const maxVerifierLen = 512
+		if len(verifier) > maxVerifierLen {
+			verifier = verifier[:maxVerifierLen] + "...(truncated)"
+		}
+		if verifier != "" {
+			return -1, fmt.Errorf("BPF_PROG_LOAD %s (expected_attach_type=%d): %w (verifier: %s)", name, expectedAttachType, errno, verifier)
+		}
+		return -1, fmt.Errorf("BPF_PROG_LOAD %s (expected_attach_type=%d): %w", name, expectedAttachType, errno)
 	}
 
 	return int(fd), nil
@@ -646,15 +667,13 @@ func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) 
 
 // attachSKSkbToMap attaches sk_skb stream parser and verdict to a map.
 func attachSKSkbToMap(parserFD, verdictFD, mapFD int) error {
-	// Attach parser (BPF_SK_SKB_STREAM_PARSER = 4)
-	if err := attachBPFProgToMap(mapFD, parserFD, 4); err != nil {
+	if err := attachBPFProgToMap(mapFD, parserFD, bpfSkSkbStreamParser); err != nil {
 		return fmt.Errorf("parser: %w", err)
 	}
 
-	// Attach verdict (BPF_SK_SKB_STREAM_VERDICT = 5)
-	if err := attachBPFProgToMap(mapFD, verdictFD, 5); err != nil {
+	if err := attachBPFProgToMap(mapFD, verdictFD, bpfSkSkbStreamVerdict); err != nil {
 		// Detach parser on partial failure to leave map in clean state.
-		detachBPFProgFromMap(mapFD, parserFD, 4)
+		detachBPFProgFromMap(mapFD, parserFD, bpfSkSkbStreamParser)
 		return fmt.Errorf("verdict: %w", err)
 	}
 
