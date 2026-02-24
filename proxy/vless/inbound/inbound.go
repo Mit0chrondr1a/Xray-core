@@ -583,13 +583,22 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				} else if realityConn, ok := iConn.(*reality.Conn); ok {
 					t = reflect.TypeOf(realityConn.Conn).Elem()
 					p = uintptr(unsafe.Pointer(realityConn.Conn))
+				} else if rc, ok := iConn.(*tls.RustConn); ok {
+					if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
+						return errors.New("RustConn without full kTLS cannot use " + requestAddons.Flow).AtWarning()
+					}
+					// kTLS handles TLS 1.3 in kernel; no input/rawInput to extract.
+					input = &bytes.Reader{}
+					rawInput = &bytes.Buffer{}
 				} else {
 					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
-				i, _ := t.FieldByName("input")
-				r, _ := t.FieldByName("rawInput")
-				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+				if t != nil {
+					i, _ := t.FieldByName("input")
+					r, _ := t.FieldByName("rawInput")
+					input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
+					rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+				}
 			}
 		} else {
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
