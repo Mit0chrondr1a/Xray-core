@@ -233,7 +233,7 @@ pub unsafe extern "C" fn xray_ipset_contains(
     ip_bytes: *const u8,
     ip_len: usize,
 ) -> bool {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    ffi_catch_bool!({
         if ipset.is_null() || ip_bytes.is_null() {
             return false;
         }
@@ -245,10 +245,7 @@ pub unsafe extern "C" fn xray_ipset_contains(
             16 => ipset.ipv6.contains(ip, 128),
             _ => false,
         }
-    })) {
-        Ok(v) => v,
-        Err(_) => false,
-    }
+    })
 }
 
 /// Get the max IPv4 prefix length in the set. Returns 0xff if empty.
@@ -257,7 +254,7 @@ pub unsafe extern "C" fn xray_ipset_contains(
 /// `ipset` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn xray_ipset_max4(ipset: *const IpSet) -> u8 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    ffi_catch_u8!(0xff, {
         if ipset.is_null() {
             return 0xff;
         }
@@ -267,10 +264,7 @@ pub unsafe extern "C" fn xray_ipset_max4(ipset: *const IpSet) -> u8 {
         } else {
             ipset.max4
         }
-    })) {
-        Ok(v) => v,
-        Err(_) => 0xff,
-    }
+    })
 }
 
 /// Get the max IPv6 prefix length in the set. Returns 0xff if empty.
@@ -279,7 +273,7 @@ pub unsafe extern "C" fn xray_ipset_max4(ipset: *const IpSet) -> u8 {
 /// `ipset` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn xray_ipset_max6(ipset: *const IpSet) -> u8 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    ffi_catch_u8!(0xff, {
         if ipset.is_null() {
             return 0xff;
         }
@@ -289,10 +283,7 @@ pub unsafe extern "C" fn xray_ipset_max6(ipset: *const IpSet) -> u8 {
         } else {
             ipset.max6
         }
-    })) {
-        Ok(v) => v,
-        Err(_) => 0xff,
-    }
+    })
 }
 
 /// Free an IP set.
