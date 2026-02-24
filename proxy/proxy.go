@@ -873,21 +873,48 @@ func startKeyUpdateMonitor(rawConn net.Conn, handler *tls.KTLSKeyUpdateHandler) 
 // underlying raw connection plus a CryptoHint describing the TLS state.
 // This must be called BEFORE UnwrapRawConn because it inspects TLS wrappers.
 func DetermineSocketCryptoHint(conn net.Conn) (net.Conn, ebpf.CryptoHint) {
+	raw, hint, _ := determineSocketCryptoHintWithSource(conn)
+	return raw, hint
+}
+
+const maxCryptoHintDepth = 8
+
+func determineSocketCryptoHintWithSource(conn net.Conn) (net.Conn, ebpf.CryptoHint, string) {
+	return determineSocketCryptoHintRecurse(conn, 0)
+}
+
+func determineSocketCryptoHintRecurse(conn net.Conn, depth int) (net.Conn, ebpf.CryptoHint, string) {
 	if conn == nil {
-		return nil, ebpf.CryptoNone
+		return nil, ebpf.CryptoNone, "nil"
 	}
+	if depth > maxCryptoHintDepth {
+		// Conservative default: assume userspace TLS to prevent sockmap
+		// from forwarding data under incorrect crypto assumptions.
+		return nil, ebpf.CryptoUserspaceTLS, "depth-exceeded"
+	}
+	source := connTypeName(conn)
 
 	// Peel encryption wrappers
 	if commonConn, ok := conn.(*encryption.CommonConn); ok {
+		source = appendCryptoHintSource(source, "*encryption.CommonConn")
 		conn = commonConn.Conn
 	}
 	if _, ok := conn.(*encryption.XorConn); ok {
-		return nil, ebpf.CryptoUserspaceTLS // XorConn is not eligible
+		return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*encryption.XorConn")
 	}
 
-	// Peel stats wrapper
+	// Peel stats and proxyproto wrappers before TLS inspection.
+	// NOTE: peel order here differs from UnwrapRawConn (which peels proxyproto
+	// after TLS). Both orderings are correct because the type assertions are
+	// independent — if proxyproto wraps TLS, we peel it first and see TLS next;
+	// if TLS wraps proxyproto, the TLS branch fires first.
 	if statConn, ok := conn.(*stat.CounterConnection); ok {
+		source = appendCryptoHintSource(source, "*stat.CounterConnection")
 		conn = statConn.Connection
+	}
+	if pc, ok := conn.(*proxyproto.Conn); ok {
+		source = appendCryptoHintSource(source, "*proxyproto.Conn")
+		conn = pc.Raw()
 	}
 
 	// Check TLS type
@@ -895,56 +922,73 @@ func DetermineSocketCryptoHint(conn net.Conn) (net.Conn, ebpf.CryptoHint) {
 		ktls := xc.KTLSEnabled()
 		raw := xc.NetConn()
 		if ktls.TxReady && ktls.RxReady {
-			return raw, ebpf.CryptoKTLSBoth
+			return raw, ebpf.CryptoKTLSBoth, appendCryptoHintSource(source, "*tls.Conn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 		}
 		if ktls.TxReady {
-			return raw, ebpf.CryptoKTLSTxOnly
+			return raw, ebpf.CryptoKTLSTxOnly, appendCryptoHintSource(source, "*tls.Conn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 		}
 		if ktls.RxReady {
-			return raw, ebpf.CryptoKTLSRxOnly
+			return raw, ebpf.CryptoKTLSRxOnly, appendCryptoHintSource(source, "*tls.Conn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 		}
-		return raw, ebpf.CryptoUserspaceTLS
+		return raw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.Conn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 	}
 
 	if rc, ok := conn.(*tls.RustConn); ok {
 		ktls := rc.KTLSEnabled()
 		raw := rc.NetConn()
 		if ktls.TxReady && ktls.RxReady {
-			return raw, ebpf.CryptoKTLSBoth
+			return raw, ebpf.CryptoKTLSBoth, appendCryptoHintSource(source, "*tls.RustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 		}
 		if ktls.TxReady {
-			return raw, ebpf.CryptoKTLSTxOnly
+			return raw, ebpf.CryptoKTLSTxOnly, appendCryptoHintSource(source, "*tls.RustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 		}
 		if ktls.RxReady {
-			return raw, ebpf.CryptoKTLSRxOnly
+			return raw, ebpf.CryptoKTLSRxOnly, appendCryptoHintSource(source, "*tls.RustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 		}
-		return raw, ebpf.CryptoUserspaceTLS
+		return raw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.RustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 	}
 
-	if _, ok := conn.(*tls.UConn); ok {
-		return nil, ebpf.CryptoUserspaceTLS
+	if utlsConn, ok := conn.(*tls.UConn); ok {
+		if utlsConn == nil || utlsConn.UConn == nil {
+			return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.UConn(nil)")
+		}
+		inner := utlsConn.NetConn()
+		innerRaw, _, innerSource := determineSocketCryptoHintRecurse(inner, depth+1)
+		return innerRaw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.UConn(userspace inner="+innerSource+")")
 	}
-	if _, ok := conn.(*reality.Conn); ok {
-		return nil, ebpf.CryptoUserspaceTLS
+	if realityConn, ok := conn.(*reality.Conn); ok {
+		if realityConn == nil || realityConn.Conn == nil {
+			return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*reality.Conn(nil)")
+		}
+		inner := realityConn.NetConn()
+		innerRaw, _, innerSource := determineSocketCryptoHintRecurse(inner, depth+1)
+		return innerRaw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*reality.Conn(userspace inner="+innerSource+")")
 	}
-	if _, ok := conn.(*reality.UConn); ok {
-		return nil, ebpf.CryptoUserspaceTLS
+	if realityUConn, ok := conn.(*reality.UConn); ok {
+		if realityUConn == nil || realityUConn.UConn == nil {
+			return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*reality.UConn(nil)")
+		}
+		inner := realityUConn.NetConn()
+		innerRaw, _, innerSource := determineSocketCryptoHintRecurse(inner, depth+1)
+		return innerRaw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*reality.UConn(userspace inner="+innerSource+")")
 	}
 
 	if _, ok := conn.(*net.TCPConn); ok {
-		return conn, ebpf.CryptoNone
+		return conn, ebpf.CryptoNone, appendCryptoHintSource(source, "*net.TCPConn(raw)")
 	}
 
-	return nil, ebpf.CryptoNone
+	return nil, ebpf.CryptoNone, appendCryptoHintSource(source, connTypeName(conn))
 }
 
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
 func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
-	// Capture crypto state before unwrapping TLS wrappers.
-	_, readerCrypto := DetermineSocketCryptoHint(readerConn)
-	_, writerCrypto := DetermineSocketCryptoHint(writerConn)
+	// Capture crypto state and diagnostic source before unwrapping TLS wrappers.
+	// Source strings are computed once here and reused in the debug path below,
+	// avoiding a redundant second traversal of the connection wrapper chain.
+	_, readerCrypto, readerCryptoSource := determineSocketCryptoHintWithSource(readerConn)
+	_, writerCrypto, writerCryptoSource := determineSocketCryptoHintWithSource(writerConn)
 
 	readerConn, readCounter, _, readerHandler := UnwrapRawConn(readerConn)
 	writerConn, _, writeCounter, writerHandler := UnwrapRawConn(writerConn)
@@ -1008,7 +1052,15 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			} else if mgr.ShouldFallbackToSplice() {
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: contention fallback active")
 			} else if !ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
-				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), " writerCrypto=", int(writerCrypto), " readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+				errors.LogDebug(ctx, "CopyRawConn crypto hint: reader=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] source=", readerCryptoSource, " writer=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] source=", writerCryptoSource)
+				switch {
+				case readerCrypto == ebpf.CryptoUserspaceTLS || writerCrypto == ebpf.CryptoUserspaceTLS:
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+				case (readerCrypto == ebpf.CryptoKTLSBoth) != (writerCrypto == ebpf.CryptoKTLSBoth):
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: asymmetric kTLS state (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+				default:
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+				}
 			} else {
 				if err := mgr.RegisterPairWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto); err == nil {
 					errors.LogDebug(ctx, "CopyRawConn sockmap (crypto: reader=", int(readerCrypto), " writer=", int(writerCrypto), ")")
@@ -1101,6 +1153,46 @@ func connTypeName(conn net.Conn) string {
 		return "<nil>"
 	}
 	return reflect.TypeOf(conn).String()
+}
+
+func appendCryptoHintSource(source, step string) string {
+	if source == "" {
+		return step
+	}
+	if step == "" {
+		return source
+	}
+	return source + " -> " + step
+}
+
+func ktlsStateName(txReady, rxReady bool) string {
+	switch {
+	case txReady && rxReady:
+		return "ktls-both"
+	case txReady:
+		return "ktls-tx-only"
+	case rxReady:
+		return "ktls-rx-only"
+	default:
+		return "userspace"
+	}
+}
+
+func cryptoHintName(h ebpf.CryptoHint) string {
+	switch h {
+	case ebpf.CryptoNone:
+		return "none"
+	case ebpf.CryptoKTLSBoth:
+		return "ktls-both"
+	case ebpf.CryptoKTLSTxOnly:
+		return "ktls-tx-only"
+	case ebpf.CryptoKTLSRxOnly:
+		return "ktls-rx-only"
+	case ebpf.CryptoUserspaceTLS:
+		return "userspace-tls"
+	default:
+		return "unknown"
+	}
 }
 
 func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer signal.ActivityUpdater, readCounter stats.Counter) error {
