@@ -246,7 +246,17 @@ func (v *Listener) keepAccepting() {
 				}
 			} else if v.realityConfig != nil {
 				rustDone := false
-				if useNativeRealityServerFn(v) {
+				nativePathEligible := useNativeRealityServerFn(v)
+				if !nativePathEligible {
+					hasMldsa65Seed := v.realityXrayConfig != nil && len(v.realityXrayConfig.Mldsa65Seed) > 0
+					errors.LogDebug(context.Background(),
+						"Rust REALITY server path disabled: nativeAvailable=", native.Available(),
+						" fullKTLS=", tls.NativeFullKTLSSupported(),
+						" hasRealityXrayConfig=", v.realityXrayConfig != nil,
+						" hasMldsa65Seed=", hasMldsa65Seed,
+					)
+				}
+				if nativePathEligible {
 					fd, fdErr := tls.ExtractFd(conn)
 					if fdErr == nil {
 						if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
@@ -267,6 +277,7 @@ func (v *Listener) keepAccepting() {
 							}
 							conn = rustConn
 							rustDone = true
+							errors.LogDebug(context.Background(), "Rust REALITY server path active: wrapped as *tls.RustConn")
 						} else {
 							if rustResult != nil && rustResult.StateHandle != nil {
 								native.TlsStateFree(rustResult.StateHandle)
@@ -289,6 +300,8 @@ func (v *Listener) keepAccepting() {
 								return
 							}
 						}
+					} else {
+						errors.LogDebugInner(context.Background(), fdErr, "Rust REALITY server path skipped: failed to extract fd")
 					}
 				}
 				if !rustDone {

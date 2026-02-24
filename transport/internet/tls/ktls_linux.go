@@ -398,6 +398,7 @@ func kernelKTLSSupportedCached() bool {
 func NativeFullKTLSSupported() bool {
 	fullKTLSOnce.Do(func() {
 		if !kernelKTLSSupportedCached() {
+			xerrors.LogDebug(context.Background(), "kTLS full probe: kernel kTLS unavailable")
 			return
 		}
 		for _, suite := range []uint16{
@@ -406,10 +407,12 @@ func NativeFullKTLSSupported() bool {
 			tls.TLS_CHACHA20_POLY1305_SHA256,
 		} {
 			if !probeFullKTLSForSuiteCached(TLS_1_3_VERSION, suite) {
+				xerrors.LogDebug(context.Background(), "kTLS full probe failed for TLS1.3 suite ", tls.CipherSuiteName(suite), " (", suite, ")")
 				return
 			}
 		}
 		fullKTLSOK = true
+		xerrors.LogDebug(context.Background(), "kTLS full probe passed for required TLS1.3 suites")
 	})
 	return fullKTLSOK
 }

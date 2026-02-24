@@ -221,7 +221,16 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	}
 	// Try Rust native path only when full bidirectional kTLS is available and
 	// no extra ML-DSA verification is configured.
-	if native.Available() && tls.NativeFullKTLSSupported() && len(config.Mldsa65Verify) == 0 {
+	fullKTLS := tls.NativeFullKTLSSupported()
+	nativePathEligible := native.Available() && fullKTLS && len(config.Mldsa65Verify) == 0
+	if !nativePathEligible {
+		errors.LogDebug(ctx,
+			"REALITY native client path disabled: nativeAvailable=", native.Available(),
+			" fullKTLS=", fullKTLS,
+			" hasMldsa65Verify=", len(config.Mldsa65Verify) > 0,
+		)
+	}
+	if nativePathEligible {
 		ecdhe := uConn.HandshakeState.State13.KeyShareKeys.Ecdhe
 		if ecdhe == nil {
 			ecdhe = uConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
@@ -238,6 +247,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					result, rustErr := native.RealityClientConnect(fd, uConn.HandshakeState.Hello.Raw, ecdhe.Bytes(), realityCfg)
 					if rustErr == nil {
 						if result != nil && result.KtlsTx && result.KtlsRx {
+							errors.LogDebug(ctx, "REALITY native client path active: wrapped as *tls.RustConn")
 							return tls.NewRustConnChecked(c, result, uConn.ServerName)
 						}
 						// Handshake succeeded but kTLS incomplete — socket data
@@ -252,7 +262,12 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					// Do not fall back to Go/uTLS on this same connection.
 					return nil, rustErr
 				}
+				errors.LogDebug(ctx, "REALITY native client path skipped: failed to allocate native reality config")
+			} else {
+				errors.LogDebugInner(ctx, fdErr, "REALITY native client path skipped: failed to extract fd")
 			}
+		} else {
+			errors.LogDebug(ctx, "REALITY native client path skipped: missing ECDHE keyshare")
 		}
 	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
