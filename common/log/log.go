@@ -16,6 +16,13 @@ type Handler interface {
 	Handle(msg Message)
 }
 
+// SeverityAwareHandler optionally exposes severity-level filtering state.
+// Handlers that do not implement this interface are treated as accepting all
+// severities.
+type SeverityAwareHandler interface {
+	IsSeverityEnabled(severity Severity) bool
+}
+
 // GeneralMessage is a general log message that can contain all kind of content.
 type GeneralMessage struct {
 	Severity Severity
@@ -30,6 +37,23 @@ func (m *GeneralMessage) String() string {
 // Record writes a message into log stream.
 func Record(msg Message) {
 	logHandler.Handle(msg)
+}
+
+// IsSeverityEnabled reports whether the current log handler would accept
+// GeneralMessage at the specified severity.
+func IsSeverityEnabled(severity Severity) bool {
+	logHandler.RLock()
+	defer logHandler.RUnlock()
+
+	if logHandler.Handler == nil {
+		return true
+	}
+
+	if h, ok := logHandler.Handler.(SeverityAwareHandler); ok {
+		return h.IsSeverityEnabled(severity)
+	}
+
+	return true
 }
 
 var logHandler syncHandler
