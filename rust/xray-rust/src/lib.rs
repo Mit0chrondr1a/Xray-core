@@ -10,6 +10,7 @@ pub mod ebpf;
 #[cfg(not(feature = "ebpf-bytecode"))]
 #[path = "ebpf_stub.rs"]
 pub mod ebpf;
+pub(crate) mod fdutil;
 pub mod geodata;
 mod geoip;
 mod mph;
