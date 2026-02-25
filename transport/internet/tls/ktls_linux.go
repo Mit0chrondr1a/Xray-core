@@ -1,3 +1,24 @@
+// ktls_linux.go — kernel TLS offload for Linux.
+//
+// Two paths for kTLS key extraction:
+//
+//  1. KeyLogWriter capture (preferred for TLS 1.3): The Go TLS config is
+//     cloned per-connection with a keyCapture writer that intercepts
+//     CLIENT/SERVER_TRAFFIC_SECRET_0 lines. Keys are derived via
+//     HKDF-Expand-Label; only sequence numbers need reflection.
+//
+//  2. Full reflection (fallback, required for TLS 1.2): Walks unexported
+//     crypto/tls.halfConn fields to extract key, IV, and seq. This is
+//     fragile across Go versions; maxTestedGoVersion gates the warning.
+//
+// Rust native path (RustConn): When native.Available() is true, rustls
+// drives the handshake and installs kTLS directly from Rust. This file's
+// TryEnableKTLS is only used for the Go TLS path.
+//
+// Probe caching: kernelKTLSSupportedCached() (basic ULP probe) and
+// probeFullKTLSForSuiteCached() (per-suite TX+RX probe) are cached via
+// sync.Once / sync.Map to avoid repeated loopback socket pairs.
+
 //go:build linux
 
 package tls
@@ -11,7 +32,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"reflect"
 	"runtime"
 	"strings"
@@ -109,7 +129,11 @@ func (kc *keyCapture) Write(p []byte) (n int, err error) {
 func (kc *keyCapture) secrets() (clientSecret, serverSecret []byte) {
 	kc.mu.Lock()
 	defer kc.mu.Unlock()
-	return kc.clientSecret, kc.serverSecret
+	// Return copies — the caller reads these after releasing the lock, but
+	// clear() may zero the originals concurrently. Without copies, a race
+	// between deriveKeysFromCapture and clear could produce partially-zeroed
+	// key material, potentially configuring kTLS with a known-zero key.
+	return append([]byte(nil), kc.clientSecret...), append([]byte(nil), kc.serverSecret...)
 }
 
 // clear zeroes captured secrets.
@@ -395,24 +419,40 @@ func kernelKTLSSupportedCached() bool {
 
 // NativeFullKTLSSupported reports whether this host supports full bidirectional
 // kTLS for the TLS 1.3 cipher suites used by native REALITY/TLS paths.
+// Suite probes run concurrently to reduce startup latency on throttled VPSes.
 func NativeFullKTLSSupported() bool {
 	fullKTLSOnce.Do(func() {
 		if !kernelKTLSSupportedCached() {
 			xerrors.LogDebug(context.Background(), "kTLS full probe: kernel kTLS unavailable")
 			return
 		}
-		for _, suite := range []uint16{
+		suites := []uint16{
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
 			tls.TLS_CHACHA20_POLY1305_SHA256,
-		} {
-			if !probeFullKTLSForSuiteCached(TLS_1_3_VERSION, suite) {
-				xerrors.LogDebug(context.Background(), "kTLS full probe failed for TLS1.3 suite ", tls.CipherSuiteName(suite), " (", suite, ")")
-				return
+		}
+		type probeResult struct {
+			suite uint16
+			ok    bool
+		}
+		ch := make(chan probeResult, len(suites))
+		for _, suite := range suites {
+			go func(s uint16) {
+				ch <- probeResult{suite: s, ok: probeFullKTLSForSuiteCached(TLS_1_3_VERSION, s)}
+			}(suite)
+		}
+		allOK := true
+		for range suites {
+			r := <-ch
+			if !r.ok {
+				xerrors.LogDebug(context.Background(), "kTLS full probe failed for TLS1.3 suite ", tls.CipherSuiteName(r.suite), " (", r.suite, ")")
+				allOK = false
 			}
 		}
-		fullKTLSOK = true
-		xerrors.LogDebug(context.Background(), "kTLS full probe passed for required TLS1.3 suites")
+		if allOK {
+			fullKTLSOK = true
+			xerrors.LogDebug(context.Background(), "kTLS full probe passed for required TLS1.3 suites")
+		}
 	})
 	return fullKTLSOK
 }
@@ -607,7 +647,7 @@ func (k *tlsKeys) zero() {
 // maxTestedGoVersion is the newest Go version against which reflective key
 // extraction has been verified. Bump after confirming crypto/tls internals
 // are unchanged in a new Go release.
-const maxTestedGoVersion = "go1.25"
+const maxTestedGoVersion = "go1.26"
 
 // extractTLSKeys extracts TLS keys from a tls.Conn using reflection.
 // This is necessarily fragile and depends on Go's internal tls.Conn structure.
@@ -615,8 +655,9 @@ func extractTLSKeys(conn *tls.Conn) (*tlsKeys, error) {
 	if !strings.HasPrefix(runtime.Version(), maxTestedGoVersion) {
 		// Log once per new Go version so operators know reflection may break.
 		extractKeysVersionWarnOnce.Do(func() {
-			fmt.Fprintf(os.Stderr, "ktls: extractTLSKeys tested up to %s, running %s — monitor for failures\n",
-				maxTestedGoVersion, runtime.Version())
+			xerrors.LogWarning(context.Background(),
+				"ktls: extractTLSKeys tested up to ", maxTestedGoVersion,
+				", running ", runtime.Version(), " — monitor for failures")
 		})
 	}
 	// Access the unexported fields via reflection
@@ -952,31 +993,72 @@ func getRecordSeq(fd int, direction int, cipherSuiteID uint16) (uint64, error) {
 	return seq, nil
 }
 
-// zeroBytes overwrites b with zeroes.
+// zeroBytes overwrites b with zeros using the memzero assembly routine.
 //
-//go:noinline
+// Why not clear(b): Go 1.26's compiler eliminates clear() on dead buffers
+// (verified: a function that fills a stack buffer then calls clear() compiles
+// to a bare RET).  memzero is implemented in assembly with //go:noescape,
+// making it immune to dead-store elimination.  See memzero_asm.go for the
+// full analysis and the migration checklist for when a stdlib secure-zero
+// API (crypto/subtle.Zero or stable runtime/secret) becomes available.
 func zeroBytes(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
+	memzero(b)
 }
 
 // zeroCryptoInfo zeroes a stack-allocated crypto info struct after setsockopt
-// copies it to kernel space, preventing key material from lingering on the stack.
+// copies it to kernel space, preventing key material from lingering on the
+// stack.  Uses memzero (assembly, DSE-immune) via unsafe.Slice.
 //
-//go:noinline
+// Migrate to crypto/subtle.Zero or runtime/secret when available — see
+// memzero_asm.go for the checklist.
 func zeroCryptoInfo(ptr unsafe.Pointer, size uintptr) {
-	zeroBytes(unsafe.Slice((*byte)(ptr), size))
+	memzero(unsafe.Slice((*byte)(ptr), size))
 }
 
 // KTLSSupported checks if kernel TLS is available.
+// The probe uses a connected loopback TCP pair because modern kernels (6.x+)
+// require TCP_ESTABLISHED state for setsockopt(TCP_ULP) and return ENOTCONN
+// on unconnected sockets.
 func KTLSSupported() bool {
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: 0,
+	})
 	if err != nil {
 		return false
 	}
-	defer syscall.Close(fd)
+	defer ln.Close()
 
-	err = syscall.SetsockoptString(fd, syscall.SOL_TCP, unix.TCP_ULP, "tls")
-	return err == nil
+	serverCh := make(chan *net.TCPConn, 1)
+	go func() {
+		c, err := ln.AcceptTCP()
+		if err != nil {
+			return
+		}
+		serverCh <- c
+	}()
+
+	client, err := net.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+
+	select {
+	case srv := <-serverCh:
+		defer srv.Close()
+	case <-time.After(500 * time.Millisecond):
+		return false
+	}
+
+	rawConn, err := client.SyscallConn()
+	if err != nil {
+		return false
+	}
+
+	var ulpErr error
+	rawConn.Control(func(fd uintptr) {
+		ulpErr = syscall.SetsockoptString(int(fd), syscall.SOL_TCP, unix.TCP_ULP, "tls")
+	})
+	return ulpErr == nil
 }
