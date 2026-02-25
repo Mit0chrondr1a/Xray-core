@@ -6,7 +6,6 @@ require (
 	github.com/apernet/quic-go v0.57.2-0.20260111184307-eec823306178
 	github.com/cloudflare/circl v1.6.3
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344
-	github.com/golang/mock v1.7.0-rc.1
 	github.com/google/go-cmp v0.7.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/klauspost/cpuid/v2 v2.3.0
@@ -19,6 +18,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/vishvananda/netlink v1.3.1
 	github.com/xtls/reality v0.0.0-20251116175510-cd53f7d50237
+	go.uber.org/mock v0.5.2
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/crypto v0.48.0
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa
