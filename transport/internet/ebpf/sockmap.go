@@ -40,6 +40,9 @@ type SockmapManager struct {
 	sweepStaleRatio   atomic.Int64 // last sweep: stale-found * 1000 / total-checked (permille)
 	spliceFallbacks   atomic.Int64 // times sockmap was skipped due to contention
 
+	// kTLS splice fallback tracking
+	ktlsSpliceFallbacks atomic.Int64 // times kTLS pairs routed to splice due to kernel incompatibility
+
 	// Userspace LRU eviction for SOCKHASH
 	lruList  *list.List                    // front=MRU, back=LRU
 	lruIndex map[SockPairKey]*list.Element // O(1) lookup
@@ -52,15 +55,16 @@ type SockmapManager struct {
 
 // SockmapStats provides a snapshot of sockmap manager statistics.
 type SockmapStats struct {
-	ActivePairs     int64
-	TotalPairs      int64
-	FullRejects     int64
-	PeakPairs       int64
-	StaleCleanups   int64
-	RegFailures     int64
-	SpliceFallbacks int64
-	Enabled         bool
-	MaxEntries      uint32
+	ActivePairs         int64
+	TotalPairs          int64
+	FullRejects         int64
+	PeakPairs           int64
+	StaleCleanups       int64
+	RegFailures         int64
+	SpliceFallbacks     int64
+	KTLSSpliceFallbacks int64
+	Enabled             bool
+	MaxEntries          uint32
 }
 
 // SockPairKey identifies a socket pair for proxying.
@@ -79,6 +83,23 @@ const (
 	CryptoKTLSRxOnly   CryptoHint = 3
 	CryptoUserspaceTLS CryptoHint = 4 // Go/uTLS — not eligible
 )
+
+func (h CryptoHint) String() string {
+	switch h {
+	case CryptoNone:
+		return "none"
+	case CryptoKTLSBoth:
+		return "kTLS-both"
+	case CryptoKTLSTxOnly:
+		return "kTLS-TX"
+	case CryptoKTLSRxOnly:
+		return "kTLS-RX"
+	case CryptoUserspaceTLS:
+		return "userspace"
+	default:
+		return "unknown"
+	}
+}
 
 const (
 	PolicyAllowRedirect uint32 = 1 << 0
@@ -112,6 +133,11 @@ const (
 	maxEvictRetries      = 3
 	regFailureWindow     = 60 * time.Second
 	regFailureMinSamples = int64(20)
+
+	// sweepStaleThresholdPermille is the permille threshold for stale entries
+	// detected by the sweeper. If >10% (100 permille) of pairs were stale in
+	// the last sweep, ShouldFallbackToSplice returns true.
+	sweepStaleThresholdPermille = 100
 )
 
 // NewSockmapManager creates a new sockmap manager.
@@ -234,6 +260,11 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 
 	// Compute redirect policy from crypto hints.
 	policy := computeRedirectPolicy(inboundCrypto, outboundCrypto)
+	if policy&PolicyAllowRedirect != 0 && inboundCrypto != outboundCrypto {
+		xerrors.LogDebug(context.Background(),
+			"sockmap: asymmetric crypto redirect (",
+			inboundCrypto.String(), " <-> ", outboundCrypto.String(), ")")
+	}
 
 	// Write policy entries before forwarding registration so the verdict program
 	// can consult them as soon as data arrives.
@@ -419,15 +450,16 @@ func (m *SockmapManager) GetStats(inbound, outbound net.Conn) (*SockPair, bool) 
 // GetSockmapStats returns a snapshot of overall sockmap statistics.
 func (m *SockmapManager) GetSockmapStats() SockmapStats {
 	return SockmapStats{
-		ActivePairs:     m.activePairs.Load(),
-		TotalPairs:      m.totalPairs.Load(),
-		FullRejects:     m.fullRejects.Load(),
-		PeakPairs:       m.peakPairs.Load(),
-		StaleCleanups:   m.staleCleanups.Load(),
-		RegFailures:     m.regFailures.Load(),
-		SpliceFallbacks: m.spliceFallbacks.Load(),
-		Enabled:         m.enabled.Load(),
-		MaxEntries:      m.config.MaxEntries,
+		ActivePairs:         m.activePairs.Load(),
+		TotalPairs:          m.totalPairs.Load(),
+		FullRejects:         m.fullRejects.Load(),
+		PeakPairs:           m.peakPairs.Load(),
+		StaleCleanups:       m.staleCleanups.Load(),
+		RegFailures:         m.regFailures.Load(),
+		SpliceFallbacks:     m.spliceFallbacks.Load(),
+		KTLSSpliceFallbacks: m.ktlsSpliceFallbacks.Load(),
+		Enabled:             m.enabled.Load(),
+		MaxEntries:          m.config.MaxEntries,
 	}
 }
 
@@ -461,7 +493,7 @@ func (m *SockmapManager) ShouldFallbackToSplice() bool {
 	}
 
 	// Check stale sweep ratio (permille).
-	if m.sweepStaleRatio.Load() > 100 {
+	if m.sweepStaleRatio.Load() > sweepStaleThresholdPermille {
 		// >10% of pairs were stale last sweep
 		m.spliceFallbacks.Add(1)
 		return true
@@ -479,29 +511,83 @@ func CanUseZeroCopy(inbound, outbound net.Conn) bool {
 	return ok1 && ok2
 }
 
+var (
+	ktlsSockhashProbeOnce sync.Once
+	ktlsSockhashOK        bool
+)
+
+// KTLSSockhashCompatible reports whether the running kernel supports inserting
+// kTLS sockets into SOCKHASH maps. This is probed once at startup by creating
+// a real kTLS socket and attempting SOCKHASH insertion.
+//
+// Kernel 6.18 removed psock_update_sk_prot from TLS proto structs, breaking
+// this path. When/if a future kernel restores the callback, this probe will
+// automatically detect it — no code changes or version gates needed.
+func KTLSSockhashCompatible() bool {
+	ktlsSockhashProbeOnce.Do(func() {
+		ktlsSockhashOK = probeKTLSSockhashCompat()
+		if ktlsSockhashOK {
+			xerrors.LogDebug(context.Background(), "sockmap: kTLS+SOCKHASH probe passed")
+		} else {
+			xerrors.LogInfo(context.Background(), "sockmap: kTLS+SOCKHASH probe failed (kernel ", unameRelease(), ") — kTLS sockets will use splice instead of sockmap")
+		}
+	})
+	return ktlsSockhashOK
+}
+
+// IncrementKTLSSpliceFallback records that a kTLS-eligible connection pair was
+// routed to splice(2) instead of sockmap due to kernel incompatibility.
+func (m *SockmapManager) IncrementKTLSSpliceFallback() {
+	m.ktlsSpliceFallbacks.Add(1)
+}
+
 // CanUseZeroCopyWithCrypto returns true if the connection pair can use
 // zero-copy given their crypto states. Both must be raw TCP connections
 // and the redirect policy must allow it.
+//
+// Security invariant: when this returns false for kTLS connections (e.g.
+// KTLSSockhashCompatible() == false on kernel 6.18+), the caller falls
+// through to splice(2). kTLS connections still get kernel-level encryption
+// via the TLS ULP — only the forwarding mechanism changes from BPF redirect
+// to splice pipe buffers. Data remains encrypted in transit and never passes
+// through userspace in cleartext.
 func CanUseZeroCopyWithCrypto(inbound, outbound net.Conn, inCrypto, outCrypto CryptoHint) bool {
 	_, ok1 := inbound.(*net.TCPConn)
 	_, ok2 := outbound.(*net.TCPConn)
 	if !ok1 || !ok2 {
 		return false
 	}
-	return computeRedirectPolicy(inCrypto, outCrypto)&PolicyAllowRedirect != 0
+	policy := computeRedirectPolicy(inCrypto, outCrypto)
+	if policy&PolicyAllowRedirect == 0 {
+		return false
+	}
+	// If either side is kTLS, verify this kernel supports kTLS+SOCKHASH.
+	if policy&PolicyKTLSActive != 0 && !KTLSSockhashCompatible() {
+		return false
+	}
+	return true
 }
 
 // computeRedirectPolicy determines the redirect policy flags for a pair of
 // sockets based on their crypto states.
+//
+// kTLS sockets are eligible for sockmap redirect because the kernel's kTLS
+// layer sits below the socket layer — it transparently encrypts on TX and
+// decrypts on RX. Sockmap operates at the socket layer (plaintext), so
+// asymmetric pairs (kTLS ↔ plain TCP) work correctly: this is the normal
+// proxy scenario where one side is encrypted (client) and the other is
+// plain (upstream target).
 func computeRedirectPolicy(inbound, outbound CryptoHint) uint32 {
-	switch {
-	case inbound == CryptoNone && outbound == CryptoNone:
-		return PolicyAllowRedirect // classic raw TCP
-	case inbound == CryptoKTLSBoth && outbound == CryptoKTLSBoth:
-		return PolicyAllowRedirect | PolicyKTLSActive // kernel handles encrypt/decrypt
-	default:
-		return 0 // asymmetric or partial — unsafe
+	inOK := inbound == CryptoNone || inbound == CryptoKTLSBoth
+	outOK := outbound == CryptoNone || outbound == CryptoKTLSBoth
+	if !inOK || !outOK {
+		return 0 // userspace TLS or partial kTLS — not eligible
 	}
+	policy := PolicyAllowRedirect
+	if inbound == CryptoKTLSBoth || outbound == CryptoKTLSBoth {
+		policy |= PolicyKTLSActive
+	}
+	return policy
 }
 
 // getConnFD extracts the file descriptor from a net.Conn.
@@ -584,29 +670,64 @@ func (m *SockmapManager) checkUtilization(active int64) {
 	}
 }
 
+const (
+	sweepIntervalMin = 5 * time.Second
+	sweepIntervalMax = 60 * time.Second
+)
+
 // sweepStaleEntries periodically checks for stale sockmap entries.
 // A stale entry is one where the FD is no longer valid or has been
 // reused by a different socket (cookie mismatch).
+// The sweep interval adapts based on the stale ratio from the last sweep:
+// >5% stale → halve interval (floor 5s), <1% stale → double interval (ceiling 60s).
 func (m *SockmapManager) sweepStaleEntries(done <-chan struct{}) {
 	defer m.sweepWG.Done()
 
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
+	interval := sweepIntervalMax
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-done:
 			return
-		case <-ticker.C:
-			m.doSweep()
+		case <-timer.C:
+			staleCount, totalCount := m.doSweep()
+			interval = m.adaptSweepInterval(interval, staleCount, totalCount)
+			timer.Reset(interval)
 		}
+	}
+}
+
+// adaptSweepInterval adjusts the sweep interval based on the stale ratio.
+func (m *SockmapManager) adaptSweepInterval(current time.Duration, staleCount, totalCount int) time.Duration {
+	if totalCount == 0 {
+		return current
+	}
+	stalePermille := staleCount * 1000 / totalCount
+	switch {
+	case stalePermille > 50: // >5% stale → halve interval
+		next := current / 2
+		if next < sweepIntervalMin {
+			next = sweepIntervalMin
+		}
+		return next
+	case stalePermille < 10: // <1% stale → double interval
+		next := current * 2
+		if next > sweepIntervalMax {
+			next = sweepIntervalMax
+		}
+		return next
+	default:
+		return current
 	}
 }
 
 // doSweep performs one sweep pass over all pairs.
 // After cleaning stale pairs, if utilization exceeds 90%, proactively
 // evicts the oldest 10% of pairs.
-func (m *SockmapManager) doSweep() {
+// Returns (staleCount, totalChecked) for adaptive sweep interval tuning.
+func (m *SockmapManager) doSweep() (int, int) {
 	var staleKeys []SockPairKey
 	var totalChecked int
 
@@ -676,6 +797,8 @@ func (m *SockmapManager) doSweep() {
 			}
 		}
 	}
+
+	return len(staleKeys), totalChecked
 }
 
 // isSockmapFull returns true if the error indicates the SOCKHASH is at capacity.

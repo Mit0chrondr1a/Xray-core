@@ -35,6 +35,7 @@ func GlobalSockmapManager() *SockmapManager {
 		}
 		globalManager = mgr
 		errors.LogDebug(ctx, "eBPF sockmap enabled")
+		logAccelerationSummary(ctx)
 	})
 	return globalManager
 }
