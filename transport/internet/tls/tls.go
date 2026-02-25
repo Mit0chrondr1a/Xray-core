@@ -38,10 +38,11 @@ type Conn struct {
 }
 
 const (
-	tlsCloseTimeout     = 250 * time.Millisecond
-	maxRecordPayload    = 16384   // TLS max record payload size
-	keyUpdateThreshold  = 1 << 24 // ~16.7M records, conservative limit below AES-GCM 2^24.5
-	maxRotationFailures = 3       // close connection after this many consecutive kTLS key rotation failures
+	tlsCloseTimeout               = 250 * time.Millisecond
+	defaultNativeHandshakeTimeout = 30 * time.Second
+	maxRecordPayload              = 16384   // TLS max record payload size
+	keyUpdateThreshold            = 1 << 24 // ~16.7M records, conservative limit below AES-GCM 2^24.5
+	maxRotationFailures           = 3       // close connection after this many consecutive kTLS key rotation failures
 )
 
 // Read overrides tls.Conn.Read. When kTLS RX is active, reads bypass the
@@ -346,14 +347,17 @@ func (c *RustConn) Write(b []byte) (int, error) {
 }
 
 func (c *RustConn) Close() error {
+	// Close keyUpdateHandler before rawConn — a concurrent Read() may call
+	// handler.Handle() (sendmsg on fd) between rawConn.Close() and handler.Close(),
+	// operating on a closed or reused fd. This matches Conn.Close() ordering.
+	if c.ktls.keyUpdateHandler != nil {
+		c.ktls.keyUpdateHandler.Close()
+		c.ktls.keyUpdateHandler = nil
+	}
 	var err error
 	if c.rawConn != nil {
 		err = c.rawConn.Close()
 		c.rawConn = nil
-	}
-	if c.ktls.keyUpdateHandler != nil {
-		c.ktls.keyUpdateHandler.Close()
-		c.ktls.keyUpdateHandler = nil
 	}
 	if c.state != nil {
 		native.TlsStateFree(c.state)
@@ -620,6 +624,12 @@ func configToNative(config *Config, dest net.Destination, isServer bool) *native
 
 // ExtractFd extracts the file descriptor from a net.Conn.
 // Returns -1 if the connection doesn't support SyscallConn.
+//
+// IMPORTANT: The connection must not have an intermediary buffered reader
+// (e.g. proxyproto.Conn) between the caller and the kernel socket. Such
+// wrappers consume bytes from the socket into a userspace buffer that is
+// invisible to raw fd readers. Callers must gate on connection type before
+// calling this function.
 func ExtractFd(conn gonet.Conn) (int, error) {
 	type syscallConner interface {
 		SyscallConn() (syscall.RawConn, error)
@@ -655,9 +665,21 @@ func validateNativeKTLS(result *native.TlsResult) error {
 	return errors.New("native TLS requires full kTLS offload (tx=", result.KtlsTx, ", rx=", result.KtlsRx, ")")
 }
 
+func normalizeNativeHandshakeTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return defaultNativeHandshakeTimeout
+	}
+	return timeout
+}
+
 // RustClient performs a TLS client handshake using the Rust rustls library
 // and enables kTLS for kernel-accelerated encryption.
 func RustClient(c net.Conn, config *Config, dest net.Destination) (net.Conn, error) {
+	return RustClientWithTimeout(c, config, dest, 0)
+}
+
+// RustClientWithTimeout performs Rust TLS handshake with an explicit timeout.
+func RustClientWithTimeout(c net.Conn, config *Config, dest net.Destination, handshakeTimeout time.Duration) (net.Conn, error) {
 	h := configToNative(config, dest, false)
 	if h == nil {
 		return nil, errors.New("failed to create native TLS config")
@@ -669,7 +691,7 @@ func RustClient(c net.Conn, config *Config, dest net.Destination) (net.Conn, err
 		return nil, errors.New("failed to extract fd: ").Base(err)
 	}
 
-	result, err := native.TlsHandshake(fd, h, true)
+	result, err := native.TlsHandshakeWithTimeout(fd, h, true, normalizeNativeHandshakeTimeout(handshakeTimeout))
 	if err != nil {
 		return nil, errors.New("native TLS client handshake failed: ").Base(err)
 	}
@@ -692,6 +714,11 @@ func RustClient(c net.Conn, config *Config, dest net.Destination) (net.Conn, err
 // RustServer performs a TLS server handshake using the Rust rustls library
 // and enables kTLS for kernel-accelerated encryption.
 func RustServer(c net.Conn, config *Config) (net.Conn, error) {
+	return RustServerWithTimeout(c, config, 0)
+}
+
+// RustServerWithTimeout performs Rust TLS server handshake with an explicit timeout.
+func RustServerWithTimeout(c net.Conn, config *Config, handshakeTimeout time.Duration) (net.Conn, error) {
 	h := configToNative(config, net.Destination{}, true)
 	if h == nil {
 		return nil, errors.New("failed to create native TLS config")
@@ -703,7 +730,7 @@ func RustServer(c net.Conn, config *Config) (net.Conn, error) {
 		return nil, errors.New("failed to extract fd: ").Base(err)
 	}
 
-	result, err := native.TlsHandshake(fd, h, false)
+	result, err := native.TlsHandshakeWithTimeout(fd, h, false, normalizeNativeHandshakeTimeout(handshakeTimeout))
 	if err != nil {
 		return nil, errors.New("native TLS server handshake failed: ").Base(err)
 	}

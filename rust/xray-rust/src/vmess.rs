@@ -45,11 +45,13 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_DIGEST] {
         opad[i] = k_padded[i] ^ 0x5c;
     }
 
-    // Inner: SHA256(ipad || msg)
-    let mut inner_data = Vec::with_capacity(SHA256_BLOCK + msg.len());
-    inner_data.extend_from_slice(&ipad);
-    inner_data.extend_from_slice(msg);
-    let inner_hash = sha256(&inner_data);
+    // Inner: SHA256(ipad || msg) — stack-allocated, bounded by KDF usage
+    let inner_len = SHA256_BLOCK + msg.len();
+    let mut inner_buf = [0u8; SHA256_BLOCK * 5];
+    assert!(inner_len <= inner_buf.len(), "hmac_sha256: msg too large for stack buffer ({inner_len} > {})", inner_buf.len());
+    inner_buf[..SHA256_BLOCK].copy_from_slice(&ipad);
+    inner_buf[SHA256_BLOCK..inner_len].copy_from_slice(msg);
+    let inner_hash = sha256(&inner_buf[..inner_len]);
 
     // Outer: SHA256(opad || inner_hash)
     let mut outer_data = [0u8; SHA256_BLOCK + SHA256_DIGEST];
@@ -75,14 +77,18 @@ fn hmac_sha256_multi(key: &[u8], parts: &[&[u8]]) -> [u8; SHA256_DIGEST] {
         opad[i] = k_padded[i] ^ 0x5c;
     }
 
-    // Inner: SHA256(ipad || part0 || part1 || ...)
+    // Inner: SHA256(ipad || part0 || part1 || ...) — stack-allocated
     let total: usize = parts.iter().map(|p| p.len()).sum();
-    let mut inner_data = Vec::with_capacity(SHA256_BLOCK + total);
-    inner_data.extend_from_slice(&ipad);
+    let inner_len = SHA256_BLOCK + total;
+    let mut inner_buf = [0u8; SHA256_BLOCK * 5];
+    assert!(inner_len <= inner_buf.len(), "hmac_sha256_multi: data too large for stack buffer ({inner_len} > {})", inner_buf.len());
+    inner_buf[..SHA256_BLOCK].copy_from_slice(&ipad);
+    let mut pos = SHA256_BLOCK;
     for part in parts {
-        inner_data.extend_from_slice(part);
+        inner_buf[pos..pos + part.len()].copy_from_slice(part);
+        pos += part.len();
     }
-    let inner_hash = sha256(&inner_data);
+    let inner_hash = sha256(&inner_buf[..inner_len]);
 
     // Outer: SHA256(opad || inner_hash)
     let mut outer_data = [0u8; SHA256_BLOCK + SHA256_DIGEST];
@@ -135,18 +141,29 @@ fn kdf(key: &[u8], paths: &[&[u8]]) -> [u8; SHA256_DIGEST] {
     }
 
     let (salt_ipad, salt_opad) = hmac_pads(KDF_SALT_VMESS_AEAD_KDF);
-    let pads: Vec<([u8; SHA256_BLOCK], [u8; SHA256_BLOCK])> =
-        paths.iter().map(|p| hmac_pads(p)).collect();
-
-    // Build initial SHA-256 data: salt_ipad || ipad[0] || ... || ipad[N-1] || key
-    let mut initial = Vec::with_capacity(SHA256_BLOCK * (paths.len() + 1) + key.len());
-    initial.extend_from_slice(&salt_ipad);
-    for (ipad, _) in &pads {
-        initial.extend_from_slice(ipad);
+    // Stack-allocated pads array (max 3 paths in VMess KDF)
+    let mut pads = [([0u8; SHA256_BLOCK], [0u8; SHA256_BLOCK]); 3];
+    assert!(paths.len() <= 3, "kdf: more than 3 paths not supported (got {})", paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        pads[i] = hmac_pads(p);
     }
-    initial.extend_from_slice(key);
+    let pads = &pads[..paths.len()];
 
-    recursive_sum(paths.len(), &initial, &pads, &salt_ipad, &salt_opad)
+    // Build initial SHA-256 data on stack: salt_ipad || ipad[0] || ... || ipad[N-1] || key
+    let initial_len = SHA256_BLOCK * (paths.len() + 1) + key.len();
+    let mut initial = [0u8; SHA256_BLOCK * 4 + SHA256_DIGEST];
+    assert!(initial_len <= initial.len(), "kdf: initial data too large for stack buffer ({initial_len} > {})", initial.len());
+    let mut pos = 0;
+    initial[pos..pos + SHA256_BLOCK].copy_from_slice(&salt_ipad);
+    pos += SHA256_BLOCK;
+    for (ipad, _) in pads {
+        initial[pos..pos + SHA256_BLOCK].copy_from_slice(ipad);
+        pos += SHA256_BLOCK;
+    }
+    initial[pos..pos + key.len()].copy_from_slice(key);
+    pos += key.len();
+
+    recursive_sum(paths.len(), &initial[..pos], pads, &salt_ipad, &salt_opad)
 }
 
 /// Recursive computation mirroring Go's shared-state HMAC Sum() chain.
@@ -175,15 +192,23 @@ fn recursive_sum(
     // After Reset at levels 0..level-1, SHA-256 state becomes:
     //   salt_ipad || ipad[0] || ... || ipad[level-2]
     // Then opad[level-1] and the inner result are appended.
-    let mut new_data = Vec::with_capacity(SHA256_BLOCK * (level + 1) + SHA256_DIGEST);
-    new_data.extend_from_slice(salt_ipad);
+    // Stack-allocated: max level=3, so max size = SHA256_BLOCK*4 + SHA256_DIGEST
+    let new_data_len = SHA256_BLOCK * (level + 1) + SHA256_DIGEST;
+    let mut new_data = [0u8; SHA256_BLOCK * 4 + SHA256_DIGEST];
+    assert!(new_data_len <= new_data.len(), "recursive_sum: data too large for stack buffer ({new_data_len} > {})", new_data.len());
+    let mut pos = 0;
+    new_data[pos..pos + SHA256_BLOCK].copy_from_slice(salt_ipad);
+    pos += SHA256_BLOCK;
     for i in 0..level.saturating_sub(1) {
-        new_data.extend_from_slice(&pads[i].0); // ipad
+        new_data[pos..pos + SHA256_BLOCK].copy_from_slice(&pads[i].0); // ipad
+        pos += SHA256_BLOCK;
     }
-    new_data.extend_from_slice(&pads[level - 1].1); // opad
-    new_data.extend_from_slice(&inner);
+    new_data[pos..pos + SHA256_BLOCK].copy_from_slice(&pads[level - 1].1); // opad
+    pos += SHA256_BLOCK;
+    new_data[pos..pos + SHA256_DIGEST].copy_from_slice(&inner);
+    pos += SHA256_DIGEST;
 
-    recursive_sum(level - 1, &new_data, pads, salt_ipad, salt_opad)
+    recursive_sum(level - 1, &new_data[..pos], pads, salt_ipad, salt_opad)
 }
 
 fn kdf16(key: &[u8], paths: &[&[u8]]) -> [u8; 16] {

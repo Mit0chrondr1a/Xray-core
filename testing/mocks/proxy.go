@@ -8,7 +8,7 @@ import (
 	context "context"
 	reflect "reflect"
 
-	gomock "github.com/golang/mock/gomock"
+	gomock "go.uber.org/mock/gomock"
 	net "github.com/xtls/xray-core/common/net"
 	routing "github.com/xtls/xray-core/features/routing"
 	transport "github.com/xtls/xray-core/transport"

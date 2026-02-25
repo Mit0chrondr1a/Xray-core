@@ -1,12 +1,21 @@
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+
+/// Cached CryptoProvider to avoid reconstructing algorithm tables per handshake.
+static DEFAULT_PROVIDER: std::sync::OnceLock<Arc<rustls::crypto::CryptoProvider>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn cached_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    DEFAULT_PROVIDER
+        .get_or_init(|| Arc::new(default_provider()))
+        .clone()
+}
 use rustls::{
     ClientConfig, ClientConnection, ConnectionTrafficSecrets, ServerConfig, ServerConnection,
 };
@@ -171,6 +180,19 @@ pub(crate) fn setup_ulp_pub(fd: i32) -> std::io::Result<()> {
 }
 
 pub(crate) fn setup_ulp(fd: i32) -> std::io::Result<()> {
+    match setup_ulp_once(fd) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {
+            // Race window: peer may close between handshake completion and
+            // kTLS install. Single retry with 100us sleep covers the gap.
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            setup_ulp_once(fd)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn setup_ulp_once(fd: i32) -> std::io::Result<()> {
     let ulp = b"tls\0";
     let ret = unsafe {
         libc::setsockopt(
@@ -182,9 +204,40 @@ pub(crate) fn setup_ulp(fd: i32) -> std::io::Result<()> {
         )
     };
     if ret < 0 {
-        return Err(std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOTCONN) {
+            // Diagnostic: why is socket not in ESTABLISHED state?
+            let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let peer_ok = unsafe {
+                libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len)
+            } == 0;
+            eprintln!(
+                "setup_ulp: ENOTCONN on fd={}, getpeername={}",
+                fd,
+                if peer_ok {
+                    "ok (has peer)"
+                } else {
+                    "failed (no peer)"
+                }
+            );
+            // Preserve raw ENOTCONN so caller retry logic can match errno.
+            return Err(err);
+        }
+        return Err(err);
     }
     Ok(())
+}
+
+pub(crate) const DEFAULT_NATIVE_HANDSHAKE_TIMEOUT_MS: u32 = 30_000;
+
+pub(crate) fn handshake_timeout_from_ms(timeout_ms: u32) -> std::time::Duration {
+    let ms = if timeout_ms == 0 {
+        DEFAULT_NATIVE_HANDSHAKE_TIMEOUT_MS
+    } else {
+        timeout_ms
+    };
+    std::time::Duration::from_millis(ms as u64)
 }
 
 fn seq_to_bytes(seq: u64) -> [u8; 8] {
@@ -334,6 +387,7 @@ mod verifier {
     use rustls::client::WebPkiServerVerifier;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use subtle::ConstantTimeEq;
 
     /// Skip all certificate verification.
     #[derive(Debug)]
@@ -394,7 +448,15 @@ mod verifier {
             _now: UnixTime,
         ) -> Result<ServerCertVerified, Error> {
             let hash = digest::digest(&digest::SHA256, end_entity.as_ref());
-            if self.hashes.iter().any(|h| h.as_slice() == hash.as_ref()) {
+            // Constant-time comparison without short-circuit: iterate all pins
+            // to prevent a MITM from timing-leaking the expected hash bytes.
+            let matched = self
+                .hashes
+                .iter()
+                .fold(subtle::Choice::from(0u8), |acc, h| {
+                    acc | h.as_slice().ct_eq(hash.as_ref())
+                });
+            if bool::from(matched) {
                 Ok(ServerCertVerified::assertion())
             } else {
                 Err(Error::General("certificate SHA-256 pin mismatch".into()))
@@ -462,10 +524,16 @@ mod verifier {
             ocsp_response: &[u8],
             now: UnixTime,
         ) -> Result<ServerCertVerified, Error> {
-            // Check pinned hash if any
+            // Check pinned hash if any (constant-time, no short-circuit)
             if !self.hashes.is_empty() {
                 let hash = digest::digest(&digest::SHA256, end_entity.as_ref());
-                if self.hashes.iter().any(|h| h.as_slice() == hash.as_ref()) {
+                let matched = self
+                    .hashes
+                    .iter()
+                    .fold(subtle::Choice::from(0u8), |acc, h| {
+                        acc | h.as_slice().ct_eq(hash.as_ref())
+                    });
+                if bool::from(matched) {
                     return Ok(ServerCertVerified::assertion());
                 }
             }
@@ -646,9 +714,19 @@ impl RecordReader {
     /// Read exactly one TLS record from the socket into the internal buffer,
     /// then serve it incrementally via the `Read` trait.
     fn fill_record(&mut self) -> std::io::Result<()> {
+        fn map_timeout(err: std::io::Error) -> std::io::Error {
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "native TLS handshake timeout",
+                );
+            }
+            err
+        }
+
         // Read 5-byte TLS record header
         let mut header = [0u8; 5];
-        self.tcp.read_exact(&mut header)?;
+        self.tcp.read_exact(&mut header).map_err(map_timeout)?;
 
         let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
         if payload_len > 16384 + 256 {
@@ -663,7 +741,9 @@ impl RecordReader {
         self.buf.reserve(5 + payload_len);
         self.buf.extend_from_slice(&header);
         self.buf.resize(5 + payload_len, 0);
-        self.tcp.read_exact(&mut self.buf[5..])?;
+        self.tcp
+            .read_exact(&mut self.buf[5..])
+            .map_err(map_timeout)?;
         self.pos = 0;
         self.len = 5 + payload_len;
 
@@ -743,25 +823,25 @@ fn build_protocol_versions(
     versions
 }
 
+/// Output of a TLS handshake — replaces the previous 9-element tuple.
+pub(crate) struct HandshakeOutput {
+    pub tls_version: u16,
+    pub tx_secrets: ConnectionTrafficSecrets,
+    pub rx_secrets: ConnectionTrafficSecrets,
+    pub tx_seq: u64,
+    pub rx_seq: u64,
+    pub negotiated_alpn: Vec<u8>,
+    pub tx_base_secret: Zeroizing<Vec<u8>>,
+    pub rx_base_secret: Zeroizing<Vec<u8>>,
+    pub drained: Vec<u8>,
+}
+
 fn do_handshake(
-    fd: i32,
+    pipeline: &mut crate::fdutil::HandshakePipeline,
     cfg: &TlsConfig,
-) -> Result<
-    (
-        u16,
-        ConnectionTrafficSecrets,
-        ConnectionTrafficSecrets,
-        u64,
-        u64,
-        Vec<u8>,
-        Vec<u8>, // tx base traffic secret
-        Vec<u8>, // rx base traffic secret
-        Vec<u8>, // drained plaintext data
-    ),
-    String,
-> {
+) -> Result<HandshakeOutput, String> {
     let versions = build_protocol_versions(cfg.min_version, cfg.max_version);
-    let provider = Arc::new(default_provider());
+    let provider = cached_provider();
 
     if cfg.is_server {
         // --- Server path ---
@@ -779,22 +859,16 @@ fn do_handshake(
         if !cfg.alpn_protocols.is_empty() {
             sc.alpn_protocols = cfg.alpn_protocols.clone();
         }
+        sc.enable_secret_extraction = true;
         let capture = Arc::new(SecretCapture::new(cfg.key_log_path.as_deref()));
         sc.key_log = capture.clone();
 
         let mut conn =
             ServerConnection::new(Arc::new(sc)).map_err(|e| format!("server connection: {}", e))?;
 
-        // dup fd so Rust owns its own copy
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            return Err(format!("dup: {}", std::io::Error::last_os_error()));
-        }
-        let tcp = unsafe { TcpStream::from_raw_fd(dup_fd) };
-        let mut reader = RecordReader::new(tcp);
-
-        // Drive handshake record-by-record
-        drive_handshake!(&mut conn, &mut reader).map_err(|e| format!("handshake: {}", e))?;
+        // Drive handshake record-by-record (reader borrows from pipeline)
+        drive_handshake!(&mut conn, pipeline.reader_mut())
+            .map_err(|e| format!("handshake: {}", e))?;
 
         // Drain any plaintext rustls buffered (should be empty with RecordReader)
         let drained = drain_plaintext(&mut conn);
@@ -810,8 +884,8 @@ fn do_handshake(
 
         let negotiated_alpn: Vec<u8> = conn.alpn_protocol().map(|a| a.to_vec()).unwrap_or_default();
 
-        // Close dup'd fd
-        drop(reader);
+        // Reader stays alive in pipeline — dup'd fd NOT closed yet.
+        // This ensures kTLS install (by the caller) sees ESTABLISHED state.
 
         let secrets = conn
             .dangerous_extract_secrets()
@@ -824,17 +898,17 @@ fn do_handshake(
         let tx_out = capture.take_server_secret();
         let rx_out = capture.take_client_secret();
 
-        Ok((
+        Ok(HandshakeOutput {
             tls_version,
             tx_secrets,
             rx_secrets,
             tx_seq,
             rx_seq,
             negotiated_alpn,
-            tx_out,
-            rx_out,
+            tx_base_secret: Zeroizing::new(tx_out),
+            rx_base_secret: Zeroizing::new(rx_out),
             drained,
-        ))
+        })
     } else {
         // --- Client path ---
         let sni: ServerName<'static> = cfg
@@ -907,21 +981,16 @@ fn do_handshake(
         if !cfg.alpn_protocols.is_empty() {
             cc.alpn_protocols = cfg.alpn_protocols.clone();
         }
+        cc.enable_secret_extraction = true;
         let capture = Arc::new(SecretCapture::new(cfg.key_log_path.as_deref()));
         cc.key_log = capture.clone();
 
         let mut conn = ClientConnection::new(Arc::new(cc), sni)
             .map_err(|e| format!("client connection: {}", e))?;
 
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            return Err(format!("dup: {}", std::io::Error::last_os_error()));
-        }
-        let tcp = unsafe { TcpStream::from_raw_fd(dup_fd) };
-        let mut reader = RecordReader::new(tcp);
-
-        // Drive handshake record-by-record
-        drive_handshake!(&mut conn, &mut reader).map_err(|e| format!("handshake: {}", e))?;
+        // Drive handshake record-by-record (reader borrows from pipeline)
+        drive_handshake!(&mut conn, pipeline.reader_mut())
+            .map_err(|e| format!("handshake: {}", e))?;
 
         // Drain any plaintext rustls buffered (should be empty with RecordReader)
         let drained = drain_plaintext(&mut conn);
@@ -937,8 +1006,7 @@ fn do_handshake(
 
         let negotiated_alpn: Vec<u8> = conn.alpn_protocol().map(|a| a.to_vec()).unwrap_or_default();
 
-        // Close dup'd fd
-        drop(reader);
+        // Reader stays alive in pipeline — dup'd fd NOT closed yet.
 
         let secrets = conn
             .dangerous_extract_secrets()
@@ -951,17 +1019,17 @@ fn do_handshake(
         let tx_out = capture.take_client_secret();
         let rx_out = capture.take_server_secret();
 
-        Ok((
+        Ok(HandshakeOutput {
             tls_version,
             tx_secrets,
             rx_secrets,
             tx_seq,
             rx_seq,
             negotiated_alpn,
-            tx_out,
-            rx_out,
+            tx_base_secret: Zeroizing::new(tx_out),
+            rx_base_secret: Zeroizing::new(rx_out),
             drained,
-        ))
+        })
     }
 }
 
@@ -1222,6 +1290,7 @@ pub extern "C" fn xray_tls_handshake(
     fd: i32,
     cfg: *const TlsConfig,
     _is_client: bool,
+    handshake_timeout_ms: u32,
     out: *mut XrayTlsResult,
 ) -> i32 {
     ffi_catch_i32!({
@@ -1239,69 +1308,63 @@ pub extern "C" fn xray_tls_handshake(
 
         let cfg = unsafe { &*cfg };
 
-        // Perform TLS handshake
-        let (
-            tls_version,
-            tx_secrets,
-            rx_secrets,
-            tx_seq,
-            rx_seq,
-            negotiated_alpn,
-            tx_secret,
-            rx_secret,
-            drained,
-        ) = match do_handshake(fd, cfg) {
+        let handshake_timeout = handshake_timeout_from_ms(handshake_timeout_ms);
+
+        // Create pipeline (dup + clear O_NONBLOCK + enforce timeout)
+        let mut pipeline = match crate::fdutil::HandshakePipeline::new(fd, handshake_timeout) {
+            Ok(p) => p,
+            Err(e) => {
+                out.set_error(1, &format!("pipeline: {}", e));
+                return 1;
+            }
+        };
+
+        // Perform TLS handshake (reader stays alive inside pipeline)
+        let output = match do_handshake(&mut pipeline, cfg) {
             Ok(v) => v,
             Err(e) => {
                 out.set_error(1, &e);
                 return 1;
             }
         };
-        let tx_secret = Zeroizing::new(tx_secret);
-        let rx_secret = Zeroizing::new(rx_secret);
+        let tx_secret = output.tx_base_secret;
+        let rx_secret = output.rx_base_secret;
 
-        out.version = tls_version;
-        out.cipher_suite = cipher_suite_to_u16(&tx_secrets);
+        out.version = output.tls_version;
+        out.cipher_suite = cipher_suite_to_u16(&output.tx_secrets);
 
         // Copy ALPN
-        let alpn_len = negotiated_alpn.len().min(31);
-        out.alpn[..alpn_len].copy_from_slice(&negotiated_alpn[..alpn_len]);
+        let alpn_len = output.negotiated_alpn.len().min(31);
+        out.alpn[..alpn_len].copy_from_slice(&output.negotiated_alpn[..alpn_len]);
 
+        // Install kTLS (dup'd fd still alive — guaranteed by pipeline ownership).
         // Native mode requires full TX/RX kTLS offload because Go will use raw
         // socket I/O via RustConn after handshake.
-        let (tx, rx) = match (|| -> Result<(bool, bool), String> {
-            setup_ulp(fd).map_err(|e| format!("ULP: {}", e))?;
-
-            let tx_res = install_ktls(fd, TLS_TX, tls_version, &tx_secrets, tx_seq);
-            let rx_res = install_ktls(fd, TLS_RX, tls_version, &rx_secrets, rx_seq);
-            let tx_ok = tx_res.is_ok();
-            let rx_ok = rx_res.is_ok();
-
-            if !tx_ok || !rx_ok {
-                let mut reasons = Vec::new();
-                if let Err(e) = tx_res {
-                    reasons.push(format!("TX: {}", e));
-                }
-                if let Err(e) = rx_res {
-                    reasons.push(format!("RX: {}", e));
-                }
-                if reasons.is_empty() {
-                    reasons.push("unknown kTLS setup error".to_string());
-                }
-                return Err(format!(
-                    "kTLS requires both TX and RX offload ({})",
-                    reasons.join(", ")
-                ));
+        let (tx, rx) = match pipeline.install_ktls_and_finish(
+            output.tls_version,
+            &output.tx_secrets,
+            output.tx_seq,
+            &output.rx_secrets,
+            output.rx_seq,
+        ) {
+            Ok(r) if r.tx_ok && r.rx_ok => (true, true),
+            Ok(r) => {
+                let msg = format!(
+                    "kTLS requires both TX and RX offload (tx={}, rx={}, tx_err={}, rx_err={})",
+                    r.tx_ok,
+                    r.rx_ok,
+                    r.tx_err.as_deref().unwrap_or("none"),
+                    r.rx_err.as_deref().unwrap_or("none"),
+                );
+                out.set_error(2, &msg);
+                return 2;
             }
-
-            Ok((tx_ok, rx_ok))
-        })() {
-            Ok(v) => v,
             Err(e) => {
                 out.set_error(2, &e);
                 return 2;
             }
         };
+        // Pipeline dropped: dup'd fd closed, O_NONBLOCK restored.
         out.ktls_tx = tx;
         out.ktls_rx = rx;
 
@@ -1321,9 +1384,9 @@ pub extern "C" fn xray_tls_handshake(
         }
 
         // Forward drained data to Go
-        if !drained.is_empty() {
-            let len = drained.len();
-            let boxed = drained.into_boxed_slice();
+        if !output.drained.is_empty() {
+            let len = output.drained.len();
+            let boxed = output.drained.into_boxed_slice();
             out.drained_ptr = Box::into_raw(boxed) as *mut u8;
             out.drained_len = len as u32;
         }

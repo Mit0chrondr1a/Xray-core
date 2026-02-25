@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"context"
 	stdErrors "errors"
 	"fmt"
@@ -254,7 +255,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 	// Build and load sk_skb stream parser
 	parserInsns := buildSKSkbParserProgram()
 	parserBytecode := encodeBPFInsns(parserInsns)
-	parserFD, err := loadSKSkbProgram(parserBytecode, 0, 0, "xray_skb_parse")
+	parserFD, err := loadSKSkbProgram(parserBytecode, 0, 0, "xray_skb_parse", bpfSkSkbStreamParser)
 	if err != nil {
 		syscall.Close(hashFD)
 		syscall.Close(policyFD)
@@ -264,7 +265,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 	// Build and load sk_skb stream verdict
 	verdictInsns := buildSKSkbVerdictProgram()
 	verdictBytecode := encodeBPFInsns(verdictInsns)
-	verdictFD, err := loadSKSkbProgram(verdictBytecode, hashFD, policyFD, "xray_skb_vrdt")
+	verdictFD, err := loadSKSkbProgram(verdictBytecode, hashFD, policyFD, "xray_skb_vrdt", bpfSkSkbStreamVerdict)
 	if err != nil {
 		syscall.Close(parserFD)
 		syscall.Close(hashFD)
@@ -281,6 +282,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 			syscall.Close(policyFD)
 			return fmt.Errorf("failed to attach sk_skb programs to sockhash: %w", err)
 		}
+		xerrors.LogInfo(context.Background(), "sockmap: SOCKHASH sk_skb attach failed (", err, "), falling back to SOCKMAP attach (kTLS+sockmap may not work)")
 
 		// Compatibility fallback for older kernels:
 		// attach sk_skb to SOCKMAP, but keep redirect lookups in SOCKHASH.
@@ -435,7 +437,7 @@ func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCooki
 	key := inboundKey
 	value := uint32(outboundFD)
 	if err := bpfMapUpdate(st.sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
-		return err
+		return fmt.Errorf("sockhash insert outbound fd=%d cookie=%d: %w", outboundFD, inboundCookie, err)
 	}
 
 	// Map outbound socket to inbound
@@ -443,7 +445,7 @@ func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCooki
 	value = uint32(inboundFD)
 	if err := bpfMapUpdate(st.sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
 		_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&inboundKey))
-		return err
+		return fmt.Errorf("sockhash insert inbound fd=%d cookie=%d: %w", inboundFD, outboundCookie, err)
 	}
 
 	// Older kernels attach sk_skb to SOCKMAP only; mirror sockets into the
@@ -463,7 +465,7 @@ func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCooki
 			}
 			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key))
 			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&inboundKey))
-			return err
+			return fmt.Errorf("sockmap-attach insert inbound fd=%d slot=%d: %w", inboundFD, inboundSlot, err)
 		}
 
 		outboundSlot, outboundCreated, err := assignSockmapAttachSlot(outboundFD, st.sockmapAttachMaxEntries)
@@ -490,7 +492,7 @@ func setupForwardingImpl(inboundFD, outboundFD int, inboundCookie, outboundCooki
 			}
 			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key))
 			_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&inboundKey))
-			return err
+			return fmt.Errorf("sockmap-attach insert outbound fd=%d slot=%d: %w", outboundFD, outboundSlot, err)
 		}
 	}
 
@@ -586,7 +588,12 @@ func releaseSockmapAttachSlot(fd int) (uint32, bool) {
 }
 
 // loadSKSkbProgram loads an sk_skb BPF program with optional map fd relocation.
-func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) (int, error) {
+const (
+	bpfSkSkbStreamParser  = 4
+	bpfSkSkbStreamVerdict = 5
+)
+
+func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string, expectedAttachType uint32) (int, error) {
 	// Patch map fd placeholders with actual map fds (no-op if no matching LD_IMM64 in insns)
 	patchMapFD(insns, skSkbMapFDPlaceholder, int32(sockhashMapFD))
 	patchMapFD(insns, skSkbPolicyFDPlaceholder, int32(polMapFD))
@@ -594,21 +601,24 @@ func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) 
 	license := []byte("GPL\x00")
 
 	attr := struct {
-		progType    uint32
-		insnCnt     uint32
-		insns       uint64
-		license     uint64
-		logLevel    uint32
-		logSize     uint32
-		logBuf      uint64
-		kernVersion uint32
-		progFlags   uint32
-		progName    [16]byte
+		progType           uint32
+		insnCnt            uint32
+		insns              uint64
+		license            uint64
+		logLevel           uint32
+		logSize            uint32
+		logBuf             uint64
+		kernVersion        uint32
+		progFlags          uint32
+		progName           [16]byte
+		progIfIndex        uint32
+		expectedAttachType uint32
 	}{
-		progType: 23, // BPF_PROG_TYPE_SK_SKB
-		insnCnt:  uint32(len(insns)),
-		insns:    uint64(uintptr(unsafe.Pointer(&insns[0]))),
-		license:  uint64(uintptr(unsafe.Pointer(&license[0]))),
+		progType:           bpfProgTypeSKSkb,
+		insnCnt:            uint32(len(insns)),
+		insns:              uint64(uintptr(unsafe.Pointer(&insns[0]))),
+		license:            uint64(uintptr(unsafe.Pointer(&license[0]))),
+		expectedAttachType: expectedAttachType,
 	}
 
 	copy(attr.progName[:], name)
@@ -638,7 +648,19 @@ func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) 
 		unsafe.Sizeof(attr),
 	)
 	if errno != 0 {
-		return -1, fmt.Errorf("BPF_PROG_LOAD %s: %w", name, errno)
+		if idx := bytes.IndexByte(logBuf, 0); idx >= 0 {
+			logBuf = logBuf[:idx]
+		}
+		verifier := strings.TrimSpace(string(logBuf))
+		// Truncate verifier output to avoid leaking excessive kernel internals.
+		const maxVerifierLen = 512
+		if len(verifier) > maxVerifierLen {
+			verifier = verifier[:maxVerifierLen] + "...(truncated)"
+		}
+		if verifier != "" {
+			return -1, fmt.Errorf("BPF_PROG_LOAD %s (expected_attach_type=%d): %w (verifier: %s)", name, expectedAttachType, errno, verifier)
+		}
+		return -1, fmt.Errorf("BPF_PROG_LOAD %s (expected_attach_type=%d): %w", name, expectedAttachType, errno)
 	}
 
 	return int(fd), nil
@@ -646,15 +668,13 @@ func loadSKSkbProgram(insns []uint64, sockhashMapFD, polMapFD int, name string) 
 
 // attachSKSkbToMap attaches sk_skb stream parser and verdict to a map.
 func attachSKSkbToMap(parserFD, verdictFD, mapFD int) error {
-	// Attach parser (BPF_SK_SKB_STREAM_PARSER = 4)
-	if err := attachBPFProgToMap(mapFD, parserFD, 4); err != nil {
+	if err := attachBPFProgToMap(mapFD, parserFD, bpfSkSkbStreamParser); err != nil {
 		return fmt.Errorf("parser: %w", err)
 	}
 
-	// Attach verdict (BPF_SK_SKB_STREAM_VERDICT = 5)
-	if err := attachBPFProgToMap(mapFD, verdictFD, 5); err != nil {
+	if err := attachBPFProgToMap(mapFD, verdictFD, bpfSkSkbStreamVerdict); err != nil {
 		// Detach parser on partial failure to leave map in clean state.
-		detachBPFProgFromMap(mapFD, parserFD, 4)
+		detachBPFProgFromMap(mapFD, parserFD, bpfSkSkbStreamParser)
 		return fmt.Errorf("verdict: %w", err)
 	}
 
@@ -882,6 +902,110 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 	return fd, nil
 }
 
+// probeKTLSSockhashCompat tests whether a kTLS socket can be inserted into a
+// SOCKHASH map on this kernel. Returns true if compatible. This runs once at
+// startup when both kTLS and sockmap are available, and gates whether kTLS
+// sockets are eligible for sockmap redirect.
+func probeKTLSSockhashCompat() bool {
+	st := currentState.Load()
+	if st.sockhashFD < 0 {
+		return false
+	}
+
+	// Create a loopback TCP pair in ESTABLISHED state.
+	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return false
+	}
+	defer ln.Close()
+
+	serverCh := make(chan *net.TCPConn, 1)
+	go func() {
+		c, err := ln.AcceptTCP()
+		if err != nil {
+			serverCh <- nil
+			return
+		}
+		serverCh <- c
+	}()
+
+	client, err := net.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+
+	server := <-serverCh
+	if server == nil {
+		return false
+	}
+	defer server.Close()
+
+	// Set up kTLS ULP + TX on the client socket.
+	rawConn, err := client.SyscallConn()
+	if err != nil {
+		return false
+	}
+
+	var ktlsOK bool
+	rawConn.Control(func(fd uintptr) {
+		intFD := int(fd)
+		// TCP_ULP = "tls"
+		if err := syscall.SetsockoptString(intFD, syscall.SOL_TCP, unix.TCP_ULP, "tls"); err != nil {
+			return
+		}
+		// Install minimal TLS 1.3 AES-128-GCM-SHA256 TX crypto info.
+		// We don't need real keys — just enough for the kernel to accept the ULP setup.
+		const (
+			solTLS = 282
+			tlsTX  = 1
+		)
+		// struct tls12_crypto_info_aes_gcm_128:
+		//   tls_crypto_info (4 bytes: version u16, cipher_type u16)
+		//   iv       [8]byte
+		//   key      [16]byte
+		//   salt     [4]byte
+		//   rec_seq  [8]byte
+		var info [40]byte
+		// version = TLS 1.3 (0x0304), little-endian u16
+		info[0] = 0x04
+		info[1] = 0x03
+		// cipher_type = TLS_CIPHER_AES_GCM_128 (51), little-endian u16
+		info[2] = 51
+		info[3] = 0
+		// rest is zeroed (dummy keys — this is a probe socket, never used for data)
+
+		_, _, errno := syscall.Syscall6(
+			syscall.SYS_SETSOCKOPT,
+			fd,
+			uintptr(solTLS),
+			uintptr(tlsTX),
+			uintptr(unsafe.Pointer(&info)),
+			uintptr(unsafe.Sizeof(info)),
+			0,
+		)
+		if errno != 0 {
+			return
+		}
+
+		// Try inserting this kTLS socket into the SOCKHASH.
+		cookie, err := getSocketCookie(intFD)
+		if err != nil {
+			return
+		}
+		key := cookie
+		value := uint32(intFD)
+		if err := bpfMapUpdate(st.sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+			return
+		}
+		// Clean up — remove probe entry.
+		_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key))
+		ktlsOK = true
+	})
+
+	return ktlsOK
+}
+
 // setPolicyEntry writes a redirect policy entry for the given socket cookie.
 func setPolicyEntry(cookie uint64, flags uint32) error {
 	st := currentState.Load()
@@ -901,6 +1025,28 @@ func deletePolicyEntry(cookie uint64) error {
 	}
 	key := cookie
 	return bpfMapDelete(st.policyMapFD, unsafe.Pointer(&key))
+}
+
+// unameRelease returns the kernel release string (e.g. "6.18.13") from uname(2).
+// Returns "unknown" on any failure.
+func unameRelease() string {
+	var buf syscall.Utsname
+	if err := syscall.Uname(&buf); err != nil {
+		return "unknown"
+	}
+	// buf.Release is [65]int8 on linux/amd64.
+	// Convert to string by finding the NUL terminator.
+	var release []byte
+	for _, b := range buf.Release {
+		if b == 0 {
+			break
+		}
+		release = append(release, byte(b))
+	}
+	if len(release) == 0 {
+		return "unknown"
+	}
+	return string(release)
 }
 
 // isSocketAlive probes whether a file descriptor is still a valid, open socket.

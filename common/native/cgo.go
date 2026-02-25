@@ -42,7 +42,7 @@ extern void    xray_tls_config_set_key_log_path(void* cfg, const uint8_t* path, 
 extern void    xray_tls_config_free(void* cfg);
 
 // TLS handshake + kTLS
-extern int32_t xray_tls_handshake(int fd, const void* cfg, bool is_client, struct xray_tls_result* out);
+extern int32_t xray_tls_handshake(int fd, const void* cfg, bool is_client, uint32_t handshake_timeout_ms, struct xray_tls_result* out);
 extern int32_t xray_tls_key_update(void* state_handle);
 extern void    xray_tls_state_free(void* state_handle);
 extern void    xray_tls_drained_free(uint8_t* ptr, size_t len);
@@ -68,7 +68,7 @@ extern void    xray_reality_config_add_short_id(void* cfg, const uint8_t* id, si
 // REALITY handshake
 extern int32_t xray_reality_client_connect(int fd, const uint8_t* client_hello_raw, size_t hello_len, const uint8_t* ecdh_privkey, size_t privkey_len, const void* reality_config, struct xray_tls_result* out);
 extern int32_t xray_reality_server_accept(int fd, const void* reality_config, struct xray_tls_result* out);
-extern int32_t xray_reality_server_handshake(int fd, const void* reality_config, struct xray_tls_result* out);
+extern int32_t xray_reality_server_handshake(int fd, const void* reality_config, uint32_t handshake_timeout_ms, struct xray_tls_result* out);
 
 // Blake3
 extern void xray_blake3_derive_key(uint8_t* out, size_t out_len,
@@ -200,6 +200,7 @@ import (
 	"runtime"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 
@@ -224,6 +225,22 @@ func EbpfAvailable() bool {
 
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
 var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
+
+const defaultNativeHandshakeTimeout = 30 * time.Second
+
+func timeoutMillis(timeout time.Duration) C.uint32_t {
+	if timeout <= 0 {
+		timeout = defaultNativeHandshakeTimeout
+	}
+	ms := uint64(timeout / time.Millisecond)
+	if ms == 0 {
+		ms = 1
+	}
+	if ms > uint64(^uint32(0)) {
+		ms = uint64(^uint32(0))
+	}
+	return C.uint32_t(ms)
+}
 
 // emptyCodeSentinel is a non-null address for empty country-code entries
 // in GeoIP/GeoSite FFI arrays, preventing UB from NULL in from_raw_parts.
@@ -408,11 +425,21 @@ func TlsConfigFree(h *TlsConfigHandle) {
 // --- TLS Handshake ---
 
 func TlsHandshake(fd int, cfg *TlsConfigHandle, isClient bool) (*TlsResult, error) {
+	return TlsHandshakeWithTimeout(fd, cfg, isClient, defaultNativeHandshakeTimeout)
+}
+
+func TlsHandshakeWithTimeout(fd int, cfg *TlsConfigHandle, isClient bool, handshakeTimeout time.Duration) (*TlsResult, error) {
 	if cfg == nil {
 		return nil, errors.New("native: nil config handle")
 	}
 	var cResult C.struct_xray_tls_result
-	rc := C.xray_tls_handshake(C.int(fd), cfg.ptr, C.bool(isClient), &cResult)
+	rc := C.xray_tls_handshake(
+		C.int(fd),
+		cfg.ptr,
+		C.bool(isClient),
+		timeoutMillis(handshakeTimeout),
+		&cResult,
+	)
 	runtime.KeepAlive(cfg)
 	if rc != 0 {
 		errMsg := C.GoString(&cResult.error_msg[0])
@@ -626,7 +653,7 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
 		if code == 1 {
-			return nil, ErrRealityAuthFailed
+			return nil, fmt.Errorf("%w: %s", ErrRealityAuthFailed, errMsg)
 		}
 		return nil, errors.New("native REALITY: " + errMsg)
 	}
@@ -644,7 +671,7 @@ func RealityServerAccept(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
 		if code == 1 {
-			return nil, ErrRealityAuthFailed
+			return nil, fmt.Errorf("%w: %s", ErrRealityAuthFailed, errMsg)
 		}
 		return nil, errors.New("native REALITY server: " + errMsg)
 	}
@@ -652,17 +679,21 @@ func RealityServerAccept(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
 }
 
 func RealityServerHandshake(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
+	return RealityServerHandshakeWithTimeout(fd, cfg, defaultNativeHandshakeTimeout)
+}
+
+func RealityServerHandshakeWithTimeout(fd int, cfg *RealityConfigHandle, handshakeTimeout time.Duration) (*TlsResult, error) {
 	if cfg == nil {
 		return nil, errors.New("native: nil reality config handle")
 	}
 	var cResult C.struct_xray_tls_result
-	rc := C.xray_reality_server_handshake(C.int(fd), cfg.ptr, &cResult)
+	rc := C.xray_reality_server_handshake(C.int(fd), cfg.ptr, timeoutMillis(handshakeTimeout), &cResult)
 	runtime.KeepAlive(cfg)
 	if rc != 0 {
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
 		if code == 1 {
-			return nil, ErrRealityAuthFailed
+			return nil, fmt.Errorf("%w: %s", ErrRealityAuthFailed, errMsg)
 		}
 		return nil, errors.New("native REALITY server handshake: " + errMsg)
 	}
@@ -1044,12 +1075,12 @@ func VisionUnpad(data []byte, state *VisionUnpadState, uuid []byte, out []byte) 
 // VisionFilterState is the stateful TLS filter state (matches Rust's VisionFilterState).
 // Field order matches repr(C) layout: i32, i32, u16, bool, bool, bool.
 type VisionFilterState struct {
-	RemainingServerHello   int32
+	RemainingServerHello    int32
 	NumberOfPacketsToFilter int32
-	Cipher                 uint16
-	IsTLS                  bool
-	IsTLS12orAbove         bool
-	EnableXtls             bool
+	Cipher                  uint16
+	IsTLS                   bool
+	IsTLS12orAbove          bool
+	EnableXtls              bool
 }
 
 // VisionFilterStateSizeC returns the C-side sizeof(struct xray_vision_filter_state).

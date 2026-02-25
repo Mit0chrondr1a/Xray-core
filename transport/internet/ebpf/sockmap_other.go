@@ -50,3 +50,13 @@ func deletePolicyEntry(cookie uint64) error {
 func isSocketAlive(fd int) bool {
 	return false
 }
+
+// probeKTLSSockhashCompat always returns false on non-Linux systems.
+func probeKTLSSockhashCompat() bool {
+	return false
+}
+
+// unameRelease returns "non-linux" on non-Linux systems.
+func unameRelease() string {
+	return "non-linux"
+}

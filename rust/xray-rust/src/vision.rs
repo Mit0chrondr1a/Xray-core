@@ -133,13 +133,19 @@ pub unsafe extern "C" fn xray_vision_pad(
     let small_range = seeds[3] as i64;
 
     // Compute padding length using CSPRNG (matches Go's crypto/rand.Int).
+    // Returns -3 on RNG failure so Go falls back to its own padding implementation
+    // rather than producing zero-padded output (which is a DPI fingerprint).
     let padding_len: i32;
 
     if content_len < threshold && long_padding {
-        let random_val = csprng_range(range);
+        let Some(random_val) = csprng_range(range) else {
+            return -3; // RNG failure
+        };
         padding_len = clamp_padding(random_val as i32 + base - content_len, content_len);
     } else {
-        let random_val = csprng_range(small_range);
+        let Some(random_val) = csprng_range(small_range) else {
+            return -3; // RNG failure
+        };
         padding_len = clamp_padding(random_val as i32, content_len);
     }
 
@@ -179,7 +185,9 @@ pub unsafe extern "C" fn xray_vision_pad(
     // Write random padding.
     if padding_len > 0 {
         let padding_slice = &mut out[pos..pos + padding_len as usize];
-        fill_random(padding_slice);
+        if !fill_random(padding_slice) {
+            return -3; // RNG failure — let Go fallback handle it
+        }
         pos += padding_len as usize;
     }
 
@@ -202,41 +210,41 @@ fn clamp_padding(mut padding: i32, content_len: i32) -> i32 {
 
 /// Generate a random value in [0, upper_bound) using CSPRNG.
 /// Values are pulled from a thread-local random cache to reduce syscall overhead.
-fn csprng_range(upper_bound: i64) -> i64 {
+/// Returns None on RNG failure — caller must propagate the error.
+fn csprng_range(upper_bound: i64) -> Option<i64> {
     if upper_bound <= 1 {
-        return 0;
+        return Some(0);
     }
 
-    let val = RNG_CACHE.with(|cache| cache.borrow_mut().next_u64());
-    let Some(val) = val else {
-        return 0;
-    };
+    let val = RNG_CACHE.with(|cache| cache.borrow_mut().next_u64())?;
 
     let val = val >> 1; // ensure positive
     // Simple modulo — for our use case (small ranges) bias is negligible.
-    (val % upper_bound as u64) as i64
+    Some((val % upper_bound as u64) as i64)
 }
 
-fn fill_random(out: &mut [u8]) {
+/// Fill buffer with random bytes from the CSPRNG cache.
+/// Returns false on RNG failure — caller must propagate the error.
+fn fill_random(out: &mut [u8]) -> bool {
     if out.is_empty() {
-        return;
+        return true;
     }
 
     // Large writes are uncommon and are fine to satisfy directly.
     if out.len() > RNG_CACHE_SIZE {
         if getrandom::fill(out).is_err() {
             warn_rng_failure_once();
-            out.fill(0);
+            return false;
         }
-        return;
+        return true;
     }
 
     let ok = RNG_CACHE.with(|cache| cache.borrow_mut().take(out));
     if !ok {
-        // RNG failure: padding becomes predictable (all zeros). Warn once per process.
         warn_rng_failure_once();
-        out.fill(0);
+        return false;
     }
+    true
 }
 
 // --- Unpadding ---

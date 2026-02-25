@@ -71,6 +71,10 @@ func (l *serverityLogger) Handle(msg Message) {
 	}
 }
 
+func (l *serverityLogger) IsSeverityEnabled(severity Severity) bool {
+	return severity <= l.logLevel
+}
+
 func (l *generalLogger) flushDropped(logger Writer) {
 	if n := l.dropped.Swap(0); n > 0 {
 		logger.Write(fmt.Sprintf("[Warning] %d log message(s) were dropped due to buffer overflow", n) + platform.LineSeparator())

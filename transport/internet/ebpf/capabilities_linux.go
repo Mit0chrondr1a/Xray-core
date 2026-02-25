@@ -13,6 +13,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	bpfProgTypeSKSkb       = 14 // BPF_PROG_TYPE_SK_SKB
+	bpfProgTypeSKReuseport = 21 // BPF_PROG_TYPE_SK_REUSEPORT
+)
+
 // probeCapabilities detects available eBPF features on Linux.
 func probeCapabilities() Capabilities {
 	caps := Capabilities{}
@@ -216,7 +221,7 @@ func probeSockmapSupport() bool {
 	}
 	syscall.Close(int(mapFD))
 
-	// Also verify we can load BPF_PROG_TYPE_SK_SKB (type 23).
+	// Also verify we can load BPF_PROG_TYPE_SK_SKB (type 14).
 	// A kernel that supports SOCKMAP but not sk_skb programs would
 	// fail at setup time; detect this early to avoid noisy fallback logs.
 	return probeSKSkbSupport()
@@ -242,7 +247,7 @@ func probeSKSkbSupport() bool {
 		logBuf      uint64
 		kernVersion uint32
 	}{
-		progType: 23, // BPF_PROG_TYPE_SK_SKB
+		progType: bpfProgTypeSKSkb,
 		insnCnt:  uint32(len(insns)),
 		insns:    uint64(uintptr(unsafe.Pointer(&insns[0]))),
 		license:  uint64(uintptr(unsafe.Pointer(&license[0]))),
@@ -318,7 +323,7 @@ func probeReuseportBPFSupport() bool {
 		logBuf      uint64
 		kernVersion uint32
 	}{
-		progType: 27, // BPF_PROG_TYPE_SK_REUSEPORT
+		progType: bpfProgTypeSKReuseport,
 		insnCnt:  2,
 	}
 

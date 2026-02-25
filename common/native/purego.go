@@ -4,6 +4,7 @@ package native
 
 import (
 	"errors"
+	"time"
 	"unsafe"
 
 	"lukechampine.com/blake3"
@@ -60,22 +61,26 @@ func (r *TlsResult) ZeroSecrets() {
 
 // --- TLS Config Builder Stubs ---
 
-func TlsConfigNew(bool) *TlsConfigHandle                             { return nil }
-func TlsConfigSetServerName(*TlsConfigHandle, string)                {}
-func TlsConfigAddCertPEM(*TlsConfigHandle, []byte, []byte) error     { return errNotAvailable }
-func TlsConfigAddRootCAPEM(*TlsConfigHandle, []byte) error           { return errNotAvailable }
-func TlsConfigUseSystemRoots(*TlsConfigHandle)                       {}
-func TlsConfigSetALPN(*TlsConfigHandle, []byte)                      {}
-func TlsConfigSetVersions(*TlsConfigHandle, uint16, uint16)          {}
-func TlsConfigSetInsecureSkipVerify(*TlsConfigHandle, bool)          {}
-func TlsConfigPinCertSHA256(*TlsConfigHandle, []byte)                {}
-func TlsConfigAddVerifyName(*TlsConfigHandle, string)                {}
-func TlsConfigSetKeyLogPath(*TlsConfigHandle, string)                {}
-func TlsConfigFree(*TlsConfigHandle)                                 {}
+func TlsConfigNew(bool) *TlsConfigHandle                         { return nil }
+func TlsConfigSetServerName(*TlsConfigHandle, string)            {}
+func TlsConfigAddCertPEM(*TlsConfigHandle, []byte, []byte) error { return errNotAvailable }
+func TlsConfigAddRootCAPEM(*TlsConfigHandle, []byte) error       { return errNotAvailable }
+func TlsConfigUseSystemRoots(*TlsConfigHandle)                   {}
+func TlsConfigSetALPN(*TlsConfigHandle, []byte)                  {}
+func TlsConfigSetVersions(*TlsConfigHandle, uint16, uint16)      {}
+func TlsConfigSetInsecureSkipVerify(*TlsConfigHandle, bool)      {}
+func TlsConfigPinCertSHA256(*TlsConfigHandle, []byte)            {}
+func TlsConfigAddVerifyName(*TlsConfigHandle, string)            {}
+func TlsConfigSetKeyLogPath(*TlsConfigHandle, string)            {}
+func TlsConfigFree(*TlsConfigHandle)                             {}
 
 // --- TLS Handshake Stubs ---
 
 func TlsHandshake(int, *TlsConfigHandle, bool) (*TlsResult, error) {
+	return nil, errNotAvailable
+}
+
+func TlsHandshakeWithTimeout(int, *TlsConfigHandle, bool, time.Duration) (*TlsResult, error) {
 	return nil, errNotAvailable
 }
 
@@ -93,20 +98,20 @@ func (*RealityConfigHandle) release() {}
 
 // --- REALITY Config Builder Stubs ---
 
-func RealityConfigNew(bool) *RealityConfigHandle                                      { return nil }
-func RealityConfigSetServerPubkey(*RealityConfigHandle, []byte)                        {}
-func RealityConfigSetShortId(*RealityConfigHandle, []byte)                             {}
-func RealityConfigSetMldsa65Verify(*RealityConfigHandle, []byte)                       {}
-func RealityConfigSetVersion(*RealityConfigHandle, uint8, uint8, uint8)                {}
-func RealityConfigFree(*RealityConfigHandle)                                           {}
-func RealityConfigSetPrivateKey(*RealityConfigHandle, []byte)                          {}
-func RealityConfigSetServerNames(*RealityConfigHandle, []byte)                         {}
-func RealityConfigSetShortIds(*RealityConfigHandle, []byte)                            {}
-func RealityConfigSetMldsa65Key(*RealityConfigHandle, []byte)                          {}
-func RealityConfigSetDest(*RealityConfigHandle, string)                                {}
-func RealityConfigSetMaxTimeDiff(*RealityConfigHandle, uint64)                         {}
+func RealityConfigNew(bool) *RealityConfigHandle                                                  { return nil }
+func RealityConfigSetServerPubkey(*RealityConfigHandle, []byte)                                   {}
+func RealityConfigSetShortId(*RealityConfigHandle, []byte)                                        {}
+func RealityConfigSetMldsa65Verify(*RealityConfigHandle, []byte)                                  {}
+func RealityConfigSetVersion(*RealityConfigHandle, uint8, uint8, uint8)                           {}
+func RealityConfigFree(*RealityConfigHandle)                                                      {}
+func RealityConfigSetPrivateKey(*RealityConfigHandle, []byte)                                     {}
+func RealityConfigSetServerNames(*RealityConfigHandle, []byte)                                    {}
+func RealityConfigSetShortIds(*RealityConfigHandle, []byte)                                       {}
+func RealityConfigSetMldsa65Key(*RealityConfigHandle, []byte)                                     {}
+func RealityConfigSetDest(*RealityConfigHandle, string)                                           {}
+func RealityConfigSetMaxTimeDiff(*RealityConfigHandle, uint64)                                    {}
 func RealityConfigSetVersionRange(*RealityConfigHandle, uint8, uint8, uint8, uint8, uint8, uint8) {}
-func RealityConfigSetTLSCert(*RealityConfigHandle, []byte, []byte)                     {}
+func RealityConfigSetTLSCert(*RealityConfigHandle, []byte, []byte)                                {}
 
 func RealityConfigAddShortId(*RealityConfigHandle, []byte) {}
 
@@ -121,6 +126,10 @@ func RealityServerAccept(int, *RealityConfigHandle) (*TlsResult, error) {
 }
 
 func RealityServerHandshake(int, *RealityConfigHandle) (*TlsResult, error) {
+	return nil, errNotAvailable
+}
+
+func RealityServerHandshakeWithTimeout(int, *RealityConfigHandle, time.Duration) (*TlsResult, error) {
 	return nil, errNotAvailable
 }
 
@@ -153,11 +162,11 @@ type MphHandle struct {
 	ptr unsafe.Pointer
 }
 
-func MphNew() *MphHandle                        { return nil }
-func MphAddPattern(*MphHandle, string, byte)     {}
-func MphBuild(*MphHandle)                        {}
-func MphMatch(*MphHandle, string) bool           { return false }
-func MphFree(*MphHandle)                         {}
+func MphNew() *MphHandle                     { return nil }
+func MphAddPattern(*MphHandle, string, byte) {}
+func MphBuild(*MphHandle)                    {}
+func MphMatch(*MphHandle, string) bool       { return false }
+func MphFree(*MphHandle)                     {}
 
 // --- GeoIP (stubs — caller must fall back to Go implementation) ---
 
@@ -166,13 +175,13 @@ type IpSetHandle struct {
 	ptr unsafe.Pointer
 }
 
-func IpSetNew() *IpSetHandle                  { return nil }
+func IpSetNew() *IpSetHandle                   { return nil }
 func IpSetAddPrefix(*IpSetHandle, []byte, int) {}
-func IpSetBuild(*IpSetHandle)                 {}
-func IpSetContains(*IpSetHandle, []byte) bool { return false }
-func IpSetMax4(*IpSetHandle) uint8            { return 0xff }
-func IpSetMax6(*IpSetHandle) uint8            { return 0xff }
-func IpSetFree(*IpSetHandle)                  {}
+func IpSetBuild(*IpSetHandle)                  {}
+func IpSetContains(*IpSetHandle, []byte) bool  { return false }
+func IpSetMax4(*IpSetHandle) uint8             { return 0xff }
+func IpSetMax6(*IpSetHandle) uint8             { return 0xff }
+func IpSetFree(*IpSetHandle)                   {}
 
 // --- Vision Padding Stubs ---
 
@@ -202,12 +211,12 @@ func VisionUnpad([]byte, *VisionUnpadState, []byte, []byte) (int, error) {
 
 // VisionFilterState is the stateful TLS filter state (matches Rust's VisionFilterState).
 type VisionFilterState struct {
-	RemainingServerHello   int32
+	RemainingServerHello    int32
 	NumberOfPacketsToFilter int32
-	Cipher                 uint16
-	IsTLS                  bool
-	IsTLS12orAbove         bool
-	EnableXtls             bool
+	Cipher                  uint16
+	IsTLS                   bool
+	IsTLS12orAbove          bool
+	EnableXtls              bool
 }
 
 // VisionFilterStateSizeC returns the Go-side sizeof(VisionFilterState) when native is unavailable.
@@ -237,18 +246,18 @@ type AeadHandle struct {
 
 func (*AeadHandle) release() {}
 
-func AeadNew(byte, []byte) *AeadHandle                                       { return nil }
-func AeadSeal(*AeadHandle, []byte, []byte, []byte) ([]byte, error)           { return nil, errNotAvailable }
-func AeadOpen(*AeadHandle, []byte, []byte, []byte) ([]byte, error)           { return nil, errNotAvailable }
-func AeadSealTo(*AeadHandle, []byte, []byte, []byte, []byte) (int, error)    { return 0, errNotAvailable }
-func AeadOpenTo(*AeadHandle, []byte, []byte, []byte, []byte) (int, error)    { return 0, errNotAvailable }
-func AeadOverhead(*AeadHandle) int                                           { return 0 }
-func AeadNonceSize(*AeadHandle) int                                          { return 0 }
-func aeadFree(*AeadHandle)                                                   {}
+func AeadNew(byte, []byte) *AeadHandle                                    { return nil }
+func AeadSeal(*AeadHandle, []byte, []byte, []byte) ([]byte, error)        { return nil, errNotAvailable }
+func AeadOpen(*AeadHandle, []byte, []byte, []byte) ([]byte, error)        { return nil, errNotAvailable }
+func AeadSealTo(*AeadHandle, []byte, []byte, []byte, []byte) (int, error) { return 0, errNotAvailable }
+func AeadOpenTo(*AeadHandle, []byte, []byte, []byte, []byte) (int, error) { return 0, errNotAvailable }
+func AeadOverhead(*AeadHandle) int                                        { return 0 }
+func AeadNonceSize(*AeadHandle) int                                       { return 0 }
+func aeadFree(*AeadHandle)                                                {}
 
 // --- VMess AEAD Header Stubs ---
 
-func VMessSealHeader([16]byte, []byte) ([]byte, error) { return nil, errNotAvailable }
+func VMessSealHeader([16]byte, []byte) ([]byte, error)           { return nil, errNotAvailable }
 func VMessOpenHeader([16]byte, [16]byte, []byte) ([]byte, error) { return nil, errNotAvailable }
 
 // --- Geodata Batch Loading Stubs ---
@@ -258,7 +267,7 @@ type GeoSiteEntry struct {
 	Value      string
 }
 
-func GeoIPLoad(string, []string) ([]*IpSetHandle, error)    { return nil, errNotAvailable }
+func GeoIPLoad(string, []string) ([]*IpSetHandle, error)     { return nil, errNotAvailable }
 func GeoSiteLoad(string, []string) ([][]GeoSiteEntry, error) { return nil, errNotAvailable }
 
 // --- eBPF Stubs ---

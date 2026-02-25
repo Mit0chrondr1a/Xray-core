@@ -56,7 +56,8 @@ var (
 		return native.Available() &&
 			tls.NativeFullKTLSSupported() &&
 			v.realityXrayConfig != nil &&
-			len(v.realityXrayConfig.Mldsa65Seed) == 0
+			len(v.realityXrayConfig.Mldsa65Seed) == 0 &&
+			(v.config == nil || !v.config.AcceptProxyProtocol)
 	}
 )
 
@@ -206,13 +207,15 @@ func (v *Listener) keepAccepting() {
 				}
 			}()
 			if v.tlsConfig != nil {
-				if native.Available() && v.tlsXrayConfig != nil && tls.NativeFullKTLSSupportedForTLSConfig(v.tlsXrayConfig) {
+				if native.Available() && v.tlsXrayConfig != nil &&
+					tls.NativeFullKTLSSupportedForTLSConfig(v.tlsXrayConfig) &&
+					(v.config == nil || !v.config.AcceptProxyProtocol) {
 					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 						errors.LogWarningInner(context.Background(), err, "failed to set Rust TLS handshake deadline on accepted connection")
 						_ = conn.Close()
 						return
 					}
-					rustConn, tlsErr := tls.RustServer(conn, v.tlsXrayConfig)
+					rustConn, tlsErr := tls.RustServerWithTimeout(conn, v.tlsXrayConfig, tlsHandshakeTimeout)
 					if err := conn.SetDeadline(time.Time{}); err != nil {
 						errors.LogWarningInner(context.Background(), err, "failed to clear Rust TLS handshake deadline on accepted connection")
 					}
@@ -246,7 +249,17 @@ func (v *Listener) keepAccepting() {
 				}
 			} else if v.realityConfig != nil {
 				rustDone := false
-				if useNativeRealityServerFn(v) {
+				nativePathEligible := useNativeRealityServerFn(v)
+				if !nativePathEligible {
+					hasMldsa65Seed := v.realityXrayConfig != nil && len(v.realityXrayConfig.Mldsa65Seed) > 0
+					errors.LogDebug(context.Background(),
+						"Rust REALITY server path disabled: nativeAvailable=", native.Available(),
+						" fullKTLS=", tls.NativeFullKTLSSupported(),
+						" hasRealityXrayConfig=", v.realityXrayConfig != nil,
+						" hasMldsa65Seed=", hasMldsa65Seed,
+					)
+				}
+				if nativePathEligible {
 					fd, fdErr := tls.ExtractFd(conn)
 					if fdErr == nil {
 						if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
@@ -267,6 +280,7 @@ func (v *Listener) keepAccepting() {
 							}
 							conn = rustConn
 							rustDone = true
+							errors.LogDebug(context.Background(), "Rust REALITY server path active: wrapped as *tls.RustConn")
 						} else {
 							if rustResult != nil && rustResult.StateHandle != nil {
 								native.TlsStateFree(rustResult.StateHandle)
@@ -274,13 +288,14 @@ func (v *Listener) keepAccepting() {
 							if rustErr == nil {
 								// Handshake succeeded but kTLS incomplete — socket data
 								// already consumed by rustls, Go fallback won't work.
-								errors.LogWarning(context.Background(), "REALITY: Rust handshake OK but kTLS incomplete, closing")
+								errors.LogWarning(context.Background(), "REALITY: Rust handshake OK but kTLS incomplete (tx=", rustResult.KtlsTx, " rx=", rustResult.KtlsRx, "), closing — check kernel kTLS support (modprobe tls)")
 								_ = conn.Close()
 								return
 							}
 							if stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
 								recordRealityFailureOnce()
 								errors.LogInfo(context.Background(), "Rust REALITY auth failed, falling back to camouflage")
+								errors.LogDebug(context.Background(), "REALITY auth detail: ", rustErr)
 								// Fall through — MSG_PEEK left socket data unconsumed,
 								// Go reality.Server() will read it and handle spider crawl.
 							} else {
@@ -289,6 +304,8 @@ func (v *Listener) keepAccepting() {
 								return
 							}
 						}
+					} else {
+						errors.LogDebugInner(context.Background(), fdErr, "Rust REALITY server path skipped: failed to extract fd")
 					}
 				}
 				if !rustDone {
@@ -356,7 +373,7 @@ func (v *Listener) doRustRealityServer(fd int) (*native.TlsResult, error) {
 			maxVer[0], maxVer[1], maxVer[2])
 	}
 
-	return native.RealityServerHandshake(fd, cfg)
+	return native.RealityServerHandshakeWithTimeout(fd, cfg, tlsHandshakeTimeout)
 }
 
 func encodeRealityServerNames(serverNames []string) []byte {

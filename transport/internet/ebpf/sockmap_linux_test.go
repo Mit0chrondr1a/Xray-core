@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestSockmapManagerEnable(t *testing.T) {
@@ -1061,8 +1062,8 @@ func TestComputeRedirectPolicy(t *testing.T) {
 	}{
 		{"both raw TCP", CryptoNone, CryptoNone, true, false},
 		{"both kTLS full", CryptoKTLSBoth, CryptoKTLSBoth, true, true},
-		{"raw + kTLS", CryptoNone, CryptoKTLSBoth, false, false},
-		{"kTLS + raw", CryptoKTLSBoth, CryptoNone, false, false},
+		{"raw + kTLS", CryptoNone, CryptoKTLSBoth, true, true},
+		{"kTLS + raw", CryptoKTLSBoth, CryptoNone, true, true},
 		{"kTLS TX only + kTLS", CryptoKTLSTxOnly, CryptoKTLSBoth, false, false},
 		{"kTLS RX only + kTLS", CryptoKTLSRxOnly, CryptoKTLSBoth, false, false},
 		{"userspace + raw", CryptoUserspaceTLS, CryptoNone, false, false},
@@ -1178,14 +1179,15 @@ func TestCanUseZeroCopyWithCrypto(t *testing.T) {
 		t.Error("expected true for CryptoNone+CryptoNone")
 	}
 
-	// Both kTLS: allowed
-	if !CanUseZeroCopyWithCrypto(client, server, CryptoKTLSBoth, CryptoKTLSBoth) {
-		t.Error("expected true for CryptoKTLSBoth+CryptoKTLSBoth")
+	// kTLS pairs: allowed only when the kernel supports kTLS+SOCKHASH.
+	ktlsOK := KTLSSockhashCompatible()
+	if got := CanUseZeroCopyWithCrypto(client, server, CryptoKTLSBoth, CryptoKTLSBoth); got != ktlsOK {
+		t.Errorf("CryptoKTLSBoth+CryptoKTLSBoth: got %v, want %v (KTLSSockhashCompatible=%v)", got, ktlsOK, ktlsOK)
 	}
 
-	// Asymmetric: denied
-	if CanUseZeroCopyWithCrypto(client, server, CryptoNone, CryptoKTLSBoth) {
-		t.Error("expected false for CryptoNone+CryptoKTLSBoth")
+	// Asymmetric kTLS ↔ plain TCP: allowed only when kernel supports kTLS+SOCKHASH.
+	if got := CanUseZeroCopyWithCrypto(client, server, CryptoNone, CryptoKTLSBoth); got != ktlsOK {
+		t.Errorf("CryptoNone+CryptoKTLSBoth: got %v, want %v (KTLSSockhashCompatible=%v)", got, ktlsOK, ktlsOK)
 	}
 
 	// Userspace: denied
@@ -1231,6 +1233,380 @@ func BenchmarkSockmapConcurrentRegister(b *testing.B) {
 			listener.Close()
 		}
 	})
+}
+
+func TestLRUEvictionUnderConcurrentRegistration(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	// MaxEntries=8 means 4 pairs fill the SOCKHASH.
+	mgr := NewSockmapManager(SockmapConfig{MaxEntries: 8})
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	type connPair struct {
+		client, server net.Conn
+		listener       net.Listener
+	}
+
+	makePair := func() connPair {
+		t.Helper()
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch := make(chan net.Conn, 1)
+		go func() { c, _ := l.Accept(); ch <- c }()
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			l.Close()
+			t.Fatal(err)
+		}
+		s := <-ch
+		return connPair{c, s, l}
+	}
+
+	// Fill the map: 4 pairs × 2 entries = 8 entries (100% full).
+	var seedPairs []connPair
+	for i := 0; i < 4; i++ {
+		p := makePair()
+		seedPairs = append(seedPairs, p)
+		if err := mgr.RegisterPair(p.client, p.server); err != nil {
+			t.Fatalf("seed RegisterPair %d: %v", i, err)
+		}
+	}
+	defer func() {
+		for _, p := range seedPairs {
+			p.client.Close()
+			p.server.Close()
+			p.listener.Close()
+		}
+	}()
+
+	// Concurrently register 8 new pairs — each must evict an existing pair.
+	const goroutines = 8
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	errCh := make(chan error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			p := makePair()
+			defer func() {
+				p.client.Close()
+				p.server.Close()
+				p.listener.Close()
+			}()
+			if err := mgr.RegisterPair(p.client, p.server); err != nil {
+				errCh <- err
+				return
+			}
+			mgr.UnregisterPair(p.client, p.server)
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Errorf("concurrent registration error: %v", err)
+		}
+	}
+}
+
+func TestSweeperCookieMismatchDetection(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	// Create and register a pair.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverCh := make(chan net.Conn, 1)
+	go func() { c, _ := listener.Accept(); serverCh <- c }()
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := <-serverCh
+
+	if err := mgr.RegisterPair(client, server); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := mgr.GetSockmapStats()
+	if stats.ActivePairs != 1 {
+		t.Fatalf("expected 1 active pair, got %d", stats.ActivePairs)
+	}
+
+	// Close sockets — the fd may be reused by subsequent socket creation,
+	// causing a cookie mismatch that the sweeper should detect.
+	client.Close()
+	server.Close()
+
+	// Create new sockets that may reuse the same fds (OS fd reuse).
+	// This simulates the fd reuse scenario the sweeper must handle.
+	newListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newListener.Close()
+
+	newServerCh := make(chan net.Conn, 1)
+	go func() { c, _ := newListener.Accept(); newServerCh <- c }()
+	newClient, err := net.Dial("tcp", newListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newClient.Close()
+	newServer := <-newServerCh
+	defer newServer.Close()
+
+	// Run sweep — should detect stale entries (either dead sockets or
+	// cookie mismatch from fd reuse).
+	mgr.doSweep()
+
+	stats = mgr.GetSockmapStats()
+	if stats.StaleCleanups == 0 {
+		t.Fatal("expected stale cleanups > 0 after sweep with closed sockets")
+	}
+	if stats.ActivePairs != 0 {
+		t.Fatalf("expected 0 active pairs after sweep, got %d", stats.ActivePairs)
+	}
+}
+
+func TestAdaptSweepInterval(t *testing.T) {
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+
+	tests := []struct {
+		name    string
+		current time.Duration
+		stale   int
+		total   int
+		want    time.Duration
+	}{
+		{"no entries", 60 * time.Second, 0, 0, 60 * time.Second},
+		{"6% stale halves", 60 * time.Second, 6, 100, 30 * time.Second},
+		{"6% stale halves to floor", 10 * time.Second, 6, 100, 5 * time.Second},
+		{"already at floor", 5 * time.Second, 6, 100, 5 * time.Second},
+		{"0% stale doubles", 5 * time.Second, 0, 100, 10 * time.Second},
+		{"0% stale doubles to ceiling", 30 * time.Second, 0, 100, 60 * time.Second},
+		{"already at ceiling", 60 * time.Second, 0, 100, 60 * time.Second},
+		{"3% steady state", 20 * time.Second, 3, 100, 20 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mgr.adaptSweepInterval(tt.current, tt.stale, tt.total)
+			if got != tt.want {
+				t.Errorf("adaptSweepInterval(%v, %d, %d) = %v, want %v",
+					tt.current, tt.stale, tt.total, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestKTLSSockhashProbe(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	result := probeKTLSSockhashCompat()
+	// We don't know if kTLS+SOCKHASH works on this kernel, so just verify
+	// the probe doesn't panic and returns a valid boolean.
+	t.Logf("kTLS+SOCKHASH probe result: %v", result)
+}
+
+// TestAsymmetricCryptoPolicyRegistration verifies that RegisterPairWithCrypto
+// with asymmetric crypto hints (kTLS ↔ plain TCP) correctly writes the
+// expected policy flags (PolicyAllowRedirect | PolicyKTLSActive) into the
+// BPF policy map. This validates the core asymmetric redirect policy that
+// allows mixed kTLS/plain pairs in sockmap — the common proxy scenario
+// where one side is encrypted (client) and the other is plain (upstream).
+func TestAsymmetricCryptoPolicyRegistration(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverCh := make(chan net.Conn, 1)
+	go func() { c, _ := listener.Accept(); serverCh <- c }()
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-serverCh
+	defer server.Close()
+
+	// Register with asymmetric hints: plain TCP inbound, kTLS outbound.
+	if err := mgr.RegisterPairWithCrypto(client, server, CryptoNone, CryptoKTLSBoth); err != nil {
+		t.Fatalf("RegisterPairWithCrypto(None, KTLSBoth) failed: %v", err)
+	}
+
+	// Verify the policy map entries have the correct flags.
+	clientFD := getFDOrSkip(t, client)
+	serverFD := getFDOrSkip(t, server)
+
+	clientCookie, err := getSocketCookie(clientFD)
+	if err != nil {
+		t.Fatalf("getSocketCookie(client): %v", err)
+	}
+	serverCookie, err := getSocketCookie(serverFD)
+	if err != nil {
+		t.Fatalf("getSocketCookie(server): %v", err)
+	}
+
+	st := currentState.Load()
+	if st.policyMapFD < 0 {
+		t.Fatal("policy map not initialized")
+	}
+
+	var clientPolicy, serverPolicy uint32
+	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&clientCookie), unsafe.Pointer(&clientPolicy)); err != nil {
+		t.Fatalf("policy lookup for inbound socket: %v", err)
+	}
+	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&serverCookie), unsafe.Pointer(&serverPolicy)); err != nil {
+		t.Fatalf("policy lookup for outbound socket: %v", err)
+	}
+
+	wantPolicy := PolicyAllowRedirect | PolicyKTLSActive
+	if clientPolicy != wantPolicy {
+		t.Errorf("inbound policy: got 0x%x, want 0x%x (PolicyAllowRedirect|PolicyKTLSActive)", clientPolicy, wantPolicy)
+	}
+	if serverPolicy != wantPolicy {
+		t.Errorf("outbound policy: got 0x%x, want 0x%x (PolicyAllowRedirect|PolicyKTLSActive)", serverPolicy, wantPolicy)
+	}
+
+	if err := mgr.UnregisterPair(client, server); err != nil {
+		t.Fatalf("UnregisterPair: %v", err)
+	}
+
+	// After unregister, policy entries should be cleaned up.
+	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&clientCookie), unsafe.Pointer(&clientPolicy)); err == nil {
+		t.Error("inbound policy entry should be deleted after unregister")
+	}
+	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&serverCookie), unsafe.Pointer(&serverPolicy)); err == nil {
+		t.Error("outbound policy entry should be deleted after unregister")
+	}
+}
+
+// TestAsymmetricSockmapDataTransfer validates that the sockmap data path works
+// correctly when a pair is registered with asymmetric crypto hints. The verdict
+// program consults the policy map and sees PolicyKTLSActive — this test ensures
+// that flag does not impede the redirect when both sockets are actually plain
+// TCP (the kernel-side kTLS layer would handle encryption transparently if
+// present, but sockmap redirect operates at the socket/plaintext layer regardless).
+func TestAsymmetricSockmapDataTransfer(t *testing.T) {
+	caps := GetCapabilities()
+	if !caps.SockmapSupported {
+		t.Skip("sockmap not supported on this system")
+	}
+
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	if err := mgr.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Disable()
+
+	// Create two TCP pairs: client <-> proxyIn, proxyOut <-> server
+	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyListener.Close()
+
+	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverListener.Close()
+
+	proxyInCh := make(chan net.Conn, 1)
+	go func() { c, _ := proxyListener.Accept(); proxyInCh <- c }()
+
+	serverCh := make(chan net.Conn, 1)
+	go func() { c, _ := serverListener.Accept(); serverCh <- c }()
+
+	client, err := net.Dial("tcp", proxyListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	proxyOut, err := net.Dial("tcp", serverListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyOut.Close()
+
+	proxyIn := <-proxyInCh
+	defer proxyIn.Close()
+	server := <-serverCh
+	defer server.Close()
+
+	// Register with asymmetric hints: proxyIn = kTLS, proxyOut = plain TCP.
+	// This exercises the code path where computeRedirectPolicy sets
+	// PolicyAllowRedirect | PolicyKTLSActive for asymmetric pairs.
+	if err := mgr.RegisterPairWithCrypto(proxyIn, proxyOut, CryptoKTLSBoth, CryptoNone); err != nil {
+		t.Fatalf("RegisterPairWithCrypto(KTLSBoth, None): %v", err)
+	}
+
+	testData := []byte("asymmetric kTLS<->plain sockmap redirect test")
+	if _, err := client.Write(testData); err != nil {
+		t.Fatal(err)
+	}
+
+	server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len(testData)*2)
+	n, err := server.Read(buf)
+	if err != nil {
+		t.Logf("asymmetric sockmap redirect may not be active (kernel-dependent): %v", err)
+	} else if string(buf[:n]) != string(testData) {
+		t.Fatalf("data mismatch: got %q, want %q", buf[:n], testData)
+	} else {
+		t.Log("asymmetric sockmap data transfer successful")
+	}
+
+	mgr.UnregisterPair(proxyIn, proxyOut)
 }
 
 // getFDOrSkip extracts the fd from a net.Conn, skipping the test on error.

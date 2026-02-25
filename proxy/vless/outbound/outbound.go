@@ -12,6 +12,8 @@ import (
 	"time"
 	"unsafe"
 
+	gonet "net"
+
 	utls "github.com/refraction-networking/utls"
 	proxyman "github.com/xtls/xray-core/app/proxyman/outbound"
 	"github.com/xtls/xray-core/app/reverse"
@@ -67,6 +69,20 @@ type Handler struct {
 type ConnExpire struct {
 	Conn   stat.Connection
 	Expire time.Time
+}
+
+func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, input *bytes.Reader, rawInput *bytes.Buffer, err error) {
+	if flow != vless.XRV {
+		return false, nil, nil, nil
+	}
+	rc, ok := conn.(*tls.RustConn)
+	if !ok {
+		return false, nil, nil, nil
+	}
+	if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
+		return true, nil, nil, errors.New("RustConn without full kTLS cannot use "+flow).AtWarning()
+	}
+	return true, &bytes.Reader{}, &bytes.Buffer{}, nil
 }
 
 // New creates a new VLess outbound handler.
@@ -309,12 +325,23 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				t = reflect.TypeOf(realityConn.Conn).Elem()
 				p = uintptr(unsafe.Pointer(realityConn.Conn))
 			} else {
-				return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
+				handled, rustInput, rustRaw, err := getVisionBuffersForRustConn(iConn, requestAddons.Flow)
+				if err != nil {
+					return err
+				}
+				if handled {
+					input = rustInput
+					rawInput = rustRaw
+				} else {
+					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
+				}
 			}
-			i, _ := t.FieldByName("input")
-			r, _ := t.FieldByName("rawInput")
-			input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-			rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+			if t != nil {
+				i, _ := t.FieldByName("input")
+				r, _ := t.FieldByName("rawInput")
+				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
+				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+			}
 		default:
 			return errors.New("unknown VLESS request command: ", request.Command)
 		}

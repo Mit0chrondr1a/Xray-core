@@ -66,6 +66,21 @@ macro_rules! ffi_catch_bool {
     }};
 }
 
+/// Wrap an FFI body that returns `u8`. On panic returns `default`.
+macro_rules! ffi_catch_u8 {
+    ($default:expr, $body:block) => {{
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().copied()
+                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                eprintln!("xray-rust FFI panic (u8): {}", msg.unwrap_or("unknown"));
+                $default
+            }
+        }
+    }};
+}
+
 /// Wrap a void FFI body. On panic the error is logged to stderr.
 macro_rules! ffi_catch_void {
     ($body:block) => {{

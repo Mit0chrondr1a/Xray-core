@@ -20,7 +20,7 @@ func TestVuln_CWE_911_PanicAfterHandshakeRelease(t *testing.T) {
 	var calls atomic.Int32
 	v := &Listener{
 		listener:      ln,
-		connSemaphore: make(chan struct{}, 1),
+		connSemaphore: make(chan struct{}, 2),
 		addConn: func(stat.Connection) {
 			calls.Add(1)
 			panic("panic in addConn")
