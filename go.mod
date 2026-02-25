@@ -18,7 +18,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/vishvananda/netlink v1.3.1
 	github.com/xtls/reality v0.0.0-20251116175510-cd53f7d50237
-	go.uber.org/mock v0.5.2
+	go.uber.org/mock v0.6.0
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/crypto v0.48.0
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa
@@ -29,7 +29,7 @@ require (
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
 	google.golang.org/grpc v1.79.1
 	google.golang.org/protobuf v1.36.11
-	gvisor.dev/gvisor v0.0.0-20260224080113-e41477ffa935
+	gvisor.dev/gvisor v0.0.0-20260224223828-c58e543f3da5
 	h12.io/socks v1.0.3
 	lukechampine.com/blake3 v1.4.1
 )
