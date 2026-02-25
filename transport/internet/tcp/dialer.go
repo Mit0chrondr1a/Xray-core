@@ -5,6 +5,7 @@ import (
 	gotls "crypto/tls"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -16,6 +17,48 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
+
+var rustClientWithTimeoutFn = tls.RustClientWithTimeout
+
+func nativeHandshakeTimeoutFromContext(ctx context.Context) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining > 0 {
+			return remaining
+		}
+		// Deadline already expired; fail fast in native handshake path.
+		return time.Millisecond
+	}
+	return 0
+}
+
+func rustClientWithContext(ctx context.Context, conn net.Conn, config *tls.Config, dest net.Destination) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	timeout := nativeHandshakeTimeoutFromContext(ctx)
+	// Ensure cancellation can interrupt the native blocking handshake early.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	defer close(done)
+	// Always clear temporary handshake deadlines so they never leak into
+	// steady-state reads/writes.
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
+	if timeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			return nil, err
+		}
+	}
+
+	return rustClientWithTimeoutFn(conn, config, dest, timeout)
+}
 
 // Dial dials a new TCP connection to the given destination.
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
@@ -73,7 +116,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 				err = conn.(*tls.UConn).HandshakeContext(ctx)
 			}
 		} else if native.Available() {
-			conn, err = tls.RustClient(conn, config, dest)
+			conn, err = rustClientWithContext(ctx, conn, config, dest)
 		} else {
 			conn = tls.Client(conn, tlsConfig)
 			err = conn.(*tls.Conn).HandshakeAndEnableKTLS(ctx)
