@@ -9,8 +9,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
-	"math/big"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -606,17 +606,9 @@ func xtlsPaddingGoFallback(b *buf.Buffer, command byte, userUUID *[]byte, longPa
 		contentLen = b.Len()
 	}
 	if contentLen < int32(testseed[0]) && longPadding {
-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[1])))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
-		}
-		paddingLen = int32(l.Int64()) + int32(testseed[2]) - contentLen
+		paddingLen = int32(cryptoRandIntn(testseed[1])) + int32(testseed[2]) - contentLen
 	} else {
-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[3])))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
-		}
-		paddingLen = int32(l.Int64())
+		paddingLen = int32(cryptoRandIntn(testseed[3]))
 	}
 	if paddingLen > buf.Size-21-contentLen {
 		paddingLen = buf.Size - 21 - contentLen
@@ -641,6 +633,25 @@ func xtlsPaddingGoFallback(b *buf.Buffer, command byte, userUUID *[]byte, longPa
 	newbuffer.Extend(paddingLen)
 	errors.LogDebug(ctx, "XtlsPadding ", contentLen, " ", paddingLen, " ", command)
 	return newbuffer
+}
+
+// cryptoRandIntn returns a cryptographically random int64 in [0, n).
+// On RNG failure, falls back to a time-derived value rather than returning 0.
+//
+// Trade-off: time-based padding is statistically distinguishable from CSPRNG
+// output by a DPI adversary with sub-microsecond timing. However, crypto/rand
+// failure means /dev/urandom is broken — the system is already unable to
+// perform TLS handshakes, so this is a degraded mode for a degraded system.
+// This is strictly better than the previous behavior (nil pointer panic).
+func cryptoRandIntn(n uint32) int64 {
+	if n == 0 {
+		return 0
+	}
+	var buf [4]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return int64(uint32(time.Now().UnixNano()) % n)
+	}
+	return int64(binary.BigEndian.Uint32(buf[:]) % n)
 }
 
 // XtlsUnpadding remove padding and parse command
@@ -1054,6 +1065,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			} else if !ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
 				errors.LogDebug(ctx, "CopyRawConn crypto hint: reader=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] source=", readerCryptoSource, " writer=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] source=", writerCryptoSource)
 				switch {
+				case !ebpf.KTLSSockhashCompatible() && (readerCrypto == ebpf.CryptoKTLSBoth || writerCrypto == ebpf.CryptoKTLSBoth):
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: kTLS+SOCKHASH not supported on this kernel, using splice")
+					mgr.IncrementKTLSSpliceFallback()
 				case readerCrypto == ebpf.CryptoUserspaceTLS || writerCrypto == ebpf.CryptoUserspaceTLS:
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
 				case (readerCrypto == ebpf.CryptoKTLSBoth) != (writerCrypto == ebpf.CryptoKTLSBoth):
