@@ -10,35 +10,36 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes128Gcm,
+    Aes256Gcm,
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::{ServerConfig, ServerConnection};
+use rustls::sign::CertifiedKey;
+use rustls::{ServerConfig, ServerConnection, SignatureScheme};
 use sha2::{Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::tls::{self, TlsState, XrayTlsResult};
-use crate::tls13::{self, Tls13Error, Tls13State};
+use crate::tls13::{self, CertVerifyPolicy, Tls13Error, Tls13State};
 
 // ---------------------------------------------------------------------------
 // Public result types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug)]
 pub struct RealityResult {
     pub tls_state: Tls13State,
-    pub auth_key: Vec<u8>,
+    pub auth_key: Zeroizing<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -85,8 +86,13 @@ fn reality_auth_key(shared_secret: &[u8], random_prefix: &[u8]) -> Result<Vec<u8
     Ok(key)
 }
 
+// AES-256-GCM with 32-byte key from HKDF-SHA256. This matches the Go REALITY
+// implementation: Go derives a 32-byte AuthKey via HKDF and passes it to
+// aes.NewCipher(), which auto-selects AES-256 for 32-byte keys. The previous
+// Rust code (Aes128Gcm with key[..16]) was truncating to 16 bytes, which was
+// the actual interop bug — it caused AEAD decryption failures against Go.
 fn aes_gcm_seal(key: &[u8], nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-    let cipher = Aes128Gcm::new_from_slice(&key[..16]).map_err(|e| format!("aes key: {}", e))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("aes key: {}", e))?;
     let nonce = aes_gcm::Nonce::from_slice(nonce);
     let payload = aes_gcm::aead::Payload {
         msg: plaintext,
@@ -103,7 +109,7 @@ fn aes_gcm_open(
     ciphertext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let cipher = Aes128Gcm::new_from_slice(&key[..16]).map_err(|e| format!("aes key: {}", e))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("aes key: {}", e))?;
     let nonce = aes_gcm::Nonce::from_slice(nonce);
     let payload = aes_gcm::aead::Payload {
         msg: ciphertext,
@@ -323,11 +329,16 @@ pub fn reality_client_connect(
     }
     client_hello_raw[39..71].copy_from_slice(&encrypted);
 
-    // Complete the TLS 1.3 handshake. tls13::complete_tls13_handshake()
-    // skips CertificateVerify — REALITY relies on the HMAC-based cert
-    // verification below (verify_reality_cert_hmac) and the Finished
-    // message's implicit binding to the ECDH shared secret instead.
-    let tls_state = tls13::complete_tls13_handshake(fd, client_hello_raw, ecdh_privkey)?;
+    // Complete the TLS 1.3 handshake with CertificateVerify skipped.
+    // REALITY relies on the HMAC-based cert verification below
+    // (verify_reality_cert_hmac) and the Finished message's implicit
+    // binding to the ECDH shared secret instead of X.509 CertificateVerify.
+    let tls_state = tls13::complete_tls13_handshake(
+        fd,
+        client_hello_raw,
+        ecdh_privkey,
+        CertVerifyPolicy::SkipForReality,
+    )?;
 
     // Verify REALITY certificate: the server's cert must have an Ed25519 public
     // key whose HMAC-SHA512(auth_key, pubkey) equals the certificate's signature.
@@ -347,7 +358,7 @@ pub fn reality_client_connect(
 
     Ok(RealityResult {
         tls_state,
-        auth_key,
+        auth_key: Zeroizing::new(auth_key),
     })
 }
 
@@ -355,18 +366,29 @@ pub fn reality_client_connect(
 // Server: parse ClientHello, validate REALITY auth
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug)]
 pub struct RealityServerResult {
     pub authenticated: bool,
     pub client_version: (u8, u8, u8),
     pub short_id: Vec<u8>,
-    pub auth_key: Vec<u8>,
+    pub auth_key: Zeroizing<Vec<u8>>,
     pub sni: String,
     pub client_hello_raw: Vec<u8>,
 }
 
+/// Constant-time server name check to prevent timing oracles.
+/// An active DPI adversary probing different SNI values must not be able to
+/// distinguish "matched" from "not matched" by measuring response time.
 fn server_name_allowed(server_names: &[String], sni: &str) -> bool {
-    server_names.iter().any(|name| name == sni)
+    let sni_bytes = sni.as_bytes();
+    let mut matched: subtle::Choice = 0u8.into();
+    for name in server_names {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() == sni_bytes.len() {
+            matched |= name_bytes.ct_eq(sni_bytes);
+        }
+    }
+    bool::from(matched)
 }
 
 fn timestamp_within_max_diff(timestamp: u32, max_time_diff_ms: u64) -> bool {
@@ -495,16 +517,22 @@ pub fn reality_server_accept(
         )));
     }
 
-    // Validate short_id (constant-time comparison for defense-in-depth)
-    let short_id_trimmed: Vec<u8> = short_id.iter().copied().take_while(|&b| b != 0).collect();
-    let mut short_id_matched = false;
+    // Validate short_id using fixed-width constant-time comparison.
+    // All values are padded to 8 bytes to prevent length-based timing leaks:
+    // without padding, the length check short-circuits before ct_eq, letting
+    // an attacker enumerate the configured short_id length via timing.
+    let mut padded_received = [0u8; 8];
+    let received_len = short_id.len().min(8);
+    padded_received[..received_len].copy_from_slice(&short_id[..received_len]);
+
+    let mut short_id_matched: subtle::Choice = 0u8.into();
     for s in short_ids {
-        let trimmed_match: bool =
-            s.len() == short_id_trimmed.len() && s.ct_eq(&short_id_trimmed).into();
-        let full_match: bool = s.len() == short_id.len() && s.ct_eq(&short_id).into();
-        short_id_matched |= trimmed_match || full_match;
+        let mut padded_configured = [0u8; 8];
+        let cfg_len = s.len().min(8);
+        padded_configured[..cfg_len].copy_from_slice(&s[..cfg_len]);
+        short_id_matched |= padded_configured.ct_eq(&padded_received);
     }
-    if !short_id_matched {
+    if !bool::from(short_id_matched) {
         return Err(RealityError::AuthFailed(
             "short_id not in allowed list".into(),
         ));
@@ -514,7 +542,7 @@ pub fn reality_server_accept(
         authenticated: true,
         client_version: client_ver,
         short_id,
-        auth_key,
+        auth_key: Zeroizing::new(auth_key),
         sni,
         client_hello_raw: ch_raw,
     })
@@ -690,15 +718,70 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+// ---------------------------------------------------------------------------
+// REALITY signing key bypass
+// ---------------------------------------------------------------------------
+
+/// Signing key wrapper that bypasses rustls signature scheme negotiation.
+///
+/// Go REALITY hardcodes `hs.sigAlg = Ed25519` and comments out
+/// `pickCertificate()`, ignoring the client's `signature_algorithms`
+/// extension entirely. Rustls is standards-compliant and rejects the
+/// handshake if Ed25519 isn't in the client's offered list. This wrapper
+/// makes `choose_scheme()` always return an Ed25519 signer regardless of
+/// what the client advertises, matching Go's behavior.
+///
+/// The Go REALITY client verifies CertificateVerify against its own
+/// internal `supportedSignatureAlgorithms()` (which includes Ed25519),
+/// NOT against the uTLS fingerprint's advertised list, so this is safe.
+///
+/// # SAFETY: REALITY-only — do NOT use for generic TLS
+///
+/// This wrapper is intentionally non-RFC-8446-compliant: it ignores the
+/// client's `signature_algorithms` extension. It MUST NOT be used in the
+/// generic TLS handshake path (`tls.rs`), which serves standard TLS
+/// clients that rely on correct signature scheme negotiation. Applying
+/// this wrapper there would cause interop failures with any client that
+/// does not offer Ed25519.
+#[derive(Debug)]
+struct RealitySigningKey(Arc<dyn rustls::sign::SigningKey>);
+
+impl rustls::sign::SigningKey for RealitySigningKey {
+    fn choose_scheme(&self, _offered: &[SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
+        self.0.choose_scheme(&[SignatureScheme::ED25519])
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        self.0.algorithm()
+    }
+}
+
+/// Cert resolver that always returns the REALITY certificate.
+#[derive(Debug)]
+struct RealityCertResolver(Arc<CertifiedKey>);
+
+impl rustls::server::ResolvesServerCert for RealityCertResolver {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.clone())
+    }
+}
+
 /// Peek at N bytes from a socket using MSG_PEEK (non-consuming).
 /// Blocks until all bytes are available or an error occurs.
-fn peek_exact(fd: i32, buf: &mut [u8]) -> io::Result<()> {
+fn peek_exact(fd: i32, buf: &mut [u8], timeout: Duration) -> io::Result<()> {
     // Limit retries to prevent slow-loris attacks holding threads indefinitely.
-    // At 100us per retry, 100_000 retries = ~10 seconds — well within the
-    // caller's 30-second handshake timeout but prevents unbounded spinning.
+    // At 100us per retry, 100_000 retries = ~10 seconds. Wall-clock timeout is
+    // still enforced by `timeout` and socket SO_RCVTIMEO.
     const MAX_RETRIES: u32 = 100_000;
     let mut retries: u32 = 0;
+    let deadline = Instant::now() + timeout;
     loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peek_exact: handshake timeout exceeded",
+            ));
+        }
         let n = unsafe {
             libc::recv(
                 fd,
@@ -712,6 +795,12 @@ fn peek_exact(fd: i32, buf: &mut [u8]) -> io::Result<()> {
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "peek_exact: receive timeout",
+                ));
+            }
             return Err(err);
         }
         if n == 0 {
@@ -722,7 +811,12 @@ fn peek_exact(fd: i32, buf: &mut [u8]) -> io::Result<()> {
             if retries >= MAX_RETRIES {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("peek_exact: short read after {} retries ({}/{} bytes)", retries, n, buf.len()),
+                    format!(
+                        "peek_exact: short read after {} retries ({}/{} bytes)",
+                        retries,
+                        n,
+                        buf.len()
+                    ),
                 ));
             }
             // MSG_PEEK|MSG_WAITALL may return short on some kernels; sleep briefly and retry
@@ -743,6 +837,7 @@ fn peek_exact(fd: i32, buf: &mut [u8]) -> io::Result<()> {
 fn reality_server_handshake_full(
     fd: i32,
     cfg: &RealityConfig,
+    handshake_timeout: std::time::Duration,
 ) -> Result<
     (
         u16,         // cipher_suite
@@ -760,8 +855,11 @@ fn reality_server_handshake_full(
 
     // Step 1: Peek at ClientHello using MSG_PEEK (non-consuming).
     // If auth fails, data stays in the buffer for Go's camouflage fallback.
+    let _peek_timeout_guard = crate::fdutil::SocketTimeoutGuard::install(fd, fd, handshake_timeout)
+        .map_err(|e| (2, format!("peek timeout guard: {}", e)))?;
     let mut header = [0u8; 5];
-    peek_exact(fd, &mut header).map_err(|e| (2, format!("peek header: {}", e)))?;
+    peek_exact(fd, &mut header, handshake_timeout)
+        .map_err(|e| (2, format!("peek header: {}", e)))?;
 
     let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
     if record_len > 16384 {
@@ -769,7 +867,8 @@ fn reality_server_handshake_full(
     }
 
     let mut peek_buf = vec![0u8; 5 + record_len];
-    peek_exact(fd, &mut peek_buf).map_err(|e| (2, format!("peek record: {}", e)))?;
+    peek_exact(fd, &mut peek_buf, handshake_timeout)
+        .map_err(|e| (2, format!("peek record: {}", e)))?;
 
     let ch_raw = &peek_buf[5..]; // ClientHello body (after TLS record header)
 
@@ -838,15 +937,19 @@ fn reality_server_handshake_full(
         ));
     }
 
-    let short_id_trimmed: Vec<u8> = short_id.iter().copied().take_while(|&b| b != 0).collect();
-    let mut short_id_matched = false;
+    // Fixed-width constant-time short_id comparison (see reality_server_accept).
+    let mut padded_received = [0u8; 8];
+    let received_len = short_id.len().min(8);
+    padded_received[..received_len].copy_from_slice(&short_id[..received_len]);
+
+    let mut short_id_matched: subtle::Choice = 0u8.into();
     for s in &cfg.short_ids {
-        let trimmed_match: bool =
-            s.len() == short_id_trimmed.len() && s.ct_eq(&short_id_trimmed).into();
-        let full_match: bool = s.len() == short_id.len() && s.ct_eq(&short_id).into();
-        short_id_matched |= trimmed_match || full_match;
+        let mut padded_configured = [0u8; 8];
+        let cfg_len = s.len().min(8);
+        padded_configured[..cfg_len].copy_from_slice(&s[..cfg_len]);
+        short_id_matched |= padded_configured.ct_eq(&padded_received);
     }
-    if !short_id_matched {
+    if !bool::from(short_id_matched) {
         return Err((1, "short_id not in allowed list".into()));
     }
 
@@ -869,18 +972,31 @@ fn reality_server_handshake_full(
     let cert_der = build_reality_cert(pkcs8_doc.as_ref(), ed25519_pub, &auth_key, cert_sni)
         .map_err(|e| (2, format!("cert gen: {}", e)))?;
 
-    // Step 4: Build rustls ServerConfig with the REALITY cert
+    // Step 4: Build rustls ServerConfig with the REALITY cert.
+    //
+    // We use RealitySigningKey to bypass rustls's signature scheme negotiation.
+    // Go REALITY hardcodes Ed25519 and ignores the client's signature_algorithms
+    // extension. Rustls is standards-compliant and would reject if Ed25519 isn't
+    // in the client's offered list (NoSignatureSchemesInCommon). The wrapper
+    // always offers Ed25519 regardless.
     let provider = tls::cached_provider();
     let cert = CertificateDer::from(cert_der);
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_doc.as_ref().to_vec()));
+
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| (2, format!("private key: {}", e)))?;
+    let reality_key = Arc::new(RealitySigningKey(signing_key));
+    let certified_key = Arc::new(CertifiedKey::new(vec![cert], reality_key));
 
     let mut sc = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| (2, format!("protocol version: {}", e)))?
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .map_err(|e| (2, format!("server cert: {}", e)))?;
+        .with_cert_resolver(Arc::new(RealityCertResolver(certified_key)));
 
+    sc.enable_secret_extraction = true;
     let capture = Arc::new(tls::SecretCapture::new(None));
     sc.key_log = capture.clone();
 
@@ -889,25 +1005,23 @@ fn reality_server_handshake_full(
 
     // Step 5: rustls handshake — reads the ClientHello from the socket
     // (consuming the data that was previously only peeked).
-    let dup_fd = unsafe { libc::dup(fd) };
-    if dup_fd < 0 {
-        return Err((2, format!("dup: {}", io::Error::last_os_error())));
-    }
-    let tcp = unsafe { TcpStream::from_raw_fd(dup_fd) };
-    let mut reader = tls::RecordReader::new(tcp);
+    let mut pipeline = crate::fdutil::HandshakePipeline::new(fd, handshake_timeout)
+        .map_err(|e| (2, format!("pipeline: {}", e)))?;
 
     // Drive handshake record-by-record
-    drive_handshake!(&mut conn, &mut reader)
-        .map_err(|e| (2i32, format!("handshake: {}", e)))?;
+    let hs_result = drive_handshake!(&mut conn, pipeline.reader_mut());
+    hs_result.map_err(|e| (2i32, format!("handshake: {}", e)))?;
 
     // TOCTOU verification: ensure the first record rustls consumed matches
     // what we peeked during auth validation.
-    let consumed_hash = reader.first_record_hash().ok_or_else(|| {
-        (2i32, "TOCTOU: no record consumed by rustls".to_string())
-    })?;
+    let consumed_hash = pipeline
+        .first_record_hash()
+        .ok_or_else(|| (2i32, "TOCTOU: no record consumed by rustls".to_string()))?;
     if consumed_hash != peek_hash.as_ref() {
-        drop(reader);
-        return Err((2, "TOCTOU: consumed ClientHello differs from peeked data".into()));
+        return Err((
+            2,
+            "TOCTOU: consumed ClientHello differs from peeked data".into(),
+        ));
     }
 
     // Drain any plaintext rustls buffered (should be empty with RecordReader)
@@ -921,9 +1035,6 @@ fn reality_server_handshake_full(
         })
         .unwrap_or(0);
 
-    // Close dup'd fd
-    drop(reader);
-
     let secrets = conn
         .dangerous_extract_secrets()
         .map_err(|e| (2, format!("extract secrets: {}", e)))?;
@@ -933,23 +1044,41 @@ fn reality_server_handshake_full(
 
     let cipher_suite = tls::cipher_suite_to_u16(&tx_secrets);
 
-    // Step 6: Install kTLS
-    tls::setup_ulp(fd).map_err(|e| (2, format!("ULP: {}", e)))?;
+    // Step 6: Install kTLS via pipeline (dup'd fd still alive — guaranteed
+    // by ownership). Pipeline drop closes dup'd fd and restores O_NONBLOCK.
+    let ktls_result = pipeline
+        .install_ktls_and_finish(tls_version, &tx_secrets, tx_seq, &rx_secrets, rx_seq)
+        .map_err(|e| (2, e))?;
 
-    let tx_ok = tls::install_ktls(fd, tls::TLS_TX, tls_version, &tx_secrets, tx_seq).is_ok();
-    let rx_ok = tls::install_ktls(fd, tls::TLS_RX, tls_version, &rx_secrets, rx_seq).is_ok();
-
-    if !tx_ok || !rx_ok {
-        return Err((2, format!("kTLS incomplete (tx={}, rx={})", tx_ok, rx_ok)));
+    if !ktls_result.tx_ok || !ktls_result.rx_ok {
+        return Err((
+            2,
+            format!(
+                "kTLS incomplete (tx={}, rx={}, tx_err={}, rx_err={})",
+                ktls_result.tx_ok,
+                ktls_result.rx_ok,
+                ktls_result.tx_err.as_deref().unwrap_or("none"),
+                ktls_result.rx_err.as_deref().unwrap_or("none"),
+            ),
+        ));
     }
+    let (tx_ok, rx_ok) = (ktls_result.tx_ok, ktls_result.rx_ok);
 
     // Create TlsState (metadata only — KeyUpdate handled on Go side)
     let state = Box::new(TlsState::new(fd, cipher_suite));
     let state_handle = Box::into_raw(state) as *mut c_void;
 
     // Server: TX = server secret, RX = client secret
-    let tx_secret = capture.server_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let rx_secret = capture.client_secret.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let tx_secret = capture
+        .server_secret
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let rx_secret = capture
+        .client_secret
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
 
     Ok((
         cipher_suite,
@@ -1064,6 +1193,7 @@ fn parse_x25519_key_share(ch: &[u8]) -> Option<[u8; 32]> {
             if ks.len() >= 2 {
                 let shares_len = u16::from_be_bytes([ks[0], ks[1]]) as usize;
                 let mut kpos = 2;
+                let mut mlkem_x25519: Option<[u8; 32]> = None;
                 while kpos + 4 <= (2 + shares_len).min(ks.len()) {
                     let group = u16::from_be_bytes([ks[kpos], ks[kpos + 1]]);
                     let klen = u16::from_be_bytes([ks[kpos + 2], ks[kpos + 3]]) as usize;
@@ -1071,12 +1201,25 @@ fn parse_x25519_key_share(ch: &[u8]) -> Option<[u8; 32]> {
                     if kpos + klen > ks.len() {
                         break;
                     }
+                    // Pure X25519 (group 0x001d): prefer this if present.
                     if group == 0x001d && klen == 32 {
                         let mut key = [0u8; 32];
                         key.copy_from_slice(&ks[kpos..kpos + 32]);
                         return Some(key);
                     }
+                    // X25519MLKEM768 (group 0x11ec): 1184-byte ML-KEM-768 encap key ‖ 32-byte X25519
+                    // (draft-ietf-tls-hybrid-design). Extract the trailing X25519 portion.
+                    const MLKEM768_ENCAP_KEY_SIZE: usize = 1184;
+                    if group == 0x11ec && klen == MLKEM768_ENCAP_KEY_SIZE + 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&ks[kpos + MLKEM768_ENCAP_KEY_SIZE..kpos + klen]);
+                        mlkem_x25519 = Some(key);
+                    }
                     kpos += klen;
+                }
+                // Fall back to X25519 extracted from X25519MLKEM768 hybrid.
+                if let Some(key) = mlkem_x25519 {
+                    return Some(key);
                 }
             }
         }
@@ -1159,9 +1302,13 @@ pub extern "C" fn xray_reality_config_set_server_pubkey(
     len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
-        if key_ptr.is_null() || len < 32 { return; }
+        if key_ptr.is_null() || len < 32 {
+            return;
+        }
         let key = unsafe { std::slice::from_raw_parts(key_ptr, 32) };
         let mut k = [0u8; 32];
         k.copy_from_slice(key);
@@ -1176,9 +1323,13 @@ pub extern "C" fn xray_reality_config_set_private_key(
     len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
-        if key_ptr.is_null() || len < 32 { return; }
+        if key_ptr.is_null() || len < 32 {
+            return;
+        }
         let key = unsafe { std::slice::from_raw_parts(key_ptr, 32) };
         let mut k = [0u8; 32];
         k.copy_from_slice(key);
@@ -1193,7 +1344,9 @@ pub extern "C" fn xray_reality_config_set_short_id(
     id_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         let id = if id_ptr.is_null() || id_len == 0 {
             &[] as &[u8]
@@ -1211,7 +1364,9 @@ pub extern "C" fn xray_reality_config_set_mldsa65_verify(
     key_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         let key = if key_ptr.is_null() || key_len == 0 {
             &[] as &[u8]
@@ -1230,7 +1385,9 @@ pub extern "C" fn xray_reality_config_set_version(
     patch: u8,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         cfg.version = (major, minor, patch);
     })
@@ -1252,7 +1409,9 @@ pub extern "C" fn xray_reality_config_set_server_names(
     data_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         let data = if data_ptr.is_null() || data_len == 0 {
             &[] as &[u8]
@@ -1278,7 +1437,9 @@ pub extern "C" fn xray_reality_config_set_short_ids(
     data_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         let data = if data_ptr.is_null() || data_len == 0 {
             &[] as &[u8]
@@ -1302,7 +1463,9 @@ pub extern "C" fn xray_reality_config_set_mldsa65_key(
     key_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         let key = if key_ptr.is_null() || key_len == 0 {
             &[] as &[u8]
@@ -1320,7 +1483,9 @@ pub extern "C" fn xray_reality_config_set_dest(
     addr_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         let addr = if addr_ptr.is_null() || addr_len == 0 {
             &[] as &[u8]
@@ -1336,7 +1501,9 @@ pub extern "C" fn xray_reality_config_set_dest(
 #[no_mangle]
 pub extern "C" fn xray_reality_config_set_max_time_diff(cfg: *mut RealityConfig, ms: u64) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         cfg.max_time_diff = ms;
     })
@@ -1353,7 +1520,9 @@ pub extern "C" fn xray_reality_config_set_version_range(
     max_patch: u8,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         cfg.version_range = Some((
             (min_major, min_minor, min_patch),
@@ -1371,7 +1540,9 @@ pub extern "C" fn xray_reality_config_set_tls_cert(
     key_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
         let cert = if cert_ptr.is_null() || cert_len == 0 {
             &[] as &[u8]
@@ -1396,9 +1567,13 @@ pub extern "C" fn xray_reality_config_add_short_id(
     id_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
-        if id_ptr.is_null() || id_len == 0 { return; }
+        if id_ptr.is_null() || id_len == 0 {
+            return;
+        }
         let id = unsafe { std::slice::from_raw_parts(id_ptr, id_len) };
         cfg.short_ids.push(id.to_vec());
     })
@@ -1411,9 +1586,13 @@ pub extern "C" fn xray_reality_config_add_server_name(
     name_len: usize,
 ) {
     ffi_catch_void!({
-        if cfg.is_null() { return; }
+        if cfg.is_null() {
+            return;
+        }
         let cfg = unsafe { &mut *cfg };
-        if name_ptr.is_null() || name_len == 0 { return; }
+        if name_ptr.is_null() || name_len == 0 {
+            return;
+        }
         let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
         if let Ok(s) = String::from_utf8(name.to_vec()) {
             cfg.server_names.push(s);
@@ -1437,7 +1616,9 @@ pub extern "C" fn xray_reality_client_connect(
     out: *mut XrayTlsResult,
 ) -> i32 {
     ffi_catch_i32!({
-        if out.is_null() { return -1; }
+        if out.is_null() {
+            return -1;
+        }
         if cfg.is_null() || client_hello_ptr.is_null() || ecdh_privkey_ptr.is_null() {
             let out = unsafe { &mut *out };
             *out = XrayTlsResult::new();
@@ -1529,7 +1710,9 @@ pub extern "C" fn xray_reality_server_accept(
     out: *mut XrayTlsResult,
 ) -> i32 {
     ffi_catch_i32!({
-        if out.is_null() { return -1; }
+        if out.is_null() {
+            return -1;
+        }
         if cfg.is_null() {
             let out = unsafe { &mut *out };
             *out = XrayTlsResult::new();
@@ -1585,10 +1768,13 @@ pub extern "C" fn xray_reality_server_accept(
 pub extern "C" fn xray_reality_server_handshake(
     fd: i32,
     cfg: *const RealityConfig,
+    handshake_timeout_ms: u32,
     out: *mut XrayTlsResult,
 ) -> i32 {
     ffi_catch_i32!({
-        if out.is_null() { return -1; }
+        if out.is_null() {
+            return -1;
+        }
         if cfg.is_null() {
             let out = unsafe { &mut *out };
             *out = XrayTlsResult::new();
@@ -1599,7 +1785,8 @@ pub extern "C" fn xray_reality_server_handshake(
         *out = XrayTlsResult::new();
         let cfg = unsafe { &*cfg };
 
-        match reality_server_handshake_full(fd, cfg) {
+        let handshake_timeout = tls::handshake_timeout_from_ms(handshake_timeout_ms);
+        match reality_server_handshake_full(fd, cfg, handshake_timeout) {
             Ok((cipher_suite, ktls_tx, ktls_rx, state_handle, tx_secret, rx_secret, drained)) => {
                 out.version = 0x0304;
                 out.cipher_suite = cipher_suite;

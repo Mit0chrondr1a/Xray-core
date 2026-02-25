@@ -35,6 +35,20 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Policy for CertificateVerify handling during TLS 1.3 handshake.
+///
+/// Standard TLS 1.3 REQUIRES CertificateVerify validation (RFC 8446 §4.4.3).
+/// This enum forces callers to explicitly declare their verification strategy,
+/// preventing accidental use of the no-verify path outside REALITY contexts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CertVerifyPolicy {
+    /// Skip CertificateVerify validation. ONLY safe when REALITY authentication
+    /// is used, because REALITY provides its own certificate verification via
+    /// ECDH-derived HMAC. The caller MUST perform REALITY HMAC verification
+    /// on the server certificate chain after the handshake completes.
+    SkipForReality,
+}
+
 #[derive(Debug, Zeroize, ZeroizeOnDrop)]
 pub struct Tls13State {
     pub client_app_secret: Vec<u8>,
@@ -571,6 +585,7 @@ pub fn complete_tls13_handshake(
     fd: i32,
     client_hello_raw: &[u8],
     ecdh_privkey: &[u8; 32],
+    cert_verify_policy: CertVerifyPolicy,
 ) -> Result<Tls13State, Tls13Error> {
     // Dup fd so Rust can own a TcpStream without taking ownership of caller's fd
     let dup_fd = unsafe { libc::dup(fd) };
@@ -730,25 +745,28 @@ pub fn complete_tls13_handshake(
                     transcript.extend_from_slice(msg_data);
                 }
                 0x0f => {
-                    // CertificateVerify: intentionally NOT validated.
-                    //
-                    // In standard TLS 1.3 (RFC 8446 Section 4.4.3), CertificateVerify
-                    // proves the server holds the private key for the certificate.
-                    // We skip this because:
-                    //
-                    // 1. REALITY does not use X.509 certificate chains. The server
-                    //    generates a self-signed Ed25519 cert where the "signature"
-                    //    is HMAC-SHA512(auth_key, ed25519_pubkey). This is verified
-                    //    by reality_client_connect() after the handshake completes.
-                    //
-                    // 2. The server Finished message (verified below at msg_type 0x14)
-                    //    is HMAC(finished_key, transcript_hash), where finished_key
-                    //    derives from server_hs_secret, which derives from the X25519
-                    //    shared secret. An active MITM cannot forge this without the
-                    //    server's ECDH private key, providing implicit authentication.
-                    //
-                    // 3. The CertificateVerify data bytes ARE included in the transcript
-                    //    hash (next line), so they still bind to the Finished value.
+                    // CertificateVerify handling depends on the caller's policy.
+                    match cert_verify_policy {
+                        CertVerifyPolicy::SkipForReality => {
+                            // Intentionally NOT validated — see module-level Security Model.
+                            //
+                            // In standard TLS 1.3 (RFC 8446 §4.4.3), CertificateVerify
+                            // proves the server holds the private key for the certificate.
+                            // We skip this because:
+                            //
+                            // 1. REALITY uses HMAC-SHA512(auth_key, ed25519_pubkey) instead
+                            //    of X.509 chains. Verified by reality_client_connect() after
+                            //    the handshake completes.
+                            //
+                            // 2. The Finished message (verified below at 0x14) binds to the
+                            //    X25519 shared secret, providing implicit MITM protection.
+                            //
+                            // 3. CertificateVerify bytes ARE included in the transcript hash,
+                            //    so they still bind to the Finished value.
+                        }
+                        // Future: CertVerifyPolicy::Verify could validate the signature
+                        // against the certificate's public key per RFC 8446.
+                    }
                     transcript.extend_from_slice(msg_data);
                 }
                 0x14 => {
@@ -960,10 +978,10 @@ pub extern "C" fn xray_tls13_handshake(
 
         let ch = unsafe { std::slice::from_raw_parts(client_hello_ptr, client_hello_len) };
         let pk = unsafe { std::slice::from_raw_parts(ecdh_privkey_ptr, 32) };
-        let mut privkey = [0u8; 32];
+        let mut privkey = zeroize::Zeroizing::new([0u8; 32]);
         privkey.copy_from_slice(pk);
 
-        match complete_tls13_handshake(fd, ch, &privkey) {
+        match complete_tls13_handshake(fd, ch, &privkey, CertVerifyPolicy::SkipForReality) {
             Ok(state) => {
                 out.cipher_suite = state.cipher_suite;
 
