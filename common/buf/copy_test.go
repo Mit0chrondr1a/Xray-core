@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	"go.uber.org/mock/gomock"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/testing/mocks"
@@ -50,6 +50,47 @@ func TestWriteError(t *testing.T) {
 
 	if err.Error() != "common/buf_test: error" {
 		t.Fatal("unexpected error message: ", err.Error())
+	}
+}
+
+type testCounter struct {
+	value    int64
+	addCalls int
+}
+
+func (c *testCounter) Value() int64 {
+	return c.value
+}
+
+func (c *testCounter) Set(v int64) int64 {
+	prev := c.value
+	c.value = v
+	return prev
+}
+
+func (c *testCounter) Add(v int64) int64 {
+	prev := c.value
+	c.value += v
+	c.addCalls++
+	return prev
+}
+
+func TestAddToStatCounterFlushOnEOF(t *testing.T) {
+	const payloadSize = int64(10 * 1024)
+
+	reader := buf.NewReader(io.LimitReader(TestReader{}, payloadSize))
+	writer := buf.Discard
+	counter := &testCounter{}
+
+	if err := buf.Copy(reader, writer, buf.AddToStatCounter(counter)); err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	if counter.Value() != payloadSize {
+		t.Fatalf("unexpected counter value: got %d, want %d", counter.Value(), payloadSize)
+	}
+	if counter.addCalls != 1 {
+		t.Fatalf("unexpected add calls: got %d, want 1", counter.addCalls)
 	}
 }
 

@@ -100,17 +100,35 @@ func IsWriteError(err error) bool {
 	return ok
 }
 
-func copyInternal(reader Reader, writer Writer, handler *copyHandler) error {
-	defer func() {
-		for _, fn := range handler.onExit {
-			fn()
-		}
-	}()
+func copyInternalNoOptions(reader Reader, writer Writer) error {
 	for {
 		buffer, err := reader.ReadMultiBuffer()
 		if !buffer.IsEmpty() {
-			for _, handler := range handler.onData {
-				handler(buffer)
+			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
+				return writeError{werr}
+			}
+		}
+
+		if err != nil {
+			return readError{err}
+		}
+	}
+}
+
+func copyInternal(reader Reader, writer Writer, handler *copyHandler) error {
+	if len(handler.onExit) > 0 {
+		defer func() {
+			for _, fn := range handler.onExit {
+				fn()
+			}
+		}()
+	}
+
+	for {
+		buffer, err := reader.ReadMultiBuffer()
+		if !buffer.IsEmpty() {
+			for _, onData := range handler.onData {
+				onData(buffer)
 			}
 
 			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
@@ -126,11 +144,16 @@ func copyInternal(reader Reader, writer Writer, handler *copyHandler) error {
 
 // Copy dumps all payload from reader to writer or stops when an error occurs. It returns nil when EOF.
 func Copy(reader Reader, writer Writer, options ...CopyOption) error {
-	var handler copyHandler
-	for _, option := range options {
-		option(&handler)
+	var err error
+	if len(options) == 0 {
+		err = copyInternalNoOptions(reader, writer)
+	} else {
+		var handler copyHandler
+		for _, option := range options {
+			option(&handler)
+		}
+		err = copyInternal(reader, writer, &handler)
 	}
-	err := copyInternal(reader, writer, &handler)
 	if err != nil && errors.Cause(err) != io.EOF {
 		return err
 	}
