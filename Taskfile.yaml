@@ -63,7 +63,7 @@ tasks:
             - "{{.CARGO}} update"
 
     update-nightly:
-        desc: "Bump eBPF nightly pin to today's date (may break eBPF build)"
+        desc: "Bump eBPF nightly pin to today and rebuild bpf-linker"
         dir: "{{.EBPF_SRC}}"
         cmds:
             - |
@@ -73,8 +73,20 @@ tasks:
                     echo ">> Already on $CURRENT"
                     exit 0
                 fi
+
+                echo ">> Installing nightly toolchain $NEW + rust-src..."
+                rustup toolchain install "$NEW" --component rust-src
+
+                echo ">> Rebuilding bpf-linker against $NEW..."
+                RUSTUP_TOOLCHAIN="$NEW" {{.CARGO}} install bpf-linker --force
+
+                # Only update rust-toolchain.toml after install + build succeed.
                 sed -i "s/channel = .*/channel = \"$NEW\"/" rust-toolchain.toml
                 echo ">> Nightly pin: $CURRENT -> $NEW"
+
+                echo ">> Removing old nightly $CURRENT (~1.5 GB)..."
+                rustup toolchain uninstall "$CURRENT" 2>/dev/null || true
+
                 echo ">> Run 'task build-ebpf' to verify the new nightly works"
 
     # ----------------------------------------------------------------------------
@@ -96,8 +108,8 @@ tasks:
             RUSTC: "{{.RUSTC}}"
         cmds:
             - |
-                # Resolve bpf-linker from cargo bin, not Nix PATH (Nix
-                # ships an older version linked against a stale LLVM).
+                # Resolve bpf-linker by absolute path to avoid PATH
+                # shadowing from system package managers.
                 BPF_LINKER="$HOME/.cargo/bin/bpf-linker"
                 if [ ! -x "$BPF_LINKER" ]; then
                     echo ">> bpf-linker not found at $BPF_LINKER, cannot build required eBPF artifact"
@@ -106,9 +118,9 @@ tasks:
                     exit 1
                 fi
 
-                # mise exports RUSTUP_TOOLCHAIN=stable; override it with
-                # the pinned nightly so both cargo AND bpf-linker (which
-                # loads LLVM at runtime via aya-rustc-llvm-proxy) resolve
+                # mise sets RUSTUP_TOOLCHAIN=stable; override with the
+                # pinned nightly so cargo and bpf-linker (which loads
+                # LLVM at runtime via aya-rustc-llvm-proxy) both resolve
                 # to the same toolchain.
                 NIGHTLY="$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)"/\1/')"
                 export RUSTUP_TOOLCHAIN="$NIGHTLY"

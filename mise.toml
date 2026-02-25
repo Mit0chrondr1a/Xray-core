@@ -1,20 +1,11 @@
 [env]
-# Prepend rustup shims to PATH so they shadow Homebrew's standalone rust
 _.path = ["~/.cargo/bin"]
 XRAY_CGO = "1"
 GOOS = "linux"
 GOARCH = "amd64"
 
 [tools]
-# Nix backend (jbadeau/mise-nix plugin)
-"nix:go" = "1.26"
-"nix:zig" = "0.15"
-"nix:llvm_20" = "latest"
-"nix:bpf-linker" = "latest"
-
-# Rust via rustup backend — installs musl cross-compilation targets + rust-src
+go = "1.26"
+zig = "0.15"
 rust = { version = "stable", targets = "x86_64-unknown-linux-musl,aarch64-unknown-linux-musl", components = "rust-src" }
 task = "latest"
-
-[settings]
-experimental = true

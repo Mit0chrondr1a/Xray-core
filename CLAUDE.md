@@ -24,18 +24,16 @@ Uses `Taskfile.yaml` + `mise` for toolchain management. **Do not look for `build
 
 ## eBPF Build Pitfalls
 
-The eBPF build has three environment hazards that cause confusing failures:
+1. **`RUSTUP_TOOLCHAIN` override:** mise sets `RUSTUP_TOOLCHAIN=stable`, which prevents rustup from reading `rust-toolchain.toml`. The Taskfile parses the pinned nightly channel and exports `RUSTUP_TOOLCHAIN` explicitly.
 
-1. **bpf-linker PATH shadowing:** Nix may install an older `bpf-linker` linked against LLVM 21 that shadows `~/.cargo/bin/bpf-linker` (LLVM 22). Symptoms: SIGSEGV in the SROA pass, or `Unknown attribute kind (Producer LLVM22 / Reader LLVM21)`. The Taskfile mitigates this by resolving `$HOME/.cargo/bin/bpf-linker` explicitly via `CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER`.
-
-2. **`RUSTUP_TOOLCHAIN` vs mise:** mise exports `RUSTUP_TOOLCHAIN=stable`. Setting it to `""` in go-task exports an empty string (not unset), which may prevent rustup from reading `rust-toolchain.toml`. The Taskfile parses the channel from `rust-toolchain.toml` and exports `RUSTUP_TOOLCHAIN` explicitly.
-
-3. **bpf-linker must match the pinned nightly's LLVM:** After bumping the nightly pin in `rust/xray-ebpf/rust-toolchain.toml`, always reinstall bpf-linker:
+2. **bpf-linker must match the pinned nightly's LLVM:** After bumping the nightly pin in `rust/xray-ebpf/rust-toolchain.toml`, always reinstall bpf-linker:
    ```bash
    RUSTUP_TOOLCHAIN=<new-nightly> cargo install bpf-linker --force
    ```
 
-**Debugging tip:** When a linker segfaults, run `which <linker>` before blaming the compiler — PATH shadowing is the most common cause.
+3. **bpf-linker PATH shadowing:** System package managers may install an older `bpf-linker` that shadows `~/.cargo/bin/bpf-linker`. Symptoms: SIGSEGV in the SROA pass, or LLVM version mismatch errors. The Taskfile resolves bpf-linker by absolute path to prevent this.
+
+**Debugging tip:** When a linker segfaults, run `which <linker>` before blaming the compiler.
 
 ## Testing
 
