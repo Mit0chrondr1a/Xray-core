@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 
 	xerrors "github.com/xtls/xray-core/common/errors"
 	xlog "github.com/xtls/xray-core/common/log"
@@ -32,10 +33,23 @@ func logAccelerationSummary(ctx context.Context) {
 		sockhashFD = st.sockhashFD
 	}
 
+	// Determine loader type and resolve sockhash FD for display.
+	loaderType := "go-native"
+	if nativeEbpfAvailable() && st != nil && st.sockmapPinPath != "" && sockhashFD < 0 {
+		// Rust/Aya loader is active — FDs are Rust-managed, so sockhashFD is -1.
+		loaderType = "rust-aya"
+		// Try to open pinned sockhash for FD display (best-effort).
+		if fd, err := openPinnedBPFMap(sockhashPinPath(st.sockmapPinPath)); err == nil {
+			sockhashFD = fd
+			defer syscall.Close(fd)
+		}
+	}
+
 	capacity := DefaultSockmapConfig().MaxEntries
 
 	xerrors.LogInfo(ctx,
-		"sockmap: acceleration summary — plain-TCP=sockmap kTLS=", ktlsPath,
+		"sockmap: acceleration summary — loader=", loaderType,
+		" plain-TCP=sockmap kTLS=", ktlsPath,
 		"(", ktlsDetail, ") kernel=", unameRelease(),
 		" sockhash-fd=", sockhashFD,
 		" capacity=", capacity,

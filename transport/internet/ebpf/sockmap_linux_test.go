@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -32,6 +33,19 @@ func TestSockmapManagerEnable(t *testing.T) {
 
 	if !mgr.IsEnabled() {
 		t.Fatal("IsEnabled should return true after Enable")
+	}
+}
+
+func TestSetupSockmapImplRejectsInvalidPinPath(t *testing.T) {
+	err := setupSockmapImpl(SockmapConfig{
+		MaxEntries: 64,
+		PinPath:    "/tmp/xray-invalid-bpf-path",
+	})
+	if err == nil {
+		t.Fatal("expected invalid pin path error")
+	}
+	if !strings.Contains(err.Error(), "pin path must be under /sys/fs/bpf/") {
+		t.Fatalf("unexpected error for invalid pin path: %v", err)
 	}
 }
 

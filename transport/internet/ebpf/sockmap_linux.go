@@ -18,6 +18,7 @@ import (
 	"unsafe"
 
 	xerrors "github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"golang.org/x/sys/unix"
 )
 
@@ -225,6 +226,16 @@ func checkBPFSysctls() {
 // the same pin directory layout (/sys/fs/bpf/xray/) and policy map schema,
 // but only one should be active per process at a time.
 func setupSockmapImpl(config SockmapConfig) error {
+	// Validate PinPath before creating any BPF resources so invalid config
+	// fails fast without allocating kernel objects or FDs.
+	pinDir := ""
+	if config.PinPath != "" {
+		pinDir = filepath.Clean(config.PinPath)
+		if !strings.HasPrefix(pinDir, "/sys/fs/bpf/") {
+			return fmt.Errorf("pin path must be under /sys/fs/bpf/: %s", pinDir)
+		}
+	}
+
 	// Create SOCKHASH map for cookie→socket redirect.
 	hashFD, err := createBPFMap(
 		bpfMapTypeSockhash,
@@ -312,17 +323,19 @@ func setupSockmapImpl(config SockmapConfig) error {
 	}
 
 	// Pin maps to BPF filesystem with 0600 permissions
-	pinDir := ""
-	if config.PinPath != "" {
-		pinDir = filepath.Clean(config.PinPath)
+	closeSetupFDs := func() {
+		if fallbackAttachFD >= 0 {
+			syscall.Close(fallbackAttachFD)
+		}
+		syscall.Close(verdictFD)
+		syscall.Close(parserFD)
+		syscall.Close(hashFD)
+		syscall.Close(policyFD)
+	}
+
+	if pinDir != "" {
 		if err := pinMaps(pinDir, hashFD, policyFD); err != nil {
-			if fallbackAttachFD >= 0 {
-				syscall.Close(fallbackAttachFD)
-			}
-			syscall.Close(verdictFD)
-			syscall.Close(parserFD)
-			syscall.Close(hashFD)
-			syscall.Close(policyFD)
+			closeSetupFDs()
 			return fmt.Errorf("failed to pin BPF maps: %w", err)
 		}
 	}
@@ -908,7 +921,20 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 // sockets are eligible for sockmap redirect.
 func probeKTLSSockhashCompat() bool {
 	st := currentState.Load()
-	if st.sockhashFD < 0 {
+	sockhashFD := st.sockhashFD
+
+	// When the Rust/Aya loader is active, sockhashFD is -1 (Rust-managed).
+	// Open the pinned SOCKHASH map for this probe, then close it after.
+	var pinnedFD int
+	if sockhashFD < 0 && st.sockmapPinPath != "" {
+		var err error
+		pinnedFD, err = openPinnedBPFMap(sockhashPinPath(st.sockmapPinPath))
+		if err != nil {
+			return false
+		}
+		defer syscall.Close(pinnedFD)
+		sockhashFD = pinnedFD
+	} else if sockhashFD < 0 {
 		return false
 	}
 
@@ -995,11 +1021,11 @@ func probeKTLSSockhashCompat() bool {
 		}
 		key := cookie
 		value := uint32(intFD)
-		if err := bpfMapUpdate(st.sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+		if err := bpfMapUpdate(sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
 			return
 		}
 		// Clean up — remove probe entry.
-		_ = bpfMapDelete(st.sockhashFD, unsafe.Pointer(&key))
+		_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
 		ktlsOK = true
 	})
 
@@ -1064,4 +1090,109 @@ func isSocketAlive(fd int) bool {
 		0,
 	)
 	return errno == 0
+}
+
+// --- Rust/Aya native eBPF loader functions ---
+
+// nativeEbpfAvailable returns true if the Rust/Aya eBPF loader is compiled in
+// and the eBPF bytecode is available.
+func nativeEbpfAvailable() bool {
+	return native.EbpfAvailable()
+}
+
+// setupSockmapNative initializes eBPF via the Rust/Aya loader. This loads all
+// three programs (SK_SKB parser + verdict + SK_MSG cork) and pins maps to bpffs.
+func setupSockmapNative(config SockmapConfig) error {
+	// Validate PinPath before passing to Rust/Aya loader (same check as Go-native path).
+	if config.PinPath != "" {
+		pinDir := filepath.Clean(config.PinPath)
+		if !strings.HasPrefix(pinDir, "/sys/fs/bpf/") {
+			return fmt.Errorf("pin path must be under /sys/fs/bpf/: %s", pinDir)
+		}
+		config.PinPath = pinDir
+	}
+
+	corkThreshold := config.CorkThreshold
+	if corkThreshold == 0 {
+		corkThreshold = 1400
+	}
+
+	if err := native.EbpfSetup(config.PinPath, config.MaxEntries, corkThreshold); err != nil {
+		return fmt.Errorf("native ebpf setup: %w", err)
+	}
+
+	// The Rust loader manages its own FDs and map pinning. Set currentState
+	// to sentinel values so the Go-native path knows not to use its FDs.
+	// sockhashFD = -1 signals "Rust-managed" to probeKTLSSockhashCompat.
+	currentState.Store(&ebpfState{
+		sockhashFD:      -1,
+		policyMapFD:     -1,
+		skSkbParserFD:   -1,
+		skSkbVerdictFD:  -1,
+		sockmapAttachFD: -1,
+		sockmapPinPath:  filepath.Clean(config.PinPath),
+	})
+
+	checkBPFSysctls()
+
+	if config.DropCapabilities {
+		if err := dropExcessCapabilities(); err != nil {
+			xerrors.LogWarning(context.Background(), "failed to drop excess capabilities: ", err)
+		}
+	}
+
+	return nil
+}
+
+// teardownSockmapNative tears down eBPF programs via the Rust/Aya loader.
+func teardownSockmapNative() error {
+	// Publish closed state before tearing down, same as Go-native path.
+	currentState.Store(&ebpfState{
+		sockhashFD:      -1,
+		policyMapFD:     -1,
+		skSkbParserFD:   -1,
+		skSkbVerdictFD:  -1,
+		sockmapAttachFD: -1,
+	})
+
+	if err := native.EbpfTeardown(); err != nil {
+		return fmt.Errorf("native ebpf teardown: %w", err)
+	}
+	return nil
+}
+
+// setupForwardingNative registers a socket pair via the Rust/Aya loader.
+// The Rust side handles SOCKHASH insertion and policy map writes atomically.
+func setupForwardingNative(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64, policyFlags uint32) error {
+	return native.EbpfRegisterPair(inboundFD, outboundFD, inboundCookie, outboundCookie, policyFlags)
+}
+
+// removeForwardingNative unregisters a socket pair via the Rust/Aya loader.
+// The Rust side handles SOCKHASH deletion and policy map cleanup atomically.
+func removeForwardingNative(inboundCookie, outboundCookie uint64) error {
+	return native.EbpfUnregisterPair(inboundCookie, outboundCookie)
+}
+
+// openPinnedBPFMap opens a pinned BPF map from the filesystem via BPF_OBJ_GET.
+// The caller is responsible for closing the returned FD.
+func openPinnedBPFMap(path string) (int, error) {
+	pathBytes := append([]byte(path), 0)
+	attr := struct {
+		pathname  uint64
+		bpfFD     uint32
+		fileFlags uint32
+	}{
+		pathname: uint64(uintptr(unsafe.Pointer(&pathBytes[0]))),
+	}
+
+	fd, _, errno := syscall.Syscall(
+		unix.SYS_BPF,
+		7, // BPF_OBJ_GET
+		uintptr(unsafe.Pointer(&attr)),
+		unsafe.Sizeof(attr),
+	)
+	if errno != 0 {
+		return -1, fmt.Errorf("BPF_OBJ_GET %s: %w", path, errno)
+	}
+	return int(fd), nil
 }
