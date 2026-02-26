@@ -80,6 +80,10 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 			if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, int(config.TcpUserTimeout)); err != nil {
 				return errors.New("failed to set TCP_USER_TIMEOUT", err)
 			}
+		} else {
+			// Default 30s: kill connections with unacked data after 30s,
+			// covering the gap where keepalives don't fire (active transfers on dead paths).
+			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, 30000)
 		}
 
 		if config.TcpMaxSeg > 0 {
@@ -195,6 +199,10 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 			if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, int(config.TcpUserTimeout)); err != nil {
 				return errors.New("failed to set TCP_USER_TIMEOUT", err)
 			}
+		} else {
+			// Default 30s: kill connections with unacked data after 30s,
+			// covering the gap where keepalives don't fire (active transfers on dead paths).
+			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, 30000)
 		}
 
 		if config.TcpMaxSeg > 0 {
