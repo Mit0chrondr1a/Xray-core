@@ -30,16 +30,16 @@ func TestNativeTLSConfigVersions(t *testing.T) {
 			wantTLS13: false,
 		},
 		{
-			name:      "unsupported range falls back to tls13",
+			name:      "legacy-only range disables native kTLS versions",
 			cfg:       &Config{MinVersion: "1.0", MaxVersion: "1.1"},
 			wantTLS12: false,
-			wantTLS13: true,
+			wantTLS13: false,
 		},
 		{
-			name:      "inverted range falls back to tls13",
+			name:      "inverted range disables native kTLS versions",
 			cfg:       &Config{MinVersion: "1.3", MaxVersion: "1.2"},
 			wantTLS12: false,
-			wantTLS13: true,
+			wantTLS13: false,
 		},
 		{
 			name:      "invalid strings keep defaults",
