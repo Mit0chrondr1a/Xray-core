@@ -91,7 +91,7 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
 		// default disable keepalive
 		lc.KeepAlive = -1
 		if sockopt != nil {
-			if sockopt.TcpKeepAliveIdle*sockopt.TcpKeepAliveInterval < 0 {
+			if hasMixedSignKeepAliveValues(sockopt.TcpKeepAliveIdle, sockopt.TcpKeepAliveInterval) {
 				return nil, errors.New("invalid TcpKeepAliveIdle or TcpKeepAliveInterval value: ", sockopt.TcpKeepAliveIdle, " ", sockopt.TcpKeepAliveInterval)
 			}
 			lc.KeepAliveConfig = net.KeepAliveConfig{
