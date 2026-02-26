@@ -69,10 +69,8 @@ func (v KernelVersion) String() string {
 }
 
 var (
-	detectedCaps     Capabilities
-	capsOnce         sync.Once
-	capsDetected     bool
-	capsMu           sync.RWMutex
+	detectedCaps Capabilities
+	capsOnce     sync.Once
 )
 
 // GetCapabilities returns the detected eBPF capabilities of the system.
@@ -80,7 +78,6 @@ var (
 func GetCapabilities() Capabilities {
 	capsOnce.Do(func() {
 		detectedCaps = probeCapabilities()
-		capsDetected = true
 	})
 	return detectedCaps
 }
@@ -143,6 +140,11 @@ type SockmapConfig struct {
 	// DropCapabilities controls whether excess Linux capabilities are
 	// dropped after BPF setup. Defense-in-depth measure.
 	DropCapabilities bool
+
+	// CorkThreshold is the SK_MSG cork batching threshold in bytes.
+	// Small sendmsg() calls are coalesced until this many bytes are buffered.
+	// Only used by the Rust/Aya loader (SK_MSG program). Default is 1400.
+	CorkThreshold uint32
 }
 
 // RoutingCacheConfig configures the BPF routing cache.
@@ -171,13 +173,14 @@ func DefaultSockmapConfig() SockmapConfig {
 		MaxEntries:       65536,
 		PinPath:          "/sys/fs/bpf/xray/",
 		DropCapabilities: true,
+		CorkThreshold:    1400,
 	}
 }
 
 // DefaultRoutingCacheConfig returns the default routing cache configuration.
 func DefaultRoutingCacheConfig() RoutingCacheConfig {
 	return RoutingCacheConfig{
-		MaxEntries: 32768,
+		MaxEntries: 8192,
 		TTLSeconds: 60,
 	}
 }

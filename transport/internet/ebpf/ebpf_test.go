@@ -15,10 +15,10 @@ func TestKernelVersionAtLeast(t *testing.T) {
 		patch  int
 		expect bool
 	}{
-		{KernelVersion{5, 4, 0}, 5, 4, 0, true},   // exact match
-		{KernelVersion{5, 4, 1}, 5, 4, 0, true},   // patch higher
-		{KernelVersion{5, 5, 0}, 5, 4, 0, true},   // minor higher
-		{KernelVersion{6, 0, 0}, 5, 4, 0, true},   // major higher
+		{KernelVersion{5, 4, 0}, 5, 4, 0, true},    // exact match
+		{KernelVersion{5, 4, 1}, 5, 4, 0, true},    // patch higher
+		{KernelVersion{5, 5, 0}, 5, 4, 0, true},    // minor higher
+		{KernelVersion{6, 0, 0}, 5, 4, 0, true},    // major higher
 		{KernelVersion{5, 3, 255}, 5, 4, 0, false}, // minor lower
 		{KernelVersion{4, 17, 0}, 5, 4, 0, false},  // major lower
 		{KernelVersion{5, 4, 0}, 5, 4, 1, false},   // patch lower
@@ -76,12 +76,26 @@ func TestDefaultSockmapConfig(t *testing.T) {
 	if !cfg.DropCapabilities {
 		t.Fatal("DropCapabilities should default to true")
 	}
+	if cfg.CorkThreshold != 1400 {
+		t.Fatalf("CorkThreshold=%d, want 1400", cfg.CorkThreshold)
+	}
+}
+
+func TestDefaultSockmapConfig_CorkThresholdIsNonZero(t *testing.T) {
+	cfg := DefaultSockmapConfig()
+	if cfg.CorkThreshold == 0 {
+		t.Fatal("CorkThreshold must be non-zero in default config")
+	}
+	// CorkThreshold should approximate typical MTU payload
+	if cfg.CorkThreshold < 500 || cfg.CorkThreshold > 9000 {
+		t.Fatalf("CorkThreshold=%d, expected a value between 500 and 9000 (near MTU)", cfg.CorkThreshold)
+	}
 }
 
 func TestDefaultRoutingCacheConfig(t *testing.T) {
 	cfg := DefaultRoutingCacheConfig()
-	if cfg.MaxEntries != 32768 {
-		t.Fatalf("MaxEntries=%d, want 32768", cfg.MaxEntries)
+	if cfg.MaxEntries != 8192 {
+		t.Fatalf("MaxEntries=%d, want 8192", cfg.MaxEntries)
 	}
 	if cfg.TTLSeconds != 60 {
 		t.Fatalf("TTLSeconds=%d, want 60", cfg.TTLSeconds)
