@@ -3,7 +3,10 @@ package freedom
 import (
 	"context"
 	"crypto/rand"
+	goerrors "errors"
 	"io"
+	gonet "net"
+	"syscall"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -78,6 +81,9 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	outbounds := session.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 {
+		return errors.New("no outbound metadata in context")
+	}
 	ob := outbounds[len(outbounds)-1]
 	if !ob.Target.IsValid() {
 		return errors.New("target not specified.")
@@ -119,7 +125,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 			ips, err := internet.LookupForIP(dialDest.Address.Domain(), strategy, outGateway)
 			if err != nil {
-				errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
+				errors.LogDebugInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
 				if h.config.DomainStrategy.ForceIP() {
 					return err
 				}
@@ -129,7 +135,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					Address: net.IPAddress(ips[dice.Roll(len(ips))]),
 					Port:    dialDest.Port,
 				}
-				errors.LogInfo(ctx, "dialing to ", dialDest)
+				errors.LogDebug(ctx, "dialing to ", dialDest)
 			}
 		}
 
@@ -156,7 +162,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("failed to open connection to ", destination).Base(err)
 	}
 	defer conn.Close()
-	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
+	errors.LogDebug(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
 	var newCtx context.Context
 	var newCancel context.CancelFunc
@@ -203,6 +209,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+			if destination.Network == net.Network_TCP && isExpectedRequestReadError(err) {
+				errors.LogDebugInner(ctx, err, "freedom: request stream closed by peer")
+				return nil
+			}
 			return errors.New("failed to process request").Base(err)
 		}
 
@@ -241,6 +251,28 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	return nil
+}
+
+func isExpectedRequestReadError(err error) bool {
+	if err == nil || !buf.IsReadError(err) {
+		return false
+	}
+	cause := errors.Cause(err)
+	if cause == nil {
+		return false
+	}
+	if goerrors.Is(cause, io.EOF) ||
+		goerrors.Is(cause, io.ErrClosedPipe) ||
+		goerrors.Is(cause, context.Canceled) ||
+		goerrors.Is(cause, gonet.ErrClosed) {
+		return true
+	}
+
+	return goerrors.Is(cause, syscall.ECONNRESET) ||
+		goerrors.Is(cause, syscall.EPIPE) ||
+		goerrors.Is(cause, syscall.ENOTCONN) ||
+		goerrors.Is(cause, syscall.ESHUTDOWN) ||
+		goerrors.Is(cause, syscall.EIO)
 }
 
 func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.Destination) buf.Reader {
