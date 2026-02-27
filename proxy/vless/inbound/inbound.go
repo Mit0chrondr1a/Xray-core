@@ -337,6 +337,15 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				alpn = cs.NegotiatedProtocol
 				errors.LogInfo(ctx, "realName = "+name)
 				errors.LogInfo(ctx, "realAlpn = "+alpn)
+			} else if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+				cs := dc.ConnectionState()
+				name = cs.ServerName
+				alpn = cs.NegotiatedProtocol
+				errors.LogInfo(ctx, "realName = "+name)
+				errors.LogInfo(ctx, "realAlpn = "+alpn)
+				if ktlsErr := dc.EnableKTLS(); ktlsErr != nil {
+					return errors.New("deferred kTLS enable failed in fallback").Base(ktlsErr).AtWarning()
+				}
 			}
 			name = strings.ToLower(name)
 			alpn = strings.ToLower(alpn)
@@ -587,7 +596,17 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
 						return errors.New("RustConn without full kTLS cannot use " + requestAddons.Flow).AtWarning()
 					}
-					// kTLS handles TLS 1.3 in kernel; no input/rawInput to extract.
+					// kTLS + Vision is a configuration error: kTLS should have been
+					// gated upstream (hub.go). Vision is the priority optimization.
+					// Proceed anyway — will likely EBADMSG if peer lacks kTLS.
+					// See docs/ktls-vision-incompatibility.md.
+					errors.LogWarning(ctx, requestAddons.Flow, " on RustConn with kTLS: ",
+						"outer TLS cannot be stripped after command=2 — kTLS should be gated upstream")
+					input = &bytes.Reader{}
+					rawInput = &bytes.Buffer{}
+				} else if _, ok := iConn.(*tls.DeferredRustConn); ok {
+					// Deferred kTLS: rustls handles TLS. Vision will strip at command=2.
+					// No Go-level TLS buffers (RecordReader reads record-by-record).
 					input = &bytes.Reader{}
 					rawInput = &bytes.Buffer{}
 				} else {
@@ -607,6 +626,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		inbound.CanSpliceCopy = 3
 		if account.Flow == vless.XRV && (request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) {
 			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
+		}
+		if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+			if err := dc.EnableKTLS(); err != nil {
+				return errors.New("deferred kTLS enable failed for non-Vision VLESS").Base(err).AtWarning()
+			} else {
+				errors.LogDebug(ctx, "non-Vision VLESS: kTLS enabled on DeferredRustConn")
+			}
 		}
 	default:
 		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()

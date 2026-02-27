@@ -387,6 +387,15 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 		alpn = cs.NegotiatedProtocol
 		errors.LogInfo(ctx, "realName = "+name)
 		errors.LogInfo(ctx, "realAlpn = "+alpn)
+	} else if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+		cs := dc.ConnectionState()
+		name = cs.ServerName
+		alpn = cs.NegotiatedProtocol
+		if ktlsErr := dc.EnableKTLS(); ktlsErr != nil {
+			return errors.New("deferred kTLS enable failed in Trojan fallback").Base(ktlsErr).AtWarning()
+		}
+		errors.LogInfo(ctx, "realName = "+name)
+		errors.LogInfo(ctx, "realAlpn = "+alpn)
 	}
 	name = strings.ToLower(name)
 	alpn = strings.ToLower(alpn)

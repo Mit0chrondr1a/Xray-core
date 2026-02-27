@@ -844,6 +844,9 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 			} else if rc, ok := conn.(*tls.RustConn); ok {
 				handler = rc.KTLSKeyUpdateHandler()
 				conn = rc.NetConn()
+			} else if dc, ok := conn.(*tls.DeferredRustConn); ok {
+				handler = dc.KTLSKeyUpdateHandler()
+				conn = dc.NetConn()
 			} else if utlsConn, ok := conn.(*tls.UConn); ok {
 				conn = utlsConn.NetConn()
 			} else if realityConn, ok := conn.(*reality.Conn); ok {
@@ -957,6 +960,21 @@ func determineSocketCryptoHintRecurse(conn net.Conn, depth int) (net.Conn, ebpf.
 			return raw, ebpf.CryptoKTLSRxOnly, appendCryptoHintSource(source, "*tls.RustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 		}
 		return raw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.RustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
+	}
+
+	if dc, ok := conn.(*tls.DeferredRustConn); ok {
+		ktls := dc.KTLSEnabled()
+		raw := dc.NetConn()
+		if ktls.TxReady && ktls.RxReady {
+			return raw, ebpf.CryptoKTLSBoth, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
+		}
+		if ktls.TxReady {
+			return raw, ebpf.CryptoKTLSTxOnly, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
+		}
+		if ktls.RxReady {
+			return raw, ebpf.CryptoKTLSRxOnly, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
+		}
+		return raw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 	}
 
 	if utlsConn, ok := conn.(*tls.UConn); ok {

@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/proxy/vmess"
 	"github.com/xtls/xray-core/proxy/vmess/encoding"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 type userByEmail struct {
@@ -230,6 +231,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 
 	iConn := stat.TryUnwrapStatsConn(connection)
+	// VMess never uses Vision — always wants kTLS if available.
+	if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+		if err := dc.EnableKTLS(); err != nil {
+			return errors.New("deferred kTLS enable failed for VMess").Base(err).AtWarning()
+		}
+	}
 	_, isDrain := iConn.(*net.TCPConn)
 	if !isDrain {
 		_, isDrain = iConn.(*net.UnixConn)
