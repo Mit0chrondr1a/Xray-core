@@ -133,6 +133,30 @@ func RealityServerHandshakeWithTimeout(int, *RealityConfigHandle, time.Duration)
 	return nil, errNotAvailable
 }
 
+// --- Deferred REALITY Session Stubs ---
+
+type DeferredSessionHandle struct{}
+type DeferredResult struct {
+	Handle      *DeferredSessionHandle
+	Version     uint16
+	CipherSuite uint16
+	ALPN        string
+	SNI         string
+}
+
+func RealityServerDeferred(int, *RealityConfigHandle, time.Duration) (*DeferredResult, error) {
+	return nil, errNotAvailable
+}
+func TlsServerDeferred(int, *TlsConfigHandle, time.Duration) (*DeferredResult, error) {
+	return nil, errNotAvailable
+}
+func DeferredRead(*DeferredSessionHandle, []byte) (int, error)  { return 0, errNotAvailable }
+func DeferredWrite(*DeferredSessionHandle, []byte) (int, error) { return 0, errNotAvailable }
+func DeferredEnableKTLS(*DeferredSessionHandle) (*TlsResult, error) {
+	return nil, errNotAvailable
+}
+func DeferredFree(*DeferredSessionHandle) {}
+
 // --- Blake3 (delegates to lukechampine.com/blake3) ---
 
 // Blake3DeriveKey derives a key using BLAKE3's KDF mode.
@@ -271,6 +295,18 @@ func GeoIPLoad(string, []string) ([]*IpSetHandle, error)     { return nil, errNo
 func GeoSiteLoad(string, []string) ([][]GeoSiteEntry, error) { return nil, errNotAvailable }
 
 // --- eBPF Stubs ---
+
+// SkMsgCapability indicates which SK_MSG tier the Rust/Aya loader achieved.
+type SkMsgCapability int
+
+const (
+	SkMsgFull     SkMsgCapability = 0
+	SkMsgCorkOnly SkMsgCapability = 1
+	SkMsgNone     SkMsgCapability = 2
+)
+
+// EbpfSkMsgCapability returns SkMsgNone when native eBPF is not available.
+func EbpfSkMsgCapability() SkMsgCapability { return SkMsgNone }
 
 func EbpfSetup(string, uint32, uint32) error                  { return errNotAvailable }
 func EbpfTeardown() error                                     { return errNotAvailable }

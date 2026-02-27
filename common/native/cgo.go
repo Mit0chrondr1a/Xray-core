@@ -70,6 +70,24 @@ extern int32_t xray_reality_client_connect(int fd, const uint8_t* client_hello_r
 extern int32_t xray_reality_server_accept(int fd, const void* reality_config, struct xray_tls_result* out);
 extern int32_t xray_reality_server_handshake(int fd, const void* reality_config, uint32_t handshake_timeout_ms, struct xray_tls_result* out);
 
+// Deferred REALITY handshake (no kTLS install)
+struct xray_deferred_result {
+    void*    handle;
+    uint16_t version;
+    uint16_t cipher_suite;
+    uint8_t  alpn[32];
+    uint8_t  sni[256];
+    int32_t  error_code;
+    char     error_msg[256];
+};
+
+extern int32_t xray_reality_server_deferred(int fd, const void* reality_config, uint32_t handshake_timeout_ms, struct xray_deferred_result* out);
+extern int32_t xray_tls_server_deferred(int fd, const void* cfg, uint32_t handshake_timeout_ms, struct xray_deferred_result* out);
+extern int32_t xray_deferred_read(void* handle, uint8_t* buf, size_t len, size_t* out_n);
+extern int32_t xray_deferred_write(void* handle, const uint8_t* buf, size_t len, size_t* out_n);
+extern int32_t xray_deferred_enable_ktls(void* handle, struct xray_tls_result* out);
+extern void    xray_deferred_free(void* handle);
+
 // Blake3
 extern void xray_blake3_derive_key(uint8_t* out, size_t out_len,
     const uint8_t* ctx, size_t ctx_len,
@@ -698,6 +716,189 @@ func RealityServerHandshakeWithTimeout(fd int, cfg *RealityConfigHandle, handsha
 		return nil, errors.New("native REALITY server handshake: " + errMsg)
 	}
 	return extractTlsResult(&cResult), nil
+}
+
+// --- Deferred REALITY Session ---
+
+// DeferredSessionHandle is an opaque handle to a Rust deferred REALITY session.
+type DeferredSessionHandle struct {
+	ptr unsafe.Pointer
+}
+
+// DeferredResult contains the result of a deferred REALITY handshake.
+type DeferredResult struct {
+	Handle      *DeferredSessionHandle
+	Version     uint16
+	CipherSuite uint16
+	ALPN        string
+	SNI         string
+}
+
+// RealityServerDeferred performs REALITY auth + handshake without installing kTLS.
+// Returns a deferred session that supports Read/Write through rustls.
+func RealityServerDeferred(fd int, cfg *RealityConfigHandle, timeout time.Duration) (*DeferredResult, error) {
+	if cfg == nil {
+		return nil, errors.New("native: nil reality config handle")
+	}
+	var cResult C.struct_xray_deferred_result
+	rc := C.xray_reality_server_deferred(C.int(fd), cfg.ptr, timeoutMillis(timeout), &cResult)
+	runtime.KeepAlive(cfg)
+	if rc != 0 {
+		errMsg := C.GoString(&cResult.error_msg[0])
+		code := int32(cResult.error_code)
+		if code == 1 {
+			return nil, fmt.Errorf("%w: %s", ErrRealityAuthFailed, errMsg)
+		}
+		return nil, errors.New("native REALITY deferred: " + errMsg)
+	}
+
+	result := &DeferredResult{
+		Version:     uint16(cResult.version),
+		CipherSuite: uint16(cResult.cipher_suite),
+	}
+	if cResult.handle != nil {
+		result.Handle = &DeferredSessionHandle{ptr: cResult.handle}
+	}
+
+	// Extract ALPN (null-terminated string in 32-byte buffer)
+	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
+	for i, b := range alpnBytes {
+		if b == 0 {
+			result.ALPN = string(alpnBytes[:i])
+			break
+		}
+	}
+
+	// Extract SNI (null-terminated string in 256-byte buffer)
+	sniBytes := C.GoBytes(unsafe.Pointer(&cResult.sni[0]), 256)
+	for i, b := range sniBytes {
+		if b == 0 {
+			result.SNI = string(sniBytes[:i])
+			break
+		}
+	}
+
+	return result, nil
+}
+
+// TlsServerDeferred performs a regular TLS server handshake via rustls without
+// installing kTLS. Returns a deferred session (same type as REALITY deferred)
+// that the protocol handler can later promote to kTLS or keep as rustls.
+func TlsServerDeferred(fd int, cfg *TlsConfigHandle, timeout time.Duration) (*DeferredResult, error) {
+	if cfg == nil {
+		return nil, errors.New("native: nil TLS config handle")
+	}
+	var cResult C.struct_xray_deferred_result
+	rc := C.xray_tls_server_deferred(C.int(fd), cfg.ptr, timeoutMillis(timeout), &cResult)
+	runtime.KeepAlive(cfg)
+	if rc != 0 {
+		errMsg := C.GoString(&cResult.error_msg[0])
+		return nil, errors.New("native TLS server deferred: " + errMsg)
+	}
+
+	result := &DeferredResult{
+		Version:     uint16(cResult.version),
+		CipherSuite: uint16(cResult.cipher_suite),
+	}
+	if cResult.handle != nil {
+		result.Handle = &DeferredSessionHandle{ptr: cResult.handle}
+	}
+
+	// Extract ALPN (null-terminated string in 32-byte buffer)
+	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
+	for i, b := range alpnBytes {
+		if b == 0 {
+			result.ALPN = string(alpnBytes[:i])
+			break
+		}
+	}
+
+	// Extract SNI (null-terminated string in 256-byte buffer)
+	sniBytes := C.GoBytes(unsafe.Pointer(&cResult.sni[0]), 256)
+	for i, b := range sniBytes {
+		if b == 0 {
+			result.SNI = string(sniBytes[:i])
+			break
+		}
+	}
+
+	return result, nil
+}
+
+// DeferredRead reads decrypted data through the deferred session's rustls connection.
+func DeferredRead(handle *DeferredSessionHandle, buf []byte) (int, error) {
+	if handle == nil || handle.ptr == nil {
+		return 0, errors.New("native: nil deferred session handle")
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	var outN C.size_t
+	rc := C.xray_deferred_read(
+		handle.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+		C.size_t(len(buf)),
+		&outN,
+	)
+	runtime.KeepAlive(handle)
+	runtime.KeepAlive(buf)
+	if rc != 0 {
+		return 0, errors.New("native: deferred read failed")
+	}
+	return int(outN), nil
+}
+
+// DeferredWrite writes plaintext data through the deferred session's rustls connection.
+func DeferredWrite(handle *DeferredSessionHandle, buf []byte) (int, error) {
+	if handle == nil || handle.ptr == nil {
+		return 0, errors.New("native: nil deferred session handle")
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	var outN C.size_t
+	rc := C.xray_deferred_write(
+		handle.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+		C.size_t(len(buf)),
+		&outN,
+	)
+	runtime.KeepAlive(handle)
+	runtime.KeepAlive(buf)
+	if rc != 0 {
+		return 0, errors.New("native: deferred write failed")
+	}
+	return int(outN), nil
+}
+
+// DeferredEnableKTLS consumes the deferred session and installs kTLS on the socket.
+// After this call, the handle is invalid and must not be used.
+func DeferredEnableKTLS(handle *DeferredSessionHandle) (*TlsResult, error) {
+	if handle == nil || handle.ptr == nil {
+		return nil, errors.New("native: nil deferred session handle")
+	}
+	ptr := handle.ptr
+	handle.ptr = nil // consumed — prevent double-free
+	var cResult C.struct_xray_tls_result
+	rc := C.xray_deferred_enable_ktls(ptr, &cResult)
+	if rc != 0 {
+		errMsg := C.GoString(&cResult.error_msg[0])
+		return nil, errors.New("native: deferred enable_ktls: " + errMsg)
+	}
+	return extractTlsResult(&cResult), nil
+}
+
+// DeferredFree releases a deferred session without enabling kTLS.
+// Used for Vision flows where kTLS is not wanted.
+func DeferredFree(handle *DeferredSessionHandle) {
+	if handle == nil {
+		return
+	}
+	ptr := handle.ptr
+	handle.ptr = nil
+	if ptr != nil {
+		C.xray_deferred_free(ptr)
+	}
 }
 
 // extractTlsResult populates a TlsResult from the C struct, extracting ALPN,
@@ -1586,6 +1787,21 @@ func GeoSiteLoad(path string, codes []string) ([][]GeoSiteEntry, error) {
 
 // --- eBPF FFI ---
 
+// SkMsgCapability indicates which SK_MSG tier the Rust/Aya loader achieved.
+type SkMsgCapability int
+
+const (
+	SkMsgFull     SkMsgCapability = 0 // cork + cookie lookup + redirect
+	SkMsgCorkOnly SkMsgCapability = 1 // cork batching only, no redirect
+	SkMsgNone     SkMsgCapability = 2 // no SK_MSG loaded
+)
+
+// ebpfSkMsgCapability records the SK_MSG tier from the last successful setup.
+var ebpfSkMsgCapability SkMsgCapability = SkMsgNone
+
+// EbpfSkMsgCapability returns the SK_MSG capability level from the Rust loader.
+func EbpfSkMsgCapability() SkMsgCapability { return ebpfSkMsgCapability }
+
 // EbpfSetup initializes eBPF sockmap with pinned maps for zero-downtime recovery.
 func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {
 	if pinPath == "" {
@@ -1601,9 +1817,10 @@ func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {
 	cPath := C.CString(pinPath)
 	defer C.free(unsafe.Pointer(cPath))
 	rc := C.xray_ebpf_setup(cPath, C.uint32_t(maxEntries), C.uint32_t(corkThreshold))
-	if rc != 0 {
+	if rc < 0 {
 		return fmt.Errorf("native: ebpf setup failed: %s (rc=%d)", ebpfSetupErrorDetail(rc), rc)
 	}
+	ebpfSkMsgCapability = SkMsgCapability(rc)
 	return nil
 }
 
