@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/uuid"
@@ -127,8 +128,16 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				if err := conn.(*tls.UConn).HandshakeContext(ctxInner); err != nil {
 					return nil, err
 				}
+			} else if native.Available() && tls.NativeFullKTLSSupportedForTLSConfig(tlsConfig) {
+				conn, err = tls.RustClientWithTimeout(conn, tlsConfig, dest, 0)
+				if err != nil {
+					return nil, err
+				}
 			} else {
 				conn = tls.Client(conn, gotlsConfig)
+				if err := conn.(*tls.Conn).HandshakeAndEnableKTLS(ctxInner); err != nil {
+					return nil, err
+				}
 			}
 		}
 

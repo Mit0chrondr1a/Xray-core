@@ -19,6 +19,7 @@ import (
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
@@ -460,6 +461,60 @@ func (c *httpServerConn) Close() error {
 	return c.Instance.Close()
 }
 
+// kTLSListener wraps a net.Listener to perform Rust-based TLS handshakes
+// with mandatory kTLS offload on Accept. The returned connections have TLS
+// handled transparently by the kernel; http.Server sees them as plaintext
+// (via KTLSPlaintextConn) and uses h2c detection for HTTP/2.
+type kTLSListener struct {
+	inner            net.Listener
+	tlsConfig        *tls.Config
+	timeout          time.Duration
+	consecutiveFails int // backoff counter for systematic handshake failures
+}
+
+func xhttpKTLSListenerEligible(port net.Port, socketSettings *internet.SocketConfig, nativeAvailable, fullKTLSSupported bool) bool {
+	if port == 0 || !nativeAvailable || !fullKTLSSupported {
+		return false
+	}
+	if socketSettings != nil && socketSettings.AcceptProxyProtocol {
+		return false
+	}
+	return true
+}
+
+func (l *kTLSListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.inner.Accept()
+		if err != nil {
+			return nil, err // real listener error (closed, shutdown) — propagate
+		}
+		rc, err := tls.RustServerWithTimeout(conn, l.tlsConfig, l.timeout)
+		if err != nil {
+			// TLS handshake failure is per-connection (scanner, bot, timeout).
+			// Log and accept the next connection — do NOT return the error,
+			// because http.Server.Serve exits on non-temporary Accept errors.
+			conn.Close()
+			l.consecutiveFails++
+			errors.LogDebug(context.Background(), "XHTTP kTLS handshake failed (consecutive=", l.consecutiveFails, "): ", err)
+			// Exponential backoff under systematic failure to prevent CPU
+			// saturation from misconfiguration or adversarial TLS bombing.
+			if l.consecutiveFails > 10 {
+				backoff := time.Duration(l.consecutiveFails-10) * 100 * time.Millisecond
+				if backoff > 5*time.Second {
+					backoff = 5 * time.Second
+				}
+				time.Sleep(backoff)
+			}
+			continue
+		}
+		l.consecutiveFails = 0
+		return tls.NewKTLSPlaintextConn(rc), nil
+	}
+}
+
+func (l *kTLSListener) Close() error   { return l.inner.Close() }
+func (l *kTLSListener) Addr() net.Addr { return l.inner.Addr() }
+
 type Listener struct {
 	sync.Mutex
 	server     http.Server
@@ -547,7 +602,18 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 	// tcp/unix (h1/h2)
 	if l.listener != nil {
 		if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
-			if tlsConfig := config.GetTLSConfig(); tlsConfig != nil {
+			acceptProxyProtocol := streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol
+			if acceptProxyProtocol {
+				errors.LogDebug(ctx, "XHTTP kTLS listener disabled: accept_proxy_protocol requires Go TLS listener")
+			}
+			if xhttpKTLSListenerEligible(port, streamSettings.SocketSettings, native.Available(), tls.NativeFullKTLSSupportedForTLSConfig(config)) {
+				l.listener = &kTLSListener{
+					inner:     l.listener,
+					tlsConfig: config,
+					timeout:   4 * time.Second,
+				}
+				errors.LogInfo(ctx, "XHTTP using kTLS-accelerated TLS listener")
+			} else if tlsConfig := config.GetTLSConfig(); tlsConfig != nil {
 				l.listener = gotls.NewListener(l.listener, tlsConfig)
 			}
 		}
