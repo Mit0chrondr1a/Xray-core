@@ -56,6 +56,10 @@ pub struct Tls13State {
     pub cipher_suite: u16,
     pub server_cert_chain: Vec<Vec<u8>>,
     pub transcript_hash: Vec<u8>,
+    /// Number of server application-data records consumed after the handshake
+    /// (typically NewSessionTicket records). This is the correct starting
+    /// sequence number for kTLS RX on the client side.
+    pub server_post_hs_records: u64,
 }
 
 #[derive(Debug)]
@@ -577,6 +581,54 @@ fn compute_finished_verify_data(alg: HashAlg, base_key: &[u8], transcript_hash: 
     }
 }
 
+/// Consume post-handshake TLS records (NewSessionTicket) from the server.
+///
+/// After the TLS 1.3 handshake completes, the server typically sends one or
+/// more NewSessionTicket records. These are application-data records (outer
+/// content type 0x17) that advance the server's TX sequence counter. The
+/// client must consume them before installing kTLS RX so that the RX
+/// sequence number accounts for these records.
+///
+/// Uses a 200ms read timeout — the NST arrives in the same TCP flight as
+/// the server's Finished message, so it's either already in the receive
+/// buffer or arriving within milliseconds.
+fn consume_post_handshake_records_tls13(stream: &mut TcpStream) -> u64 {
+    // Save current timeout
+    let saved_timeout = stream.read_timeout().ok().flatten();
+
+    // Set short timeout for NST drain
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+
+    let mut count: u64 = 0;
+    loop {
+        match recv_tls_record(stream) {
+            Ok((ct, _data)) => {
+                if ct == 0x14 {
+                    // ChangeCipherSpec (compatibility) — ignore, don't count
+                    continue;
+                }
+                // Application data record (0x17) = likely NST
+                count += 1;
+            }
+            Err(_) => {
+                // Timeout or error — no more records pending
+                break;
+            }
+        }
+    }
+
+    // Restore original timeout
+    let _ = stream.set_read_timeout(saved_timeout);
+
+    if count > 0 {
+        eprintln!(
+            "tls13: consumed {} post-handshake record(s) (rx_seq correction)",
+            count
+        );
+    }
+    count
+}
+
 // ---------------------------------------------------------------------------
 // Main handshake function
 // ---------------------------------------------------------------------------
@@ -869,6 +921,13 @@ pub fn complete_tls13_handshake(
     let server_app_secret =
         derive_secret(alg, &master_secret, "s ap traffic", &full_transcript_hash)?;
 
+    // Step 10: Consume post-handshake records (NewSessionTicket) so that
+    // the kTLS RX sequence number accounts for them. Without this, the
+    // client installs kTLS RX with seq=0 while the server's kTLS TX starts
+    // at seq=N (where N = number of NST records), causing AEAD nonce
+    // mismatch and EBADMSG on every read. See docs/ktls-nst-sequence-bug.md.
+    let server_post_hs_records = consume_post_handshake_records_tls13(&mut stream);
+
     // Drop the dup'd stream (closes dup'd fd)
     drop(stream);
 
@@ -878,6 +937,7 @@ pub fn complete_tls13_handshake(
         cipher_suite,
         server_cert_chain,
         transcript_hash: full_transcript_hash,
+        server_post_hs_records,
     })
 }
 
@@ -929,6 +989,11 @@ impl XrayTls13Result {
 /// Install kTLS for a TLS 1.3 connection using secrets from the minimal
 /// handshake engine. Called internally from the REALITY client path.
 /// Returns (ktls_tx, ktls_rx).
+///
+/// The RX sequence number is set to `state.server_post_hs_records` to
+/// account for NewSessionTicket records consumed by the handshake engine
+/// before kTLS installation. Without this, the client's kTLS RX nonce
+/// would be desynchronized from the server's kTLS TX nonce.
 pub(crate) fn install_ktls_from_tls13_state(fd: i32, state: &Tls13State) -> (bool, bool) {
     let inner = || -> Result<(bool, bool), Tls13Error> {
         let cs = state.cipher_suite;
@@ -943,8 +1008,11 @@ pub(crate) fn install_ktls_from_tls13_state(fd: i32, state: &Tls13State) -> (boo
             return Ok((false, false));
         }
 
+        // TX seq=0: client hasn't sent any application data yet
         let tx_ok = install_ktls_raw(fd, 1, cs, &tx_key, &tx_iv, 0).is_ok();
-        let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, 0).is_ok();
+        // RX seq=N: account for N post-handshake records (NSTs) the server sent
+        let rx_seq = state.server_post_hs_records;
+        let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, rx_seq).is_ok();
         Ok((tx_ok, rx_ok))
     };
     inner().unwrap_or((false, false))
