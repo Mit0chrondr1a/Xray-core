@@ -25,3 +25,11 @@ func newKTLSKeyUpdateHandler(fd int, cipherSuiteID uint16, rxSecret, txSecret []
 func IsKeyExpired(err error) bool { return false }
 
 func isKeyExpired(err error) bool { return false }
+
+func isBadMessage(err error) bool { return false }
+
+func isEIO(err error) bool { return false }
+
+func ktlsRxDiagnostics(fd int, cipherSuiteID uint16) (rxSeq uint64, seqErr error) {
+	return 0, nil
+}

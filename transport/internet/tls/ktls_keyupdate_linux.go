@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -28,6 +29,11 @@ const (
 // When the kernel encounters a KeyUpdate record it cannot process, it returns
 // EKEYEXPIRED on subsequent reads. This handler derives new traffic keys via
 // HKDF-Expand-Label (RFC 8446 Section 7.2) and reinstalls them via setsockopt.
+// minKeyUpdateInterval is the minimum time between peer-initiated KeyUpdate
+// processing. A peer sending KeyUpdates faster than this is not legitimate
+// TLS behavior and the connection will be terminated.
+const minKeyUpdateInterval = 100 * time.Millisecond
+
 type KTLSKeyUpdateHandler struct {
 	mu            sync.Mutex
 	fd            int
@@ -36,6 +42,7 @@ type KTLSKeyUpdateHandler struct {
 	keyLen        int
 	rxSecret      []byte
 	txSecret      []byte
+	lastKeyUpdate time.Time // rate limiting for peer-initiated KeyUpdates
 }
 
 func newKTLSKeyUpdateHandler(fd int, cipherSuiteID uint16, rxSecret, txSecret []byte) *KTLSKeyUpdateHandler {
@@ -73,6 +80,13 @@ func (h *KTLSKeyUpdateHandler) CipherSuiteID() uint16 {
 func (h *KTLSKeyUpdateHandler) Handle() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Rate-limit peer-initiated KeyUpdates to prevent CPU exhaustion.
+	now := time.Now()
+	if !h.lastKeyUpdate.IsZero() && now.Sub(h.lastKeyUpdate) < minKeyUpdateInterval {
+		return fmt.Errorf("ktls: KeyUpdate rate exceeded (interval=%v)", now.Sub(h.lastKeyUpdate))
+	}
+	h.lastKeyUpdate = now
 
 	// Read the decrypted KeyUpdate message from the kernel's control record queue.
 	recordType, data, err := recvControlRecord(h.fd)
@@ -248,4 +262,19 @@ func IsKeyExpired(err error) bool {
 
 func isKeyExpired(err error) bool {
 	return errors.Is(err, unix.EKEYEXPIRED)
+}
+
+func isBadMessage(err error) bool {
+	return errors.Is(err, syscall.Errno(0x4a)) // EBADMSG = 74
+}
+
+func isEIO(err error) bool {
+	return errors.Is(err, unix.EIO) // EIO = 5
+}
+
+// ktlsRxDiagnostics gathers kernel-side kTLS RX state for EBADMSG analysis.
+// fd must be a valid kTLS socket file descriptor.
+func ktlsRxDiagnostics(fd int, cipherSuiteID uint16) (rxSeq uint64, seqErr error) {
+	rxSeq, seqErr = getRecordSeq(fd, TLS_RX, cipherSuiteID)
+	return
 }
