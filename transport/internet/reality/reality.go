@@ -29,6 +29,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -222,7 +223,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	// Try Rust native path only when full bidirectional kTLS is available and
 	// no extra ML-DSA verification is configured.
 	fullKTLS := tls.NativeFullKTLSSupported()
-	nativePathEligible := native.Available() && fullKTLS && len(config.Mldsa65Verify) == 0
+	nativePathEligible := native.Available() && fullKTLS &&
+		len(config.Mldsa65Verify) == 0 &&
+		!session.VisionFlowFromContext(ctx) // Vision strips outer TLS — kTLS incompatible
 	if !nativePathEligible {
 		errors.LogDebug(ctx,
 			"REALITY native client path disabled: nativeAvailable=", native.Available(),

@@ -71,6 +71,15 @@ type ConnExpire struct {
 	Expire time.Time
 }
 
+func contextWithOutboundVisionFlow(ctx context.Context, flow string) context.Context {
+	if strings.HasPrefix(flow, vless.XRV) {
+		// Vision must be marked before dialing so the transport layer can
+		// avoid kTLS-producing native TLS/REALITY paths for this connection.
+		return session.ContextWithVisionFlow(ctx, true)
+	}
+	return ctx
+}
+
 func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, input *bytes.Reader, rawInput *bytes.Buffer, err error) {
 	if flow != vless.XRV {
 		return false, nil, nil, nil
@@ -79,8 +88,13 @@ func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, in
 	if !ok {
 		return false, nil, nil, nil
 	}
+	// This path should be unreachable now: the Vision flow gate in outbound.go
+	// sets ContextWithVisionFlow(ctx, true) before dialing, which skips Rust
+	// native paths in the transport layer.  If we reach here, a code path
+	// bypassed the gate (e.g., pre-connect without VisionFlow propagation).
+	errors.LogWarning(context.Background(), "Vision flow on RustConn — VisionFlow context gate may have been bypassed; kTLS+Vision is incompatible")
 	if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
-		return true, nil, nil, errors.New("RustConn without full kTLS cannot use "+flow).AtWarning()
+		return true, nil, nil, errors.New("RustConn without full kTLS cannot use " + flow).AtWarning()
 	}
 	return true, &bytes.Reader{}, &bytes.Buffer{}, nil
 }
@@ -170,11 +184,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	rec := h.server
 	var conn stat.Connection
+	accountFlow := rec.User.Account.(*vless.MemoryAccount).Flow
+	ctx = contextWithOutboundVisionFlow(ctx, accountFlow)
 
 	if h.testpre > 0 && h.reverse == nil {
 		h.initpre.Do(func() {
 			h.preConns = make(chan *ConnExpire)
 			h.preCtx, h.preCancel = context.WithCancel(context.Background())
+			// Keep pre-connect transport selection consistent with normal dials.
+			h.preCtx = contextWithOutboundVisionFlow(h.preCtx, accountFlow)
 			for range h.testpre {
 				h.preWG.Add(1)
 				go func() {

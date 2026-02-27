@@ -139,9 +139,12 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			} else {
 				err = conn.(*tls.UConn).HandshakeContext(ctx)
 			}
-		} else if shouldUseNativeTLSClient(nativeTLSConfig) {
+		} else if shouldUseNativeTLSClient(nativeTLSConfig) && !session.VisionFlowFromContext(ctx) {
 			conn, err = rustClientWithContext(ctx, conn, nativeTLSConfig, dest)
 		} else {
+			if shouldUseNativeTLSClient(nativeTLSConfig) {
+				errors.LogDebug(ctx, "Rust native TLS client skipped: Vision flow active — kTLS incompatible")
+			}
 			conn = tls.Client(conn, tlsConfig)
 			err = conn.(*tls.Conn).HandshakeAndEnableKTLS(ctx)
 		}
