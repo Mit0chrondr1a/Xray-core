@@ -21,12 +21,7 @@ use aya_ebpf::{
     programs::SkMsgContext,
 };
 
-use crate::maps::{POLICY_MAP, SOCKHASH, POLICY_ALLOW_REDIRECT, POLICY_USE_INGRESS};
-
-/// Cork threshold: batch small writes into chunks of this size.
-/// 1400 bytes is just under typical MTU (1500) minus TCP/IP headers,
-/// ensuring batched data fits in a single TCP segment.
-const CORK_THRESHOLD: u32 = 1400;
+use crate::maps::{CORK_THRESHOLD, POLICY_MAP, SOCKHASH, POLICY_ALLOW_REDIRECT, POLICY_USE_INGRESS};
 
 /// SK_MSG verdict: cork small writes and redirect batched data.
 #[sk_msg]

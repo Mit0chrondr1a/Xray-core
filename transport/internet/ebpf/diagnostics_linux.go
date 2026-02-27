@@ -13,6 +13,7 @@ import (
 
 	xerrors "github.com/xtls/xray-core/common/errors"
 	xlog "github.com/xtls/xray-core/common/log"
+	"github.com/xtls/xray-core/common/native"
 	"golang.org/x/sys/unix"
 )
 
@@ -45,10 +46,21 @@ func logAccelerationSummary(ctx context.Context) {
 		}
 	}
 
+	skMsgMode := "none"
+	if loaderType == "rust-aya" {
+		switch native.EbpfSkMsgCapability() {
+		case native.SkMsgFull:
+			skMsgMode = "full"
+		case native.SkMsgCorkOnly:
+			skMsgMode = "cork-only"
+		}
+	}
+
 	capacity := DefaultSockmapConfig().MaxEntries
 
 	xerrors.LogInfo(ctx,
 		"sockmap: acceleration summary — loader=", loaderType,
+		" sk_msg=", skMsgMode,
 		" plain-TCP=sockmap kTLS=", ktlsPath,
 		"(", ktlsDetail, ") kernel=", unameRelease(),
 		" sockhash-fd=", sockhashFD,

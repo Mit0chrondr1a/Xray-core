@@ -12,7 +12,7 @@
 //!   4. Attach all programs to the SOCKHASH
 
 use aya::{
-    maps::{Map, SockHash},
+    maps::{sock::SockMapFd, Map, SockHash},
     programs::{SkMsg, SkSkb},
     Ebpf,
 };
@@ -72,6 +72,11 @@ const EBPF_ERR_PERMISSION: i32 = -2;
 const EBPF_ERR_MISSING_FEATURE: i32 = -3;
 const EBPF_ERR_LOAD_FAILURE: i32 = -4;
 
+/// SK_MSG capability levels (positive return codes from xray_ebpf_setup).
+const SK_MSG_FULL: i32 = 0;
+const SK_MSG_CORK_ONLY: i32 = 1;
+const SK_MSG_NONE: i32 = 2;
+
 /// Classify an error string into an FFI error code.
 fn classify_ebpf_error(err: &str) -> i32 {
     let lower = err.to_lowercase();
@@ -101,7 +106,7 @@ fn classify_ebpf_error(err: &str) -> i32 {
 // bytecode. cork_threshold should be passed to the SK_MSG program via a BPF
 // array map in a future revision. See Go-native path in sockmap_linux.go for
 // the runtime-configurable equivalent.
-fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -> Result<(), String> {
+fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -> Result<i32, String> {
     let mut guard = EBPF_STATE.write().unwrap_or_else(|e| {
         eprintln!("xray-rust eBPF: recovering poisoned write lock");
         e.into_inner()
@@ -121,14 +126,15 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
     {
         // Step 2: Replace stale pin files and pin current maps.
         let pin_dir = Path::new(pin_path);
-        std::fs::create_dir_all(pin_dir)
-            .map_err(|e| format!("mkdir {pin_path}: {e}"))?;
-        // Harden directory permissions to 0700 (root-only), matching Go ensureBPFPinDir.
+        // Create with explicit 0700 mode atomically to avoid a TOCTOU window
+        // where the directory is world-readable between create_dir_all and chmod.
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(pin_dir, perms)
-                .map_err(|e| format!("chmod {pin_path}: {e}"))?;
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(pin_dir)
+                .map_err(|e| format!("mkdir {pin_path}: {e}"))?;
         }
 
         // Aya 0.13 doesn't expose map fd reuse for already loaded objects.
@@ -192,18 +198,8 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
             .attach(&sockhash_map_fd)
             .map_err(|e| format!("verdict attach: {e}"))?;
 
-        // SK_MSG verdict (cork + redirect).
-        let msg_verdict: &mut SkMsg = bpf
-            .program_mut("xray_sk_msg")
-            .ok_or("missing xray_sk_msg program")?
-            .try_into()
-            .map_err(|e| format!("sk_msg type: {e}"))?;
-        msg_verdict
-            .load()
-            .map_err(|e| format!("sk_msg load: {e}"))?;
-        msg_verdict
-            .attach(&sockhash_map_fd)
-            .map_err(|e| format!("sk_msg attach: {e}"))?;
+        // SK_MSG verdict — try full (cork+redirect), fall back to cork-only, then none.
+        let sk_msg_level = attach_sk_msg_with_fallback(&mut bpf, &sockhash_map_fd);
 
         *guard = Some(EbpfState {
             _bpf: bpf,
@@ -212,8 +208,51 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
             pin_path: pin_path.to_string(),
         });
 
-        Ok(())
+        Ok(sk_msg_level)
     }
+}
+
+/// Try SK_MSG variants in order: full → cork-only → none.
+/// Never fails the whole setup over SK_MSG — returns the capability level.
+fn attach_sk_msg_with_fallback(bpf: &mut Ebpf, sockhash_map_fd: &SockMapFd) -> i32 {
+    // Tier 1: Full SK_MSG (cork + cookie lookup + redirect).
+    match try_load_attach_sk_msg(bpf, "xray_sk_msg", sockhash_map_fd) {
+        Ok(()) => {
+            eprintln!("xray-rust eBPF: SK_MSG full (cork+redirect) loaded");
+            return SK_MSG_FULL;
+        }
+        Err(e) => {
+            eprintln!("xray-rust eBPF: SK_MSG full failed ({e}), trying cork-only fallback");
+        }
+    }
+
+    // Tier 2: Cork-only SK_MSG (batching, no cookie/redirect).
+    match try_load_attach_sk_msg(bpf, "xray_sk_msg_cork", sockhash_map_fd) {
+        Ok(()) => {
+            eprintln!("xray-rust eBPF: SK_MSG cork-only loaded");
+            return SK_MSG_CORK_ONLY;
+        }
+        Err(e) => {
+            eprintln!("xray-rust eBPF: SK_MSG cork-only failed ({e}), continuing without SK_MSG");
+        }
+    }
+
+    // Tier 3: No SK_MSG — SK_SKB-only, log and continue.
+    eprintln!("xray-rust eBPF: no SK_MSG loaded — SK_SKB-only mode");
+    SK_MSG_NONE
+}
+
+/// Load and attach a single SK_MSG program by name.
+fn try_load_attach_sk_msg(bpf: &mut Ebpf, prog_name: &str, sockhash_map_fd: &SockMapFd) -> Result<(), String> {
+    let prog: &mut SkMsg = bpf
+        .program_mut(prog_name)
+        .ok_or_else(|| format!("missing {prog_name} program"))?
+        .try_into()
+        .map_err(|e| format!("{prog_name} type: {e}"))?;
+    prog.load().map_err(|e| format!("{prog_name} load: {e}"))?;
+    prog.attach(sockhash_map_fd)
+        .map_err(|e| format!("{prog_name} attach: {e}"))?;
+    Ok(())
 }
 
 /// Set 0600 root-only permissions on pinned map files.
@@ -425,7 +464,7 @@ pub unsafe extern "C" fn xray_ebpf_setup(
             Err(_) => return EBPF_ERR_GENERIC,
         };
         match setup_sockmap_impl(path, max_entries, cork_threshold) {
-            Ok(()) => 0,
+            Ok(level) => level,
             Err(e) => {
                 eprintln!("xray_ebpf_setup: {e}");
                 classify_ebpf_error(&e)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	xerrors "github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 )
 
 // SockmapManager manages sockmap-based zero-copy TCP proxying.
@@ -67,6 +68,7 @@ type SockmapStats struct {
 	Enabled             bool
 	MaxEntries          uint32
 	NativeLoader        bool // true when Rust/Aya eBPF loader is active
+	SkMsgCapability     int  // 0=full, 1=cork-only, 2=none
 }
 
 // SockPairKey identifies a socket pair for proxying.
@@ -495,6 +497,7 @@ func (m *SockmapManager) GetSockmapStats() SockmapStats {
 		Enabled:             m.enabled.Load(),
 		MaxEntries:          m.config.MaxEntries,
 		NativeLoader:        m.useNativeLoader,
+		SkMsgCapability:     int(native.EbpfSkMsgCapability()),
 	}
 }
 
