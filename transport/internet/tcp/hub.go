@@ -47,19 +47,35 @@ var (
 	realityBlacklist     *ebpf.BlacklistManager
 	realityBlacklistOnce sync.Once
 
-	getRealityBlacklistFn = getRealityBlacklist
-	realityServerFn       = reality.Server
-	doRustRealityServerFn = func(v *Listener, fd int) (*native.TlsResult, error) {
-		return v.doRustRealityServer(fd)
+	getRealityBlacklistFn   = getRealityBlacklist
+	realityServerFn         = reality.Server
+	doRustRealityDeferredFn = func(v *Listener, fd int) (*native.DeferredResult, error) {
+		return v.doRustRealityDeferred(fd)
 	}
+	// Rust REALITY server path re-enabled with deferred kTLS:
+	// TLS handshake completes via rustls but kTLS is NOT installed yet.
+	// The VLESS handler decides: Vision flows keep rustls (no kTLS),
+	// non-Vision flows call EnableKTLS() to install kTLS in-place.
+	// See docs/ktls-vision-incompatibility.md.
 	useNativeRealityServerFn = func(v *Listener) bool {
-		return native.Available() &&
-			tls.NativeFullKTLSSupported() &&
-			v.realityXrayConfig != nil &&
-			len(v.realityXrayConfig.Mldsa65Seed) == 0 &&
-			(v.config == nil || !v.config.AcceptProxyProtocol)
+		return nativeRealityServerEligible(v, native.Available(), tls.NativeFullKTLSSupported(), tls.DeferredKTLSPromotionDisabled())
 	}
 )
+
+func nativeRealityServerEligible(v *Listener, nativeAvailable, fullKTLS, deferredPromotionDisabled bool) bool {
+	if !nativeAvailable || !fullKTLS || deferredPromotionDisabled || v == nil || v.realityXrayConfig == nil {
+		return false
+	}
+	if v.config != nil && v.config.AcceptProxyProtocol {
+		return false
+	}
+	// Go REALITY derives ML-DSA signing key from mldsa65_seed. Keep Go path
+	// until native deferred server config wires equivalent signing material.
+	if len(v.realityXrayConfig.Mldsa65Seed) > 0 {
+		return false
+	}
+	return true
+}
 
 // getRealityBlacklist returns the global REALITY auth blacklist manager,
 // lazily initialized on first call.
@@ -209,22 +225,27 @@ func (v *Listener) keepAccepting() {
 			if v.tlsConfig != nil {
 				if native.Available() && v.tlsXrayConfig != nil &&
 					tls.NativeFullKTLSSupportedForTLSConfig(v.tlsXrayConfig) &&
-					(v.config == nil || !v.config.AcceptProxyProtocol) {
+					(v.config == nil || !v.config.AcceptProxyProtocol) &&
+					!tls.DeferredKTLSPromotionDisabled() {
 					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 						errors.LogWarningInner(context.Background(), err, "failed to set Rust TLS handshake deadline on accepted connection")
 						_ = conn.Close()
 						return
 					}
-					rustConn, tlsErr := tls.RustServerWithTimeout(conn, v.tlsXrayConfig, tlsHandshakeTimeout)
+					// Deferred kTLS: handshake completes via rustls but kTLS is
+					// NOT installed yet. The protocol handler decides: Vision
+					// flows keep rustls (no kTLS), non-Vision flows call
+					// EnableKTLS() to install kTLS in-place.
+					deferredConn, tlsErr := tls.RustServerDeferred(conn, v.tlsXrayConfig, tlsHandshakeTimeout)
 					if err := conn.SetDeadline(time.Time{}); err != nil {
 						errors.LogWarningInner(context.Background(), err, "failed to clear Rust TLS handshake deadline on accepted connection")
 					}
 					if tlsErr != nil {
-						errors.LogWarningInner(context.Background(), tlsErr, "failed Rust TLS handshake on accepted connection")
+						errors.LogWarningInner(context.Background(), tlsErr, "failed Rust TLS deferred handshake on accepted connection")
 						_ = conn.Close()
 						return
 					}
-					conn = rustConn
+					conn = deferredConn
 				} else {
 					tlsConn := tls.Server(conn, v.tlsConfig)
 					// Reassign conn immediately so the panic handler's defer
@@ -251,11 +272,15 @@ func (v *Listener) keepAccepting() {
 				rustDone := false
 				nativePathEligible := useNativeRealityServerFn(v)
 				if !nativePathEligible {
+					acceptProxyProtocol := v.config != nil && v.config.AcceptProxyProtocol
 					hasMldsa65Seed := v.realityXrayConfig != nil && len(v.realityXrayConfig.Mldsa65Seed) > 0
+					deferredPromotionDisabled := tls.DeferredKTLSPromotionDisabled()
 					errors.LogDebug(context.Background(),
 						"Rust REALITY server path disabled: nativeAvailable=", native.Available(),
 						" fullKTLS=", tls.NativeFullKTLSSupported(),
 						" hasRealityXrayConfig=", v.realityXrayConfig != nil,
+						" deferredPromotionDisabled=", deferredPromotionDisabled,
+						" acceptProxyProtocol=", acceptProxyProtocol,
 						" hasMldsa65Seed=", hasMldsa65Seed,
 					)
 				}
@@ -267,42 +292,33 @@ func (v *Listener) keepAccepting() {
 							_ = conn.Close()
 							return
 						}
-						rustResult, rustErr := doRustRealityServerFn(v, fd)
+						deferredResult, deferredErr := doRustRealityDeferredFn(v, fd)
 						if err := conn.SetDeadline(time.Time{}); err != nil {
 							errors.LogWarningInner(context.Background(), err, "failed to clear REALITY handshake deadline")
 						}
-						if rustErr == nil && rustResult.KtlsTx && rustResult.KtlsRx {
-							rustConn, wrapErr := tls.NewRustConnChecked(conn, rustResult, "")
+						if deferredErr == nil {
+							deferredConn, wrapErr := tls.NewDeferredRustConn(conn, deferredResult)
 							if wrapErr != nil {
-								errors.LogWarningInner(context.Background(), wrapErr, "Rust REALITY handshake succeeded but native kTLS session init failed")
+								errors.LogWarningInner(context.Background(), wrapErr, "Rust REALITY deferred handshake succeeded but wrap failed")
+								if deferredResult.Handle != nil {
+									native.DeferredFree(deferredResult.Handle)
+								}
 								_ = conn.Close()
 								return
 							}
-							conn = rustConn
+							conn = deferredConn
 							rustDone = true
-							errors.LogDebug(context.Background(), "Rust REALITY server path active: wrapped as *tls.RustConn")
+							errors.LogDebug(context.Background(), "Rust REALITY deferred path active: wrapped as *tls.DeferredRustConn (kTLS deferred)")
+						} else if stderrors.Is(deferredErr, native.ErrRealityAuthFailed) {
+							recordRealityFailureOnce()
+							errors.LogInfo(context.Background(), "Rust REALITY auth failed, falling back to camouflage")
+							errors.LogDebug(context.Background(), "REALITY auth detail: ", deferredErr)
+							// Fall through — MSG_PEEK left socket data unconsumed,
+							// Go reality.Server() will read it and handle spider crawl.
 						} else {
-							if rustResult != nil && rustResult.StateHandle != nil {
-								native.TlsStateFree(rustResult.StateHandle)
-							}
-							if rustErr == nil {
-								// Handshake succeeded but kTLS incomplete — socket data
-								// already consumed by rustls, Go fallback won't work.
-								errors.LogWarning(context.Background(), "REALITY: Rust handshake OK but kTLS incomplete (tx=", rustResult.KtlsTx, " rx=", rustResult.KtlsRx, "), closing — check kernel kTLS support (modprobe tls)")
-								_ = conn.Close()
-								return
-							}
-							if stderrors.Is(rustErr, native.ErrRealityAuthFailed) {
-								recordRealityFailureOnce()
-								errors.LogInfo(context.Background(), "Rust REALITY auth failed, falling back to camouflage")
-								errors.LogDebug(context.Background(), "REALITY auth detail: ", rustErr)
-								// Fall through — MSG_PEEK left socket data unconsumed,
-								// Go reality.Server() will read it and handle spider crawl.
-							} else {
-								errors.LogWarningInner(context.Background(), rustErr, "Rust REALITY server handshake failed")
-								_ = conn.Close()
-								return
-							}
+							errors.LogWarningInner(context.Background(), deferredErr, "Rust REALITY deferred handshake failed")
+							_ = conn.Close()
+							return
 						}
 					} else {
 						errors.LogDebugInner(context.Background(), fdErr, "Rust REALITY server path skipped: failed to extract fd")
@@ -341,7 +357,7 @@ func (v *Listener) keepAccepting() {
 	}
 }
 
-func (v *Listener) doRustRealityServer(fd int) (*native.TlsResult, error) {
+func (v *Listener) doRustRealityDeferred(fd int) (*native.DeferredResult, error) {
 	cfg := native.RealityConfigNew(false)
 	if cfg == nil {
 		return nil, errors.New("failed to create native REALITY server config")
@@ -373,7 +389,7 @@ func (v *Listener) doRustRealityServer(fd int) (*native.TlsResult, error) {
 			maxVer[0], maxVer[1], maxVer[2])
 	}
 
-	return native.RealityServerHandshakeWithTimeout(fd, cfg, tlsHandshakeTimeout)
+	return native.RealityServerDeferred(fd, cfg, tlsHandshakeTimeout)
 }
 
 func encodeRealityServerNames(serverNames []string) []byte {
