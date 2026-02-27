@@ -86,3 +86,7 @@ resources/
 
 # Deploy
 Taskfile.local.yml
+
+# Internal design docs and operational scripts (perf branch working notes)
+docs/
+verify-*.sh
