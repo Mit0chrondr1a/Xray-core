@@ -112,6 +112,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			UDPOverride.Port = destination.Port
 		}
 	}
+	proxy.RecordPipelineFlowMix(ctx, destination.Network, session.AllowedNetworkFromContext(ctx))
 
 	input := link.Reader
 	output := link.Writer
