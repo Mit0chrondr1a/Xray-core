@@ -685,6 +685,82 @@ impl rustls::KeyLog for SecretCapture {
 }
 
 // ---------------------------------------------------------------------------
+// poll()-based I/O helpers for non-blocking fd compatibility.
+//
+// After RestoreNonBlock is called, the socket fd is in O_NONBLOCK mode
+// while Rust's RecordReader may still be actively reading. These helpers
+// handle EAGAIN by calling poll(2) to wait for readiness, then retrying.
+// ---------------------------------------------------------------------------
+
+/// Read exactly `buf.len()` bytes from `fd`, handling EAGAIN via poll(2).
+/// Handles EINTR from both read() and poll() (SA_RESTART does not apply to poll on Linux).
+fn read_exact_with_poll(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let ret = unsafe {
+            libc::read(
+                fd,
+                buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - filled,
+            )
+        };
+        if ret > 0 {
+            filled += ret as usize;
+        } else if ret == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read_exact_with_poll: unexpected EOF",
+            ));
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                poll_readable(fd)?;
+                continue;
+            }
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Block until `fd` is readable, handling EINTR and edge cases.
+fn poll_readable(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let pret = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if pret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR — retry poll
+            }
+            return Err(err);
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "poll_readable: poll error",
+            ));
+        }
+        // POLLHUP with POLLIN means data available before hangup — let read() drain it.
+        // POLLHUP alone (no POLLIN) means peer closed without data.
+        if pfd.revents & libc::POLLHUP != 0 && pfd.revents & libc::POLLIN == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "poll_readable: peer hangup",
+            ));
+        }
+        return Ok(());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RecordReader — reads exactly one TLS record at a time from the socket.
 // Prevents rustls from over-reading past the current record boundary,
 // which would cause data loss when kTLS takes over the socket.
@@ -769,16 +845,22 @@ impl RecordReader {
     /// Used by DeferredSession's split-lock read path: socket I/O happens
     /// under the reader lock, then the returned bytes are fed to rustls under
     /// the tls lock via Cursor.
+    ///
+    /// Uses poll()-based reads to handle EAGAIN after RestoreNonBlock restores
+    /// O_NONBLOCK on the fd while this reader is still active.
     pub(crate) fn read_one_record(&mut self) -> std::io::Result<Vec<u8>> {
+        use std::os::unix::io::AsRawFd;
+
         // Drain leftover buffered bytes from handshake phase
         if self.pos < self.len {
             let leftover = self.buf[self.pos..self.len].to_vec();
             self.pos = self.len;
             return Ok(leftover);
         }
+        let fd = self.tcp.as_raw_fd();
         // Read fresh TLS record: 5-byte header + payload
         let mut header = [0u8; 5];
-        self.tcp.read_exact(&mut header)?;
+        read_exact_with_poll(fd, &mut header)?;
         let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
         if payload_len > 16384 + 256 {
             return Err(std::io::Error::new(
@@ -789,7 +871,7 @@ impl RecordReader {
         let mut record = Vec::with_capacity(5 + payload_len);
         record.extend_from_slice(&header);
         record.resize(5 + payload_len, 0);
-        self.tcp.read_exact(&mut record[5..])?;
+        read_exact_with_poll(fd, &mut record[5..])?;
         Ok(record)
     }
 
@@ -2675,5 +2757,43 @@ mod ktls_selftest {
             "[PASS] Sequence numbers verified: server_tx={} client_rx={}",
             srv_tx_seq, cli_rx_seq
         );
+    }
+
+    #[test]
+    fn test_read_exact_with_poll_basic() {
+        // Test read_exact_with_poll on a Unix socket pair
+        use std::os::unix::io::AsRawFd;
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let data = b"test data for read_exact_with_poll";
+        let mut w = writer;
+        std::io::Write::write_all(&mut w, data).unwrap();
+
+        let fd = reader.as_raw_fd();
+        let mut buf = vec![0u8; data.len()];
+        read_exact_with_poll(fd, &mut buf).unwrap();
+        assert_eq!(&buf, data);
+    }
+
+    #[test]
+    fn test_read_exact_with_poll_nonblocking_fd() {
+        // Verify read_exact_with_poll works on a non-blocking fd
+        use std::os::unix::io::AsRawFd;
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+
+        let data = b"nonblocking read test";
+        let fd_r = reader.as_raw_fd();
+
+        // Write in a separate thread to exercise the poll path
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut w = writer;
+            std::io::Write::write_all(&mut w, data).unwrap();
+        });
+
+        let mut buf = vec![0u8; data.len()];
+        read_exact_with_poll(fd_r, &mut buf).unwrap();
+        assert_eq!(&buf, &data[..]);
+        handle.join().unwrap();
     }
 }

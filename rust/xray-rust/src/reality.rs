@@ -1095,6 +1095,67 @@ fn reality_server_handshake_full(
 // Deferred REALITY handshake (Phase 1: no kTLS install)
 // ---------------------------------------------------------------------------
 
+/// Write all bytes from `buf` to `fd`, handling EAGAIN via poll(2).
+/// Handles EINTR from both write() and poll() (SA_RESTART does not apply to poll on Linux).
+/// Used by DeferredSession::write() after RestoreNonBlock restores O_NONBLOCK.
+fn write_all_with_poll(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<()> {
+    let mut written = 0;
+    while written < buf.len() {
+        let ret = unsafe {
+            libc::write(
+                fd,
+                buf[written..].as_ptr() as *const libc::c_void,
+                buf.len() - written,
+            )
+        };
+        if ret > 0 {
+            written += ret as usize;
+        } else if ret == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_all_with_poll: zero-length write",
+            ));
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                poll_writable(fd)?;
+                continue;
+            }
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Block until `fd` is writable, handling EINTR.
+fn poll_writable(fd: std::os::unix::io::RawFd) -> io::Result<()> {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let pret = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if pret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue; // EINTR — retry poll
+            }
+            return Err(err);
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "poll_writable: poll error/hangup",
+            ));
+        }
+        return Ok(());
+    }
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -1267,13 +1328,14 @@ impl DeferredSession {
             (n, ciphertext)
         }; // tls lock released
 
-        // Step 2: Send ciphertext on wire
+        // Step 2: Send ciphertext on wire (poll-based for non-blocking fd safety)
         {
+            use std::os::unix::io::AsRawFd;
             let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             let writer = writer_guard.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "deferred session writer closed")
             })?;
-            writer.write_all(&ciphertext)?;
+            write_all_with_poll(writer.as_raw_fd(), &ciphertext)?;
             writer.flush()?;
         } // writer lock released
 
@@ -1338,6 +1400,21 @@ impl DeferredSession {
         }
 
         Ok((plaintext, raw_ahead))
+    }
+
+    /// Restore O_NONBLOCK on the underlying fd without detaching.
+    /// After this call, Rust's reader/writer use poll()-based I/O to handle
+    /// EAGAIN. This allows Go's VisionWriter to safely write to the raw socket
+    /// without blocking the OS thread during the window before DrainAndDetach.
+    ///
+    /// Idempotent — safe to call multiple times or after detach.
+    pub fn restore_nonblock(&self) -> io::Result<()> {
+        if self.detached.load(Ordering::Acquire) {
+            return Ok(()); // already detached, O_NONBLOCK already restored
+        }
+        let mut guard = self.blocking_guard.lock().unwrap_or_else(|e| e.into_inner());
+        guard.restore_nonblock_early();
+        Ok(())
     }
 
     /// Consume the session, install kTLS on the socket, and return the
@@ -1926,6 +2003,25 @@ pub extern "C" fn xray_deferred_drain_and_detach(
             }
             Err((_, msg)) => {
                 eprintln!("xray_deferred_drain_and_detach: {}", msg);
+                -1
+            }
+        }
+    })
+}
+
+/// Restore O_NONBLOCK on the deferred session's fd without detaching.
+/// Returns 0 on success, -1 on error. Idempotent.
+#[unsafe(no_mangle)]
+pub extern "C" fn xray_deferred_restore_nonblock(handle: *mut c_void) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null() {
+            return -1;
+        }
+        let session = unsafe { &*(handle as *const DeferredSession) };
+        match session.restore_nonblock() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("xray_deferred_restore_nonblock: {}", e);
                 -1
             }
         }
@@ -2831,5 +2927,21 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500);
         assert!(timestamp_within_max_diff_at(101, 500, now));
         assert!(!timestamp_within_max_diff_at(101, 499, now));
+    }
+
+    #[test]
+    fn test_write_all_with_poll_basic() {
+        // Test write_all_with_poll on a pipe (always blocking-safe)
+        use std::os::unix::io::AsRawFd;
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = writer.as_raw_fd();
+        let data = b"hello from write_all_with_poll";
+        write_all_with_poll(fd, data).unwrap();
+
+        let mut buf = vec![0u8; data.len()];
+        use std::io::Read;
+        let mut r = reader;
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, data);
     }
 }
