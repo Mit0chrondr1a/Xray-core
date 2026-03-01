@@ -763,6 +763,66 @@ impl RecordReader {
     pub(crate) fn first_record_hash(&self) -> Option<&[u8; 32]> {
         self.first_record_hash.as_ref()
     }
+
+    /// Read one complete TLS record from the socket and return it as a Vec<u8>.
+    /// Drains any leftover buffered bytes from the handshake phase first.
+    /// Used by DeferredSession's split-lock read path: socket I/O happens
+    /// under the reader lock, then the returned bytes are fed to rustls under
+    /// the tls lock via Cursor.
+    pub(crate) fn read_one_record(&mut self) -> std::io::Result<Vec<u8>> {
+        // Drain leftover buffered bytes from handshake phase
+        if self.pos < self.len {
+            let leftover = self.buf[self.pos..self.len].to_vec();
+            self.pos = self.len;
+            return Ok(leftover);
+        }
+        // Read fresh TLS record: 5-byte header + payload
+        let mut header = [0u8; 5];
+        self.tcp.read_exact(&mut header)?;
+        let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if payload_len > 16384 + 256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("TLS record too large: {}", payload_len),
+            ));
+        }
+        let mut record = Vec::with_capacity(5 + payload_len);
+        record.extend_from_slice(&header);
+        record.resize(5 + payload_len, 0);
+        self.tcp.read_exact(&mut record[5..])?;
+        Ok(record)
+    }
+
+    /// Push back unconsumed bytes into the reader's buffer.
+    /// Used by DeferredSession's split-lock read path: after `read_tls` from a
+    /// Cursor, any bytes the Cursor didn't consume must be pushed back so the
+    /// next `read_one_record()` call returns them before reading from the socket.
+    pub(crate) fn push_back(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        // Replace buf with the pushback data, positioned at start
+        self.buf.clear();
+        self.buf.extend_from_slice(data);
+        self.pos = 0;
+        self.len = data.len();
+    }
+
+    /// Return bytes already read from the socket but not yet consumed by rustls.
+    /// These bytes are required when Vision strips the outer TLS layer.
+    pub(crate) fn take_pending_bytes(&mut self) -> Vec<u8> {
+        if self.pos >= self.len {
+            self.buf.clear();
+            self.pos = 0;
+            self.len = 0;
+            return Vec::new();
+        }
+        let pending = self.buf[self.pos..self.len].to_vec();
+        self.buf.clear();
+        self.pos = 0;
+        self.len = 0;
+        pending
+    }
 }
 
 impl Read for RecordReader {
@@ -812,10 +872,7 @@ pub(crate) fn drain_plaintext<S: rustls::SideData>(
 ///
 /// Uses a short (200ms) SO_RCVTIMEO to avoid blocking indefinitely if no
 /// post-handshake records are pending.
-fn consume_post_handshake_records(
-    conn: &mut ClientConnection,
-    reader: &mut RecordReader,
-) {
+fn consume_post_handshake_records(conn: &mut ClientConnection, reader: &mut RecordReader) {
     // Save the current SO_RCVTIMEO and set a short timeout for draining.
     let fd = {
         use std::os::unix::io::AsRawFd;
@@ -848,25 +905,32 @@ fn consume_post_handshake_records(
         );
     }
 
-    let mut count = 0u32;
+    let mut _count = 0u32;
     loop {
         match conn.read_tls(reader) {
             Ok(0) => break,
-            Ok(_) => {
-                match conn.process_new_packets() {
-                    Ok(_) => {
-                        count += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("consume_post_handshake: process error: {}", e);
-                        break;
-                    }
+            Ok(_) => match conn.process_new_packets() {
+                Ok(_) => {
+                    _count += 1;
                 }
+                Err(_) => break,
+            },
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                   || e.kind() == std::io::ErrorKind::TimedOut => break,
             Err(_) => break,
         }
+    }
+
+    #[cfg(debug_assertions)]
+    if _count > 0 {
+        eprintln!(
+            "consume_post_handshake: drained {} post-handshake record(s)",
+            _count
+        );
     }
 
     // Restore original SO_RCVTIMEO
@@ -880,10 +944,6 @@ fn consume_post_handshake_records(
                 std::mem::size_of::<libc::timeval>() as libc::socklen_t,
             );
         }
-    }
-
-    if count > 0 {
-        eprintln!("consume_post_handshake: drained {} post-handshake record(s)", count);
     }
 }
 
@@ -965,8 +1025,7 @@ fn do_server_handshake_core(
         ServerConnection::new(Arc::new(sc)).map_err(|e| format!("server connection: {}", e))?;
 
     // Drive handshake record-by-record (reader borrows from pipeline)
-    drive_handshake!(&mut conn, pipeline.reader_mut())
-        .map_err(|e| format!("handshake: {}", e))?;
+    drive_handshake!(&mut conn, pipeline.reader_mut()).map_err(|e| format!("handshake: {}", e))?;
 
     let tls_version = conn
         .protocol_version()
@@ -1016,7 +1075,7 @@ pub(crate) fn tls_server_handshake_deferred(
     // Clear handshake timeout for data-transfer phase
     pipeline.clear_handshake_timeout();
 
-    Ok(Box::new(crate::reality::DeferredSession::new(
+    let session = crate::reality::DeferredSession::new(
         core.conn,
         pipeline,
         core.capture,
@@ -1024,7 +1083,9 @@ pub(crate) fn tls_server_handshake_deferred(
         core.tls_version,
         core.negotiated_alpn,
         sni,
-    )))
+    )
+    .map_err(|e| format!("deferred session init: {}", e))?;
+    Ok(Box::new(session))
 }
 
 fn do_handshake(
@@ -1802,11 +1863,7 @@ mod ktls_selftest {
 
         let mut buf = vec![0u8; 256];
         let n = b.read(&mut buf).expect("read B");
-        assert_eq!(
-            &buf[..n],
-            payload,
-            "AES-128-GCM seq=0 round-trip mismatch"
-        );
+        assert_eq!(&buf[..n], payload, "AES-128-GCM seq=0 round-trip mismatch");
         eprintln!("[PASS] AES-128-GCM seq=0 round-trip: {} bytes", n);
     }
 
@@ -1956,7 +2013,11 @@ mod ktls_selftest {
         }
 
         let _a = writer.join().expect("writer thread");
-        assert_eq!(received.len(), payload.len(), "large payload length mismatch");
+        assert_eq!(
+            received.len(),
+            payload.len(),
+            "large payload length mismatch"
+        );
         assert_eq!(received, payload, "large payload content mismatch");
         eprintln!(
             "[PASS] AES-128-GCM large payload: {} bytes OK",
@@ -2061,7 +2122,11 @@ mod ktls_selftest {
 
         // dup the "server" fd (socket A), mimicking HandshakePipeline::new
         let dup_fd = unsafe { libc::dup(a_fd) };
-        assert!(dup_fd >= 0, "dup failed: {}", std::io::Error::last_os_error());
+        assert!(
+            dup_fd >= 0,
+            "dup failed: {}",
+            std::io::Error::last_os_error()
+        );
 
         // Clear O_NONBLOCK on dup_fd (as BlockingGuard does)
         let old_flags = unsafe { libc::fcntl(dup_fd, libc::F_GETFL) };
@@ -2074,9 +2139,8 @@ mod ktls_selftest {
         //  ClientHello through dup_fd. We'll just send a small payload as a
         //  stand-in, then read it on the other end.)
         let hs_msg = b"fake-handshake-data";
-        let written = unsafe {
-            libc::write(dup_fd, hs_msg.as_ptr() as *const c_void, hs_msg.len())
-        };
+        let written =
+            unsafe { libc::write(dup_fd, hs_msg.as_ptr() as *const c_void, hs_msg.len()) };
         assert_eq!(written as usize, hs_msg.len(), "dup_fd write failed");
         let mut hs_buf = [0u8; 64];
         let n = b.read(&mut hs_buf).expect("read handshake from B");
@@ -2097,7 +2161,12 @@ mod ktls_selftest {
         // In production, HandshakePipeline drops RecordReader (which wraps dup_fd),
         // closing it AFTER kTLS is installed on the original fd.
         let rc = unsafe { libc::close(dup_fd) };
-        assert_eq!(rc, 0, "close(dup_fd) failed: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "close(dup_fd) failed: {}",
+            std::io::Error::last_os_error()
+        );
 
         // Restore O_NONBLOCK on original fd (as BlockingGuard does)
         if old_flags >= 0 && (old_flags & libc::O_NONBLOCK) != 0 {
@@ -2112,7 +2181,10 @@ mod ktls_selftest {
         let mut buf = vec![0u8; 256];
         let n = b.read(&mut buf).expect("read kTLS data on B");
         assert_eq!(&buf[..n], payload, "kTLS data mismatch after dup close");
-        eprintln!("[PASS] dup fd lifecycle: kTLS works after close(dup_fd), {} bytes", n);
+        eprintln!(
+            "[PASS] dup fd lifecycle: kTLS works after close(dup_fd), {} bytes",
+            n
+        );
 
         // Multiple records after dup close to verify seq increments correctly
         for i in 0..10 {
@@ -2180,10 +2252,13 @@ mod ktls_selftest {
     // =======================================================================
 
     /// Generate a self-signed certificate and private key for testing.
-    fn generate_test_cert() -> (Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>) {
+    fn generate_test_cert() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
         let key_pair = rcgen::KeyPair::generate().expect("generate key pair");
-        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-            .expect("cert params");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
         let cert = params.self_signed(&key_pair).expect("self-signed cert");
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
         let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
@@ -2198,9 +2273,9 @@ mod ktls_selftest {
         server_tcp: TcpStream,
         client_tcp: TcpStream,
     ) -> (TcpStream, TcpStream, u16, u64, u64, u64, u64) {
-        use std::os::unix::io::{AsRawFd, FromRawFd};
-        use rustls::{ServerConfig, ClientConfig, ServerConnection, ClientConnection};
         use rustls::pki_types::ServerName;
+        use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+        use std::os::unix::io::{AsRawFd, FromRawFd};
 
         let (certs, key) = generate_test_cert();
         let provider = cached_provider();
@@ -2225,7 +2300,8 @@ mod ktls_selftest {
 
         let sni: ServerName<'static> = "localhost".to_string().try_into().unwrap();
         let mut server_conn = ServerConnection::new(std::sync::Arc::new(sc)).expect("server conn");
-        let mut client_conn = ClientConnection::new(std::sync::Arc::new(cc), sni).expect("client conn");
+        let mut client_conn =
+            ClientConnection::new(std::sync::Arc::new(cc), sni).expect("client conn");
 
         let server_fd = server_tcp.as_raw_fd();
         let client_fd = client_tcp.as_raw_fd();
@@ -2236,7 +2312,13 @@ mod ktls_selftest {
         // Clear O_NONBLOCK on dup (as BlockingGuard does)
         let server_old_flags = unsafe { libc::fcntl(server_dup_fd, libc::F_GETFL) };
         if server_old_flags >= 0 && (server_old_flags & libc::O_NONBLOCK) != 0 {
-            unsafe { libc::fcntl(server_dup_fd, libc::F_SETFL, server_old_flags & !libc::O_NONBLOCK) };
+            unsafe {
+                libc::fcntl(
+                    server_dup_fd,
+                    libc::F_SETFL,
+                    server_old_flags & !libc::O_NONBLOCK,
+                )
+            };
         }
         let server_dup_tcp = unsafe { TcpStream::from_raw_fd(server_dup_fd) };
         let mut server_reader = RecordReader::new(server_dup_tcp);
@@ -2246,7 +2328,13 @@ mod ktls_selftest {
         assert!(client_dup_fd >= 0, "dup client failed");
         let client_old_flags = unsafe { libc::fcntl(client_dup_fd, libc::F_GETFL) };
         if client_old_flags >= 0 && (client_old_flags & libc::O_NONBLOCK) != 0 {
-            unsafe { libc::fcntl(client_dup_fd, libc::F_SETFL, client_old_flags & !libc::O_NONBLOCK) };
+            unsafe {
+                libc::fcntl(
+                    client_dup_fd,
+                    libc::F_SETFL,
+                    client_old_flags & !libc::O_NONBLOCK,
+                )
+            };
         }
         let client_dup_tcp = unsafe { TcpStream::from_raw_fd(client_dup_fd) };
         let mut client_reader = RecordReader::new(client_dup_tcp);
@@ -2257,20 +2345,26 @@ mod ktls_selftest {
             // Drive client handshake
             loop {
                 while client_conn.wants_write() {
-                    client_conn.write_tls(&mut client_reader.tcp).expect("client write_tls");
+                    client_conn
+                        .write_tls(&mut client_reader.tcp)
+                        .expect("client write_tls");
                 }
                 client_reader.tcp.flush().expect("client flush");
                 if !client_conn.is_handshaking() {
                     break;
                 }
                 if client_conn.wants_read() {
-                    client_conn.read_tls(&mut client_reader).expect("client read_tls");
+                    client_conn
+                        .read_tls(&mut client_reader)
+                        .expect("client read_tls");
                     client_conn.process_new_packets().expect("client process");
                 }
             }
             // Final flush
             while client_conn.wants_write() {
-                client_conn.write_tls(&mut client_reader.tcp).expect("client final write_tls");
+                client_conn
+                    .write_tls(&mut client_reader.tcp)
+                    .expect("client final write_tls");
             }
             client_reader.tcp.flush().expect("client final flush");
 
@@ -2282,61 +2376,85 @@ mod ktls_selftest {
             //
             // Set a short read timeout so we don't block forever waiting
             // for records that may not come.
-            client_reader.tcp.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            client_reader
+                .tcp
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
                 .expect("set client read timeout");
             loop {
                 match client_conn.read_tls(&mut client_reader) {
                     Ok(0) => break,
                     Ok(_) => {
-                        client_conn.process_new_packets().expect("client process post-hs");
+                        client_conn
+                            .process_new_packets()
+                            .expect("client process post-hs");
                         eprintln!("Client: consumed post-handshake record");
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                           || e.kind() == std::io::ErrorKind::TimedOut => break,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break
+                    }
                     Err(e) => panic!("client post-handshake read: {}", e),
                 }
             }
             // Restore no-timeout
-            client_reader.tcp.set_read_timeout(None).expect("clear client read timeout");
+            client_reader
+                .tcp
+                .set_read_timeout(None)
+                .expect("clear client read timeout");
 
             // Drain any buffered plaintext
             let drained = drain_plaintext(&mut client_conn);
 
-            let secrets = client_conn.dangerous_extract_secrets().expect("client extract secrets");
+            let secrets = client_conn
+                .dangerous_extract_secrets()
+                .expect("client extract secrets");
             (client_reader, secrets, drained)
         });
 
         // Drive server handshake
         loop {
             while server_conn.wants_write() {
-                server_conn.write_tls(&mut server_reader.tcp).expect("server write_tls");
+                server_conn
+                    .write_tls(&mut server_reader.tcp)
+                    .expect("server write_tls");
             }
             server_reader.tcp.flush().expect("server flush");
             if !server_conn.is_handshaking() {
                 break;
             }
             if server_conn.wants_read() {
-                server_conn.read_tls(&mut server_reader).expect("server read_tls");
+                server_conn
+                    .read_tls(&mut server_reader)
+                    .expect("server read_tls");
                 server_conn.process_new_packets().expect("server process");
             }
         }
         // Final flush
         while server_conn.wants_write() {
-            server_conn.write_tls(&mut server_reader.tcp).expect("server final write_tls");
+            server_conn
+                .write_tls(&mut server_reader.tcp)
+                .expect("server final write_tls");
         }
         server_reader.tcp.flush().expect("server final flush");
 
         // Drain any buffered plaintext
         let server_drained = drain_plaintext(&mut server_conn);
 
-        let server_secrets = server_conn.dangerous_extract_secrets().expect("server extract secrets");
+        let server_secrets = server_conn
+            .dangerous_extract_secrets()
+            .expect("server extract secrets");
         let (server_tx_seq, server_tx_secrets) = server_secrets.tx;
         let (server_rx_seq, server_rx_secrets) = server_secrets.rx;
 
         let server_cipher = cipher_suite_to_u16(&server_tx_secrets);
         eprintln!(
             "Server: cipher=0x{:04x} tx_seq={} rx_seq={} drained={} bytes",
-            server_cipher, server_tx_seq, server_rx_seq, server_drained.len()
+            server_cipher,
+            server_tx_seq,
+            server_rx_seq,
+            server_drained.len()
         );
 
         // Install kTLS on server's ORIGINAL fd
@@ -2363,7 +2481,10 @@ mod ktls_selftest {
         let client_cipher = cipher_suite_to_u16(&client_tx_secrets);
         eprintln!(
             "Client: cipher=0x{:04x} tx_seq={} rx_seq={} drained={} bytes",
-            client_cipher, client_tx_seq, client_rx_seq, client_drained.len()
+            client_cipher,
+            client_tx_seq,
+            client_rx_seq,
+            client_drained.len()
         );
 
         // Install kTLS on client's ORIGINAL fd
@@ -2381,8 +2502,15 @@ mod ktls_selftest {
             unsafe { libc::fcntl(client_fd, libc::F_SETFL, client_old_flags) };
         }
 
-        (server_tcp, client_tcp, server_cipher,
-         server_tx_seq, server_rx_seq, client_tx_seq, client_rx_seq)
+        (
+            server_tcp,
+            client_tcp,
+            server_cipher,
+            server_tx_seq,
+            server_rx_seq,
+            client_tx_seq,
+            client_rx_seq,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -2399,8 +2527,7 @@ mod ktls_selftest {
     #[test]
     fn ktls_real_handshake_roundtrip() {
         let (server_tcp, client_tcp) = tcp_pair();
-        let (mut server, mut client, cipher,
-             srv_tx_seq, srv_rx_seq, cli_tx_seq, cli_rx_seq) =
+        let (mut server, mut client, cipher, srv_tx_seq, srv_rx_seq, cli_tx_seq, cli_rx_seq) =
             handshake_and_install_ktls(server_tcp, client_tcp);
 
         eprintln!(
@@ -2469,7 +2596,9 @@ mod ktls_selftest {
         // Write in background thread to avoid deadlock
         let payload_clone = payload.clone();
         let writer = std::thread::spawn(move || {
-            server.write_all(&payload_clone).expect("write large payload");
+            server
+                .write_all(&payload_clone)
+                .expect("write large payload");
             server.flush().expect("flush large");
             server
         });
@@ -2486,9 +2615,16 @@ mod ktls_selftest {
         }
 
         let _server = writer.join().expect("writer thread");
-        assert_eq!(received.len(), payload.len(), "large payload length mismatch");
+        assert_eq!(
+            received.len(),
+            payload.len(),
+            "large payload length mismatch"
+        );
         assert_eq!(received, payload, "large payload content mismatch");
-        eprintln!("[PASS] 128KB payload after real handshake: {} bytes OK", received.len());
+        eprintln!(
+            "[PASS] 128KB payload after real handshake: {} bytes OK",
+            received.len()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2503,14 +2639,10 @@ mod ktls_selftest {
     #[test]
     fn ktls_real_handshake_verify_seq() {
         let (server_tcp, client_tcp) = tcp_pair();
-        let (_server, _client, cipher,
-             srv_tx_seq, srv_rx_seq, cli_tx_seq, cli_rx_seq) =
+        let (_server, _client, cipher, srv_tx_seq, srv_rx_seq, cli_tx_seq, cli_rx_seq) =
             handshake_and_install_ktls(server_tcp, client_tcp);
 
-        eprintln!(
-            "Sequence numbers after handshake: cipher=0x{:04x}",
-            cipher
-        );
+        eprintln!("Sequence numbers after handshake: cipher=0x{:04x}", cipher);
         eprintln!("  Server: tx_seq={}, rx_seq={}", srv_tx_seq, srv_rx_seq);
         eprintln!("  Client: tx_seq={}, rx_seq={}", cli_tx_seq, cli_rx_seq);
 
@@ -2539,6 +2671,9 @@ mod ktls_selftest {
             "client tx_seq ({}) should match server rx_seq ({})",
             cli_tx_seq, srv_rx_seq
         );
-        eprintln!("[PASS] Sequence numbers verified: server_tx={} client_rx={}", srv_tx_seq, cli_rx_seq);
+        eprintln!(
+            "[PASS] Sequence numbers verified: server_tx={} client_rx={}",
+            srv_tx_seq, cli_rx_seq
+        );
     }
 }
