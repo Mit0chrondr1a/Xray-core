@@ -80,9 +80,16 @@ const SK_MSG_NONE: i32 = 2;
 /// Classify an error string into an FFI error code.
 fn classify_ebpf_error(err: &str) -> i32 {
     let lower = err.to_lowercase();
-    if lower.contains("permission") || lower.contains("eperm") || lower.contains("eacces") || lower.contains("operation not permitted") {
+    if lower.contains("permission")
+        || lower.contains("eperm")
+        || lower.contains("eacces")
+        || lower.contains("operation not permitted")
+    {
         EBPF_ERR_PERMISSION
-    } else if lower.contains("missing") || lower.contains("not compiled") || lower.contains("not found") {
+    } else if lower.contains("missing")
+        || lower.contains("not compiled")
+        || lower.contains("not found")
+    {
         EBPF_ERR_MISSING_FEATURE
     } else if lower.contains("load") || lower.contains("attach") || lower.contains("pin") {
         EBPF_ERR_LOAD_FAILURE
@@ -106,7 +113,11 @@ fn classify_ebpf_error(err: &str) -> i32 {
 // bytecode. cork_threshold should be passed to the SK_MSG program via a BPF
 // array map in a future revision. See Go-native path in sockmap_linux.go for
 // the runtime-configurable equivalent.
-fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -> Result<i32, String> {
+fn setup_sockmap_impl(
+    pin_path: &str,
+    _max_entries: u32,
+    _cork_threshold: u32,
+) -> Result<i32, String> {
     let mut guard = EBPF_STATE.write().unwrap_or_else(|e| {
         eprintln!("xray-rust eBPF: recovering poisoned write lock");
         e.into_inner()
@@ -160,9 +171,7 @@ fn setup_sockmap_impl(pin_path: &str, _max_entries: u32, _cork_threshold: u32) -
             (fd, map_fd)
         };
 
-        let policy = bpf
-            .map("POLICY_MAP")
-            .ok_or("missing POLICY_MAP")?;
+        let policy = bpf.map("POLICY_MAP").ok_or("missing POLICY_MAP")?;
         let policy_fd = match policy {
             Map::HashMap(data) | Map::LruHashMap(data) => data.fd().as_fd().as_raw_fd(),
             _ => return Err("POLICY_MAP is not a hash map".into()),
@@ -243,7 +252,11 @@ fn attach_sk_msg_with_fallback(bpf: &mut Ebpf, sockhash_map_fd: &SockMapFd) -> i
 }
 
 /// Load and attach a single SK_MSG program by name.
-fn try_load_attach_sk_msg(bpf: &mut Ebpf, prog_name: &str, sockhash_map_fd: &SockMapFd) -> Result<(), String> {
+fn try_load_attach_sk_msg(
+    bpf: &mut Ebpf,
+    prog_name: &str,
+    sockhash_map_fd: &SockMapFd,
+) -> Result<(), String> {
     let prog: &mut SkMsg = bpf
         .program_mut(prog_name)
         .ok_or_else(|| format!("missing {prog_name} program"))?
@@ -297,12 +310,10 @@ fn register_pair_impl(
     // from closing fds. BPF map operations are kernel-atomic so concurrent
     // register calls on different socket pairs are safe.
     // Recover from poison to avoid permanent failure after a panic in another thread.
-    let guard = EBPF_STATE
-        .read()
-        .unwrap_or_else(|e| {
-            eprintln!("xray-rust eBPF: recovering poisoned read lock in register");
-            e.into_inner()
-        });
+    let guard = EBPF_STATE.read().unwrap_or_else(|e| {
+        eprintln!("xray-rust eBPF: recovering poisoned read lock in register");
+        e.into_inner()
+    });
     let state = guard
         .as_ref()
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENODEV))?;
@@ -332,12 +343,10 @@ fn register_pair_impl(
 
 /// Unregister a socket pair.
 fn unregister_pair_impl(inbound_cookie: u64, outbound_cookie: u64) -> std::io::Result<()> {
-    let guard = EBPF_STATE
-        .read()
-        .unwrap_or_else(|e| {
-            eprintln!("xray-rust eBPF: recovering poisoned read lock in unregister");
-            e.into_inner()
-        });
+    let guard = EBPF_STATE.read().unwrap_or_else(|e| {
+        eprintln!("xray-rust eBPF: recovering poisoned read lock in unregister");
+        e.into_inner()
+    });
     let state = guard
         .as_ref()
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENODEV))?;
@@ -497,8 +506,13 @@ pub extern "C" fn xray_ebpf_register_pair(
     policy_flags: u32,
 ) -> i32 {
     ffi_catch_i32!({
-        match register_pair_impl(inbound_fd, outbound_fd, inbound_cookie, outbound_cookie, policy_flags)
-        {
+        match register_pair_impl(
+            inbound_fd,
+            outbound_fd,
+            inbound_cookie,
+            outbound_cookie,
+            policy_flags,
+        ) {
             Ok(()) => 0,
             Err(e) => neg_errno(&e),
         }
@@ -507,10 +521,7 @@ pub extern "C" fn xray_ebpf_register_pair(
 
 /// Unregister a socket pair.
 #[no_mangle]
-pub extern "C" fn xray_ebpf_unregister_pair(
-    inbound_cookie: u64,
-    outbound_cookie: u64,
-) -> i32 {
+pub extern "C" fn xray_ebpf_unregister_pair(inbound_cookie: u64, outbound_cookie: u64) -> i32 {
     ffi_catch_i32!({
         match unregister_pair_impl(inbound_cookie, outbound_cookie) {
             Ok(()) => 0,

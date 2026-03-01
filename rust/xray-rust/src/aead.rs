@@ -4,7 +4,7 @@
 //! implementations. The handle keeps cipher state in Rust, minimising FFI
 //! overhead for the hot-path chunk encryption used by VMess and Shadowsocks.
 
-use ring::aead::{self, LessSafeKey, UnboundKey, Nonce, Aad};
+use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use std::slice;
 
 /// Algorithm selector passed from Go.
@@ -101,7 +101,9 @@ pub unsafe extern "C" fn xray_aead_seal(
         }
         let nonce_bytes = if nonce_len > 0 {
             slice::from_raw_parts(nonce_ptr, nonce_len)
-        } else { &[] };
+        } else {
+            &[]
+        };
         let nonce = match Nonce::try_assume_unique_for_key(nonce_bytes) {
             Ok(n) => n,
             Err(_) => return crate::ffi::FFI_ERR_CRYPTO,
@@ -124,7 +126,10 @@ pub unsafe extern "C" fn xray_aead_seal(
         }
         let in_out = &mut out_buf[..needed];
 
-        match h.key.seal_in_place_separate_tag(nonce, Aad::from(aad_slice), &mut in_out[..pt_len]) {
+        match h
+            .key
+            .seal_in_place_separate_tag(nonce, Aad::from(aad_slice), &mut in_out[..pt_len])
+        {
             Ok(tag) => {
                 // Append tag after plaintext
                 in_out[pt_len..needed].copy_from_slice(tag.as_ref());
@@ -180,7 +185,9 @@ pub unsafe extern "C" fn xray_aead_open(
         }
         let nonce_bytes = if nonce_len > 0 {
             slice::from_raw_parts(nonce_ptr, nonce_len)
-        } else { &[] };
+        } else {
+            &[]
+        };
         let nonce = match Nonce::try_assume_unique_for_key(nonce_bytes) {
             Ok(n) => n,
             Err(_) => return crate::ffi::FFI_ERR_CRYPTO,
@@ -278,10 +285,16 @@ mod tests {
             let mut ct_buf = vec![0u8; plaintext.len() + 16];
             let mut ct_len: usize = 0;
             let rc = xray_aead_seal(
-                handle, nonce.as_ptr(), nonce.len(),
-                aad.as_ptr(), aad.len(),
-                plaintext.as_ptr(), plaintext.len(),
-                ct_buf.as_mut_ptr(), ct_buf.len(), &mut ct_len,
+                handle,
+                nonce.as_ptr(),
+                nonce.len(),
+                aad.as_ptr(),
+                aad.len(),
+                plaintext.as_ptr(),
+                plaintext.len(),
+                ct_buf.as_mut_ptr(),
+                ct_buf.len(),
+                &mut ct_len,
             );
             assert_eq!(rc, 0);
             assert_eq!(ct_len, plaintext.len() + 16);
@@ -290,10 +303,16 @@ mod tests {
             let mut pt_buf = vec![0u8; ct_len];
             let mut pt_len: usize = 0;
             let rc = xray_aead_open(
-                handle, nonce.as_ptr(), nonce.len(),
-                aad.as_ptr(), aad.len(),
-                ct_buf.as_ptr(), ct_len,
-                pt_buf.as_mut_ptr(), pt_buf.len(), &mut pt_len,
+                handle,
+                nonce.as_ptr(),
+                nonce.len(),
+                aad.as_ptr(),
+                aad.len(),
+                ct_buf.as_ptr(),
+                ct_len,
+                pt_buf.as_mut_ptr(),
+                pt_buf.len(),
+                &mut pt_len,
             );
             assert_eq!(rc, 0);
             assert_eq!(pt_len, plaintext.len());
@@ -316,20 +335,32 @@ mod tests {
             let mut ct_buf = vec![0u8; plaintext.len() + 16];
             let mut ct_len: usize = 0;
             let rc = xray_aead_seal(
-                handle, nonce.as_ptr(), nonce.len(),
-                std::ptr::null(), 0,
-                plaintext.as_ptr(), plaintext.len(),
-                ct_buf.as_mut_ptr(), ct_buf.len(), &mut ct_len,
+                handle,
+                nonce.as_ptr(),
+                nonce.len(),
+                std::ptr::null(),
+                0,
+                plaintext.as_ptr(),
+                plaintext.len(),
+                ct_buf.as_mut_ptr(),
+                ct_buf.len(),
+                &mut ct_len,
             );
             assert_eq!(rc, 0);
 
             let mut pt_buf = vec![0u8; ct_len];
             let mut pt_len: usize = 0;
             let rc = xray_aead_open(
-                handle, nonce.as_ptr(), nonce.len(),
-                std::ptr::null(), 0,
-                ct_buf.as_ptr(), ct_len,
-                pt_buf.as_mut_ptr(), pt_buf.len(), &mut pt_len,
+                handle,
+                nonce.as_ptr(),
+                nonce.len(),
+                std::ptr::null(),
+                0,
+                ct_buf.as_ptr(),
+                ct_len,
+                pt_buf.as_mut_ptr(),
+                pt_buf.len(),
+                &mut pt_len,
             );
             assert_eq!(rc, 0);
             assert_eq!(&pt_buf[..pt_len], &plaintext[..]);
@@ -351,20 +382,32 @@ mod tests {
             let mut ct_buf = vec![0u8; plaintext.len() + 16];
             let mut ct_len: usize = 0;
             let rc = xray_aead_seal(
-                handle, nonce.as_ptr(), nonce.len(),
-                std::ptr::null(), 0,
-                plaintext.as_ptr(), plaintext.len(),
-                ct_buf.as_mut_ptr(), ct_buf.len(), &mut ct_len,
+                handle,
+                nonce.as_ptr(),
+                nonce.len(),
+                std::ptr::null(),
+                0,
+                plaintext.as_ptr(),
+                plaintext.len(),
+                ct_buf.as_mut_ptr(),
+                ct_buf.len(),
+                &mut ct_len,
             );
             assert_eq!(rc, 0);
 
             let mut pt_buf = vec![0u8; ct_len];
             let mut pt_len: usize = 0;
             let rc = xray_aead_open(
-                handle, nonce.as_ptr(), nonce.len(),
-                std::ptr::null(), 0,
-                ct_buf.as_ptr(), ct_len,
-                pt_buf.as_mut_ptr(), pt_buf.len(), &mut pt_len,
+                handle,
+                nonce.as_ptr(),
+                nonce.len(),
+                std::ptr::null(),
+                0,
+                ct_buf.as_ptr(),
+                ct_len,
+                pt_buf.as_mut_ptr(),
+                pt_buf.len(),
+                &mut pt_len,
             );
             assert_eq!(rc, 0);
             assert_eq!(&pt_buf[..pt_len], &plaintext[..]);
@@ -386,10 +429,16 @@ mod tests {
             let mut ct_buf = vec![0u8; plaintext.len() + 16];
             let mut ct_len: usize = 0;
             xray_aead_seal(
-                handle, nonce.as_ptr(), nonce.len(),
-                std::ptr::null(), 0,
-                plaintext.as_ptr(), plaintext.len(),
-                ct_buf.as_mut_ptr(), ct_buf.len(), &mut ct_len,
+                handle,
+                nonce.as_ptr(),
+                nonce.len(),
+                std::ptr::null(),
+                0,
+                plaintext.as_ptr(),
+                plaintext.len(),
+                ct_buf.as_mut_ptr(),
+                ct_buf.len(),
+                &mut ct_len,
             );
 
             // Tamper with ciphertext
@@ -398,10 +447,16 @@ mod tests {
             let mut pt_buf = vec![0u8; ct_len];
             let mut pt_len: usize = 0;
             let rc = xray_aead_open(
-                handle, nonce.as_ptr(), nonce.len(),
-                std::ptr::null(), 0,
-                ct_buf.as_ptr(), ct_len,
-                pt_buf.as_mut_ptr(), pt_buf.len(), &mut pt_len,
+                handle,
+                nonce.as_ptr(),
+                nonce.len(),
+                std::ptr::null(),
+                0,
+                ct_buf.as_ptr(),
+                ct_len,
+                pt_buf.as_mut_ptr(),
+                pt_buf.len(),
+                &mut pt_len,
             );
             assert_ne!(rc, 0); // Should fail
 

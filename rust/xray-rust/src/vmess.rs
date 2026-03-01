@@ -48,7 +48,11 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_DIGEST] {
     // Inner: SHA256(ipad || msg) — stack-allocated, bounded by KDF usage
     let inner_len = SHA256_BLOCK + msg.len();
     let mut inner_buf = [0u8; SHA256_BLOCK * 5];
-    assert!(inner_len <= inner_buf.len(), "hmac_sha256: msg too large for stack buffer ({inner_len} > {})", inner_buf.len());
+    assert!(
+        inner_len <= inner_buf.len(),
+        "hmac_sha256: msg too large for stack buffer ({inner_len} > {})",
+        inner_buf.len()
+    );
     inner_buf[..SHA256_BLOCK].copy_from_slice(&ipad);
     inner_buf[SHA256_BLOCK..inner_len].copy_from_slice(msg);
     let inner_hash = sha256(&inner_buf[..inner_len]);
@@ -81,7 +85,11 @@ fn hmac_sha256_multi(key: &[u8], parts: &[&[u8]]) -> [u8; SHA256_DIGEST] {
     let total: usize = parts.iter().map(|p| p.len()).sum();
     let inner_len = SHA256_BLOCK + total;
     let mut inner_buf = [0u8; SHA256_BLOCK * 5];
-    assert!(inner_len <= inner_buf.len(), "hmac_sha256_multi: data too large for stack buffer ({inner_len} > {})", inner_buf.len());
+    assert!(
+        inner_len <= inner_buf.len(),
+        "hmac_sha256_multi: data too large for stack buffer ({inner_len} > {})",
+        inner_buf.len()
+    );
     inner_buf[..SHA256_BLOCK].copy_from_slice(&ipad);
     let mut pos = SHA256_BLOCK;
     for part in parts {
@@ -143,7 +151,11 @@ fn kdf(key: &[u8], paths: &[&[u8]]) -> [u8; SHA256_DIGEST] {
     let (salt_ipad, salt_opad) = hmac_pads(KDF_SALT_VMESS_AEAD_KDF);
     // Stack-allocated pads array (max 3 paths in VMess KDF)
     let mut pads = [([0u8; SHA256_BLOCK], [0u8; SHA256_BLOCK]); 3];
-    assert!(paths.len() <= 3, "kdf: more than 3 paths not supported (got {})", paths.len());
+    assert!(
+        paths.len() <= 3,
+        "kdf: more than 3 paths not supported (got {})",
+        paths.len()
+    );
     for (i, p) in paths.iter().enumerate() {
         pads[i] = hmac_pads(p);
     }
@@ -152,7 +164,11 @@ fn kdf(key: &[u8], paths: &[&[u8]]) -> [u8; SHA256_DIGEST] {
     // Build initial SHA-256 data on stack: salt_ipad || ipad[0] || ... || ipad[N-1] || key
     let initial_len = SHA256_BLOCK * (paths.len() + 1) + key.len();
     let mut initial = [0u8; SHA256_BLOCK * 4 + SHA256_DIGEST];
-    assert!(initial_len <= initial.len(), "kdf: initial data too large for stack buffer ({initial_len} > {})", initial.len());
+    assert!(
+        initial_len <= initial.len(),
+        "kdf: initial data too large for stack buffer ({initial_len} > {})",
+        initial.len()
+    );
     let mut pos = 0;
     initial[pos..pos + SHA256_BLOCK].copy_from_slice(&salt_ipad);
     pos += SHA256_BLOCK;
@@ -195,7 +211,11 @@ fn recursive_sum(
     // Stack-allocated: max level=3, so max size = SHA256_BLOCK*4 + SHA256_DIGEST
     let new_data_len = SHA256_BLOCK * (level + 1) + SHA256_DIGEST;
     let mut new_data = [0u8; SHA256_BLOCK * 4 + SHA256_DIGEST];
-    assert!(new_data_len <= new_data.len(), "recursive_sum: data too large for stack buffer ({new_data_len} > {})", new_data.len());
+    assert!(
+        new_data_len <= new_data.len(),
+        "recursive_sum: data too large for stack buffer ({new_data_len} > {})",
+        new_data.len()
+    );
     let mut pos = 0;
     new_data[pos..pos + SHA256_BLOCK].copy_from_slice(salt_ipad);
     pos += SHA256_BLOCK;
@@ -272,7 +292,11 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 }
 
 /// Inner seal logic returning Result for clean error propagation.
-fn seal_header_inner(cmd_key: &[u8; 16], header_data: &[u8], out_buf: &mut [u8]) -> Result<usize, i32> {
+fn seal_header_inner(
+    cmd_key: &[u8; 16],
+    header_data: &[u8],
+    out_buf: &mut [u8],
+) -> Result<usize, i32> {
     let header_len = header_data.len();
 
     // Create AuthID
@@ -287,11 +311,19 @@ fn seal_header_inner(cmd_key: &[u8; 16], header_data: &[u8], out_buf: &mut [u8])
     // Derive keys for length encryption
     let length_key = kdf16(
         cmd_key,
-        &[KDF_SALT_HEADER_PAYLOAD_LENGTH_AEAD_KEY, &auth_id, &conn_nonce],
+        &[
+            KDF_SALT_HEADER_PAYLOAD_LENGTH_AEAD_KEY,
+            &auth_id,
+            &conn_nonce,
+        ],
     );
     let length_nonce_full = kdf(
         cmd_key,
-        &[KDF_SALT_HEADER_PAYLOAD_LENGTH_AEAD_IV, &auth_id, &conn_nonce],
+        &[
+            KDF_SALT_HEADER_PAYLOAD_LENGTH_AEAD_IV,
+            &auth_id,
+            &conn_nonce,
+        ],
     );
 
     // Derive keys for header encryption
@@ -307,8 +339,7 @@ fn seal_header_inner(cmd_key: &[u8; 16], header_data: &[u8], out_buf: &mut [u8])
     // Encrypt length (2 bytes -> 18 bytes with tag)
     let length_val = (header_len as u16).to_be_bytes();
     let length_aead_key = LessSafeKey::new(
-        UnboundKey::new(&aead::AES_128_GCM, &length_key)
-            .map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?,
+        UnboundKey::new(&aead::AES_128_GCM, &length_key).map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?,
     );
     let mut length_ct = [0u8; 18]; // 2 + 16
     length_ct[..2].copy_from_slice(&length_val);
@@ -321,19 +352,14 @@ fn seal_header_inner(cmd_key: &[u8; 16], header_data: &[u8], out_buf: &mut [u8])
 
     // Encrypt header
     let header_aead_key = LessSafeKey::new(
-        UnboundKey::new(&aead::AES_128_GCM, &header_key)
-            .map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?,
+        UnboundKey::new(&aead::AES_128_GCM, &header_key).map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?,
     );
     let mut header_ct = vec![0u8; header_len + 16];
     header_ct[..header_len].copy_from_slice(header_data);
     let nonce = Nonce::try_assume_unique_for_key(&header_nonce_full[..12])
         .map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?;
     let tag = header_aead_key
-        .seal_in_place_separate_tag(
-            nonce,
-            Aad::from(&auth_id[..]),
-            &mut header_ct[..header_len],
-        )
+        .seal_in_place_separate_tag(nonce, Aad::from(&auth_id[..]), &mut header_ct[..header_len])
         .map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?;
     header_ct[header_len..].copy_from_slice(tag.as_ref());
 
@@ -404,7 +430,12 @@ pub unsafe extern "C" fn xray_vmess_seal_header(
 }
 
 /// Inner open logic returning Result for clean error propagation.
-fn open_header_inner(cmd_key: &[u8; 16], auth_id: &[u8; 16], data_buf: &[u8], out_buf: &mut [u8]) -> Result<usize, i32> {
+fn open_header_inner(
+    cmd_key: &[u8; 16],
+    auth_id: &[u8; 16],
+    data_buf: &[u8],
+    out_buf: &mut [u8],
+) -> Result<usize, i32> {
     // Parse: encrypted_length[18] + nonce[8] + encrypted_header[...]
     let enc_length = &data_buf[..18];
     let conn_nonce = &data_buf[18..26];
@@ -422,26 +453,22 @@ fn open_header_inner(cmd_key: &[u8; 16], auth_id: &[u8; 16], data_buf: &[u8], ou
 
     // Decrypt length
     let length_aead_key = LessSafeKey::new(
-        UnboundKey::new(&aead::AES_128_GCM, &length_key)
-            .map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?,
+        UnboundKey::new(&aead::AES_128_GCM, &length_key).map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?,
     );
     let mut length_buf = [0u8; 18];
     length_buf.copy_from_slice(enc_length);
     let nonce = Nonce::try_assume_unique_for_key(&length_nonce_full[..12])
         .map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?;
-    let plaintext_length = match length_aead_key.open_in_place(
-        nonce,
-        Aad::from(&auth_id[..]),
-        &mut length_buf,
-    ) {
-        Ok(pt) => {
-            if pt.len() != 2 {
-                return Err(crate::ffi::FFI_ERR_CRYPTO);
+    let plaintext_length =
+        match length_aead_key.open_in_place(nonce, Aad::from(&auth_id[..]), &mut length_buf) {
+            Ok(pt) => {
+                if pt.len() != 2 {
+                    return Err(crate::ffi::FFI_ERR_CRYPTO);
+                }
+                u16::from_be_bytes([pt[0], pt[1]]) as usize
             }
-            u16::from_be_bytes([pt[0], pt[1]]) as usize
-        }
-        Err(_) => return Err(crate::ffi::FFI_ERR_CRYPTO),
-    };
+            Err(_) => return Err(crate::ffi::FFI_ERR_CRYPTO),
+        };
 
     // Check we have enough data for the header
     let expected_enc_header_len = plaintext_length + 16;
@@ -464,18 +491,13 @@ fn open_header_inner(cmd_key: &[u8; 16], auth_id: &[u8; 16], data_buf: &[u8], ou
 
     // Decrypt header
     let header_aead_key = LessSafeKey::new(
-        UnboundKey::new(&aead::AES_128_GCM, &header_key)
-            .map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?,
+        UnboundKey::new(&aead::AES_128_GCM, &header_key).map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?,
     );
     let mut header_buf = vec![0u8; expected_enc_header_len];
     header_buf.copy_from_slice(&enc_header[..expected_enc_header_len]);
     let nonce = Nonce::try_assume_unique_for_key(&header_nonce_full[..12])
         .map_err(|_| crate::ffi::FFI_ERR_CRYPTO)?;
-    match header_aead_key.open_in_place(
-        nonce,
-        Aad::from(&auth_id[..]),
-        &mut header_buf,
-    ) {
+    match header_aead_key.open_in_place(nonce, Aad::from(&auth_id[..]), &mut header_buf) {
         Ok(pt) => {
             out_buf[..pt.len()].copy_from_slice(pt);
             Ok(pt.len())
@@ -504,7 +526,12 @@ pub unsafe extern "C" fn xray_vmess_open_header(
     out_len: *mut usize,
 ) -> i32 {
     ffi_catch_i32!({
-        if cmd_key.is_null() || authid.is_null() || data.is_null() || out.is_null() || out_len.is_null() {
+        if cmd_key.is_null()
+            || authid.is_null()
+            || data.is_null()
+            || out.is_null()
+            || out_len.is_null()
+        {
             return crate::ffi::FFI_ERR_NULL;
         }
         // Minimum: 18 (enc_length) + 8 (nonce) = 26 bytes
@@ -609,26 +636,41 @@ mod tests {
 
     #[test]
     fn test_kdf_derived_keys() {
-        let cmd_key: [u8; 16] = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16];
-        let authid: [u8; 16] = [0xAA,0xBB,0xCC,0xDD,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0x00,0xEE,0xFF];
-        let nonce: [u8; 8] = [1,2,3,4,5,6,7,8];
+        let cmd_key: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let authid: [u8; 16] = [
+            0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00,
+            0xEE, 0xFF,
+        ];
+        let nonce: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
-        let len_key = kdf16(&cmd_key, &[KDF_SALT_HEADER_PAYLOAD_LENGTH_AEAD_KEY, &authid, &nonce]);
+        let len_key = kdf16(
+            &cmd_key,
+            &[KDF_SALT_HEADER_PAYLOAD_LENGTH_AEAD_KEY, &authid, &nonce],
+        );
         assert_eq!(hex::encode(len_key), "e2b8ce928a988bc8dc473f12c74bd21a");
 
-        let len_nonce = kdf(&cmd_key, &[KDF_SALT_HEADER_PAYLOAD_LENGTH_AEAD_IV, &authid, &nonce]);
+        let len_nonce = kdf(
+            &cmd_key,
+            &[KDF_SALT_HEADER_PAYLOAD_LENGTH_AEAD_IV, &authid, &nonce],
+        );
         assert_eq!(hex::encode(&len_nonce[..12]), "85fb26f7561ddac2ba960e2a");
 
-        let hdr_key = kdf16(&cmd_key, &[KDF_SALT_HEADER_PAYLOAD_AEAD_KEY, &authid, &nonce]);
+        let hdr_key = kdf16(
+            &cmd_key,
+            &[KDF_SALT_HEADER_PAYLOAD_AEAD_KEY, &authid, &nonce],
+        );
         assert_eq!(hex::encode(hdr_key), "92f57e7847f3cb97c379ccac221df8b8");
 
-        let hdr_nonce = kdf(&cmd_key, &[KDF_SALT_HEADER_PAYLOAD_AEAD_IV, &authid, &nonce]);
+        let hdr_nonce = kdf(
+            &cmd_key,
+            &[KDF_SALT_HEADER_PAYLOAD_AEAD_IV, &authid, &nonce],
+        );
         assert_eq!(hex::encode(&hdr_nonce[..12]), "94d563a3b219b6e46860143d");
     }
 
     #[test]
     fn test_seal_open_round_trip() {
-        let cmd_key: [u8; 16] = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16];
+        let cmd_key: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let header = b"Test VMess Header Data";
 
         unsafe {
@@ -636,8 +678,12 @@ mod tests {
             let mut sealed_len: usize = 0;
 
             let rc = xray_vmess_seal_header(
-                cmd_key.as_ptr(), header.as_ptr(), header.len(),
-                sealed.as_mut_ptr(), sealed.len(), &mut sealed_len,
+                cmd_key.as_ptr(),
+                header.as_ptr(),
+                header.len(),
+                sealed.as_mut_ptr(),
+                sealed.len(),
+                &mut sealed_len,
             );
             assert_eq!(rc, 0);
             assert_eq!(sealed_len, 16 + 18 + 8 + header.len() + 16);
@@ -650,9 +696,13 @@ mod tests {
             let mut opened_len: usize = 0;
 
             let rc = xray_vmess_open_header(
-                cmd_key.as_ptr(), authid.as_ptr(),
-                data.as_ptr(), data.len(),
-                opened.as_mut_ptr(), opened.len(), &mut opened_len,
+                cmd_key.as_ptr(),
+                authid.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+                opened.as_mut_ptr(),
+                opened.len(),
+                &mut opened_len,
             );
             assert_eq!(rc, 0, "open failed");
             assert_eq!(opened_len, header.len());
