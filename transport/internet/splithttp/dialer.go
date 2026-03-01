@@ -41,6 +41,8 @@ var (
 	globalDialerAccess sync.Mutex
 )
 
+const xhttpMaxInFlightPacketPosts = 16
+
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
@@ -353,6 +355,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
 		xmuxClient2.OpenUsage.Add(1)
 	}
+	uploadCtx, cancelUpload := context.WithCancel(ctx)
 	var closed atomic.Int32
 
 	reader, writer := io.Pipe()
@@ -362,6 +365,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			if closed.Add(1) > 1 {
 				return
 			}
+			cancelUpload()
 			if xmuxClient != nil {
 				xmuxClient.OpenUsage.Add(-1)
 			}
@@ -416,11 +420,12 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	go func() {
 		var seq int64
 		var lastWrite time.Time
+		inFlight := make(chan struct{}, xhttpMaxInFlightPacketPosts)
 
 		for {
 			wroteRequest := done.New()
 
-			ctx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			chunkCtx := httptrace.WithClientTrace(uploadCtx, &httptrace.ClientTrace{
 				WroteRequest: func(httptrace.WroteRequestInfo) {
 					wroteRequest.Close()
 				},
@@ -448,24 +453,35 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 			if xmuxClient != nil && (xmuxClient.LeftRequests.Add(-1) <= 0 ||
 				(xmuxClient.UnreusableAt != time.Time{} && lastWrite.After(xmuxClient.UnreusableAt))) {
-				httpClient, xmuxClient = getHTTPClient(ctx, dest, streamSettings)
+				httpClient, xmuxClient = getHTTPClient(chunkCtx, dest, streamSettings)
 			}
 
-			go func() {
-				err := httpClient.PostPacket(
-					ctx,
-					url.String(),
-					sessionId,
+			select {
+			case inFlight <- struct{}{}:
+			case <-uploadCtx.Done():
+				buf.ReleaseMulti(chunk)
+				return
+			}
+
+			client := httpClient
+			chunkURL := url.String()
+			chunkLen := int64(chunk.Len())
+			go func(client DialerClient, chunkCtx context.Context, chunk buf.MultiBuffer, chunkURL, sessionID, seqStr string, chunkLen int64) {
+				defer func() { <-inFlight }()
+				err := client.PostPacket(
+					chunkCtx,
+					chunkURL,
+					sessionID,
 					seqStr,
 					&buf.MultiBufferContainer{MultiBuffer: chunk},
-					int64(chunk.Len()),
+					chunkLen,
 				)
 				wroteRequest.Close()
 				if err != nil {
-					errors.LogInfoInner(ctx, err, "failed to send upload")
+					errors.LogInfoInner(chunkCtx, err, "failed to send upload")
 					uploadPipeReader.Interrupt()
 				}
-			}()
+			}(client, chunkCtx, chunk, chunkURL, sessionId, seqStr, chunkLen)
 
 			if _, ok := httpClient.(*DefaultDialerClient); ok {
 				<-wroteRequest.Wait()
@@ -512,11 +528,12 @@ func (w uploadWriter) Write(b []byte) (int, error) {
 
 	var writed int
 	for _, buff := range buffer.MultiBuffer {
+		n := int(buff.Len())
 		err := w.WriteMultiBuffer(buf.MultiBuffer{buff})
 		if err != nil {
 			return writed, err
 		}
-		writed += int(buff.Len())
+		writed += n
 	}
 	return writed, nil
 }
