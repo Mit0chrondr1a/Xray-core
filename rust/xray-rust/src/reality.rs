@@ -1095,14 +1095,29 @@ fn reality_server_handshake_full(
 // Deferred REALITY handshake (Phase 1: no kTLS install)
 // ---------------------------------------------------------------------------
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// DeferredSession holds a completed REALITY handshake without kTLS installed.
 /// The caller reads/writes through rustls, then either:
 /// - calls `enable_ktls()` to install kTLS in-place (non-Vision flows)
-/// - drops the session (Vision flows — rustls handles TLS, then UnwrapRawConn strips it)
+/// - calls `drain_and_detach()` then free (Vision flows — outer TLS stripped)
+///
+/// Uses three independent locks so read() and write() never contend:
+/// - `tls`:    rustls ServerConnection (brief lock, no socket I/O)
+/// - `reader`: RecordReader (may block on socket read, independent)
+/// - `writer`: TcpStream dup (brief socket writes, independent)
+///
+/// No method ever holds two locks simultaneously — deadlock impossible.
 pub(crate) struct DeferredSession {
-    inner: Mutex<DeferredSessionInner>,
+    tls: Mutex<Option<ServerConnection>>,
+    reader: Mutex<Option<tls::RecordReader>>,
+    writer: Mutex<Option<std::net::TcpStream>>,
+    detached: AtomicBool,
+    capture: Mutex<Option<Arc<tls::SecretCapture>>>,
+    pub original_fd: i32,
+    blocking_guard: Mutex<crate::fdutil::BlockingGuard>,
+    _timeout_guard: crate::fdutil::SocketTimeoutGuard,
     // Immutable metadata (set at construction, no lock needed)
     pub cipher_suite: u16,
     pub tls_version: u16,
@@ -1110,15 +1125,10 @@ pub(crate) struct DeferredSession {
     pub sni: String,
 }
 
-struct DeferredSessionInner {
-    conn: ServerConnection,
-    pipeline: crate::fdutil::HandshakePipeline,
-    capture: Arc<tls::SecretCapture>,
-}
-
 impl DeferredSession {
     /// Construct a DeferredSession from a completed server handshake.
     /// Used by both REALITY (reality.rs) and regular TLS (tls.rs) deferred paths.
+    /// Returns Result because `into_parts()` may fail on dup().
     pub(crate) fn new(
         conn: ServerConnection,
         pipeline: crate::fdutil::HandshakePipeline,
@@ -1127,67 +1137,207 @@ impl DeferredSession {
         tls_version: u16,
         alpn: Vec<u8>,
         sni: String,
-    ) -> Self {
-        Self {
-            inner: Mutex::new(DeferredSessionInner {
-                conn,
-                pipeline,
-                capture,
-            }),
+    ) -> Result<Self, std::io::Error> {
+        let (reader, write_stream, guard, timeout, original_fd) = pipeline.into_parts()?;
+        Ok(Self {
+            tls: Mutex::new(Some(conn)),
+            reader: Mutex::new(Some(reader)),
+            writer: Mutex::new(Some(write_stream)),
+            detached: AtomicBool::new(false),
+            capture: Mutex::new(Some(capture)),
+            original_fd,
+            blocking_guard: Mutex::new(guard),
+            _timeout_guard: timeout,
             cipher_suite,
             tls_version,
             alpn,
             sni,
-        }
+        })
     }
 
     /// Read decrypted plaintext through rustls.
-    /// Uses RecordReader (record-by-record) — no read-ahead past TLS boundaries.
+    /// Three-step lock protocol — no lock held during socket I/O:
+    /// 1. Lock tls (brief) → check rustls plaintext buffer → return if data → unlock
+    /// 2. Lock reader (may block) → read_one_record() → get record bytes → unlock
+    /// 3. Lock tls (brief) → feed record to rustls → read plaintext → unlock
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let DeferredSessionInner {
-            ref mut conn,
-            ref mut pipeline,
-            ..
-        } = *inner;
-        // Feed any pending TLS records into rustls
+        if self.detached.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "deferred session detached",
+            ));
+        }
         loop {
-            // Try to read plaintext first
-            match conn.reader().read(buf) {
-                Ok(0) => {}
-                Ok(n) => return Ok(n),
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e),
+            // Step 1: Check if rustls already has plaintext buffered
+            {
+                let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = tls_guard.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "deferred session closed")
+                })?;
+                match conn.reader().read(buf) {
+                    Ok(0) => {} // no plaintext yet
+                    Ok(n) => return Ok(n),
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
+                }
+            } // tls lock released
+
+            // Step 2: Read one TLS record from socket (may block)
+            let record = {
+                let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+                let reader = reader_guard.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "deferred session reader closed")
+                })?;
+                reader.read_one_record()?
+            }; // reader lock released
+
+            // Check detached between socket I/O and tls lock
+            if self.detached.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "deferred session detached",
+                ));
             }
-            // Need more TLS data — read one record
-            match conn.read_tls(pipeline.reader_mut()) {
-                Ok(0) => {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
+
+            // Step 3: Feed record bytes to rustls and read plaintext.
+            // Save any bytes the Cursor didn't consume back into the reader
+            // (e.g., leftover from handshake containing multiple TLS records).
+            let leftover = {
+                let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = tls_guard.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "deferred session closed")
+                })?;
+                let mut cursor = io::Cursor::new(&record);
+                match conn.read_tls(&mut cursor) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "peer closed",
+                        ));
+                    }
+                    Ok(_) => {
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Ok(_) => {
-                    conn.process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                // Capture any bytes the Cursor didn't consume
+                let pos = cursor.position() as usize;
+                if pos < record.len() {
+                    Some(record[pos..].to_vec())
+                } else {
+                    None
                 }
-                Err(e) => return Err(e),
+            }; // tls lock released
+
+            // Push unconsumed bytes back into the reader so the next
+            // read_one_record() returns them before reading from the socket.
+            if let Some(leftover) = leftover {
+                let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(reader) = reader_guard.as_mut() {
+                    reader.push_back(&leftover);
+                }
             }
         }
     }
 
     /// Write plaintext through rustls (encrypts and sends on wire).
+    /// Two-step lock protocol — socket I/O under separate writer lock:
+    /// 1. Lock tls (brief) → encrypt plaintext → get ciphertext bytes → unlock
+    /// 2. Lock writer (brief) → write_all ciphertext → flush → unlock
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let DeferredSessionInner {
-            ref mut conn,
-            ref mut pipeline,
-            ..
-        } = *inner;
-        let n = conn.writer().write(buf)?;
-        // Flush TLS records to the wire
-        while conn.wants_write() {
-            conn.write_tls(&mut pipeline.reader_mut().tcp)?;
+        if self.detached.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "deferred session detached",
+            ));
         }
-        pipeline.reader_mut().tcp.flush()?;
+
+        // Step 1: Encrypt plaintext through rustls → ciphertext buffer
+        let (n, ciphertext) = {
+            let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = tls_guard.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "deferred session closed")
+            })?;
+            let n = conn.writer().write(buf)?;
+            let mut ciphertext = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut ciphertext)?;
+            }
+            (n, ciphertext)
+        }; // tls lock released
+
+        // Step 2: Send ciphertext on wire
+        {
+            let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_guard.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "deferred session writer closed")
+            })?;
+            writer.write_all(&ciphertext)?;
+            writer.flush()?;
+        } // writer lock released
+
         Ok(n)
+    }
+
+    /// Drain rustls plaintext buffers plus raw read-ahead bytes and detach.
+    /// After success, the deferred session no longer owns rustls/reader/writer state.
+    /// Sequential locks — never two at once.
+    pub fn drain_and_detach(&self) -> Result<(Vec<u8>, Vec<u8>), (i32, String)> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err((2, "deferred session already detached".into()));
+        }
+
+        // Step 1: Lock tls → process + drain plaintext → unlock
+        let plaintext = {
+            let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = tls_guard
+                .as_mut()
+                .ok_or_else(|| (2, "deferred session closed".to_string()))?;
+            conn.process_new_packets()
+                .map_err(|e| (2, format!("process new packets: {}", e)))?;
+            tls::drain_plaintext(conn)
+        }; // tls lock released
+
+        // Step 2: Lock reader → take pending bytes → unlock
+        let raw_ahead = {
+            let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(reader) = reader_guard.as_mut() {
+                reader.take_pending_bytes()
+            } else {
+                Vec::new()
+            }
+        }; // reader lock released
+
+        // Step 3: Restore O_NONBLOCK on the original fd BEFORE marking
+        // detached. The writer goroutine may race to use rawConn.Write()
+        // once it sees detached=true — the fd must be non-blocking by then
+        // or Go's runtime will block the OS thread.
+        {
+            let mut guard = self.blocking_guard.lock().unwrap_or_else(|e| e.into_inner());
+            guard.restore_nonblock_early();
+        }
+        self.detached.store(true, Ordering::Release);
+
+        // Step 4: Take all Options to None (drops rustls + dup'd fds)
+        {
+            let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+            tls_guard.take();
+        }
+        {
+            let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+            reader_guard.take();
+        }
+        {
+            let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            writer_guard.take();
+        }
+        {
+            let mut capture_guard = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+            capture_guard.take();
+        }
+
+        Ok((plaintext, raw_ahead))
     }
 
     /// Consume the session, install kTLS on the socket, and return the
@@ -1207,14 +1357,38 @@ impl DeferredSession {
         (i32, String),
     > {
         let tls_version = self.tls_version;
-        let DeferredSessionInner {
-            mut conn,
-            pipeline,
-            capture,
-        } = self.inner.into_inner().unwrap_or_else(|e| e.into_inner());
+        let original_fd = self.original_fd;
 
-        // Capture the original fd before pipeline is consumed
-        let original_fd = pipeline.original_fd();
+        if self.detached.load(Ordering::Acquire) {
+            return Err((2, "deferred session already detached".into()));
+        }
+
+        // Extract all state from the three locks (self is consumed, so into_inner is safe)
+        let mut conn = self
+            .tls
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| (2, "deferred session closed".to_string()))?;
+        let reader = self
+            .reader
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| (2, "deferred session reader closed".to_string()))?;
+        let writer = self
+            .writer
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| (2, "deferred session writer closed".to_string()))?;
+        let capture = self
+            .capture
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| (2, "deferred session capture closed".to_string()))?;
+
+        // Drop reader + writer (closes dup'd fds) — but keep guards alive
+        // until after kTLS install (they restore O_NONBLOCK/timeouts on original fd)
+        drop(reader);
+        drop(writer);
 
         // Drain any buffered plaintext
         let drained = tls::drain_plaintext(&mut conn);
@@ -1228,20 +1402,39 @@ impl DeferredSession {
 
         let cipher_suite = tls::cipher_suite_to_u16(&tx_secrets);
 
-        // install_ktls_and_finish consumes pipeline (closes dup'd fd, restores O_NONBLOCK)
-        let ktls_result = pipeline
-            .install_ktls_and_finish(tls_version, &tx_secrets, tx_seq, &rx_secrets, rx_seq)
-            .map_err(|e| (2, e))?;
+        // Install kTLS on the original fd
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "kTLS install: fd={} version=0x{:04x} cipher=0x{:04x} tx_seq={} rx_seq={}",
+            original_fd, tls_version, cipher_suite, tx_seq, rx_seq,
+        );
 
-        if !ktls_result.tx_ok || !ktls_result.rx_ok {
+        tls::setup_ulp(original_fd).map_err(|e| (2, format!("ULP: {}", e)))?;
+        let tx_result = tls::install_ktls(original_fd, tls::TLS_TX, tls_version, &tx_secrets, tx_seq);
+        let rx_result = tls::install_ktls(original_fd, tls::TLS_RX, tls_version, &rx_secrets, rx_seq);
+
+        #[cfg(debug_assertions)]
+        {
+            if let Err(ref e) = tx_result {
+                eprintln!("kTLS install TX failed: fd={} err={}", original_fd, e);
+            }
+            if let Err(ref e) = rx_result {
+                eprintln!("kTLS install RX failed: fd={} err={}", original_fd, e);
+            }
+        }
+
+        let ktls_tx = tx_result.is_ok();
+        let ktls_rx = rx_result.is_ok();
+
+        if !ktls_tx || !ktls_rx {
             return Err((
                 2,
                 format!(
                     "kTLS incomplete (tx={}, rx={}, tx_err={}, rx_err={})",
-                    ktls_result.tx_ok,
-                    ktls_result.rx_ok,
-                    ktls_result.tx_err.as_deref().unwrap_or("none"),
-                    ktls_result.rx_err.as_deref().unwrap_or("none"),
+                    ktls_tx,
+                    ktls_rx,
+                    tx_result.err().map(|e| e.to_string()).as_deref().unwrap_or("none"),
+                    rx_result.err().map(|e| e.to_string()).as_deref().unwrap_or("none"),
                 ),
             ));
         }
@@ -1251,21 +1444,16 @@ impl DeferredSession {
         let state_handle = Box::into_raw(state) as *mut c_void;
 
         // Server: TX = server secret, RX = client secret
-        let tx_secret = capture
-            .server_secret
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let rx_secret = capture
-            .client_secret
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // Use take() to zero the source, matching the non-deferred path.
+        let tx_secret = capture.take_server_secret();
+        let rx_secret = capture.take_client_secret();
+
+        // self drops here: _blocking_guard restores O_NONBLOCK, _timeout_guard restores SO_RCVTIMEO
 
         Ok((
             cipher_suite,
-            ktls_result.tx_ok,
-            ktls_result.rx_ok,
+            ktls_tx,
+            ktls_rx,
             state_handle,
             tx_secret,
             rx_secret,
@@ -1469,7 +1657,7 @@ fn reality_server_handshake_deferred(
         })
         .unwrap_or(0);
 
-    Ok(Box::new(DeferredSession::new(
+    let session = DeferredSession::new(
         conn,
         pipeline,
         capture,
@@ -1477,7 +1665,9 @@ fn reality_server_handshake_deferred(
         tls_version,
         negotiated_alpn,
         sni,
-    )))
+    )
+    .map_err(|e| (2, format!("deferred session init: {}", e)))?;
+    Ok(Box::new(session))
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,7 +1780,19 @@ pub extern "C" fn xray_deferred_read(
             }
             Err(e) => {
                 eprintln!("xray_deferred_read: {}", e);
-                -1
+                match e.kind() {
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => {
+                        unsafe { *out_n = 0 };
+                        1 // EOF / peer closed
+                    }
+                    io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected => {
+                        unsafe { *out_n = 0 };
+                        2 // local closed / detached
+                    }
+                    _ => -1,
+                }
             }
         }
     })
@@ -1617,6 +1819,113 @@ pub extern "C" fn xray_deferred_write(
             }
             Err(e) => {
                 eprintln!("xray_deferred_write: {}", e);
+                let mut code = match e.kind() {
+                    io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset => {
+                        1 // EOF / peer closed
+                    }
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::NotConnected => {
+                        2 // local closed / detached
+                    }
+                    _ => -1,
+                };
+                if code < 0 {
+                    if let Some(raw) = e.raw_os_error() {
+                        code = match raw {
+                            libc::EPIPE | libc::ECONNRESET | libc::ESHUTDOWN => 1,
+                            libc::ENOTCONN | libc::EBADF => 2,
+                            _ => -1,
+                        };
+                    }
+                }
+                if code < 0 {
+                    let msg = e.to_string().to_ascii_lowercase();
+                    if msg.contains("broken pipe")
+                        || msg.contains("connection reset")
+                        || msg.contains("peer closed")
+                        || msg.contains("close notify")
+                    {
+                        code = 1;
+                    } else if msg.contains("not connected")
+                        || msg.contains("closed")
+                        || msg.contains("detached")
+                    {
+                        code = 2;
+                    }
+                }
+                if code < 0 {
+                    // For streaming proxy semantics, unknown write-side I/O
+                    // errors are safest treated as connection-closure events.
+                    // This avoids surfacing transient close races as fatal
+                    // "deferred write failed" errors.
+                    code = 1;
+                }
+                if code > 0 {
+                    unsafe { *out_n = 0 };
+                }
+                code
+            }
+        }
+    })
+}
+
+/// Drain buffered plaintext and raw read-ahead bytes, then detach the deferred
+/// rustls session from the socket. On success, the handle becomes detached and
+/// subsequent read/write calls on it will fail.
+///
+/// Returns:
+/// - out_plaintext_ptr/out_plaintext_len: decrypted bytes buffered in rustls
+/// - out_raw_ptr/out_raw_len: bytes already read from socket but not yet
+///   consumed by rustls
+#[no_mangle]
+pub extern "C" fn xray_deferred_drain_and_detach(
+    handle: *mut c_void,
+    out_plaintext_ptr: *mut *mut u8,
+    out_plaintext_len: *mut usize,
+    out_raw_ptr: *mut *mut u8,
+    out_raw_len: *mut usize,
+) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null()
+            || out_plaintext_ptr.is_null()
+            || out_plaintext_len.is_null()
+            || out_raw_ptr.is_null()
+            || out_raw_len.is_null()
+        {
+            return -1;
+        }
+
+        unsafe {
+            *out_plaintext_ptr = std::ptr::null_mut();
+            *out_plaintext_len = 0;
+            *out_raw_ptr = std::ptr::null_mut();
+            *out_raw_len = 0;
+        }
+
+        let session = unsafe { &*(handle as *const DeferredSession) };
+        match session.drain_and_detach() {
+            Ok((plaintext, raw_ahead)) => {
+                if !plaintext.is_empty() {
+                    let len = plaintext.len();
+                    let boxed = plaintext.into_boxed_slice();
+                    unsafe {
+                        *out_plaintext_ptr = Box::into_raw(boxed) as *mut u8;
+                        *out_plaintext_len = len;
+                    }
+                }
+                if !raw_ahead.is_empty() {
+                    let len = raw_ahead.len();
+                    let boxed = raw_ahead.into_boxed_slice();
+                    unsafe {
+                        *out_raw_ptr = Box::into_raw(boxed) as *mut u8;
+                        *out_raw_len = len;
+                    }
+                }
+                0
+            }
+            Err((_, msg)) => {
+                eprintln!("xray_deferred_drain_and_detach: {}", msg);
                 -1
             }
         }
@@ -1680,12 +1989,14 @@ pub extern "C" fn xray_deferred_free(handle: *mut c_void) {
         if !handle.is_null() {
             let session = unsafe { Box::from_raw(handle as *mut DeferredSession) };
             // Drain any residual plaintext for defense-in-depth
-            let mut inner = session
-                .inner
-                .into_inner()
-                .unwrap_or_else(|e| e.into_inner());
-            tls::drain_plaintext(&mut inner.conn);
-            // inner drops here: pipeline drops (closes dup'd fd, restores O_NONBLOCK)
+            {
+                let mut tls_guard = session.tls.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(conn) = tls_guard.as_mut() {
+                    tls::drain_plaintext(conn);
+                }
+            }
+            // session drops here: reader/writer dup'd fds close,
+            // _blocking_guard restores O_NONBLOCK, _timeout_guard restores timeouts
         }
     })
 }
