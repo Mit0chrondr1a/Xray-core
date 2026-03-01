@@ -182,7 +182,8 @@ func DeferredDrainAndDetach(*DeferredSessionHandle) ([]byte, []byte, error) {
 func DeferredEnableKTLS(*DeferredSessionHandle) (*TlsResult, error) {
 	return nil, errNotAvailable
 }
-func DeferredFree(*DeferredSessionHandle) {}
+func DeferredRestoreNonBlock(*DeferredSessionHandle) error { return nil }
+func DeferredFree(*DeferredSessionHandle)                  {}
 
 // --- Blake3 (delegates to lukechampine.com/blake3) ---
 

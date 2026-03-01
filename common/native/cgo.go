@@ -87,6 +87,7 @@ extern int32_t xray_deferred_read(void* handle, uint8_t* buf, size_t len, size_t
 extern int32_t xray_deferred_write(void* handle, const uint8_t* buf, size_t len, size_t* out_n);
 extern int32_t xray_deferred_drain_and_detach(void* handle, uint8_t** out_plaintext_ptr, size_t* out_plaintext_len, uint8_t** out_raw_ptr, size_t* out_raw_len);
 extern int32_t xray_deferred_enable_ktls(void* handle, struct xray_tls_result* out);
+extern int32_t xray_deferred_restore_nonblock(void* handle);
 extern void    xray_deferred_free(void* handle);
 
 // Blake3
@@ -964,6 +965,21 @@ func DeferredEnableKTLS(handle *DeferredSessionHandle) (*TlsResult, error) {
 		return nil, errors.New("native: deferred enable_ktls: " + errMsg)
 	}
 	return extractTlsResult(&cResult), nil
+}
+
+// DeferredRestoreNonBlock restores O_NONBLOCK on the deferred session's fd
+// without detaching. After this call, Rust's reader/writer handle EAGAIN via
+// poll(2), and Go can safely write to the raw socket without blocking.
+func DeferredRestoreNonBlock(handle *DeferredSessionHandle) error {
+	if handle == nil || handle.ptr == nil {
+		return errors.New("native: nil deferred session handle")
+	}
+	rc := C.xray_deferred_restore_nonblock(handle.ptr)
+	runtime.KeepAlive(handle)
+	if rc != 0 {
+		return errors.New("native: deferred restore_nonblock failed")
+	}
+	return nil
 }
 
 // DeferredFree releases a deferred session without enabling kTLS.

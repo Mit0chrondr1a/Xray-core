@@ -292,3 +292,20 @@ func TestDeferredRustConn_ReadWriteAfterDetached(t *testing.T) {
 		t.Fatal("expected IsDetached() to report true")
 	}
 }
+
+func TestDeferredRustConn_RestoreNonBlockNilHandle(t *testing.T) {
+	dc := &DeferredRustConn{rawConn: nil}
+	// Nil handle should be a no-op (returns nil).
+	if err := dc.RestoreNonBlock(); err != nil {
+		t.Fatalf("expected nil error for nil handle, got %v", err)
+	}
+}
+
+func TestDeferredRustConn_RestoreNonBlockAfterDetach(t *testing.T) {
+	dc := &DeferredRustConn{rawConn: nil}
+	dc.detached.Store(true)
+	// Already detached — should be a no-op.
+	if err := dc.RestoreNonBlock(); err != nil {
+		t.Fatalf("expected nil error after detach, got %v", err)
+	}
+}

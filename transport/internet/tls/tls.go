@@ -1048,6 +1048,22 @@ func (c *DeferredRustConn) IsDetached() bool {
 	return c.detached.Load()
 }
 
+// RestoreNonBlock restores O_NONBLOCK on the underlying fd without detaching.
+// After this call, Go can safely write to the raw socket (via UnwrapRawConn)
+// without blocking the OS thread, while Rust's reader/writer handle EAGAIN
+// via poll(2).
+func (c *DeferredRustConn) RestoreNonBlock() error {
+	if c.detached.Load() {
+		return nil // already detached, O_NONBLOCK already restored
+	}
+	c.deferredMu.RLock()
+	defer c.deferredMu.RUnlock()
+	if c.handle == nil {
+		return nil
+	}
+	return native.DeferredRestoreNonBlock(c.handle)
+}
+
 // ConnectionState returns a tls.ConnectionState with REALITY session metadata.
 func (c *DeferredRustConn) ConnectionState() tls.ConnectionState {
 	c.deferredMu.RLock()
