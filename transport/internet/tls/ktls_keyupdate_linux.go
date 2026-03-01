@@ -110,9 +110,21 @@ func (h *KTLSKeyUpdateHandler) Handle() error {
 	hashSize := h.hashFunc.Size()
 
 	// Derive new RX traffic secret and key material (RFC 8446 Section 7.2).
-	newRxSecret := expandLabel(h.hashFunc, h.rxSecret, "traffic upd", nil, hashSize)
-	newRxKey := expandLabel(h.hashFunc, newRxSecret, "key", nil, h.keyLen)
-	newRxIV := expandLabel(h.hashFunc, newRxSecret, "iv", nil, 12)
+	newRxSecret, err := expandLabel(h.hashFunc, h.rxSecret, "traffic upd", nil, hashSize)
+	if err != nil {
+		return fmt.Errorf("ktls: HKDF-Expand-Label rx secret: %w", err)
+	}
+	newRxKey, err := expandLabel(h.hashFunc, newRxSecret, "key", nil, h.keyLen)
+	if err != nil {
+		zeroBytes(newRxSecret)
+		return fmt.Errorf("ktls: HKDF-Expand-Label rx key: %w", err)
+	}
+	newRxIV, err := expandLabel(h.hashFunc, newRxSecret, "iv", nil, 12)
+	if err != nil {
+		zeroBytes(newRxKey)
+		zeroBytes(newRxSecret)
+		return fmt.Errorf("ktls: HKDF-Expand-Label rx iv: %w", err)
+	}
 
 	// Install new RX key with reset sequence number.
 	if err := setKTLSCryptoInfo(h.fd, TLS_RX, TLS_1_3_VERSION, h.cipherSuiteID, newRxKey, newRxIV, make([]byte, 8)); err != nil {
@@ -134,9 +146,21 @@ func (h *KTLSKeyUpdateHandler) Handle() error {
 			return fmt.Errorf("ktls: sendmsg KeyUpdate response: %w", err)
 		}
 
-		newTxSecret := expandLabel(h.hashFunc, h.txSecret, "traffic upd", nil, hashSize)
-		newTxKey := expandLabel(h.hashFunc, newTxSecret, "key", nil, h.keyLen)
-		newTxIV := expandLabel(h.hashFunc, newTxSecret, "iv", nil, 12)
+		newTxSecret, err := expandLabel(h.hashFunc, h.txSecret, "traffic upd", nil, hashSize)
+		if err != nil {
+			return fmt.Errorf("ktls: HKDF-Expand-Label tx secret: %w", err)
+		}
+		newTxKey, err := expandLabel(h.hashFunc, newTxSecret, "key", nil, h.keyLen)
+		if err != nil {
+			zeroBytes(newTxSecret)
+			return fmt.Errorf("ktls: HKDF-Expand-Label tx key: %w", err)
+		}
+		newTxIV, err := expandLabel(h.hashFunc, newTxSecret, "iv", nil, 12)
+		if err != nil {
+			zeroBytes(newTxKey)
+			zeroBytes(newTxSecret)
+			return fmt.Errorf("ktls: HKDF-Expand-Label tx iv: %w", err)
+		}
 
 		if err := setKTLSCryptoInfo(h.fd, TLS_TX, TLS_1_3_VERSION, h.cipherSuiteID, newTxKey, newTxIV, make([]byte, 8)); err != nil {
 			zeroBytes(newTxKey)
@@ -171,9 +195,21 @@ func (h *KTLSKeyUpdateHandler) InitiateUpdate() error {
 	hashSize := h.hashFunc.Size()
 
 	// Derive new TX secret: HKDF-Expand-Label(txSecret, "traffic upd", nil, hashSize)
-	newTxSecret := expandLabel(h.hashFunc, h.txSecret, "traffic upd", nil, hashSize)
-	newTxKey := expandLabel(h.hashFunc, newTxSecret, "key", nil, h.keyLen)
-	newTxIV := expandLabel(h.hashFunc, newTxSecret, "iv", nil, 12)
+	newTxSecret, err := expandLabel(h.hashFunc, h.txSecret, "traffic upd", nil, hashSize)
+	if err != nil {
+		return fmt.Errorf("ktls: HKDF-Expand-Label tx secret: %w", err)
+	}
+	newTxKey, err := expandLabel(h.hashFunc, newTxSecret, "key", nil, h.keyLen)
+	if err != nil {
+		zeroBytes(newTxSecret)
+		return fmt.Errorf("ktls: HKDF-Expand-Label tx key: %w", err)
+	}
+	newTxIV, err := expandLabel(h.hashFunc, newTxSecret, "iv", nil, 12)
+	if err != nil {
+		zeroBytes(newTxKey)
+		zeroBytes(newTxSecret)
+		return fmt.Errorf("ktls: HKDF-Expand-Label tx iv: %w", err)
+	}
 
 	if err := setKTLSCryptoInfo(h.fd, TLS_TX, TLS_1_3_VERSION, h.cipherSuiteID, newTxKey, newTxIV, make([]byte, 8)); err != nil {
 		zeroBytes(newTxKey)
@@ -201,7 +237,7 @@ func (h *KTLSKeyUpdateHandler) Close() {
 }
 
 // expandLabel implements HKDF-Expand-Label from RFC 8446 Section 7.1.
-func expandLabel(hashFunc crypto.Hash, secret []byte, label string, context []byte, length int) []byte {
+func expandLabel(hashFunc crypto.Hash, secret []byte, label string, context []byte, length int) ([]byte, error) {
 	hkdfLabel := make([]byte, 0, 2+1+6+len(label)+1+len(context))
 	hkdfLabel = binary.BigEndian.AppendUint16(hkdfLabel, uint16(length))
 	hkdfLabel = append(hkdfLabel, byte(6+len(label)))
@@ -209,8 +245,7 @@ func expandLabel(hashFunc crypto.Hash, secret []byte, label string, context []by
 	hkdfLabel = append(hkdfLabel, label...)
 	hkdfLabel = append(hkdfLabel, byte(len(context)))
 	hkdfLabel = append(hkdfLabel, context...)
-	out, _ := hkdf.Expand(hashFunc.New, secret, string(hkdfLabel), length)
-	return out
+	return hkdf.Expand(hashFunc.New, secret, string(hkdfLabel), length)
 }
 
 // recvControlRecord reads a TLS control record from the kernel via recvmsg.
