@@ -56,6 +56,10 @@ var (
 	// TLS handshake completes via rustls but kTLS is NOT installed yet.
 	// The VLESS handler decides: Vision flows keep rustls (no kTLS),
 	// non-Vision flows call EnableKTLS() to install kTLS in-place.
+	// Camouflage is preserved: auth uses MSG_PEEK so unauthenticated
+	// probers always fall through to Go goreality which mirrors the
+	// real Dest's ServerHello. Only authenticated clients (our own
+	// Xray clients) see the Rust ServerHello.
 	// See docs/ktls-vision-incompatibility.md.
 	useNativeRealityServerFn = func(v *Listener) bool {
 		return nativeRealityServerEligible(v, native.Available(), tls.NativeFullKTLSSupported(), tls.DeferredKTLSPromotionDisabled())
@@ -223,50 +227,29 @@ func (v *Listener) keepAccepting() {
 				}
 			}()
 			if v.tlsConfig != nil {
-				if native.Available() && v.tlsXrayConfig != nil &&
-					tls.NativeFullKTLSSupportedForTLSConfig(v.tlsXrayConfig) &&
-					(v.config == nil || !v.config.AcceptProxyProtocol) &&
-					!tls.DeferredKTLSPromotionDisabled() {
-					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
-						errors.LogWarningInner(context.Background(), err, "failed to set Rust TLS handshake deadline on accepted connection")
-						_ = conn.Close()
-						return
-					}
-					// Deferred kTLS: handshake completes via rustls but kTLS is
-					// NOT installed yet. The protocol handler decides: Vision
-					// flows keep rustls (no kTLS), non-Vision flows call
-					// EnableKTLS() to install kTLS in-place.
-					deferredConn, tlsErr := tls.RustServerDeferred(conn, v.tlsXrayConfig, tlsHandshakeTimeout)
-					if err := conn.SetDeadline(time.Time{}); err != nil {
-						errors.LogWarningInner(context.Background(), err, "failed to clear Rust TLS handshake deadline on accepted connection")
-					}
-					if tlsErr != nil {
-						errors.LogWarningInner(context.Background(), tlsErr, "failed Rust TLS deferred handshake on accepted connection")
-						_ = conn.Close()
-						return
-					}
-					conn = deferredConn
-				} else {
-					tlsConn := tls.Server(conn, v.tlsConfig)
-					// Reassign conn immediately so the panic handler's defer
-					// closes the TLS wrapper (not just rawConn) on panic.
-					conn = tlsConn
-					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
-						errors.LogWarningInner(context.Background(), err, "failed to set TLS handshake deadline on accepted connection")
-						_ = conn.Close()
-						return
-					}
-					hsCtx, cancel := context.WithTimeout(context.Background(), tlsHandshakeTimeout)
-					hsErr := conn.(*tls.Conn).HandshakeAndEnableKTLS(hsCtx)
-					cancel()
-					if err := conn.SetDeadline(time.Time{}); err != nil {
-						errors.LogWarningInner(context.Background(), err, "failed to clear TLS handshake deadline on accepted connection")
-					}
-					if hsErr != nil {
-						errors.LogWarningInner(context.Background(), hsErr, "failed TLS handshake on accepted connection")
-						_ = conn.Close()
-						return
-					}
+				// Complete the TLS handshake first and defer any kTLS decision
+				// to protocol-layer logic (for example, VLESS flow handling).
+				// This avoids eager kTLS state transitions before the protocol
+				// decides whether direct-copy stripping is required.
+				tlsConn := tls.Server(conn, v.tlsConfig)
+				// Reassign conn immediately so the panic handler's defer
+				// closes the TLS wrapper (not just rawConn) on panic.
+				conn = tlsConn
+				if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+					errors.LogWarningInner(context.Background(), err, "failed to set TLS handshake deadline on accepted connection")
+					_ = conn.Close()
+					return
+				}
+				hsCtx, cancel := context.WithTimeout(context.Background(), tlsHandshakeTimeout)
+				hsErr := conn.(*tls.Conn).HandshakeContext(hsCtx)
+				cancel()
+				if err := conn.SetDeadline(time.Time{}); err != nil {
+					errors.LogWarningInner(context.Background(), err, "failed to clear TLS handshake deadline on accepted connection")
+				}
+				if hsErr != nil {
+					errors.LogWarningInner(context.Background(), hsErr, "failed TLS handshake on accepted connection")
+					_ = conn.Close()
+					return
 				}
 			} else if v.realityConfig != nil {
 				rustDone := false
@@ -315,6 +298,10 @@ func (v *Listener) keepAccepting() {
 							errors.LogDebug(context.Background(), "REALITY auth detail: ", deferredErr)
 							// Fall through — MSG_PEEK left socket data unconsumed,
 							// Go reality.Server() will read it and handle spider crawl.
+						} else if isDeferredRealityPeekTimeout(deferredErr) {
+							// Timeout happened before auth/handshake consumed bytes.
+							// Try Go REALITY path for better compatibility on slow paths.
+							errors.LogDebugInner(context.Background(), deferredErr, "Rust REALITY deferred peek timed out, falling back to Go REALITY")
 						} else {
 							errors.LogWarningInner(context.Background(), deferredErr, "Rust REALITY deferred handshake failed")
 							_ = conn.Close()
@@ -325,15 +312,10 @@ func (v *Listener) keepAccepting() {
 					}
 				}
 				if !rustDone {
-					if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
-						errors.LogWarningInner(context.Background(), err, "failed to set REALITY fallback handshake deadline")
-						_ = conn.Close()
-						return
-					}
+					// Keep fallback behavior aligned with upstream Go REALITY
+					// listener: do not wrap reality.Server() with an external
+					// deadline, so camouflage flow/timing remains unchanged.
 					realityConn, serveErr := realityServerFn(conn, v.realityConfig)
-					if err := conn.SetDeadline(time.Time{}); err != nil {
-						errors.LogWarningInner(context.Background(), err, "failed to clear REALITY fallback handshake deadline")
-					}
 					if serveErr != nil {
 						recordRealityFailureOnce()
 						errors.LogInfo(context.Background(), serveErr.Error())
@@ -429,6 +411,10 @@ func realityVersionRange(minClientVer, maxClientVer []byte) (bool, [3]uint8, [3]
 	}
 
 	return hasVersionRange, minVer, maxVer
+}
+
+func isDeferredRealityPeekTimeout(err error) bool {
+	return native.IsRealityDeferredPeekTimeout(err)
 }
 
 // Addr implements internet.Listener.Addr.
