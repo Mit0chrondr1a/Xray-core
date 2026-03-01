@@ -295,7 +295,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if errR != nil {
 		return errR
 	}
-	errors.LogInfo(ctx, "firstLen = ", firstLen)
 
 	reader := &buf.BufferedReader{
 		Reader: buf.NewReader(connection),
@@ -344,6 +343,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				errors.LogInfo(ctx, "realName = "+name)
 				errors.LogInfo(ctx, "realAlpn = "+alpn)
 				if ktlsErr := dc.EnableKTLS(); ktlsErr != nil {
+					// Deferred handle is consumed by FFI even on failure, so
+					// this connection cannot safely continue rustls I/O.
 					return errors.New("deferred kTLS enable failed in fallback").Base(ktlsErr).AtWarning()
 				}
 			}
@@ -564,6 +565,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	var input *bytes.Reader
 	var rawInput *bytes.Buffer
+	deferredVisionPath := false
 	switch requestAddons.Flow {
 	case vless.XRV:
 		if account.Flow == requestAddons.Flow {
@@ -606,9 +608,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					rawInput = &bytes.Buffer{}
 				} else if _, ok := iConn.(*tls.DeferredRustConn); ok {
 					// Deferred kTLS: rustls handles TLS. Vision will strip at command=2.
-					// No Go-level TLS buffers (RecordReader reads record-by-record).
-					input = &bytes.Reader{}
-					rawInput = &bytes.Buffer{}
+					// VisionReader will call DeferredRustConn.DrainAndDetach().
+					deferredVisionPath = true
+					input = nil
+					rawInput = nil
 				} else {
 					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
@@ -633,6 +636,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			} else {
 				errors.LogDebug(ctx, "non-Vision VLESS: kTLS enabled on DeferredRustConn")
 			}
+		} else if tlsConn, ok := iConn.(*tls.Conn); ok {
+			if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
+				return errors.New("kTLS enable failed for non-Vision VLESS TLS connection").Base(err).AtWarning()
+			}
 		}
 	default:
 		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
@@ -651,6 +658,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 
 	trafficState := proxy.NewTrafficState(userSentID)
+	if deferredVisionPath {
+		trafficState.NumberOfPacketToFilter = 32
+	}
 	visionReaderCtx := ctx
 	visionWriterCtx := ctx
 	// Vision uplink/downlink processing can run concurrently, so each direction

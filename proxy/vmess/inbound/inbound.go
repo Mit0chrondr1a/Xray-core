@@ -257,6 +257,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		}
 		return err
 	}
+	if tlsConn, ok := iConn.(*tls.Conn); ok {
+		if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
+			return errors.New("kTLS enable failed for VMess TLS connection").Base(err).AtWarning()
+		}
+	}
 
 	if request.Command != protocol.RequestCommandMux {
 		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
