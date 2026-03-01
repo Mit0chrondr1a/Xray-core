@@ -5,8 +5,10 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
+	stderrors "errors"
 	"fmt"
 	"io"
+	stdnet "net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -378,8 +380,11 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
 			currentSession.isFullyConnected.Close()
-			if currentSession.reaperTimer != nil {
-				currentSession.reaperTimer.Stop()
+			h.sessionMu.Lock()
+			reaper := currentSession.reaperTimer
+			h.sessionMu.Unlock()
+			if reaper != nil {
+				reaper.Stop()
 			}
 			defer func() {
 				h.releaseSession(sessionId, currentSession)
@@ -472,6 +477,21 @@ type kTLSListener struct {
 	consecutiveFails int // backoff counter for systematic handshake failures
 }
 
+var xhttpListenerSleepFn = time.Sleep
+
+func xhttpListenerApplyBackoff(consecutiveFails int) {
+	// Exponential backoff under systematic failure to prevent CPU saturation
+	// from misconfiguration or adversarial handshake bombing.
+	if consecutiveFails <= 10 {
+		return
+	}
+	backoff := time.Duration(consecutiveFails-10) * 100 * time.Millisecond
+	if backoff > 5*time.Second {
+		backoff = 5 * time.Second
+	}
+	xhttpListenerSleepFn(backoff)
+}
+
 func xhttpKTLSListenerEligible(port net.Port, socketSettings *internet.SocketConfig, nativeAvailable, fullKTLSSupported bool) bool {
 	if port == 0 || !nativeAvailable || !fullKTLSSupported {
 		return false
@@ -496,15 +516,7 @@ func (l *kTLSListener) Accept() (net.Conn, error) {
 			conn.Close()
 			l.consecutiveFails++
 			errors.LogDebug(context.Background(), "XHTTP kTLS handshake failed (consecutive=", l.consecutiveFails, "): ", err)
-			// Exponential backoff under systematic failure to prevent CPU
-			// saturation from misconfiguration or adversarial TLS bombing.
-			if l.consecutiveFails > 10 {
-				backoff := time.Duration(l.consecutiveFails-10) * 100 * time.Millisecond
-				if backoff > 5*time.Second {
-					backoff = 5 * time.Second
-				}
-				time.Sleep(backoff)
-			}
+			xhttpListenerApplyBackoff(l.consecutiveFails)
 			continue
 		}
 		l.consecutiveFails = 0
@@ -514,6 +526,308 @@ func (l *kTLSListener) Accept() (net.Conn, error) {
 
 func (l *kTLSListener) Close() error   { return l.inner.Close() }
 func (l *kTLSListener) Addr() net.Addr { return l.inner.Addr() }
+
+// kREALITYListener wraps a net.Listener to perform Rust REALITY handshakes
+// with immediate deferred kTLS promotion for XHTTP. On Rust auth failure
+// (or safe peek-timeout cases), it falls back to Go REALITY for camouflage.
+type kREALITYListener struct {
+	inner             net.Listener
+	realityConfig     *goreality.Config
+	realityXrayConfig *reality.Config
+	timeout           time.Duration
+	handshakeSem      chan struct{}
+	conns             chan net.Conn
+	done              chan struct{}
+	closeOnce         sync.Once
+	mu                sync.Mutex
+	err               error
+}
+
+const xhttpMaxConcurrentRealityHandshakes = 4096
+const xhttpRealityAcceptRetryDelay = 100 * time.Millisecond
+
+func xhttpKREALITYListenerEligible(
+	port net.Port,
+	socketSettings *internet.SocketConfig,
+	realityConfig *reality.Config,
+	nativeAvailable, fullKTLSSupported, deferredPromotionDisabled bool,
+) bool {
+	if port == 0 || !nativeAvailable || !fullKTLSSupported || deferredPromotionDisabled || realityConfig == nil {
+		return false
+	}
+	if socketSettings != nil && socketSettings.AcceptProxyProtocol {
+		return false
+	}
+	// Go REALITY derives ML-DSA signing key from mldsa65_seed.
+	// Keep Go REALITY server path when configured.
+	if len(realityConfig.Mldsa65Seed) > 0 {
+		return false
+	}
+	return true
+}
+
+func newKREALITYListener(inner net.Listener, realityConfig *goreality.Config, realityXrayConfig *reality.Config, timeout time.Duration) *kREALITYListener {
+	l := &kREALITYListener{
+		inner:             inner,
+		realityConfig:     realityConfig,
+		realityXrayConfig: realityXrayConfig,
+		timeout:           timeout,
+		handshakeSem:      make(chan struct{}, xhttpMaxConcurrentRealityHandshakes),
+		conns:             make(chan net.Conn),
+		done:              make(chan struct{}),
+	}
+	go l.keepAccepting()
+	return l
+}
+
+func xhttpIsTemporaryAcceptErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var temporary interface{ Temporary() bool }
+	if stderrors.As(err, &temporary) && temporary.Temporary() {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return stderrors.As(err, &timeout) && timeout.Timeout()
+}
+
+func xhttpIsClosedListenerErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if stderrors.Is(err, io.EOF) || stderrors.Is(err, stdnet.ErrClosed) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "listener closed")
+}
+
+func (l *kREALITYListener) shutdown(err error) {
+	l.closeOnce.Do(func() {
+		l.mu.Lock()
+		if l.err == nil {
+			l.err = err
+		}
+		l.mu.Unlock()
+		close(l.done)
+	})
+}
+
+func (l *kREALITYListener) keepAccepting() {
+	for {
+		rawConn, err := l.inner.Accept()
+		if err != nil {
+			if xhttpIsClosedListenerErr(err) {
+				l.shutdown(io.EOF)
+				return
+			}
+			if xhttpIsTemporaryAcceptErr(err) {
+				errors.LogWarningInner(context.Background(), err, "XHTTP kREALITY accept temporary error; retrying")
+				xhttpListenerSleepFn(xhttpRealityAcceptRetryDelay)
+				continue
+			}
+			l.shutdown(err)
+			return
+		}
+		select {
+		case l.handshakeSem <- struct{}{}:
+		default:
+			errors.LogWarning(context.Background(),
+				"XHTTP kREALITY handshake limit reached (",
+				xhttpMaxConcurrentRealityHandshakes,
+				"), rejecting connection from ",
+				rawConn.RemoteAddr(),
+			)
+			_ = rawConn.Close()
+			continue
+		}
+		go l.handshakeAndEnqueue(rawConn)
+	}
+}
+
+func (l *kREALITYListener) handshakeAndEnqueue(rawConn net.Conn) {
+	conn := rawConn
+	defer func() {
+		<-l.handshakeSem
+		if r := recover(); r != nil {
+			errors.LogError(context.Background(), "panic in XHTTP kREALITY handshake worker: ", r)
+			_ = conn.Close()
+		}
+	}()
+	conn, err := l.processConn(rawConn)
+	if err != nil {
+		if err != io.EOF {
+			errors.LogDebugInner(context.Background(), err, "XHTTP kREALITY handshake worker dropped connection")
+		}
+		_ = rawConn.Close()
+		return
+	}
+	select {
+	case <-l.done:
+		_ = conn.Close()
+	case l.conns <- conn:
+	}
+}
+
+func (l *kREALITYListener) processConn(rawConn net.Conn) (net.Conn, error) {
+	tryGoFallback := false
+	fd, fdErr := tls.ExtractFd(rawConn)
+	if fdErr != nil {
+		errors.LogDebugInner(context.Background(), fdErr, "XHTTP Rust REALITY path skipped: failed to extract fd")
+		tryGoFallback = true
+	} else {
+		if err := rawConn.SetDeadline(time.Now().Add(l.timeout)); err != nil {
+			return nil, errors.New("XHTTP Rust REALITY path: failed to set handshake deadline").Base(err)
+		}
+		deferredResult, deferredErr := l.doRustRealityDeferred(fd)
+		if err := rawConn.SetDeadline(time.Time{}); err != nil {
+			errors.LogWarningInner(context.Background(), err, "XHTTP Rust REALITY path: failed to clear handshake deadline")
+		}
+		if deferredErr == nil {
+			deferredConn, wrapErr := tls.NewDeferredRustConn(rawConn, deferredResult)
+			if wrapErr != nil {
+				if deferredResult != nil && deferredResult.Handle != nil {
+					native.DeferredFree(deferredResult.Handle)
+				}
+				return nil, errors.New("XHTTP Rust REALITY deferred handshake succeeded but wrap failed").Base(wrapErr)
+			}
+			if err := deferredConn.EnableKTLS(); err != nil {
+				// Rust REALITY handshake already consumed TLS bytes; Go fallback
+				// cannot safely re-handshake on this socket. Don't close deferredConn
+				// here — the handle is already consumed by EnableKTLS FFI, and
+				// handshakeAndEnqueue closes rawConn on error return.
+				return nil, errors.New("XHTTP Rust REALITY deferred kTLS promotion failed").Base(err)
+			}
+			return tls.NewKTLSPlaintextConn(deferredConn), nil
+		}
+		if stderrors.Is(deferredErr, native.ErrRealityAuthFailed) {
+			errors.LogInfo(context.Background(), "XHTTP Rust REALITY auth failed, falling back to Go REALITY camouflage")
+			errors.LogDebug(context.Background(), "XHTTP REALITY auth detail: ", deferredErr)
+			tryGoFallback = true
+		} else if xhttpIsDeferredRealityPeekTimeout(deferredErr) {
+			// Timeout happened before auth/handshake consumed bytes.
+			errors.LogDebugInner(context.Background(), deferredErr, "XHTTP Rust REALITY deferred peek timed out, falling back to Go REALITY")
+			tryGoFallback = true
+		} else {
+			return nil, errors.New("XHTTP Rust REALITY deferred handshake failed").Base(deferredErr)
+		}
+	}
+
+	if tryGoFallback {
+		// Keep fallback behavior aligned with upstream REALITY listener: no extra
+		// deadline wrapper around reality.Server(), so camouflage timing/flow
+		// matches the main Go path.
+		realityConn, fallbackErr := reality.Server(rawConn, l.realityConfig)
+		if fallbackErr != nil {
+			return nil, fallbackErr
+		}
+		return realityConn, nil
+	}
+
+	return nil, io.EOF
+}
+
+func (l *kREALITYListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.done:
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return nil, l.err
+	}
+	return nil, io.EOF
+}
+
+func (l *kREALITYListener) Close() error {
+	err := l.inner.Close()
+	if err != nil {
+		l.shutdown(err)
+		return err
+	}
+	l.shutdown(io.EOF)
+	return nil
+}
+
+func (l *kREALITYListener) Addr() net.Addr { return l.inner.Addr() }
+
+func (l *kREALITYListener) doRustRealityDeferred(fd int) (*native.DeferredResult, error) {
+	cfg := native.RealityConfigNew(false)
+	if cfg == nil {
+		return nil, errors.New("failed to create native REALITY server config")
+	}
+	defer native.RealityConfigFree(cfg)
+
+	rc := l.realityXrayConfig
+	native.RealityConfigSetPrivateKey(cfg, rc.PrivateKey)
+
+	if serverNames := xhttpEncodeRealityServerNames(rc.ServerNames); len(serverNames) > 0 {
+		native.RealityConfigSetServerNames(cfg, serverNames)
+	}
+
+	for _, sid := range rc.ShortIds {
+		if len(sid) > 0 {
+			native.RealityConfigAddShortId(cfg, sid)
+		}
+	}
+
+	native.RealityConfigSetMaxTimeDiff(cfg, rc.MaxTimeDiff)
+
+	if hasVersionRange, minVer, maxVer := xhttpRealityVersionRange(rc.MinClientVer, rc.MaxClientVer); hasVersionRange {
+		native.RealityConfigSetVersionRange(cfg,
+			minVer[0], minVer[1], minVer[2],
+			maxVer[0], maxVer[1], maxVer[2])
+	}
+
+	return native.RealityServerDeferred(fd, cfg, l.timeout)
+}
+
+func xhttpEncodeRealityServerNames(serverNames []string) []byte {
+	totalLen := 0
+	for _, name := range serverNames {
+		if len(name) > 0 {
+			totalLen += len(name) + 1 // null separator expected by native parser
+		}
+	}
+	if totalLen == 0 {
+		return nil
+	}
+
+	encoded := make([]byte, 0, totalLen)
+	for _, name := range serverNames {
+		if len(name) == 0 {
+			continue
+		}
+		encoded = append(encoded, name...)
+		encoded = append(encoded, 0)
+	}
+	return encoded
+}
+
+func xhttpRealityVersionRange(minClientVer, maxClientVer []byte) (bool, [3]uint8, [3]uint8) {
+	minVer := [3]uint8{}
+	maxVer := [3]uint8{255, 255, 255}
+	hasVersionRange := false
+
+	if len(minClientVer) > 0 {
+		hasVersionRange = true
+		copy(minVer[:], minClientVer)
+	}
+	if len(maxClientVer) > 0 {
+		hasVersionRange = true
+		copy(maxVer[:], maxClientVer)
+	}
+
+	return hasVersionRange, minVer, maxVer
+}
+
+func xhttpIsDeferredRealityPeekTimeout(err error) bool {
+	return native.IsRealityDeferredPeekTimeout(err)
+}
 
 type Listener struct {
 	sync.Mutex
@@ -618,7 +932,23 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			}
 		}
 		if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
-			l.listener = goreality.NewListener(l.listener, config.GetREALITYConfig())
+			acceptProxyProtocol := streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol
+			if acceptProxyProtocol {
+				errors.LogDebug(ctx, "XHTTP kREALITY listener disabled: accept_proxy_protocol requires Go REALITY listener")
+			}
+			if xhttpKREALITYListenerEligible(
+				port,
+				streamSettings.SocketSettings,
+				config,
+				native.Available(),
+				tls.NativeFullKTLSSupported(),
+				tls.DeferredKTLSPromotionDisabled(),
+			) {
+				l.listener = newKREALITYListener(l.listener, config.GetREALITYConfig(), config, 8*time.Second)
+				errors.LogInfo(ctx, "XHTTP using kTLS-accelerated REALITY listener")
+			} else {
+				l.listener = goreality.NewListener(l.listener, config.GetREALITYConfig())
+			}
 		}
 
 		handler.localAddr = l.listener.Addr()
