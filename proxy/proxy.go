@@ -141,10 +141,17 @@ type OutboundState struct {
 	UplinkWriterDirectCopy bool
 }
 
+const (
+	visionPacketsToFilterDefault  = 16
+	visionPacketsToFilterDeferred = 32
+)
+
 func NewTrafficState(userUUID []byte) *TrafficState {
 	return &TrafficState{
-		UserUUID:               userUUID,
-		NumberOfPacketToFilter: 8,
+		UserUUID: userUUID,
+		// Keep a moderate default filter budget for mixed workloads.
+		// Deferred REALITY paths can override this to a larger value.
+		NumberOfPacketToFilter: visionPacketsToFilterDefault,
 		EnableXtls:             false,
 		IsTLS12orAbove:         false,
 		IsTLS:                  false,
@@ -171,6 +178,26 @@ func NewTrafficState(userUUID []byte) *TrafficState {
 			UplinkWriterDirectCopy:   false,
 		},
 	}
+}
+
+func unwrapVisionDeferredConn(conn net.Conn) *tls.DeferredRustConn {
+	if conn == nil {
+		return nil
+	}
+	if dc, ok := conn.(*tls.DeferredRustConn); ok {
+		return dc
+	}
+	if sc := stat.TryUnwrapStatsConn(conn); sc != nil && sc != conn {
+		if dc, ok := sc.(*tls.DeferredRustConn); ok {
+			return dc
+		}
+	}
+	if cc, ok := conn.(*encryption.CommonConn); ok && cc != nil {
+		if dc, ok := cc.Conn.(*tls.DeferredRustConn); ok {
+			return dc
+		}
+	}
+	return nil
 }
 
 // VisionReader is used to read xtls vision protocol
@@ -240,6 +267,8 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			newbuffer := XtlsUnpadding(b, w.trafficState, w.isUplink, w.ctx)
 			if newbuffer.Len() > 0 {
 				mb2 = append(mb2, newbuffer)
+			} else {
+				newbuffer.Release()
 			}
 		}
 		buffer = mb2
@@ -259,17 +288,38 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	if *switchToDirectCopy {
-		// XTLS Vision processes TLS-like conn's input and rawInput
-		if inputBuffer, err := buf.ReadFrom(w.input); err == nil && !inputBuffer.IsEmpty() {
-			buffer, _ = buf.MergeMulti(buffer, inputBuffer)
+		if dc := unwrapVisionDeferredConn(w.conn); dc != nil {
+			plaintext, rawAhead, drainErr := dc.DrainAndDetach()
+			if drainErr != nil {
+				// Cannot safely strip outer TLS. Keep rustls active for correctness.
+				errors.LogWarning(w.ctx, "Vision: DeferredRustConn drain failed, keeping rustls active: ", drainErr)
+				*switchToDirectCopy = false
+				return buffer, err
+			}
+			errors.LogDebug(w.ctx, "Vision: DeferredRustConn drained and detached; switching reader to raw socket")
+			if len(plaintext) > 0 {
+				buffer = append(buffer, buf.FromBytes(plaintext))
+			}
+			if len(rawAhead) > 0 {
+				buffer = append(buffer, buf.FromBytes(rawAhead))
+			}
+		} else {
+			// XTLS Vision processes TLS-like conn's input and rawInput
+			if w.input != nil {
+				if inputBuffer, err := buf.ReadFrom(w.input); err == nil && !inputBuffer.IsEmpty() {
+					buffer, _ = buf.MergeMulti(buffer, inputBuffer)
+				}
+				*w.input = bytes.Reader{} // release memory
+				w.input = nil
+			}
+			if w.rawInput != nil {
+				if rawInputBuffer, err := buf.ReadFrom(w.rawInput); err == nil && !rawInputBuffer.IsEmpty() {
+					buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
+				}
+				*w.rawInput = bytes.Buffer{} // release memory
+				w.rawInput = nil
+			}
 		}
-		if rawInputBuffer, err := buf.ReadFrom(w.rawInput); err == nil && !rawInputBuffer.IsEmpty() {
-			buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
-		}
-		*w.input = bytes.Reader{} // release memory
-		w.input = nil
-		*w.rawInput = bytes.Buffer{} // release memory
-		w.rawInput = nil
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
 			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
@@ -335,10 +385,21 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		isPadding = &w.trafficState.Inbound.IsPadding
 		switchToDirectCopy = &w.trafficState.Inbound.DownlinkWriterDirectCopy
 	}
-
-	if *switchToDirectCopy {
+	switchNow := *switchToDirectCopy
+	if switchNow {
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil {
-			if !w.isUplink && inbound.CanSpliceCopy == 2 {
+			// For DeferredRustConn that hasn't been detached yet, skip the
+			// CanSpliceCopy transition. The underlying fd is in blocking mode
+			// (O_NONBLOCK cleared by BlockingGuard for rustls), and splice(2)
+			// on a blocking fd blocks the OS thread instead of yielding to
+			// Go's epoll poller — causing jitter and stalls. Keep CopyRawConn
+			// in the userspace copy loop; DrainAndDetach (called by
+			// VisionReader) restores O_NONBLOCK before setting detached=true.
+			deferredBlocking := false
+			if dc := unwrapVisionDeferredConn(w.conn); dc != nil && !dc.IsDetached() {
+				deferredBlocking = true
+			}
+			if !deferredBlocking && !w.isUplink && inbound.CanSpliceCopy == 2 {
 				inbound.CanSpliceCopy = 1
 			}
 			// if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // TODO: enable uplink splice
@@ -367,7 +428,11 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		mb = ReshapeMultiBuffer(w.ctx, mb)
 		longPadding := w.trafficState.IsTLS
 		for i, b := range mb {
-			if w.trafficState.IsTLS && b.Len() >= 6 && bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) && isComplete {
+			allowDirectOnFragmentedTLS13 := w.trafficState.EnableXtls
+			if w.trafficState.IsTLS &&
+				b.Len() >= 6 &&
+				bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) &&
+				(isComplete || allowDirectOnFragmentedTLS13) {
 				if w.trafficState.EnableXtls {
 					*switchToDirectCopy = true
 				}
@@ -845,6 +910,10 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 				handler = rc.KTLSKeyUpdateHandler()
 				conn = rc.NetConn()
 			} else if dc, ok := conn.(*tls.DeferredRustConn); ok {
+				if !dc.IsDetached() && !dc.KTLSEnabled().Enabled {
+					errors.LogWarning(context.Background(),
+						"UnwrapRawConn: DeferredRustConn is neither detached nor kTLS-active; unwrapping to raw socket may lose rustls-buffered data")
+				}
 				handler = dc.KTLSKeyUpdateHandler()
 				conn = dc.NetConn()
 			} else if utlsConn, ok := conn.(*tls.UConn); ok {
@@ -974,6 +1043,11 @@ func determineSocketCryptoHintRecurse(conn net.Conn, depth int) (net.Conn, ebpf.
 		if ktls.RxReady {
 			return raw, ebpf.CryptoKTLSRxOnly, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 		}
+		if dc.IsDetached() {
+			// After Vision command=2 drain+detach, outer rustls is removed and
+			// bytes flow on the raw socket. Classify as raw TCP for sockmap policy.
+			return raw, ebpf.CryptoNone, appendCryptoHintSource(source, "*tls.DeferredRustConn(detached)")
+		}
 		return raw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 	}
 
@@ -1018,45 +1092,72 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	// avoiding a redundant second traversal of the connection wrapper chain.
 	_, readerCrypto, readerCryptoSource := determineSocketCryptoHintWithSource(readerConn)
 	_, writerCrypto, writerCryptoSource := determineSocketCryptoHintWithSource(writerConn)
+	userspaceReader := buf.NewReader(readerConn)
 
-	readerConn, readCounter, _, readerHandler := UnwrapRawConn(readerConn)
-	writerConn, _, writeCounter, writerHandler := UnwrapRawConn(writerConn)
-	var readerForBuf net.Conn = readerConn
-	if readerHandler != nil {
-		readerForBuf = &ktlsReader{Conn: readerConn, handler: readerHandler}
+	var (
+		rawReady                     bool
+		rawReaderConn, rawWriterConn net.Conn
+		readCounter, writeCounter    stats.Counter
+		readerHandler, writerHandler *tls.KTLSKeyUpdateHandler
+		rawWriterTCP                 *net.TCPConn
+		rawUserspaceReader           buf.Reader
+	)
+	ensureRaw := func() bool {
+		if rawReady {
+			return true
+		}
+		candidateReaderConn, candidateReadCounter, _, candidateReaderHandler := UnwrapRawConn(readerConn)
+		candidateWriterConn, _, candidateWriteCounter, candidateWriterHandler := UnwrapRawConn(writerConn)
+
+		if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+			errors.LogDebug(ctx, "CopyRawConn fallback to readv: unsupported OS ", runtime.GOOS)
+			return false
+		}
+		if candidateReaderConn == nil || candidateWriterConn == nil {
+			errors.LogDebug(ctx, "CopyRawConn fallback to readv: nil raw conn(s) readerType=", connTypeName(candidateReaderConn), " writerType=", connTypeName(candidateWriterConn))
+			return false
+		}
+		tc, ok := candidateWriterConn.(*net.TCPConn)
+		if !ok {
+			errors.LogDebug(ctx, "CopyRawConn fallback to readv: writer is not *net.TCPConn (writerType=", connTypeName(candidateWriterConn), ")")
+			return false
+		}
+
+		readerForUserspace := candidateReaderConn
+		if candidateReaderHandler != nil {
+			readerForUserspace = &ktlsReader{Conn: candidateReaderConn, handler: candidateReaderHandler}
+		}
+
+		rawReaderConn = candidateReaderConn
+		rawWriterConn = candidateWriterConn
+		readCounter = candidateReadCounter
+		writeCounter = candidateWriteCounter
+		readerHandler = candidateReaderHandler
+		writerHandler = candidateWriterHandler
+		rawWriterTCP = tc
+		rawUserspaceReader = buf.NewReader(readerForUserspace)
+		rawReady = true
+		return true
 	}
-	reader := buf.NewReader(readerForBuf)
-	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
-		errors.LogDebug(ctx, "CopyRawConn fallback to readv: unsupported OS ", runtime.GOOS)
-		return readV(ctx, reader, writer, timer, readCounter)
-	}
-	if readerConn == nil || writerConn == nil {
-		errors.LogDebug(ctx, "CopyRawConn fallback to readv: nil raw conn(s) readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn))
-		return readV(ctx, reader, writer, timer, readCounter)
-	}
-	tc, ok := writerConn.(*net.TCPConn)
-	if !ok {
-		errors.LogDebug(ctx, "CopyRawConn fallback to readv: writer is not *net.TCPConn (writerType=", connTypeName(writerConn), ")")
-		return readV(ctx, reader, writer, timer, readCounter)
-	}
+
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: missing inbound metadata")
-		return readV(ctx, reader, writer, timer, readCounter)
+		return readV(ctx, userspaceReader, writer, timer, nil)
 	}
 	if inbound.CanSpliceCopy == 3 {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: inbound.CanSpliceCopy=3")
-		return readV(ctx, reader, writer, timer, readCounter)
+		return readV(ctx, userspaceReader, writer, timer, nil)
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: no outbound metadata")
-		return readV(ctx, reader, writer, timer, readCounter)
+		return readV(ctx, userspaceReader, writer, timer, nil)
 	}
 	for i, ob := range outbounds {
 		if ob.CanSpliceCopy == 3 {
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: outbounds[", i, "].CanSpliceCopy=3")
-			return readV(ctx, reader, writer, timer, readCounter)
+			return readV(ctx, userspaceReader, writer, timer, nil)
 		}
 	}
 
@@ -1075,40 +1176,44 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 		}
 		if splice {
+			if !ensureRaw() {
+				return readV(ctx, userspaceReader, writer, timer, nil)
+			}
+
 			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
 			if mgr := ebpf.GlobalSockmapManager(); mgr == nil {
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: manager unavailable")
 			} else if mgr.ShouldFallbackToSplice() {
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: contention fallback active")
-			} else if !ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
+			} else if !ebpf.CanUseZeroCopyWithCrypto(rawReaderConn, rawWriterConn, readerCrypto, writerCrypto) {
 				errors.LogDebug(ctx, "CopyRawConn crypto hint: reader=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] source=", readerCryptoSource, " writer=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] source=", writerCryptoSource)
 				switch {
 				case !ebpf.KTLSSockhashCompatible() && (readerCrypto == ebpf.CryptoKTLSBoth || writerCrypto == ebpf.CryptoKTLSBoth):
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: kTLS+SOCKHASH not supported on this kernel, using splice")
 					mgr.IncrementKTLSSpliceFallback()
 				case readerCrypto == ebpf.CryptoUserspaceTLS || writerCrypto == ebpf.CryptoUserspaceTLS:
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 				case (readerCrypto == ebpf.CryptoKTLSBoth) != (writerCrypto == ebpf.CryptoKTLSBoth):
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: asymmetric kTLS state (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: asymmetric kTLS state (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 				default:
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 				}
 			} else {
-				if err := mgr.RegisterPairWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto); err == nil {
+				if err := mgr.RegisterPairWithCrypto(rawReaderConn, rawWriterConn, readerCrypto, writerCrypto); err == nil {
 					errors.LogDebug(ctx, "CopyRawConn sockmap (crypto: reader=", int(readerCrypto), " writer=", int(writerCrypto), ")")
-					writerMonitor := startKeyUpdateMonitor(writerConn, writerHandler)
+					writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
 					timer.SetTimeout(24 * time.Hour)
 					if inTimer != nil {
 						inTimer.SetTimeout(24 * time.Hour)
 					}
-					fallbackToSplice, waitErr := waitForSockmapForwarding(readerConn, writerConn)
+					fallbackToSplice, waitErr := waitForSockmapForwarding(rawReaderConn, rawWriterConn)
 					writerMonitor.Stop()
-					if err := mgr.UnregisterPair(readerConn, writerConn); err != nil {
+					if err := mgr.UnregisterPair(rawReaderConn, rawWriterConn); err != nil {
 						errors.LogDebugInner(ctx, err, "CopyRawConn sockmap unregister failed")
 					}
 					// Prevent GC from finalizing connections while BPF ops used their FDs.
-					runtime.KeepAlive(readerConn)
-					runtime.KeepAlive(writerConn)
+					runtime.KeepAlive(rawReaderConn)
+					runtime.KeepAlive(rawWriterConn)
 					if waitErr != nil {
 						errors.LogDebugInner(ctx, waitErr, "CopyRawConn sockmap wait failed, falling back to splice")
 					} else if !fallbackToSplice {
@@ -1130,8 +1235,8 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
-			writerMonitor := startKeyUpdateMonitor(writerConn, writerHandler)
-			w, err := tc.ReadFrom(readerConn)
+			writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
+			w, err := rawWriterTCP.ReadFrom(rawReaderConn)
 			writerMonitor.Stop()
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
@@ -1161,11 +1266,16 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 			loggedUserspaceLoop = true
 		}
-		buffer, err := reader.ReadMultiBuffer()
+		currentReader := userspaceReader
+		// After Vision command=2, inbound switches to raw direct-copy mode.
+		// If splice is disabled by peer metadata, userspace fallback must read
+		// from the same unwrapped/raw layer to avoid waiting for TLS framing.
+		if inbound.CanSpliceCopy == 1 && ensureRaw() && rawUserspaceReader != nil {
+			currentReader = rawUserspaceReader
+		}
+
+		buffer, err := currentReader.ReadMultiBuffer()
 		if !buffer.IsEmpty() {
-			if readCounter != nil {
-				readCounter.Add(int64(buffer.Len()))
-			}
 			timer.Update()
 			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
 				return werr

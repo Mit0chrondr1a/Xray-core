@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 // --- NewTrafficState ---
@@ -19,8 +21,8 @@ func TestNewTrafficState(t *testing.T) {
 	if string(ts.UserUUID) != string(uuid) {
 		t.Fatalf("UserUUID mismatch: got %v", ts.UserUUID)
 	}
-	if ts.NumberOfPacketToFilter != 8 {
-		t.Fatalf("NumberOfPacketToFilter=%d, want 8", ts.NumberOfPacketToFilter)
+	if ts.NumberOfPacketToFilter != visionPacketsToFilterDefault {
+		t.Fatalf("NumberOfPacketToFilter=%d, want %d", ts.NumberOfPacketToFilter, visionPacketsToFilterDefault)
 	}
 	if ts.EnableXtls {
 		t.Fatal("EnableXtls should be false initially")
@@ -424,6 +426,65 @@ func TestTlsByteMarkers(t *testing.T) {
 	}
 	if TlsApplicationDataStart[0] != 0x17 {
 		t.Fatalf("TlsApplicationDataStart[0] = 0x%02x, want 0x17", TlsApplicationDataStart[0])
+	}
+}
+
+func TestVisionWriterSwitchesImmediatelyOnDeferredRustConn(t *testing.T) {
+	// The writer must switch to raw socket immediately when switchToDirectCopy
+	// is true, even if the DeferredRustConn hasn't been detached yet. Deferring
+	// the switch causes the server to keep sending encrypted data after command=2,
+	// while the client has already switched to raw socket reads.
+	ts := NewTrafficState(nil)
+	ts.Inbound.IsPadding = false
+	ts.Inbound.DownlinkWriterDirectCopy = true
+
+	w := NewVisionWriter(
+		buf.Discard,
+		ts,
+		false,
+		context.Background(),
+		&tls.DeferredRustConn{},
+		nil,
+		nil,
+	)
+
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{}); err != nil {
+		t.Fatalf("WriteMultiBuffer() error = %v", err)
+	}
+
+	if ts.Inbound.DownlinkWriterDirectCopy {
+		t.Fatal("DownlinkWriterDirectCopy should be cleared immediately — writer must not defer the switch")
+	}
+}
+
+func TestVisionWriterSkipsSpliceOnBlockingDeferredRustConn(t *testing.T) {
+	// When DeferredRustConn is not detached, the underlying fd is in blocking
+	// mode (O_NONBLOCK cleared for rustls). CanSpliceCopy must NOT transition
+	// to 1, otherwise CopyRawConn enters the splice(2) path on a blocking fd
+	// — splice blocks the OS thread instead of yielding to Go's epoll poller.
+	ts := NewTrafficState(nil)
+	ts.Inbound.IsPadding = false
+	ts.Inbound.DownlinkWriterDirectCopy = true
+
+	inbound := &session.Inbound{CanSpliceCopy: 2}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+
+	w := NewVisionWriter(
+		buf.Discard,
+		ts,
+		false, // downlink writer
+		ctx,
+		&tls.DeferredRustConn{}, // not detached
+		nil,
+		nil,
+	)
+
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{}); err != nil {
+		t.Fatalf("WriteMultiBuffer() error = %v", err)
+	}
+
+	if inbound.CanSpliceCopy != 2 {
+		t.Fatalf("CanSpliceCopy = %d, want 2 — must not transition to 1 while fd is blocking", inbound.CanSpliceCopy)
 	}
 }
 
