@@ -4,6 +4,7 @@ package native
 
 import (
 	"errors"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -24,6 +25,29 @@ var errNotAvailable = errors.New("native TLS not available (build without CGO or
 
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
 var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
+
+// ErrRealityDeferredPeekTimeout indicates deferred REALITY failed during the
+// pre-auth MSG_PEEK phase and callers may safely fall back to Go REALITY.
+var ErrRealityDeferredPeekTimeout = errors.New("REALITY deferred peek timeout: needs fallback")
+
+func isRealityDeferredPeekTimeoutMsg(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "peek_exact: receive timeout") ||
+		strings.Contains(m, "peek_exact: handshake timeout exceeded") ||
+		strings.Contains(m, "peek_exact: short read after")
+}
+
+// IsRealityDeferredPeekTimeout reports whether err represents a deferred
+// REALITY pre-auth MSG_PEEK timeout/short-read condition.
+func IsRealityDeferredPeekTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRealityDeferredPeekTimeout) {
+		return true
+	}
+	return isRealityDeferredPeekTimeoutMsg(err.Error())
+}
 
 // --- TLS Types ---
 
@@ -152,6 +176,9 @@ func TlsServerDeferred(int, *TlsConfigHandle, time.Duration) (*DeferredResult, e
 }
 func DeferredRead(*DeferredSessionHandle, []byte) (int, error)  { return 0, errNotAvailable }
 func DeferredWrite(*DeferredSessionHandle, []byte) (int, error) { return 0, errNotAvailable }
+func DeferredDrainAndDetach(*DeferredSessionHandle) ([]byte, []byte, error) {
+	return nil, nil, errNotAvailable
+}
 func DeferredEnableKTLS(*DeferredSessionHandle) (*TlsResult, error) {
 	return nil, errNotAvailable
 }

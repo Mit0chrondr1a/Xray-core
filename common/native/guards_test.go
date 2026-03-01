@@ -218,3 +218,13 @@ func TestTlsResult_ZeroSecrets_NilSlices(t *testing.T) {
 		t.Error("TxSecret should be nil after ZeroSecrets")
 	}
 }
+
+func TestDeferredDrainAndDetach_NilHandle(t *testing.T) {
+	plain, raw, err := DeferredDrainAndDetach(nil)
+	if err == nil {
+		t.Fatal("DeferredDrainAndDetach(nil) should return error")
+	}
+	if plain != nil || raw != nil {
+		t.Fatal("DeferredDrainAndDetach(nil) should return nil buffers")
+	}
+}

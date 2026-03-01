@@ -85,6 +85,7 @@ extern int32_t xray_reality_server_deferred(int fd, const void* reality_config, 
 extern int32_t xray_tls_server_deferred(int fd, const void* cfg, uint32_t handshake_timeout_ms, struct xray_deferred_result* out);
 extern int32_t xray_deferred_read(void* handle, uint8_t* buf, size_t len, size_t* out_n);
 extern int32_t xray_deferred_write(void* handle, const uint8_t* buf, size_t len, size_t* out_n);
+extern int32_t xray_deferred_drain_and_detach(void* handle, uint8_t** out_plaintext_ptr, size_t* out_plaintext_len, uint8_t** out_raw_ptr, size_t* out_raw_len);
 extern int32_t xray_deferred_enable_ktls(void* handle, struct xray_tls_result* out);
 extern void    xray_deferred_free(void* handle);
 
@@ -215,7 +216,9 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -244,7 +247,30 @@ func EbpfAvailable() bool {
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
 var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 
+// ErrRealityDeferredPeekTimeout indicates deferred REALITY failed during the
+// pre-auth MSG_PEEK phase and callers may safely fall back to Go REALITY.
+var ErrRealityDeferredPeekTimeout = errors.New("REALITY deferred peek timeout: needs fallback")
+
 const defaultNativeHandshakeTimeout = 30 * time.Second
+
+func isRealityDeferredPeekTimeoutMsg(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "peek_exact: receive timeout") ||
+		strings.Contains(m, "peek_exact: handshake timeout exceeded") ||
+		strings.Contains(m, "peek_exact: short read after")
+}
+
+// IsRealityDeferredPeekTimeout reports whether err represents a deferred
+// REALITY pre-auth MSG_PEEK timeout/short-read condition.
+func IsRealityDeferredPeekTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRealityDeferredPeekTimeout) {
+		return true
+	}
+	return isRealityDeferredPeekTimeoutMsg(err.Error())
+}
 
 func timeoutMillis(timeout time.Duration) C.uint32_t {
 	if timeout <= 0 {
@@ -749,6 +775,9 @@ func RealityServerDeferred(fd int, cfg *RealityConfigHandle, timeout time.Durati
 		if code == 1 {
 			return nil, fmt.Errorf("%w: %s", ErrRealityAuthFailed, errMsg)
 		}
+		if isRealityDeferredPeekTimeoutMsg(errMsg) {
+			return nil, fmt.Errorf("%w: %s", ErrRealityDeferredPeekTimeout, errMsg)
+		}
 		return nil, errors.New("native REALITY deferred: " + errMsg)
 	}
 
@@ -843,7 +872,14 @@ func DeferredRead(handle *DeferredSessionHandle, buf []byte) (int, error) {
 	runtime.KeepAlive(handle)
 	runtime.KeepAlive(buf)
 	if rc != 0 {
-		return 0, errors.New("native: deferred read failed")
+		switch rc {
+		case 1:
+			return int(outN), io.EOF
+		case 2:
+			return int(outN), io.ErrClosedPipe
+		default:
+			return 0, errors.New("native: deferred read failed")
+		}
 	}
 	return int(outN), nil
 }
@@ -866,9 +902,51 @@ func DeferredWrite(handle *DeferredSessionHandle, buf []byte) (int, error) {
 	runtime.KeepAlive(handle)
 	runtime.KeepAlive(buf)
 	if rc != 0 {
-		return 0, errors.New("native: deferred write failed")
+		switch rc {
+		case 1:
+			return int(outN), io.EOF
+		case 2:
+			return int(outN), io.ErrClosedPipe
+		default:
+			return 0, io.ErrClosedPipe
+		}
 	}
 	return int(outN), nil
+}
+
+// DeferredDrainAndDetach drains rustls buffered plaintext and raw read-ahead
+// bytes from a deferred session, then detaches the rustls state from the
+// socket. On success, the handle remains allocated but detached; callers should
+// stop using it and switch to the raw socket.
+func DeferredDrainAndDetach(handle *DeferredSessionHandle) ([]byte, []byte, error) {
+	if handle == nil || handle.ptr == nil {
+		return nil, nil, errors.New("native: nil deferred session handle")
+	}
+	var plaintextPtr *C.uint8_t
+	var plaintextLen C.size_t
+	var rawPtr *C.uint8_t
+	var rawLen C.size_t
+	rc := C.xray_deferred_drain_and_detach(
+		handle.ptr,
+		&plaintextPtr,
+		&plaintextLen,
+		&rawPtr,
+		&rawLen,
+	)
+	runtime.KeepAlive(handle)
+	if rc != 0 {
+		// Defensive cleanup in case Rust returned partially populated outputs.
+		if plaintextPtr != nil && plaintextLen > 0 {
+			C.xray_tls_drained_free(plaintextPtr, plaintextLen)
+		}
+		if rawPtr != nil && rawLen > 0 {
+			C.xray_tls_drained_free(rawPtr, rawLen)
+		}
+		return nil, nil, errors.New("native: deferred drain_and_detach failed")
+	}
+	plaintext := drainBytesFromNative(plaintextPtr, plaintextLen)
+	rawAhead := drainBytesFromNative(rawPtr, rawLen)
+	return plaintext, rawAhead, nil
 }
 
 // DeferredEnableKTLS consumes the deferred session and installs kTLS on the socket.
@@ -899,6 +977,19 @@ func DeferredFree(handle *DeferredSessionHandle) {
 	if ptr != nil {
 		C.xray_deferred_free(ptr)
 	}
+}
+
+func drainBytesFromNative(ptr *C.uint8_t, n C.size_t) []byte {
+	if ptr == nil || n == 0 {
+		return nil
+	}
+	if n > C.size_t(1<<30) {
+		C.xray_tls_drained_free(ptr, n)
+		return nil
+	}
+	out := C.GoBytes(unsafe.Pointer(ptr), C.int(n))
+	C.xray_tls_drained_free(ptr, n)
+	return out
 }
 
 // extractTlsResult populates a TlsResult from the C struct, extracting ALPN,
