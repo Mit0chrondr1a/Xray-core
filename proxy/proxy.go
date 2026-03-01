@@ -10,10 +10,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	goerrors "errors"
 	"io"
+	gonet "net"
 	"reflect"
 	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -58,6 +63,137 @@ const (
 	CommandPaddingContinue byte = 0x00
 	CommandPaddingEnd      byte = 0x01
 	CommandPaddingDirect   byte = 0x02
+
+	pipelineMarkerLogInterval = 30 * time.Second
+)
+
+var (
+	pipelineMarkerDeferredRawUnwrapWarning    atomic.Uint64
+	pipelineMarkerRawUnwrapToDetachNanosTotal atomic.Uint64
+	pipelineMarkerRawUnwrapToDetachSamples    atomic.Uint64
+	pipelineMarkerRawUnwrapToDetachLt5ms      atomic.Uint64
+	pipelineMarkerRawUnwrapToDetach5To20ms    atomic.Uint64
+	pipelineMarkerRawUnwrapToDetach20To100ms  atomic.Uint64
+	pipelineMarkerRawUnwrapToDetachGe100ms    atomic.Uint64
+	pipelineMarkerDeferredSpliceGuardHit      atomic.Uint64
+	pipelineMarkerVisionDrainDetachAttempt    atomic.Uint64
+	pipelineMarkerVisionDrainDetachSuccess    atomic.Uint64
+	pipelineMarkerVisionDrainDetachFail       atomic.Uint64
+	pipelineMarkerVisionRestoreNBAttempt      atomic.Uint64
+	pipelineMarkerVisionRestoreNBFail         atomic.Uint64
+	pipelineMarkerVisionPaddingPhaseNanos     atomic.Uint64
+	pipelineMarkerVisionPaddingPhaseCount     atomic.Uint64
+	pipelineMarkerVisionDetachPhaseNanos      atomic.Uint64
+	pipelineMarkerVisionDetachPhaseCount      atomic.Uint64
+	pipelineMarkerVisionPostDetachNanos       atomic.Uint64
+	pipelineMarkerVisionPostDetachCount       atomic.Uint64
+	pipelineMarkerVisionPostDetachSplice      atomic.Uint64
+	pipelineMarkerVisionPostDetachUserspace   atomic.Uint64
+	pipelineMarkerVisionPostDetachSockmap     atomic.Uint64
+	pipelineMarkerSpliceAttempts              atomic.Uint64
+	pipelineMarkerSpliceCompleted             atomic.Uint64
+	pipelineMarkerSpliceExpectedTeardown      atomic.Uint64
+	pipelineMarkerSpliceUnexpectedError       atomic.Uint64
+	pipelineMarkerSpliceBytesTotal            atomic.Uint64
+	pipelineMarkerSpliceDurationNanosTotal    atomic.Uint64
+	pipelineMarkerSpliceBytesLt4K             atomic.Uint64
+	pipelineMarkerSpliceBytes4KTo64K          atomic.Uint64
+	pipelineMarkerSpliceBytes64KTo1M          atomic.Uint64
+	pipelineMarkerSpliceBytesGe1M             atomic.Uint64
+	pipelineMarkerSpliceDurLt1ms              atomic.Uint64
+	pipelineMarkerSpliceDur1To5ms             atomic.Uint64
+	pipelineMarkerSpliceDur5To20ms            atomic.Uint64
+	pipelineMarkerSpliceDur20To100ms          atomic.Uint64
+	pipelineMarkerSpliceDurGe100ms            atomic.Uint64
+	pipelineMarkerUserspaceCopyReads          atomic.Uint64
+	pipelineMarkerUserspaceCopyBytesTotal     atomic.Uint64
+	pipelineMarkerUserspaceRawReaderHits      atomic.Uint64
+	pipelineMarkerUserspaceTLSReaderHits      atomic.Uint64
+	pipelineMarkerEnsureRawFailOS             atomic.Uint64
+	pipelineMarkerEnsureRawFailNilConn        atomic.Uint64
+	pipelineMarkerEnsureRawFailWriterType     atomic.Uint64
+	pipelineMarkerSockmapSkipMgr              atomic.Uint64
+	pipelineMarkerSockmapSkipContention       atomic.Uint64
+	pipelineMarkerSockmapSkipKTLSSockhash     atomic.Uint64
+	pipelineMarkerSockmapSkipUserspaceTLS     atomic.Uint64
+	pipelineMarkerSockmapSkipAsymmetric       atomic.Uint64
+	pipelineMarkerSockmapSkipOther            atomic.Uint64
+	pipelineMarkerSockmapRegisterAttempt      atomic.Uint64
+	pipelineMarkerSockmapRegisterSuccess      atomic.Uint64
+	pipelineMarkerSockmapRegisterFail         atomic.Uint64
+	pipelineMarkerSockmapWaitSuccess          atomic.Uint64
+	pipelineMarkerSockmapWaitFallback         atomic.Uint64
+	pipelineMarkerSockmapWaitError            atomic.Uint64
+	pipelineMarkerFlowMuxUDP                  atomic.Uint64
+	pipelineMarkerFlowPureTCP                 atomic.Uint64
+	pipelineMarkerFlowMuxTCP                  atomic.Uint64
+	pipelineMarkerFlowOther                   atomic.Uint64
+
+	// previous snapshot totals for per-interval deltas
+	pipelineMarkerLastDeferredRawUnwrapWarning    atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetachNanosTotal atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetachSamples    atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetachLt5ms      atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetach5To20ms    atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetach20To100ms  atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetachGe100ms    atomic.Uint64
+	pipelineMarkerLastDeferredSpliceGuardHit      atomic.Uint64
+	pipelineMarkerLastVisionDrainDetachAttempt    atomic.Uint64
+	pipelineMarkerLastVisionDrainDetachSuccess    atomic.Uint64
+	pipelineMarkerLastVisionDrainDetachFail       atomic.Uint64
+	pipelineMarkerLastVisionRestoreNBAttempt      atomic.Uint64
+	pipelineMarkerLastVisionRestoreNBFail         atomic.Uint64
+	pipelineMarkerLastVisionPaddingPhaseNanos     atomic.Uint64
+	pipelineMarkerLastVisionPaddingPhaseCount     atomic.Uint64
+	pipelineMarkerLastVisionDetachPhaseNanos      atomic.Uint64
+	pipelineMarkerLastVisionDetachPhaseCount      atomic.Uint64
+	pipelineMarkerLastVisionPostDetachNanos       atomic.Uint64
+	pipelineMarkerLastVisionPostDetachCount       atomic.Uint64
+	pipelineMarkerLastVisionPostDetachSplice      atomic.Uint64
+	pipelineMarkerLastVisionPostDetachUserspace   atomic.Uint64
+	pipelineMarkerLastVisionPostDetachSockmap     atomic.Uint64
+	pipelineMarkerLastSpliceAttempts              atomic.Uint64
+	pipelineMarkerLastSpliceCompleted             atomic.Uint64
+	pipelineMarkerLastSpliceExpectedTeardown      atomic.Uint64
+	pipelineMarkerLastSpliceUnexpectedError       atomic.Uint64
+	pipelineMarkerLastSpliceBytesTotal            atomic.Uint64
+	pipelineMarkerLastSpliceDurationNanosTotal    atomic.Uint64
+	pipelineMarkerLastSpliceBytesLt4K             atomic.Uint64
+	pipelineMarkerLastSpliceBytes4KTo64K          atomic.Uint64
+	pipelineMarkerLastSpliceBytes64KTo1M          atomic.Uint64
+	pipelineMarkerLastSpliceBytesGe1M             atomic.Uint64
+	pipelineMarkerLastSpliceDurLt1ms              atomic.Uint64
+	pipelineMarkerLastSpliceDur1To5ms             atomic.Uint64
+	pipelineMarkerLastSpliceDur5To20ms            atomic.Uint64
+	pipelineMarkerLastSpliceDur20To100ms          atomic.Uint64
+	pipelineMarkerLastSpliceDurGe100ms            atomic.Uint64
+	pipelineMarkerLastUserspaceCopyReads          atomic.Uint64
+	pipelineMarkerLastUserspaceCopyBytesTotal     atomic.Uint64
+	pipelineMarkerLastUserspaceRawReaderHits      atomic.Uint64
+	pipelineMarkerLastUserspaceTLSReaderHits      atomic.Uint64
+	pipelineMarkerLastEnsureRawFailOS             atomic.Uint64
+	pipelineMarkerLastEnsureRawFailNilConn        atomic.Uint64
+	pipelineMarkerLastEnsureRawFailWriterType     atomic.Uint64
+	pipelineMarkerLastSockmapSkipMgr              atomic.Uint64
+	pipelineMarkerLastSockmapSkipContention       atomic.Uint64
+	pipelineMarkerLastSockmapSkipKTLSSockhash     atomic.Uint64
+	pipelineMarkerLastSockmapSkipUserspaceTLS     atomic.Uint64
+	pipelineMarkerLastSockmapSkipAsymmetric       atomic.Uint64
+	pipelineMarkerLastSockmapSkipOther            atomic.Uint64
+	pipelineMarkerLastSockmapRegisterAttempt      atomic.Uint64
+	pipelineMarkerLastSockmapRegisterSuccess      atomic.Uint64
+	pipelineMarkerLastSockmapRegisterFail         atomic.Uint64
+	pipelineMarkerLastSockmapWaitSuccess          atomic.Uint64
+	pipelineMarkerLastSockmapWaitFallback         atomic.Uint64
+	pipelineMarkerLastSockmapWaitError            atomic.Uint64
+	pipelineMarkerLastFlowMuxUDP                  atomic.Uint64
+	pipelineMarkerLastFlowPureTCP                 atomic.Uint64
+	pipelineMarkerLastFlowMuxTCP                  atomic.Uint64
+	pipelineMarkerLastFlowOther                   atomic.Uint64
+
+	pipelineMarkerLastSummaryUnix     atomic.Int64
+	pipelineVisionDetachUnixByConn    sync.Map
+	pipelineVisionRawUnwrapUnixByConn sync.Map
 )
 
 // An Inbound processes inbound connections.
@@ -106,6 +242,7 @@ type GetOutbound interface {
 type TrafficState struct {
 	UserUUID               []byte
 	NumberOfPacketToFilter int
+	CreatedAtUnixNano      int64
 	EnableXtls             bool
 	IsTLS12orAbove         bool
 	IsTLS                  bool
@@ -152,6 +289,7 @@ func NewTrafficState(userUUID []byte) *TrafficState {
 		// Keep a moderate default filter budget for mixed workloads.
 		// Deferred REALITY paths can override this to a larger value.
 		NumberOfPacketToFilter: visionPacketsToFilterDefault,
+		CreatedAtUnixNano:      time.Now().UnixNano(),
 		EnableXtls:             false,
 		IsTLS12orAbove:         false,
 		IsTLS:                  false,
@@ -289,13 +427,33 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 	if *switchToDirectCopy {
 		if dc := unwrapVisionDeferredConn(w.conn); dc != nil {
+			pipelineMarkerVisionDrainDetachAttempt.Add(1)
+			detachStart := time.Now()
 			plaintext, rawAhead, drainErr := dc.DrainAndDetach()
+			detachDuration := time.Since(detachStart)
+			pipelineMarkerVisionDetachPhaseNanos.Add(uint64(detachDuration.Nanoseconds()))
+			pipelineMarkerVisionDetachPhaseCount.Add(1)
 			if drainErr != nil {
+				pipelineMarkerVisionDrainDetachFail.Add(1)
+				maybeLogPipelineRuntimeSummary(w.ctx)
 				// Cannot safely strip outer TLS. Keep rustls active for correctness.
-				errors.LogWarning(w.ctx, "Vision: DeferredRustConn drain failed, keeping rustls active: ", drainErr)
+				errors.LogWarning(w.ctx, "[kind=vision.drain_detach_failed] DeferredRustConn drain failed, keeping rustls active: ", drainErr)
 				*switchToDirectCopy = false
 				return buffer, err
 			}
+			pipelineMarkerVisionDrainDetachSuccess.Add(1)
+			detachDoneUnix := time.Now().UnixNano()
+			if w.trafficState != nil && w.trafficState.CreatedAtUnixNano > 0 && detachDoneUnix > w.trafficState.CreatedAtUnixNano {
+				pipelineMarkerVisionPaddingPhaseNanos.Add(uint64(detachDoneUnix - w.trafficState.CreatedAtUnixNano))
+				pipelineMarkerVisionPaddingPhaseCount.Add(1)
+			}
+			if rawUnwrapUnix, ok := consumeVisionRawUnwrapWarningTimestamp(w.conn); ok && detachDoneUnix > rawUnwrapUnix {
+				unwrapToDetachNs := uint64(detachDoneUnix - rawUnwrapUnix)
+				pipelineMarkerRawUnwrapToDetachNanosTotal.Add(unwrapToDetachNs)
+				pipelineMarkerRawUnwrapToDetachSamples.Add(1)
+				recordRawUnwrapToDetachHistogram(unwrapToDetachNs)
+			}
+			storeVisionDetachTimestamp(w.conn, detachDoneUnix)
 			errors.LogDebug(w.ctx, "Vision: DeferredRustConn drained and detached; switching reader to raw socket")
 			if len(plaintext) > 0 {
 				buffer = append(buffer, buf.FromBytes(plaintext))
@@ -319,6 +477,13 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				*w.rawInput = bytes.Buffer{} // release memory
 				w.rawInput = nil
 			}
+		}
+
+		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil && inbound.CanSpliceCopy == 2 {
+			// Vision command=2 reached and reader switched to raw path. At this
+			// point TLS decryption is no longer required on this leg, so the
+			// response copy loop can safely transition to splice/readv-raw path.
+			inbound.CanSpliceCopy = 1
 		}
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
@@ -388,18 +553,20 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	switchNow := *switchToDirectCopy
 	if switchNow {
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil {
-			// For DeferredRustConn that hasn't been detached yet, skip the
-			// CanSpliceCopy transition. The underlying fd is in blocking mode
-			// (O_NONBLOCK cleared by BlockingGuard for rustls), and splice(2)
-			// on a blocking fd blocks the OS thread instead of yielding to
-			// Go's epoll poller — causing jitter and stalls. Keep CopyRawConn
-			// in the userspace copy loop; DrainAndDetach (called by
-			// VisionReader) restores O_NONBLOCK before setting detached=true.
-			deferredBlocking := false
+			// Restore O_NONBLOCK before switching to raw socket writes.
+			// Without this, the fd is in blocking mode (cleared by Rust's
+			// BlockingGuard) and raw writes would block the OS thread.
+			// NOTE: CanSpliceCopy stays at 2 while DeferredRustConn is active
+			// because CopyRawConn uses CanSpliceCopy==1 to gate rawUserspaceReader,
+			// which bypasses TLS decryption on the outbound — wrong for HTTPS targets.
 			if dc := unwrapVisionDeferredConn(w.conn); dc != nil && !dc.IsDetached() {
-				deferredBlocking = true
-			}
-			if !deferredBlocking && !w.isUplink && inbound.CanSpliceCopy == 2 {
+				pipelineMarkerVisionRestoreNBAttempt.Add(1)
+				if err := dc.RestoreNonBlock(); err != nil {
+					pipelineMarkerVisionRestoreNBFail.Add(1)
+					maybeLogPipelineRuntimeSummary(w.ctx)
+					errors.LogWarning(w.ctx, "[kind=vision.restore_nonblock_failed] RestoreNonBlock failed: ", err)
+				}
+			} else if !w.isUplink && inbound.CanSpliceCopy == 2 {
 				inbound.CanSpliceCopy = 1
 			}
 			// if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // TODO: enable uplink splice
@@ -911,8 +1078,11 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 				conn = rc.NetConn()
 			} else if dc, ok := conn.(*tls.DeferredRustConn); ok {
 				if !dc.IsDetached() && !dc.KTLSEnabled().Enabled {
+					storeVisionRawUnwrapWarningTimestamp(dc, time.Now().UnixNano())
+					pipelineMarkerDeferredRawUnwrapWarning.Add(1)
+					maybeLogPipelineRuntimeSummary(context.Background())
 					errors.LogWarning(context.Background(),
-						"UnwrapRawConn: DeferredRustConn is neither detached nor kTLS-active; unwrapping to raw socket may lose rustls-buffered data")
+						"[kind=vision.deferred_raw_unwrap] UnwrapRawConn: DeferredRustConn is neither detached nor kTLS-active; unwrapping to raw socket may lose rustls-buffered data")
 				}
 				handler = dc.KTLSKeyUpdateHandler()
 				conn = dc.NetConn()
@@ -1110,15 +1280,18 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		candidateWriterConn, _, candidateWriteCounter, candidateWriterHandler := UnwrapRawConn(writerConn)
 
 		if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+			pipelineMarkerEnsureRawFailOS.Add(1)
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: unsupported OS ", runtime.GOOS)
 			return false
 		}
 		if candidateReaderConn == nil || candidateWriterConn == nil {
+			pipelineMarkerEnsureRawFailNilConn.Add(1)
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: nil raw conn(s) readerType=", connTypeName(candidateReaderConn), " writerType=", connTypeName(candidateWriterConn))
 			return false
 		}
 		tc, ok := candidateWriterConn.(*net.TCPConn)
 		if !ok {
+			pipelineMarkerEnsureRawFailWriterType.Add(1)
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: writer is not *net.TCPConn (writerType=", connTypeName(candidateWriterConn), ")")
 			return false
 		}
@@ -1162,6 +1335,33 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 
 	loggedUserspaceLoop := false
+	postDetachPhaseMarked := false
+	markPostDetachPhase := func(path string) {
+		if postDetachPhaseMarked {
+			return
+		}
+		detachUnix, ok := consumeVisionDetachTimestamp(writerConn)
+		if !ok {
+			detachUnix, ok = consumeVisionDetachTimestamp(readerConn)
+			if !ok {
+				return
+			}
+		}
+		nowUnix := time.Now().UnixNano()
+		if nowUnix > detachUnix {
+			pipelineMarkerVisionPostDetachNanos.Add(uint64(nowUnix - detachUnix))
+		}
+		pipelineMarkerVisionPostDetachCount.Add(1)
+		switch path {
+		case "splice":
+			pipelineMarkerVisionPostDetachSplice.Add(1)
+		case "sockmap":
+			pipelineMarkerVisionPostDetachSockmap.Add(1)
+		default:
+			pipelineMarkerVisionPostDetachUserspace.Add(1)
+		}
+		postDetachPhaseMarked = true
+	}
 	for {
 		var splice = inbound.CanSpliceCopy == 1
 		firstNonSpliceOutbound := -1
@@ -1175,6 +1375,15 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				}
 			}
 		}
+		writerStillUsesDeferredTLS := deferredWriterRequiresTLS(writerConn)
+		if splice && writerStillUsesDeferredTLS {
+			// Deferred rustls is still active on writerConn. Keep userspace path
+			// until detach/promotion completes; raw splice at this point can race
+			// with TLS state and produce broken-pipe/short-circuit failures.
+			pipelineMarkerDeferredSpliceGuardHit.Add(1)
+			maybeLogPipelineRuntimeSummary(ctx)
+			splice = false
+		}
 		if splice {
 			if !ensureRaw() {
 				return readV(ctx, userspaceReader, writer, timer, nil)
@@ -1182,24 +1391,33 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 
 			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
 			if mgr := ebpf.GlobalSockmapManager(); mgr == nil {
+				pipelineMarkerSockmapSkipMgr.Add(1)
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: manager unavailable")
 			} else if mgr.ShouldFallbackToSplice() {
+				pipelineMarkerSockmapSkipContention.Add(1)
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: contention fallback active")
 			} else if !ebpf.CanUseZeroCopyWithCrypto(rawReaderConn, rawWriterConn, readerCrypto, writerCrypto) {
 				errors.LogDebug(ctx, "CopyRawConn crypto hint: reader=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] source=", readerCryptoSource, " writer=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] source=", writerCryptoSource)
 				switch {
 				case !ebpf.KTLSSockhashCompatible() && (readerCrypto == ebpf.CryptoKTLSBoth || writerCrypto == ebpf.CryptoKTLSBoth):
+					pipelineMarkerSockmapSkipKTLSSockhash.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: kTLS+SOCKHASH not supported on this kernel, using splice")
 					mgr.IncrementKTLSSpliceFallback()
 				case readerCrypto == ebpf.CryptoUserspaceTLS || writerCrypto == ebpf.CryptoUserspaceTLS:
+					pipelineMarkerSockmapSkipUserspaceTLS.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 				case (readerCrypto == ebpf.CryptoKTLSBoth) != (writerCrypto == ebpf.CryptoKTLSBoth):
+					pipelineMarkerSockmapSkipAsymmetric.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: asymmetric kTLS state (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 				default:
+					pipelineMarkerSockmapSkipOther.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 				}
 			} else {
+				pipelineMarkerSockmapRegisterAttempt.Add(1)
 				if err := mgr.RegisterPairWithCrypto(rawReaderConn, rawWriterConn, readerCrypto, writerCrypto); err == nil {
+					pipelineMarkerSockmapRegisterSuccess.Add(1)
+					markPostDetachPhase("sockmap")
 					errors.LogDebug(ctx, "CopyRawConn sockmap (crypto: reader=", int(readerCrypto), " writer=", int(writerCrypto), ")")
 					writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
 					timer.SetTimeout(24 * time.Hour)
@@ -1215,13 +1433,17 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 					runtime.KeepAlive(rawReaderConn)
 					runtime.KeepAlive(rawWriterConn)
 					if waitErr != nil {
+						pipelineMarkerSockmapWaitError.Add(1)
 						errors.LogDebugInner(ctx, waitErr, "CopyRawConn sockmap wait failed, falling back to splice")
 					} else if !fallbackToSplice {
+						pipelineMarkerSockmapWaitSuccess.Add(1)
 						return nil
 					} else {
+						pipelineMarkerSockmapWaitFallback.Add(1)
 						errors.LogDebug(ctx, "CopyRawConn sockmap inactive, falling back to splice")
 					}
 				} else {
+					pipelineMarkerSockmapRegisterFail.Add(1)
 					errors.LogDebugInner(ctx, err, "CopyRawConn sockmap register failed, falling back to splice")
 				}
 			}
@@ -1236,8 +1458,16 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				inTimer.SetTimeout(24 * time.Hour)
 			}
 			writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
+			pipelineMarkerSpliceAttempts.Add(1)
+			maybeLogPipelineRuntimeSummary(ctx)
+			spliceStart := time.Now()
+			markPostDetachPhase("splice")
 			w, err := rawWriterTCP.ReadFrom(rawReaderConn)
 			writerMonitor.Stop()
+			spliceDuration := time.Since(spliceStart)
+			pipelineMarkerSpliceBytesTotal.Add(uint64(w))
+			pipelineMarkerSpliceDurationNanosTotal.Add(uint64(spliceDuration.Nanoseconds()))
+			recordSpliceHistogram(uint64(w), uint64(spliceDuration.Nanoseconds()))
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
 			}
@@ -1253,14 +1483,28 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				}
 				continue // retry splice after key update
 			}
-			if err != nil && errors.Cause(err) != io.EOF {
-				return err
+			if err == nil || errors.Cause(err) == io.EOF {
+				pipelineMarkerSpliceCompleted.Add(1)
+				maybeLogPipelineRuntimeSummary(ctx)
+				return nil
 			}
-			return nil
+			if isExpectedSpliceReadFromError(err) {
+				pipelineMarkerSpliceExpectedTeardown.Add(1)
+				pipelineMarkerSpliceCompleted.Add(1)
+				maybeLogPipelineRuntimeSummary(ctx)
+				errors.LogWarning(ctx, "[kind=vision.splice_expected_teardown] splice/readfrom closed by peer or stream teardown: ", err)
+				return nil
+			}
+			pipelineMarkerSpliceUnexpectedError.Add(1)
+			maybeLogPipelineRuntimeSummary(ctx)
+			errors.LogWarning(ctx, "[kind=vision.splice_unexpected_error] splice/readfrom failed: ", err)
+			return err
 		}
 		if !loggedUserspaceLoop {
 			if inbound.CanSpliceCopy != 1 {
 				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: inbound.CanSpliceCopy=", inbound.CanSpliceCopy)
+			} else if writerStillUsesDeferredTLS {
+				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: writer still in deferred rustls state")
 			} else {
 				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: outbounds[", firstNonSpliceOutbound, "].CanSpliceCopy=", firstNonSpliceValue)
 			}
@@ -1305,6 +1549,316 @@ func appendCryptoHintSource(source, step string) string {
 		return source
 	}
 	return source + " -> " + step
+}
+
+func RecordPipelineFlowMix(ctx context.Context, destNet net.Network, allowedNet net.Network) {
+	switch {
+	case destNet == net.Network_TCP && allowedNet == net.Network_UDP:
+		pipelineMarkerFlowMuxUDP.Add(1)
+	case destNet == net.Network_TCP && allowedNet == net.Network_Unknown:
+		pipelineMarkerFlowPureTCP.Add(1)
+	case destNet == net.Network_TCP && allowedNet == net.Network_TCP:
+		pipelineMarkerFlowMuxTCP.Add(1)
+	default:
+		pipelineMarkerFlowOther.Add(1)
+	}
+}
+
+func maybeLogPipelineRuntimeSummary(ctx context.Context) {
+	now := time.Now().Unix()
+	last := pipelineMarkerLastSummaryUnix.Load()
+	if last != 0 && now-last < int64(pipelineMarkerLogInterval/time.Second) {
+		return
+	}
+	if !pipelineMarkerLastSummaryUnix.CompareAndSwap(last, now) {
+		return
+	}
+	deferredRaw, deferredRawDelta := markerSnapshot(&pipelineMarkerDeferredRawUnwrapWarning, &pipelineMarkerLastDeferredRawUnwrapWarning)
+	rawUnwrapDeltaNanos, rawUnwrapDeltaNanosDelta := markerSnapshot(&pipelineMarkerRawUnwrapToDetachNanosTotal, &pipelineMarkerLastRawUnwrapToDetachNanosTotal)
+	rawUnwrapDeltaSamples, rawUnwrapDeltaSamplesDelta := markerSnapshot(&pipelineMarkerRawUnwrapToDetachSamples, &pipelineMarkerLastRawUnwrapToDetachSamples)
+	rawUnwrapLt5ms, rawUnwrapLt5msDelta := markerSnapshot(&pipelineMarkerRawUnwrapToDetachLt5ms, &pipelineMarkerLastRawUnwrapToDetachLt5ms)
+	rawUnwrap5To20ms, rawUnwrap5To20msDelta := markerSnapshot(&pipelineMarkerRawUnwrapToDetach5To20ms, &pipelineMarkerLastRawUnwrapToDetach5To20ms)
+	rawUnwrap20To100ms, rawUnwrap20To100msDelta := markerSnapshot(&pipelineMarkerRawUnwrapToDetach20To100ms, &pipelineMarkerLastRawUnwrapToDetach20To100ms)
+	rawUnwrapGe100ms, rawUnwrapGe100msDelta := markerSnapshot(&pipelineMarkerRawUnwrapToDetachGe100ms, &pipelineMarkerLastRawUnwrapToDetachGe100ms)
+	deferredGuard, deferredGuardDelta := markerSnapshot(&pipelineMarkerDeferredSpliceGuardHit, &pipelineMarkerLastDeferredSpliceGuardHit)
+	visionDrainTry, visionDrainTryDelta := markerSnapshot(&pipelineMarkerVisionDrainDetachAttempt, &pipelineMarkerLastVisionDrainDetachAttempt)
+	visionDrainOK, visionDrainOKDelta := markerSnapshot(&pipelineMarkerVisionDrainDetachSuccess, &pipelineMarkerLastVisionDrainDetachSuccess)
+	visionDrainFail, visionDrainFailDelta := markerSnapshot(&pipelineMarkerVisionDrainDetachFail, &pipelineMarkerLastVisionDrainDetachFail)
+	visionNBTry, visionNBTryDelta := markerSnapshot(&pipelineMarkerVisionRestoreNBAttempt, &pipelineMarkerLastVisionRestoreNBAttempt)
+	visionNBFail, visionNBFailDelta := markerSnapshot(&pipelineMarkerVisionRestoreNBFail, &pipelineMarkerLastVisionRestoreNBFail)
+	visionPaddingNanos, visionPaddingNanosDelta := markerSnapshot(&pipelineMarkerVisionPaddingPhaseNanos, &pipelineMarkerLastVisionPaddingPhaseNanos)
+	visionPaddingCount, visionPaddingCountDelta := markerSnapshot(&pipelineMarkerVisionPaddingPhaseCount, &pipelineMarkerLastVisionPaddingPhaseCount)
+	visionDetachNanos, visionDetachNanosDelta := markerSnapshot(&pipelineMarkerVisionDetachPhaseNanos, &pipelineMarkerLastVisionDetachPhaseNanos)
+	visionDetachCount, visionDetachCountDelta := markerSnapshot(&pipelineMarkerVisionDetachPhaseCount, &pipelineMarkerLastVisionDetachPhaseCount)
+	visionPostDetachNanos, visionPostDetachNanosDelta := markerSnapshot(&pipelineMarkerVisionPostDetachNanos, &pipelineMarkerLastVisionPostDetachNanos)
+	visionPostDetachCount, visionPostDetachCountDelta := markerSnapshot(&pipelineMarkerVisionPostDetachCount, &pipelineMarkerLastVisionPostDetachCount)
+	visionPostDetachSplice, visionPostDetachSpliceDelta := markerSnapshot(&pipelineMarkerVisionPostDetachSplice, &pipelineMarkerLastVisionPostDetachSplice)
+	visionPostDetachUserspace, visionPostDetachUserspaceDelta := markerSnapshot(&pipelineMarkerVisionPostDetachUserspace, &pipelineMarkerLastVisionPostDetachUserspace)
+	visionPostDetachSockmap, visionPostDetachSockmapDelta := markerSnapshot(&pipelineMarkerVisionPostDetachSockmap, &pipelineMarkerLastVisionPostDetachSockmap)
+
+	spliceTry, spliceTryDelta := markerSnapshot(&pipelineMarkerSpliceAttempts, &pipelineMarkerLastSpliceAttempts)
+	spliceDone, spliceDoneDelta := markerSnapshot(&pipelineMarkerSpliceCompleted, &pipelineMarkerLastSpliceCompleted)
+	spliceExpected, spliceExpectedDelta := markerSnapshot(&pipelineMarkerSpliceExpectedTeardown, &pipelineMarkerLastSpliceExpectedTeardown)
+	spliceUnexpected, spliceUnexpectedDelta := markerSnapshot(&pipelineMarkerSpliceUnexpectedError, &pipelineMarkerLastSpliceUnexpectedError)
+	spliceBytes, spliceBytesDelta := markerSnapshot(&pipelineMarkerSpliceBytesTotal, &pipelineMarkerLastSpliceBytesTotal)
+	spliceNanos, spliceNanosDelta := markerSnapshot(&pipelineMarkerSpliceDurationNanosTotal, &pipelineMarkerLastSpliceDurationNanosTotal)
+	spliceBytesLt4K, spliceBytesLt4KDelta := markerSnapshot(&pipelineMarkerSpliceBytesLt4K, &pipelineMarkerLastSpliceBytesLt4K)
+	spliceBytes4KTo64K, spliceBytes4KTo64KDelta := markerSnapshot(&pipelineMarkerSpliceBytes4KTo64K, &pipelineMarkerLastSpliceBytes4KTo64K)
+	spliceBytes64KTo1M, spliceBytes64KTo1MDelta := markerSnapshot(&pipelineMarkerSpliceBytes64KTo1M, &pipelineMarkerLastSpliceBytes64KTo1M)
+	spliceBytesGe1M, spliceBytesGe1MDelta := markerSnapshot(&pipelineMarkerSpliceBytesGe1M, &pipelineMarkerLastSpliceBytesGe1M)
+	spliceDurLt1ms, spliceDurLt1msDelta := markerSnapshot(&pipelineMarkerSpliceDurLt1ms, &pipelineMarkerLastSpliceDurLt1ms)
+	spliceDur1To5ms, spliceDur1To5msDelta := markerSnapshot(&pipelineMarkerSpliceDur1To5ms, &pipelineMarkerLastSpliceDur1To5ms)
+	spliceDur5To20ms, spliceDur5To20msDelta := markerSnapshot(&pipelineMarkerSpliceDur5To20ms, &pipelineMarkerLastSpliceDur5To20ms)
+	spliceDur20To100ms, spliceDur20To100msDelta := markerSnapshot(&pipelineMarkerSpliceDur20To100ms, &pipelineMarkerLastSpliceDur20To100ms)
+	spliceDurGe100ms, spliceDurGe100msDelta := markerSnapshot(&pipelineMarkerSpliceDurGe100ms, &pipelineMarkerLastSpliceDurGe100ms)
+
+	userspaceReads, userspaceReadsDelta := markerSnapshot(&pipelineMarkerUserspaceCopyReads, &pipelineMarkerLastUserspaceCopyReads)
+	userspaceBytes, userspaceBytesDelta := markerSnapshot(&pipelineMarkerUserspaceCopyBytesTotal, &pipelineMarkerLastUserspaceCopyBytesTotal)
+	userspaceRawHits, userspaceRawHitsDelta := markerSnapshot(&pipelineMarkerUserspaceRawReaderHits, &pipelineMarkerLastUserspaceRawReaderHits)
+	userspaceTLSHits, userspaceTLSHitsDelta := markerSnapshot(&pipelineMarkerUserspaceTLSReaderHits, &pipelineMarkerLastUserspaceTLSReaderHits)
+	ensureRawOS, ensureRawOSDelta := markerSnapshot(&pipelineMarkerEnsureRawFailOS, &pipelineMarkerLastEnsureRawFailOS)
+	ensureRawNil, ensureRawNilDelta := markerSnapshot(&pipelineMarkerEnsureRawFailNilConn, &pipelineMarkerLastEnsureRawFailNilConn)
+	ensureRawType, ensureRawTypeDelta := markerSnapshot(&pipelineMarkerEnsureRawFailWriterType, &pipelineMarkerLastEnsureRawFailWriterType)
+
+	sockSkipMgr, sockSkipMgrDelta := markerSnapshot(&pipelineMarkerSockmapSkipMgr, &pipelineMarkerLastSockmapSkipMgr)
+	sockSkipContention, sockSkipContentionDelta := markerSnapshot(&pipelineMarkerSockmapSkipContention, &pipelineMarkerLastSockmapSkipContention)
+	sockSkipKtls, sockSkipKtlsDelta := markerSnapshot(&pipelineMarkerSockmapSkipKTLSSockhash, &pipelineMarkerLastSockmapSkipKTLSSockhash)
+	sockSkipUserspace, sockSkipUserspaceDelta := markerSnapshot(&pipelineMarkerSockmapSkipUserspaceTLS, &pipelineMarkerLastSockmapSkipUserspaceTLS)
+	sockSkipAsymmetric, sockSkipAsymmetricDelta := markerSnapshot(&pipelineMarkerSockmapSkipAsymmetric, &pipelineMarkerLastSockmapSkipAsymmetric)
+	sockSkipOther, sockSkipOtherDelta := markerSnapshot(&pipelineMarkerSockmapSkipOther, &pipelineMarkerLastSockmapSkipOther)
+	sockRegTry, sockRegTryDelta := markerSnapshot(&pipelineMarkerSockmapRegisterAttempt, &pipelineMarkerLastSockmapRegisterAttempt)
+	sockRegOK, sockRegOKDelta := markerSnapshot(&pipelineMarkerSockmapRegisterSuccess, &pipelineMarkerLastSockmapRegisterSuccess)
+	sockRegFail, sockRegFailDelta := markerSnapshot(&pipelineMarkerSockmapRegisterFail, &pipelineMarkerLastSockmapRegisterFail)
+	sockWaitOK, sockWaitOKDelta := markerSnapshot(&pipelineMarkerSockmapWaitSuccess, &pipelineMarkerLastSockmapWaitSuccess)
+	sockWaitFallback, sockWaitFallbackDelta := markerSnapshot(&pipelineMarkerSockmapWaitFallback, &pipelineMarkerLastSockmapWaitFallback)
+	sockWaitErr, sockWaitErrDelta := markerSnapshot(&pipelineMarkerSockmapWaitError, &pipelineMarkerLastSockmapWaitError)
+	flowMuxUDP, flowMuxUDPDelta := markerSnapshot(&pipelineMarkerFlowMuxUDP, &pipelineMarkerLastFlowMuxUDP)
+	flowPureTCP, flowPureTCPDelta := markerSnapshot(&pipelineMarkerFlowPureTCP, &pipelineMarkerLastFlowPureTCP)
+	flowMuxTCP, flowMuxTCPDelta := markerSnapshot(&pipelineMarkerFlowMuxTCP, &pipelineMarkerLastFlowMuxTCP)
+	flowOther, flowOtherDelta := markerSnapshot(&pipelineMarkerFlowOther, &pipelineMarkerLastFlowOther)
+
+	errors.LogInfo(ctx, "proxy markers[kind=vision]: ",
+		"drain_detach_attempt=", fmtMarkerWithDelta(visionDrainTry, visionDrainTryDelta),
+		" drain_detach_success=", fmtMarkerWithDelta(visionDrainOK, visionDrainOKDelta),
+		" drain_detach_failed=", fmtMarkerWithDelta(visionDrainFail, visionDrainFailDelta),
+		" restore_nonblock_attempt=", fmtMarkerWithDelta(visionNBTry, visionNBTryDelta),
+		" restore_nonblock_failed=", fmtMarkerWithDelta(visionNBFail, visionNBFailDelta),
+		" deferred_splice_guard_hit=", fmtMarkerWithDelta(deferredGuard, deferredGuardDelta),
+	)
+	errors.LogInfo(ctx, "proxy markers[kind=vision-phase]: ",
+		"padding_samples=", fmtMarkerWithDelta(visionPaddingCount, visionPaddingCountDelta),
+		" padding_ns=", fmtMarkerWithDelta(visionPaddingNanos, visionPaddingNanosDelta),
+		" padding_avg_ns=", fmtAverageNanos(visionPaddingNanos, visionPaddingCount),
+		" detach_samples=", fmtMarkerWithDelta(visionDetachCount, visionDetachCountDelta),
+		" detach_ns=", fmtMarkerWithDelta(visionDetachNanos, visionDetachNanosDelta),
+		" detach_avg_ns=", fmtAverageNanos(visionDetachNanos, visionDetachCount),
+		" post_detach_samples=", fmtMarkerWithDelta(visionPostDetachCount, visionPostDetachCountDelta),
+		" post_detach_ns=", fmtMarkerWithDelta(visionPostDetachNanos, visionPostDetachNanosDelta),
+		" post_detach_avg_ns=", fmtAverageNanos(visionPostDetachNanos, visionPostDetachCount),
+		" post_detach_splice=", fmtMarkerWithDelta(visionPostDetachSplice, visionPostDetachSpliceDelta),
+		" post_detach_userspace=", fmtMarkerWithDelta(visionPostDetachUserspace, visionPostDetachUserspaceDelta),
+		" post_detach_sockmap=", fmtMarkerWithDelta(visionPostDetachSockmap, visionPostDetachSockmapDelta),
+	)
+	errors.LogInfo(ctx, "proxy markers[kind=splice]: ",
+		"attempts=", fmtMarkerWithDelta(spliceTry, spliceTryDelta),
+		" completed=", fmtMarkerWithDelta(spliceDone, spliceDoneDelta),
+		" expected_teardown=", fmtMarkerWithDelta(spliceExpected, spliceExpectedDelta),
+		" unexpected_error=", fmtMarkerWithDelta(spliceUnexpected, spliceUnexpectedDelta),
+		" bytes=", fmtMarkerWithDelta(spliceBytes, spliceBytesDelta),
+		" duration_ns=", fmtMarkerWithDelta(spliceNanos, spliceNanosDelta),
+	)
+	errors.LogInfo(ctx, "proxy markers[kind=splice-buckets]: ",
+		"bytes_lt4k=", fmtMarkerWithDelta(spliceBytesLt4K, spliceBytesLt4KDelta),
+		" bytes_4k_64k=", fmtMarkerWithDelta(spliceBytes4KTo64K, spliceBytes4KTo64KDelta),
+		" bytes_64k_1m=", fmtMarkerWithDelta(spliceBytes64KTo1M, spliceBytes64KTo1MDelta),
+		" bytes_ge1m=", fmtMarkerWithDelta(spliceBytesGe1M, spliceBytesGe1MDelta),
+		" dur_lt1ms=", fmtMarkerWithDelta(spliceDurLt1ms, spliceDurLt1msDelta),
+		" dur_1_5ms=", fmtMarkerWithDelta(spliceDur1To5ms, spliceDur1To5msDelta),
+		" dur_5_20ms=", fmtMarkerWithDelta(spliceDur5To20ms, spliceDur5To20msDelta),
+		" dur_20_100ms=", fmtMarkerWithDelta(spliceDur20To100ms, spliceDur20To100msDelta),
+		" dur_ge100ms=", fmtMarkerWithDelta(spliceDurGe100ms, spliceDurGe100msDelta),
+	)
+	errors.LogInfo(ctx, "proxy markers[kind=userspace]: ",
+		"copy_reads=", fmtMarkerWithDelta(userspaceReads, userspaceReadsDelta),
+		" copy_bytes=", fmtMarkerWithDelta(userspaceBytes, userspaceBytesDelta),
+		" raw_reader_hits=", fmtMarkerWithDelta(userspaceRawHits, userspaceRawHitsDelta),
+		" tls_reader_hits=", fmtMarkerWithDelta(userspaceTLSHits, userspaceTLSHitsDelta),
+		" ensure_raw_fail_os=", fmtMarkerWithDelta(ensureRawOS, ensureRawOSDelta),
+		" ensure_raw_fail_nil=", fmtMarkerWithDelta(ensureRawNil, ensureRawNilDelta),
+		" ensure_raw_fail_writer_type=", fmtMarkerWithDelta(ensureRawType, ensureRawTypeDelta),
+	)
+	errors.LogInfo(ctx, "proxy markers[kind=sockmap]: ",
+		"skip_manager=", fmtMarkerWithDelta(sockSkipMgr, sockSkipMgrDelta),
+		" skip_contention=", fmtMarkerWithDelta(sockSkipContention, sockSkipContentionDelta),
+		" skip_ktls_probe=", fmtMarkerWithDelta(sockSkipKtls, sockSkipKtlsDelta),
+		" skip_userspace_tls=", fmtMarkerWithDelta(sockSkipUserspace, sockSkipUserspaceDelta),
+		" skip_asymmetric_ktls=", fmtMarkerWithDelta(sockSkipAsymmetric, sockSkipAsymmetricDelta),
+		" skip_other=", fmtMarkerWithDelta(sockSkipOther, sockSkipOtherDelta),
+		" register_attempt=", fmtMarkerWithDelta(sockRegTry, sockRegTryDelta),
+		" register_success=", fmtMarkerWithDelta(sockRegOK, sockRegOKDelta),
+		" register_failed=", fmtMarkerWithDelta(sockRegFail, sockRegFailDelta),
+		" wait_success=", fmtMarkerWithDelta(sockWaitOK, sockWaitOKDelta),
+		" wait_fallback=", fmtMarkerWithDelta(sockWaitFallback, sockWaitFallbackDelta),
+		" wait_error=", fmtMarkerWithDelta(sockWaitErr, sockWaitErrDelta),
+	)
+	errors.LogInfo(ctx, "proxy markers[kind=flow-mix]: ",
+		"mux_udp=", fmtMarkerWithDelta(flowMuxUDP, flowMuxUDPDelta),
+		" pure_tcp=", fmtMarkerWithDelta(flowPureTCP, flowPureTCPDelta),
+		" mux_tcp=", fmtMarkerWithDelta(flowMuxTCP, flowMuxTCPDelta),
+		" other=", fmtMarkerWithDelta(flowOther, flowOtherDelta),
+	)
+	errors.LogInfo(ctx, "proxy markers[kind=raw-unwrap]: ",
+		"deferred_raw_unwrap_warning=", fmtMarkerWithDelta(deferredRaw, deferredRawDelta),
+		" unwrap_to_detach_samples=", fmtMarkerWithDelta(rawUnwrapDeltaSamples, rawUnwrapDeltaSamplesDelta),
+		" unwrap_to_detach_ns=", fmtMarkerWithDelta(rawUnwrapDeltaNanos, rawUnwrapDeltaNanosDelta),
+		" unwrap_to_detach_avg_ns=", fmtAverageNanos(rawUnwrapDeltaNanos, rawUnwrapDeltaSamples),
+		" unwrap_to_detach_lt5ms=", fmtMarkerWithDelta(rawUnwrapLt5ms, rawUnwrapLt5msDelta),
+		" unwrap_to_detach_5_20ms=", fmtMarkerWithDelta(rawUnwrap5To20ms, rawUnwrap5To20msDelta),
+		" unwrap_to_detach_20_100ms=", fmtMarkerWithDelta(rawUnwrap20To100ms, rawUnwrap20To100msDelta),
+		" unwrap_to_detach_ge100ms=", fmtMarkerWithDelta(rawUnwrapGe100ms, rawUnwrapGe100msDelta),
+	)
+}
+
+func markerSnapshot(total *atomic.Uint64, last *atomic.Uint64) (current uint64, delta uint64) {
+	current = total.Load()
+	prev := last.Swap(current)
+	if current >= prev {
+		delta = current - prev
+	}
+	return current, delta
+}
+
+func fmtMarkerWithDelta(current, delta uint64) string {
+	if delta == 0 {
+		return strconv.FormatUint(current, 10)
+	}
+	return strconv.FormatUint(current, 10) + "(+" + strconv.FormatUint(delta, 10) + ")"
+}
+
+func fmtAverageNanos(total uint64, count uint64) string {
+	if count == 0 {
+		return "0"
+	}
+	return strconv.FormatUint(total/count, 10)
+}
+
+func recordSpliceHistogram(bytes uint64, durationNs uint64) {
+	switch {
+	case bytes < 4*1024:
+		pipelineMarkerSpliceBytesLt4K.Add(1)
+	case bytes < 64*1024:
+		pipelineMarkerSpliceBytes4KTo64K.Add(1)
+	case bytes < 1024*1024:
+		pipelineMarkerSpliceBytes64KTo1M.Add(1)
+	default:
+		pipelineMarkerSpliceBytesGe1M.Add(1)
+	}
+	switch {
+	case durationNs < uint64(time.Millisecond):
+		pipelineMarkerSpliceDurLt1ms.Add(1)
+	case durationNs < uint64(5*time.Millisecond):
+		pipelineMarkerSpliceDur1To5ms.Add(1)
+	case durationNs < uint64(20*time.Millisecond):
+		pipelineMarkerSpliceDur5To20ms.Add(1)
+	case durationNs < uint64(100*time.Millisecond):
+		pipelineMarkerSpliceDur20To100ms.Add(1)
+	default:
+		pipelineMarkerSpliceDurGe100ms.Add(1)
+	}
+}
+
+func recordRawUnwrapToDetachHistogram(durationNs uint64) {
+	switch {
+	case durationNs < uint64(5*time.Millisecond):
+		pipelineMarkerRawUnwrapToDetachLt5ms.Add(1)
+	case durationNs < uint64(20*time.Millisecond):
+		pipelineMarkerRawUnwrapToDetach5To20ms.Add(1)
+	case durationNs < uint64(100*time.Millisecond):
+		pipelineMarkerRawUnwrapToDetach20To100ms.Add(1)
+	default:
+		pipelineMarkerRawUnwrapToDetachGe100ms.Add(1)
+	}
+}
+
+func storeVisionRawUnwrapWarningTimestamp(conn gonet.Conn, unixNano int64) {
+	if unixNano <= 0 {
+		return
+	}
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return
+	}
+	if _, loaded := pipelineVisionRawUnwrapUnixByConn.LoadOrStore(dc, unixNano); loaded {
+		return
+	}
+}
+
+func consumeVisionRawUnwrapWarningTimestamp(conn gonet.Conn) (int64, bool) {
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return 0, false
+	}
+	value, ok := pipelineVisionRawUnwrapUnixByConn.LoadAndDelete(dc)
+	if !ok {
+		return 0, false
+	}
+	unixNano, ok := value.(int64)
+	if !ok || unixNano <= 0 {
+		return 0, false
+	}
+	return unixNano, true
+}
+
+func storeVisionDetachTimestamp(conn gonet.Conn, unixNano int64) {
+	if unixNano <= 0 {
+		return
+	}
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return
+	}
+	pipelineVisionDetachUnixByConn.Store(dc, unixNano)
+}
+
+func consumeVisionDetachTimestamp(conn gonet.Conn) (int64, bool) {
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return 0, false
+	}
+	value, ok := pipelineVisionDetachUnixByConn.LoadAndDelete(dc)
+	if !ok {
+		return 0, false
+	}
+	unixNano, ok := value.(int64)
+	if !ok || unixNano <= 0 {
+		return 0, false
+	}
+	return unixNano, true
+}
+
+func deferredWriterRequiresTLS(conn gonet.Conn) bool {
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return false
+	}
+	if dc.IsDetached() {
+		return false
+	}
+	return !dc.KTLSEnabled().Enabled
+}
+
+func isExpectedSpliceReadFromError(err error) bool {
+	cause := errors.Cause(err)
+	if cause == nil {
+		cause = err
+	}
+	return goerrors.Is(cause, io.ErrClosedPipe) ||
+		goerrors.Is(cause, gonet.ErrClosed) ||
+		goerrors.Is(cause, context.Canceled) ||
+		goerrors.Is(cause, syscall.EPIPE) ||
+		goerrors.Is(cause, syscall.ECONNRESET) ||
+		goerrors.Is(cause, syscall.ENOTCONN) ||
+		goerrors.Is(cause, syscall.ESHUTDOWN)
 }
 
 func ktlsStateName(txReady, rxReady bool) string {

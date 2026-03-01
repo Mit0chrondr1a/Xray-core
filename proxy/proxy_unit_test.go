@@ -2,9 +2,17 @@ package proxy
 
 import (
 	"context"
+	goerrors "errors"
+	"io"
+	gonet "net"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -457,11 +465,8 @@ func TestVisionWriterSwitchesImmediatelyOnDeferredRustConn(t *testing.T) {
 	}
 }
 
-func TestVisionWriterSkipsSpliceOnBlockingDeferredRustConn(t *testing.T) {
-	// When DeferredRustConn is not detached, the underlying fd is in blocking
-	// mode (O_NONBLOCK cleared for rustls). CanSpliceCopy must NOT transition
-	// to 1, otherwise CopyRawConn enters the splice(2) path on a blocking fd
-	// — splice blocks the OS thread instead of yielding to Go's epoll poller.
+func TestVisionWriterCanSpliceCopyTransitions(t *testing.T) {
+	// With active DeferredRustConn, writer restores nonblock but keeps state at 2.
 	ts := NewTrafficState(nil)
 	ts.Inbound.IsPadding = false
 	ts.Inbound.DownlinkWriterDirectCopy = true
@@ -484,7 +489,71 @@ func TestVisionWriterSkipsSpliceOnBlockingDeferredRustConn(t *testing.T) {
 	}
 
 	if inbound.CanSpliceCopy != 2 {
-		t.Fatalf("CanSpliceCopy = %d, want 2 — must not transition to 1 while fd is blocking", inbound.CanSpliceCopy)
+		t.Fatalf("CanSpliceCopy = %d, want 2", inbound.CanSpliceCopy)
+	}
+}
+
+func TestVisionWriterCanSpliceCopyTransitionsNoDeferredConn(t *testing.T) {
+	// Without DeferredRustConn, downlink writer can transition 2 -> 1.
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	ts := NewTrafficState(nil)
+	ts.Inbound.IsPadding = false
+	ts.Inbound.DownlinkWriterDirectCopy = true
+
+	inbound := &session.Inbound{CanSpliceCopy: 2}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+
+	w := NewVisionWriter(
+		buf.Discard,
+		ts,
+		false,
+		ctx,
+		left,
+		nil,
+		nil,
+	)
+
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{}); err != nil {
+		t.Fatalf("WriteMultiBuffer() error = %v", err)
+	}
+
+	if inbound.CanSpliceCopy != 1 {
+		t.Fatalf("CanSpliceCopy = %d, want 1", inbound.CanSpliceCopy)
+	}
+}
+
+func TestVisionReaderDirectCopyPromotesInboundSpliceState(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	ts := NewTrafficState(nil)
+	ts.Outbound.WithinPaddingBuffers = true
+	ts.Outbound.CurrentCommand = 2
+
+	inbound := &session.Inbound{CanSpliceCopy: 2, Conn: left}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+
+	b := buf.New()
+	b.Write([]byte("abc"))
+	reader := &singleReadReader{
+		mb: buf.MultiBuffer{b},
+	}
+	vr := NewVisionReader(reader, ts, false, ctx, left, nil, nil, nil)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	buf.ReleaseMulti(mb)
+
+	if !ts.Outbound.DownlinkReaderDirectCopy {
+		t.Fatal("DownlinkReaderDirectCopy should be true after command=2")
+	}
+	if inbound.CanSpliceCopy != 1 {
+		t.Fatalf("CanSpliceCopy = %d, want 1", inbound.CanSpliceCopy)
 	}
 }
 
@@ -541,4 +610,277 @@ func TestDetermineSocketCryptoHintNil(t *testing.T) {
 	if hint != 0 { // CryptoNone = 0
 		t.Fatalf("expected CryptoNone for nil input, got %d", hint)
 	}
+}
+
+func TestIsExpectedSpliceReadFromError(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{io.ErrClosedPipe, true},
+		{gonet.ErrClosed, true},
+		{context.Canceled, true},
+		{syscall.EPIPE, true},
+		{syscall.ECONNRESET, true},
+		{syscall.ENOTCONN, true},
+		{syscall.ESHUTDOWN, true},
+		{io.EOF, false},
+		{goerrors.New("boom"), false},
+	}
+	for _, tc := range cases {
+		got := isExpectedSpliceReadFromError(tc.err)
+		if got != tc.want {
+			t.Fatalf("isExpectedSpliceReadFromError(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestDeferredWriterRequiresTLS(t *testing.T) {
+	if deferredWriterRequiresTLS(nil) {
+		t.Fatal("nil conn should not require deferred TLS")
+	}
+
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+	if deferredWriterRequiresTLS(left) {
+		t.Fatal("raw TCP conn should not require deferred TLS")
+	}
+
+	// Zero-value DeferredRustConn is non-detached and not kTLS-active.
+	if !deferredWriterRequiresTLS(&tls.DeferredRustConn{}) {
+		t.Fatal("DeferredRustConn should require TLS while non-detached and non-kTLS")
+	}
+}
+
+func TestFmtMarkerWithDelta(t *testing.T) {
+	if got := fmtMarkerWithDelta(12, 0); got != "12" {
+		t.Fatalf("fmtMarkerWithDelta(12,0)=%q, want %q", got, "12")
+	}
+	if got := fmtMarkerWithDelta(12, 3); got != "12(+3)" {
+		t.Fatalf("fmtMarkerWithDelta(12,3)=%q, want %q", got, "12(+3)")
+	}
+}
+
+func TestFmtAverageNanos(t *testing.T) {
+	if got := fmtAverageNanos(0, 0); got != "0" {
+		t.Fatalf("fmtAverageNanos(0,0)=%q, want 0", got)
+	}
+	if got := fmtAverageNanos(100, 4); got != "25" {
+		t.Fatalf("fmtAverageNanos(100,4)=%q, want 25", got)
+	}
+}
+
+func TestMarkerSnapshot(t *testing.T) {
+	var total atomic.Uint64
+	var last atomic.Uint64
+	total.Store(10)
+	current, delta := markerSnapshot(&total, &last)
+	if current != 10 || delta != 10 {
+		t.Fatalf("first snapshot got current=%d delta=%d, want 10/10", current, delta)
+	}
+	current, delta = markerSnapshot(&total, &last)
+	if current != 10 || delta != 0 {
+		t.Fatalf("second snapshot got current=%d delta=%d, want 10/0", current, delta)
+	}
+	total.Store(15)
+	current, delta = markerSnapshot(&total, &last)
+	if current != 15 || delta != 5 {
+		t.Fatalf("third snapshot got current=%d delta=%d, want 15/5", current, delta)
+	}
+}
+
+func TestRecordSpliceHistogramBuckets(t *testing.T) {
+	resetSpliceHistogramCounters()
+	recordSpliceHistogram(1000, uint64(500*time.Microsecond))
+	recordSpliceHistogram(5*1024, uint64(2*time.Millisecond))
+	recordSpliceHistogram(70*1024, uint64(10*time.Millisecond))
+	recordSpliceHistogram(2*1024*1024, uint64(50*time.Millisecond))
+	recordSpliceHistogram(2*1024*1024, uint64(200*time.Millisecond))
+
+	if got := pipelineMarkerSpliceBytesLt4K.Load(); got != 1 {
+		t.Fatalf("bytes<4k=%d, want 1", got)
+	}
+	if got := pipelineMarkerSpliceBytes4KTo64K.Load(); got != 1 {
+		t.Fatalf("bytes4k_64k=%d, want 1", got)
+	}
+	if got := pipelineMarkerSpliceBytes64KTo1M.Load(); got != 1 {
+		t.Fatalf("bytes64k_1m=%d, want 1", got)
+	}
+	if got := pipelineMarkerSpliceBytesGe1M.Load(); got != 2 {
+		t.Fatalf("bytes>=1m=%d, want 2", got)
+	}
+	if got := pipelineMarkerSpliceDurLt1ms.Load(); got != 1 {
+		t.Fatalf("dur<1ms=%d, want 1", got)
+	}
+	if got := pipelineMarkerSpliceDur1To5ms.Load(); got != 1 {
+		t.Fatalf("dur1_5ms=%d, want 1", got)
+	}
+	if got := pipelineMarkerSpliceDur5To20ms.Load(); got != 1 {
+		t.Fatalf("dur5_20ms=%d, want 1", got)
+	}
+	if got := pipelineMarkerSpliceDur20To100ms.Load(); got != 1 {
+		t.Fatalf("dur20_100ms=%d, want 1", got)
+	}
+	if got := pipelineMarkerSpliceDurGe100ms.Load(); got != 1 {
+		t.Fatalf("dur>=100ms=%d, want 1", got)
+	}
+}
+
+func TestRecordRawUnwrapToDetachHistogramBuckets(t *testing.T) {
+	resetRawUnwrapHistogramCounters()
+	recordRawUnwrapToDetachHistogram(uint64(1 * time.Millisecond))
+	recordRawUnwrapToDetachHistogram(uint64(10 * time.Millisecond))
+	recordRawUnwrapToDetachHistogram(uint64(50 * time.Millisecond))
+	recordRawUnwrapToDetachHistogram(uint64(150 * time.Millisecond))
+
+	if got := pipelineMarkerRawUnwrapToDetachLt5ms.Load(); got != 1 {
+		t.Fatalf("lt5ms=%d, want 1", got)
+	}
+	if got := pipelineMarkerRawUnwrapToDetach5To20ms.Load(); got != 1 {
+		t.Fatalf("5_20ms=%d, want 1", got)
+	}
+	if got := pipelineMarkerRawUnwrapToDetach20To100ms.Load(); got != 1 {
+		t.Fatalf("20_100ms=%d, want 1", got)
+	}
+	if got := pipelineMarkerRawUnwrapToDetachGe100ms.Load(); got != 1 {
+		t.Fatalf("ge100ms=%d, want 1", got)
+	}
+}
+
+func TestVisionRawUnwrapWarningTimestampHelpers(t *testing.T) {
+	clearSyncMap(&pipelineVisionRawUnwrapUnixByConn)
+	clearSyncMap(&pipelineVisionDetachUnixByConn)
+	conn := &tls.DeferredRustConn{}
+
+	storeVisionRawUnwrapWarningTimestamp(conn, 123)
+	storeVisionRawUnwrapWarningTimestamp(conn, 456) // keep first
+	if got, ok := consumeVisionRawUnwrapWarningTimestamp(conn); !ok || got != 123 {
+		t.Fatalf("consume raw unwrap got (%d,%v), want (123,true)", got, ok)
+	}
+	if _, ok := consumeVisionRawUnwrapWarningTimestamp(conn); ok {
+		t.Fatal("second consume should be empty")
+	}
+
+	storeVisionDetachTimestamp(conn, 789)
+	if got, ok := consumeVisionDetachTimestamp(conn); !ok || got != 789 {
+		t.Fatalf("consume detach got (%d,%v), want (789,true)", got, ok)
+	}
+	if _, ok := consumeVisionDetachTimestamp(conn); ok {
+		t.Fatal("second detach consume should be empty")
+	}
+}
+
+func TestRecordPipelineFlowMix(t *testing.T) {
+	pipelineMarkerFlowMuxUDP.Store(0)
+	pipelineMarkerFlowPureTCP.Store(0)
+	pipelineMarkerFlowMuxTCP.Store(0)
+	pipelineMarkerFlowOther.Store(0)
+
+	RecordPipelineFlowMix(context.Background(), xnet.Network_TCP, xnet.Network_UDP)
+	RecordPipelineFlowMix(context.Background(), xnet.Network_TCP, xnet.Network_Unknown)
+	RecordPipelineFlowMix(context.Background(), xnet.Network_TCP, xnet.Network_TCP)
+	RecordPipelineFlowMix(context.Background(), xnet.Network_UDP, xnet.Network_UDP)
+
+	if got := pipelineMarkerFlowMuxUDP.Load(); got != 1 {
+		t.Fatalf("mux_udp=%d, want 1", got)
+	}
+	if got := pipelineMarkerFlowPureTCP.Load(); got != 1 {
+		t.Fatalf("pure_tcp=%d, want 1", got)
+	}
+	if got := pipelineMarkerFlowMuxTCP.Load(); got != 1 {
+		t.Fatalf("mux_tcp=%d, want 1", got)
+	}
+	if got := pipelineMarkerFlowOther.Load(); got != 1 {
+		t.Fatalf("other=%d, want 1", got)
+	}
+}
+
+type singleReadReader struct {
+	mb   buf.MultiBuffer
+	err  error
+	read bool
+}
+
+func (r *singleReadReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	if r.read {
+		return nil, io.EOF
+	}
+	r.read = true
+	return r.mb, r.err
+}
+
+func resetSpliceHistogramCounters() {
+	pipelineMarkerSpliceBytesLt4K.Store(0)
+	pipelineMarkerSpliceBytes4KTo64K.Store(0)
+	pipelineMarkerSpliceBytes64KTo1M.Store(0)
+	pipelineMarkerSpliceBytesGe1M.Store(0)
+	pipelineMarkerSpliceDurLt1ms.Store(0)
+	pipelineMarkerSpliceDur1To5ms.Store(0)
+	pipelineMarkerSpliceDur5To20ms.Store(0)
+	pipelineMarkerSpliceDur20To100ms.Store(0)
+	pipelineMarkerSpliceDurGe100ms.Store(0)
+}
+
+func resetRawUnwrapHistogramCounters() {
+	pipelineMarkerRawUnwrapToDetachLt5ms.Store(0)
+	pipelineMarkerRawUnwrapToDetach5To20ms.Store(0)
+	pipelineMarkerRawUnwrapToDetach20To100ms.Store(0)
+	pipelineMarkerRawUnwrapToDetachGe100ms.Store(0)
+}
+
+func clearSyncMap(m *sync.Map) {
+	m.Range(func(k, _ any) bool {
+		m.Delete(k)
+		return true
+	})
+}
+
+func mustTCPPair(t *testing.T) (*gonet.TCPConn, *gonet.TCPConn) {
+	t.Helper()
+
+	ln, err := gonet.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() failed: %v", err)
+	}
+	defer ln.Close()
+
+	acceptCh := make(chan *gonet.TCPConn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			errCh <- aerr
+			return
+		}
+		tc, ok := conn.(*gonet.TCPConn)
+		if !ok {
+			_ = conn.Close()
+			errCh <- goerrors.New("accepted conn is not *net.TCPConn")
+			return
+		}
+		acceptCh <- tc
+	}()
+
+	clientConn, err := gonet.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() failed: %v", err)
+	}
+	clientTCP, ok := clientConn.(*gonet.TCPConn)
+	if !ok {
+		_ = clientConn.Close()
+		t.Fatal("dialed conn is not *net.TCPConn")
+	}
+
+	select {
+	case aerr := <-errCh:
+		_ = clientTCP.Close()
+		t.Fatalf("Accept() failed: %v", aerr)
+	case serverTCP := <-acceptCh:
+		return clientTCP, serverTCP
+	case <-time.After(2 * time.Second):
+		_ = clientTCP.Close()
+		t.Fatal("timeout waiting for accept")
+	}
+	return nil, nil
 }
