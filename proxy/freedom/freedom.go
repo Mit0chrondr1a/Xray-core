@@ -6,6 +6,7 @@ import (
 	goerrors "errors"
 	"io"
 	gonet "net"
+	"strings"
 	"syscall"
 	"time"
 
@@ -209,7 +210,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
-			if destination.Network == net.Network_TCP && isExpectedRequestReadError(err) {
+			if isExpectedRequestReadError(err) {
 				errors.LogDebugInner(ctx, err, "freedom: request stream closed by peer")
 				return nil
 			}
@@ -267,12 +268,23 @@ func isExpectedRequestReadError(err error) bool {
 		goerrors.Is(cause, gonet.ErrClosed) {
 		return true
 	}
+	if isExpectedStreamCancel(cause) {
+		return true
+	}
 
 	return goerrors.Is(cause, syscall.ECONNRESET) ||
 		goerrors.Is(cause, syscall.EPIPE) ||
 		goerrors.Is(cause, syscall.ENOTCONN) ||
 		goerrors.Is(cause, syscall.ESHUTDOWN) ||
 		goerrors.Is(cause, syscall.EIO)
+}
+
+func isExpectedStreamCancel(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "stream error") && strings.Contains(msg, "cancel")
 }
 
 func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.Destination) buf.Reader {

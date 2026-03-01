@@ -1,6 +1,7 @@
 package freedom
 
 import (
+	goerrors "errors"
 	"io"
 	"syscall"
 	"testing"
@@ -60,5 +61,31 @@ func TestIsExpectedRequestReadErrorWriteEIO(t *testing.T) {
 	}
 	if isExpectedRequestReadError(err) {
 		t.Fatal("write-side EIO must not be treated as request-closure")
+	}
+}
+
+func TestIsExpectedRequestReadErrorReadStreamCancel(t *testing.T) {
+	err := buf.Copy(&errReader{err: goerrors.New("stream error: stream ID 5; CANCEL")}, buf.Discard)
+	if err == nil {
+		t.Fatal("expected non-nil error")
+	}
+	if !buf.IsReadError(err) {
+		t.Fatalf("expected read error, got %T", err)
+	}
+	if !isExpectedRequestReadError(err) {
+		t.Fatal("expected stream CANCEL read error to be treated as request-closure")
+	}
+}
+
+func TestIsExpectedRequestReadErrorWriteStreamCancel(t *testing.T) {
+	err := buf.Copy(&oneShotReader{}, &errWriter{err: goerrors.New("stream error: stream ID 5; CANCEL")})
+	if err == nil {
+		t.Fatal("expected non-nil error")
+	}
+	if buf.IsReadError(err) {
+		t.Fatalf("expected write error, got read error: %T", err)
+	}
+	if isExpectedRequestReadError(err) {
+		t.Fatal("write-side stream CANCEL must not be treated as request-closure")
 	}
 }
