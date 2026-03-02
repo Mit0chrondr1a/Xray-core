@@ -33,6 +33,22 @@ impl AeadHandle {
     }
 }
 
+#[inline]
+unsafe fn copy_bytes_maybe_overlap(src: *const u8, dst: *mut u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let src_start = src as usize;
+    let src_end = src_start.saturating_add(len);
+    let dst_start = dst as usize;
+    let dst_end = dst_start.saturating_add(len);
+    if src_start < dst_end && dst_start < src_end {
+        std::ptr::copy(src, dst, len);
+    } else {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+    }
+}
+
 /// Create a new AEAD handle.
 ///
 /// `algo`: 0 = AES-128-GCM, 1 = AES-256-GCM, 2 = ChaCha20-Poly1305.
@@ -122,7 +138,7 @@ pub unsafe extern "C" fn xray_aead_seal(
             if pt_ptr.is_null() {
                 return crate::ffi::FFI_ERR_NULL;
             }
-            std::ptr::copy_nonoverlapping(pt_ptr, out_buf.as_mut_ptr(), pt_len);
+            copy_bytes_maybe_overlap(pt_ptr, out_buf.as_mut_ptr(), pt_len);
         }
         let in_out = &mut out_buf[..needed];
 
@@ -206,7 +222,7 @@ pub unsafe extern "C" fn xray_aead_open(
         }
         let out_buf = slice::from_raw_parts_mut(out_ptr, out_cap);
         if ct_len > 0 {
-            std::ptr::copy_nonoverlapping(ct_ptr, out_buf.as_mut_ptr(), ct_len);
+            copy_bytes_maybe_overlap(ct_ptr, out_buf.as_mut_ptr(), ct_len);
         }
         let in_out = &mut out_buf[..ct_len];
 

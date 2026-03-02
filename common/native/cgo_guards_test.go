@@ -3,6 +3,7 @@
 package native
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -128,5 +129,44 @@ func TestAeadOpenTo_NilHandle_CGO(t *testing.T) {
 	_, err := AeadOpenTo(nil, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("AeadOpenTo with nil handle should return error")
+	}
+}
+
+// TestAeadSealOpenTo_InPlaceAlias_CGO verifies AEAD FFI can safely operate
+// when src and dst alias the same Go-owned buffer.
+func TestAeadSealOpenTo_InPlaceAlias_CGO(t *testing.T) {
+	key := bytes.Repeat([]byte{0x11}, 16)
+	h := AeadNew(AeadAes128Gcm, key)
+	if h == nil {
+		t.Fatal("AeadNew returned nil handle")
+	}
+	defer aeadFree(h)
+
+	nonce := bytes.Repeat([]byte{0x22}, AeadNonceSize(h))
+	aad := []byte("alias-aad")
+	plain := []byte("in-place AEAD roundtrip payload")
+
+	buf := make([]byte, len(plain)+AeadOverhead(h))
+	copy(buf, plain)
+
+	// In-place seal: plaintext and dst alias the same backing array.
+	nSeal, err := AeadSealTo(h, nonce, aad, buf[:len(plain)], buf)
+	if err != nil {
+		t.Fatalf("AeadSealTo failed: %v", err)
+	}
+	if nSeal <= len(plain) {
+		t.Fatalf("unexpected sealed length: %d", nSeal)
+	}
+
+	ct := buf[:nSeal]
+
+	// In-place open: ciphertext and dst alias exactly.
+	nOpen, err := AeadOpenTo(h, nonce, aad, ct, ct)
+	if err != nil {
+		t.Fatalf("AeadOpenTo failed: %v", err)
+	}
+	got := ct[:nOpen]
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("roundtrip mismatch: got=%x want=%x", got, plain)
 	}
 }
