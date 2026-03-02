@@ -327,8 +327,9 @@ func (v *Listener) keepAccepting() {
 			}
 
 			// Release handshake semaphore BEFORE session begins.
-			// The semaphore now gates concurrent TLS handshakes (CPU-intensive),
-			// not session lifetime. The worker semaphore gates total sessions.
+			// The semaphore gates concurrent handshake work (TLS, Rust REALITY
+			// deferred path, and Go REALITY fallback), not session lifetime.
+			// The worker semaphore gates total sessions.
 			releaseHandshake()
 
 			if v.authConfig != nil {

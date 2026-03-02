@@ -479,19 +479,19 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			}
 		}
 
-		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil && inbound.CanSpliceCopy == 2 {
+		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil && inbound.GetCanSpliceCopy() == 2 {
 			// Vision command=2 reached and reader switched to raw path. At this
 			// point TLS decryption is no longer required on this leg, so the
 			// response copy loop can safely transition to splice/readv-raw path.
-			inbound.CanSpliceCopy = 1
+			inbound.SetCanSpliceCopy(1)
 		}
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
 			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
 			// 	inbound.CanSpliceCopy = 1
 			// }
-			if !w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // ob need to be passed in due to context can have more than one ob
-				w.ob.CanSpliceCopy = 1
+			if !w.isUplink && w.ob != nil && w.ob.GetCanSpliceCopy() == 2 { // ob need to be passed in due to context can have more than one ob
+				w.ob.SetCanSpliceCopy(1)
 			}
 		}
 		readerConn, readCounter, _, readerHandler := UnwrapRawConn(w.conn)
@@ -552,31 +552,32 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 	switchNow := *switchToDirectCopy
 	if switchNow {
+		dc := unwrapVisionDeferredConn(w.conn)
+		deferredReady := true
+		// Avoid raw unwrap while DeferredRustConn still owns unread rustls state.
+		// Wait until detach (or kTLS promotion) completes, then switch.
+		if dc != nil && !dc.IsDetached() && !dc.KTLSEnabled().Enabled {
+			deferredReady = false
+			switchNow = false
+		}
+
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil {
-			// Restore O_NONBLOCK before switching to raw socket writes.
-			// Without this, the fd is in blocking mode (cleared by Rust's
-			// BlockingGuard) and raw writes would block the OS thread.
 			// NOTE: CanSpliceCopy stays at 2 while DeferredRustConn is active
 			// because CopyRawConn uses CanSpliceCopy==1 to gate rawUserspaceReader,
 			// which bypasses TLS decryption on the outbound — wrong for HTTPS targets.
-			if dc := unwrapVisionDeferredConn(w.conn); dc != nil && !dc.IsDetached() {
-				pipelineMarkerVisionRestoreNBAttempt.Add(1)
-				if err := dc.RestoreNonBlock(); err != nil {
-					pipelineMarkerVisionRestoreNBFail.Add(1)
-					maybeLogPipelineRuntimeSummary(w.ctx)
-					errors.LogWarning(w.ctx, "[kind=vision.restore_nonblock_failed] RestoreNonBlock failed: ", err)
-				}
-			} else if !w.isUplink && inbound.CanSpliceCopy == 2 {
-				inbound.CanSpliceCopy = 1
+			if !w.isUplink && inbound.GetCanSpliceCopy() == 2 && deferredReady {
+				inbound.SetCanSpliceCopy(1)
 			}
 			// if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // TODO: enable uplink splice
 			// 	w.ob.CanSpliceCopy = 1
 			// }
 		}
-		rawConn, _, writerCounter, _ := UnwrapRawConn(w.conn)
-		w.Writer = buf.NewWriter(rawConn)
-		w.directWriteCounter = writerCounter
-		*switchToDirectCopy = false
+		if switchNow {
+			rawConn, _, writerCounter, _ := UnwrapRawConn(w.conn)
+			w.Writer = buf.NewWriter(rawConn)
+			w.directWriteCounter = writerCounter
+			*switchToDirectCopy = false
+		}
 	}
 	if !mb.IsEmpty() && w.directWriteCounter != nil {
 		w.directWriteCounter.Add(int64(mb.Len()))
@@ -1318,7 +1319,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: missing inbound metadata")
 		return readV(ctx, userspaceReader, writer, timer, nil)
 	}
-	if inbound.CanSpliceCopy == 3 {
+	if inbound.GetCanSpliceCopy() == 3 {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: inbound.CanSpliceCopy=3")
 		return readV(ctx, userspaceReader, writer, timer, nil)
 	}
@@ -1328,7 +1329,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		return readV(ctx, userspaceReader, writer, timer, nil)
 	}
 	for i, ob := range outbounds {
-		if ob.CanSpliceCopy == 3 {
+		if ob.GetCanSpliceCopy() == 3 {
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: outbounds[", i, "].CanSpliceCopy=3")
 			return readV(ctx, userspaceReader, writer, timer, nil)
 		}
@@ -1363,15 +1364,16 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		postDetachPhaseMarked = true
 	}
 	for {
-		var splice = inbound.CanSpliceCopy == 1
+		var splice = inbound.GetCanSpliceCopy() == 1
 		firstNonSpliceOutbound := -1
 		firstNonSpliceValue := 0
 		for i, ob := range outbounds {
-			if ob.CanSpliceCopy != 1 {
+			obSplice := ob.GetCanSpliceCopy()
+			if obSplice != 1 {
 				splice = false
 				if firstNonSpliceOutbound == -1 {
 					firstNonSpliceOutbound = i
-					firstNonSpliceValue = ob.CanSpliceCopy
+					firstNonSpliceValue = obSplice
 				}
 			}
 		}
@@ -1501,8 +1503,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			return err
 		}
 		if !loggedUserspaceLoop {
-			if inbound.CanSpliceCopy != 1 {
-				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: inbound.CanSpliceCopy=", inbound.CanSpliceCopy)
+			inboundSplice := inbound.GetCanSpliceCopy()
+			if inboundSplice != 1 {
+				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: inbound.CanSpliceCopy=", inboundSplice)
 			} else if writerStillUsesDeferredTLS {
 				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: writer still in deferred rustls state")
 			} else {
@@ -1514,7 +1517,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		// After Vision command=2, inbound switches to raw direct-copy mode.
 		// If splice is disabled by peer metadata, userspace fallback must read
 		// from the same unwrapped/raw layer to avoid waiting for TLS framing.
-		if inbound.CanSpliceCopy == 1 && ensureRaw() && rawUserspaceReader != nil {
+		if inbound.GetCanSpliceCopy() == 1 && ensureRaw() && rawUserspaceReader != nil {
 			currentReader = rawUserspaceReader
 		}
 

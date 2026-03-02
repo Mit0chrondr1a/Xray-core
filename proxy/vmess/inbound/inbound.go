@@ -281,7 +281,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "vmess"
-	inbound.CanSpliceCopy = 3
+	inbound.SetCanSpliceCopy(3)
 	inbound.User = request.User
 
 	sessionPolicy = h.policyManager.ForLevel(request.User.Level)

@@ -437,11 +437,9 @@ func TestTlsByteMarkers(t *testing.T) {
 	}
 }
 
-func TestVisionWriterSwitchesImmediatelyOnDeferredRustConn(t *testing.T) {
-	// The writer must switch to raw socket immediately when switchToDirectCopy
-	// is true, even if the DeferredRustConn hasn't been detached yet. Deferring
-	// the switch causes the server to keep sending encrypted data after command=2,
-	// while the client has already switched to raw socket reads.
+func TestVisionWriterDefersRawSwitchUntilDeferredConnReady(t *testing.T) {
+	// Writer must not unwrap to raw while DeferredRustConn is neither detached
+	// nor kTLS-active; otherwise rustls-buffered data can be bypassed/lost.
 	ts := NewTrafficState(nil)
 	ts.Inbound.IsPadding = false
 	ts.Inbound.DownlinkWriterDirectCopy = true
@@ -460,13 +458,13 @@ func TestVisionWriterSwitchesImmediatelyOnDeferredRustConn(t *testing.T) {
 		t.Fatalf("WriteMultiBuffer() error = %v", err)
 	}
 
-	if ts.Inbound.DownlinkWriterDirectCopy {
-		t.Fatal("DownlinkWriterDirectCopy should be cleared immediately — writer must not defer the switch")
+	if !ts.Inbound.DownlinkWriterDirectCopy {
+		t.Fatal("DownlinkWriterDirectCopy should remain armed until deferred conn is detached or kTLS-active")
 	}
 }
 
 func TestVisionWriterCanSpliceCopyTransitions(t *testing.T) {
-	// With active DeferredRustConn, writer restores nonblock but keeps state at 2.
+	// With active DeferredRustConn, writer keeps state at 2 until raw switch is safe.
 	ts := NewTrafficState(nil)
 	ts.Inbound.IsPadding = false
 	ts.Inbound.DownlinkWriterDirectCopy = true
@@ -488,8 +486,8 @@ func TestVisionWriterCanSpliceCopyTransitions(t *testing.T) {
 		t.Fatalf("WriteMultiBuffer() error = %v", err)
 	}
 
-	if inbound.CanSpliceCopy != 2 {
-		t.Fatalf("CanSpliceCopy = %d, want 2", inbound.CanSpliceCopy)
+	if inbound.GetCanSpliceCopy() != 2 {
+		t.Fatalf("CanSpliceCopy = %d, want 2", inbound.GetCanSpliceCopy())
 	}
 }
 
@@ -520,8 +518,8 @@ func TestVisionWriterCanSpliceCopyTransitionsNoDeferredConn(t *testing.T) {
 		t.Fatalf("WriteMultiBuffer() error = %v", err)
 	}
 
-	if inbound.CanSpliceCopy != 1 {
-		t.Fatalf("CanSpliceCopy = %d, want 1", inbound.CanSpliceCopy)
+	if inbound.GetCanSpliceCopy() != 1 {
+		t.Fatalf("CanSpliceCopy = %d, want 1", inbound.GetCanSpliceCopy())
 	}
 }
 
@@ -552,8 +550,8 @@ func TestVisionReaderDirectCopyPromotesInboundSpliceState(t *testing.T) {
 	if !ts.Outbound.DownlinkReaderDirectCopy {
 		t.Fatal("DownlinkReaderDirectCopy should be true after command=2")
 	}
-	if inbound.CanSpliceCopy != 1 {
-		t.Fatalf("CanSpliceCopy = %d, want 1", inbound.CanSpliceCopy)
+	if inbound.GetCanSpliceCopy() != 1 {
+		t.Fatalf("CanSpliceCopy = %d, want 1", inbound.GetCanSpliceCopy())
 	}
 }
 

@@ -90,7 +90,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("target not specified.")
 	}
 	ob.Name = "freedom"
-	ob.CanSpliceCopy = 1
+	ob.SetCanSpliceCopy(1)
 	inbound := session.InboundFromContext(ctx)
 
 	destination := ob.Target

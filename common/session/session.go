@@ -4,6 +4,7 @@ package session // import "github.com/xtls/xray-core/common/session"
 import (
 	"context"
 	"math/rand"
+	"sync/atomic"
 
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
@@ -54,7 +55,7 @@ type Inbound struct {
 	Timer *signal.ActivityTimer
 	// CanSpliceCopy is a property for this connection
 	// 1 = can, 2 = after processing protocol info should be able to, 3 = cannot
-	CanSpliceCopy int
+	CanSpliceCopy int32
 }
 
 // Outbound is the metadata of an outbound connection.
@@ -73,7 +74,35 @@ type Outbound struct {
 	Conn net.Conn
 	// CanSpliceCopy is a property for this connection
 	// 1 = can, 2 = after processing protocol info should be able to, 3 = cannot
-	CanSpliceCopy int
+	CanSpliceCopy int32
+}
+
+func (i *Inbound) GetCanSpliceCopy() int {
+	if i == nil {
+		return 3
+	}
+	return int(atomic.LoadInt32(&i.CanSpliceCopy))
+}
+
+func (i *Inbound) SetCanSpliceCopy(v int) {
+	if i == nil {
+		return
+	}
+	atomic.StoreInt32(&i.CanSpliceCopy, int32(v))
+}
+
+func (o *Outbound) GetCanSpliceCopy() int {
+	if o == nil {
+		return 3
+	}
+	return int(atomic.LoadInt32(&o.CanSpliceCopy))
+}
+
+func (o *Outbound) SetCanSpliceCopy(v int) {
+	if o == nil {
+		return
+	}
+	atomic.StoreInt32(&o.CanSpliceCopy, int32(v))
 }
 
 // SniffingRequest controls the behavior of content sniffing. They are from inbound config. Read-only
