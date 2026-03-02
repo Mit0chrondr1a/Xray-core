@@ -1053,6 +1053,19 @@ func (c *DeferredRustConn) EnableKTLS() error {
 	c.drainedData = result.DrainedData
 	c.drainedOff = 0
 
+	// Optional post-install sanity check: read a zero-length MSG_PEEK to confirm
+	// kTLS stack is responsive. If it returns EAGAIN/OK, proceed; if it returns
+	// EBADMSG/errno, mark promotion as failed so caller can fall back.
+	if fd, err := ExtractFd(c.rawConn); err == nil {
+		var buf [0]byte
+		_, _, serr := syscall.Recvfrom(fd, buf[:], syscall.MSG_PEEK)
+		if serr != nil && serr != syscall.EAGAIN && serr != syscall.EWOULDBLOCK {
+			c.ktlsActive = false
+			deferKTLSPromotionForCooldown()
+			return errors.New("tls: kTLS post-install sanity failed").Base(serr)
+		}
+	}
+
 	// Store state handle for cleanup
 	c.state = result.StateHandle
 	result.StateHandle = nil

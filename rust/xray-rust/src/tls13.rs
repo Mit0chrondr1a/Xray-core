@@ -21,6 +21,7 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::FromRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::{aead::Aead, Aes128Gcm, Aes256Gcm, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -1030,6 +1031,10 @@ pub struct XrayTls13Result {
     pub client_secret_len: u8,
     pub server_secret: [u8; 48],
     pub server_secret_len: u8,
+    // Correct starting RX sequence for kTLS installation.
+    // Equals the number of post-handshake server records (e.g. NST)
+    // consumed by the handshake engine.
+    pub rx_seq_start: u64,
     pub transcript_hash: [u8; 48],
     pub transcript_hash_len: u8,
     pub cert_chain_written: usize, // bytes written to Go-provided cert buffer
@@ -1046,6 +1051,7 @@ impl XrayTls13Result {
             client_secret_len: 0,
             server_secret: [0u8; 48],
             server_secret_len: 0,
+            rx_seq_start: 0,
             transcript_hash: [0u8; 48],
             transcript_hash_len: 0,
             cert_chain_written: 0,
@@ -1141,6 +1147,7 @@ pub extern "C" fn xray_tls13_handshake(
                 let ss_len = state.server_app_secret.len().min(48);
                 out.server_secret[..ss_len].copy_from_slice(&state.server_app_secret[..ss_len]);
                 out.server_secret_len = ss_len as u8;
+                out.rx_seq_start = state.server_post_hs_records;
 
                 let th_len = state.transcript_hash.len().min(48);
                 out.transcript_hash[..th_len].copy_from_slice(&state.transcript_hash[..th_len]);
@@ -1181,17 +1188,93 @@ pub extern "C" fn xray_tls13_state_free(_state: *mut std::ffi::c_void) {
     })
 }
 
+static TLS13_INSTALL_CALLS: AtomicU64 = AtomicU64::new(0);
+static TLS13_INSTALL_RX_SEQ_NONZERO: AtomicU64 = AtomicU64::new(0);
+static TLS13_INSTALL_LEGACY_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+fn maybe_log_tls13_install_markers(calls: u64) {
+    if calls == 1 || calls % 64 == 0 {
+        let nonzero = TLS13_INSTALL_RX_SEQ_NONZERO.load(Ordering::Relaxed);
+        let rejected = TLS13_INSTALL_LEGACY_REJECTED.load(Ordering::Relaxed);
+        eprintln!(
+            "tls13 markers[kind=tls13-install]: calls={} rx_seq_nonzero={} legacy_api_rejected={}",
+            calls, nonzero, rejected
+        );
+    }
+}
+
+fn install_ktls_from_secrets(
+    fd: i32,
+    cipher_suite: u16,
+    client_secret: &[u8],
+    server_secret: &[u8],
+    rx_seq_start: u64,
+) -> Result<(bool, bool), Tls13Error> {
+    let alg = HashAlg::from_cipher_suite(cipher_suite)?;
+    let tx_key = hkdf_expand_label(alg, client_secret, "key", &[], key_length(cipher_suite)?)?;
+    let tx_iv = hkdf_expand_label(alg, client_secret, "iv", &[], 12)?;
+    let rx_key = hkdf_expand_label(alg, server_secret, "key", &[], key_length(cipher_suite)?)?;
+    let rx_iv = hkdf_expand_label(alg, server_secret, "iv", &[], 12)?;
+
+    if crate::tls::setup_ulp_pub(fd).is_err() {
+        return Ok((false, false));
+    }
+
+    let tx_ok = install_ktls_raw(fd, 1, cipher_suite, &tx_key, &tx_iv, 0).is_ok();
+    let rx_ok = install_ktls_raw(fd, 2, cipher_suite, &rx_key, &rx_iv, rx_seq_start).is_ok();
+    Ok((tx_ok, rx_ok))
+}
+
 /// Install kTLS using application traffic secrets directly.
 /// Called after xray_tls13_handshake succeeds — secrets are passed from Go
 /// (which copied them from the XrayTls13Result inline arrays).
+///
+/// Legacy API note: this function lacks RX sequence input and therefore cannot
+/// safely install TLS RX for TLS 1.3 when post-handshake records were consumed.
+/// It fails closed and instructs callers to use
+/// `xray_tls13_install_ktls_with_rx_seq`.
 #[no_mangle]
 pub extern "C" fn xray_tls13_install_ktls(
+    _fd: i32,
+    _cipher_suite: u16,
+    _client_secret_ptr: *const u8,
+    _client_secret_len: usize,
+    _server_secret_ptr: *const u8,
+    _server_secret_len: usize,
+    out_ktls_tx: *mut bool,
+    out_ktls_rx: *mut bool,
+) -> i32 {
+    ffi_catch_i32!({
+        if out_ktls_tx.is_null() || out_ktls_rx.is_null() {
+            return -1;
+        }
+        unsafe {
+            *out_ktls_tx = false;
+            *out_ktls_rx = false;
+        }
+        let calls = TLS13_INSTALL_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let rejected = TLS13_INSTALL_LEGACY_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        maybe_log_tls13_install_markers(calls);
+        if rejected <= 3 || rejected % 64 == 0 {
+            eprintln!(
+                "[kind=tls13.rx_seq_missing] xray_tls13_install_ktls called without rx_seq_start; refusing install. use xray_tls13_install_ktls_with_rx_seq"
+            );
+        }
+        -1
+    })
+}
+
+/// Install kTLS using TLS 1.3 application traffic secrets and explicit RX
+/// sequence start (post-handshake record count).
+#[no_mangle]
+pub extern "C" fn xray_tls13_install_ktls_with_rx_seq(
     fd: i32,
     cipher_suite: u16,
     client_secret_ptr: *const u8,
     client_secret_len: usize,
     server_secret_ptr: *const u8,
     server_secret_len: usize,
+    rx_seq_start: u64,
     out_ktls_tx: *mut bool,
     out_ktls_rx: *mut bool,
 ) -> i32 {
@@ -1202,30 +1285,21 @@ pub extern "C" fn xray_tls13_install_ktls(
         if client_secret_ptr.is_null() || server_secret_ptr.is_null() {
             return -1;
         }
+
+        let calls = TLS13_INSTALL_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if rx_seq_start > 0 {
+            TLS13_INSTALL_RX_SEQ_NONZERO.fetch_add(1, Ordering::Relaxed);
+        }
+        maybe_log_tls13_install_markers(calls);
+
         let client_secret =
             unsafe { std::slice::from_raw_parts(client_secret_ptr, client_secret_len) };
         let server_secret =
             unsafe { std::slice::from_raw_parts(server_secret_ptr, server_secret_len) };
-        let cs = cipher_suite;
 
-        let inner = || -> Result<(bool, bool), Tls13Error> {
-            let alg = HashAlg::from_cipher_suite(cs)?;
-            let tx_key = hkdf_expand_label(alg, client_secret, "key", &[], key_length(cs)?)?;
-            let tx_iv = hkdf_expand_label(alg, client_secret, "iv", &[], 12)?;
-            let rx_key = hkdf_expand_label(alg, server_secret, "key", &[], key_length(cs)?)?;
-            let rx_iv = hkdf_expand_label(alg, server_secret, "iv", &[], 12)?;
-
-            // ULP setup
-            if crate::tls::setup_ulp_pub(fd).is_err() {
-                return Ok((false, false));
-            }
-
-            let tx_ok = install_ktls_raw(fd, 1, cs, &tx_key, &tx_iv, 0).is_ok();
-            let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, 0).is_ok();
-            Ok((tx_ok, rx_ok))
-        };
-
-        let (tx_ok, rx_ok) = inner().unwrap_or((false, false));
+        let (tx_ok, rx_ok) =
+            install_ktls_from_secrets(fd, cipher_suite, client_secret, server_secret, rx_seq_start)
+                .unwrap_or((false, false));
         unsafe {
             *out_ktls_tx = tx_ok;
             *out_ktls_rx = rx_ok;

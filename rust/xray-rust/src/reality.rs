@@ -379,14 +379,26 @@ pub struct RealityServerResult {
 /// Constant-time server name check to prevent timing oracles.
 /// An active DPI adversary probing different SNI values must not be able to
 /// distinguish "matched" from "not matched" by measuring response time.
+const MAX_SERVER_NAME_LEN: usize = 255;
+
+fn pad_server_name_for_ct_eq(name: &[u8]) -> [u8; MAX_SERVER_NAME_LEN] {
+    let mut padded = [0u8; MAX_SERVER_NAME_LEN];
+    let copy_len = name.len().min(MAX_SERVER_NAME_LEN);
+    padded[..copy_len].copy_from_slice(&name[..copy_len]);
+    padded
+}
+
 fn server_name_allowed(server_names: &[String], sni: &str) -> bool {
     let sni_bytes = sni.as_bytes();
+    let padded_sni = pad_server_name_for_ct_eq(sni_bytes);
+    let sni_in_range = subtle::Choice::from((sni_bytes.len() <= MAX_SERVER_NAME_LEN) as u8);
     let mut matched: subtle::Choice = 0u8.into();
     for name in server_names {
         let name_bytes = name.as_bytes();
-        if name_bytes.len() == sni_bytes.len() {
-            matched |= name_bytes.ct_eq(sni_bytes);
-        }
+        let padded_name = pad_server_name_for_ct_eq(name_bytes);
+        let name_in_range = subtle::Choice::from((name_bytes.len() <= MAX_SERVER_NAME_LEN) as u8);
+        let same_len = (name_bytes.len() as u16).ct_eq(&(sni_bytes.len() as u16));
+        matched |= name_in_range & sni_in_range & same_len & padded_name.ct_eq(&padded_sni);
     }
     bool::from(matched)
 }
@@ -773,13 +785,20 @@ fn peek_exact(fd: i32, buf: &mut [u8], timeout: Duration) -> io::Result<()> {
     // At 100us per retry, 100_000 retries = ~10 seconds. Wall-clock timeout is
     // still enforced by `timeout` and socket SO_RCVTIMEO.
     const MAX_RETRIES: u32 = 100_000;
+    const RETRY_BACKOFF: Duration = Duration::from_micros(100);
     let mut retries: u32 = 0;
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
     loop {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "peek_exact: handshake timeout exceeded",
+                format!(
+                    "peek_exact: handshake timeout exceeded after {:?} (retries={})",
+                    now.saturating_duration_since(start),
+                    retries
+                ),
             ));
         }
         let n = unsafe {
@@ -796,10 +815,21 @@ fn peek_exact(fd: i32, buf: &mut [u8], timeout: Duration) -> io::Result<()> {
                 continue;
             }
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "peek_exact: receive timeout",
-                ));
+                retries += 1;
+                if retries >= MAX_RETRIES || Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "peek_exact: receive timeout after {:?} (retries={})",
+                            Instant::now().saturating_duration_since(start),
+                            retries
+                        ),
+                    ));
+                }
+                // On nonblocking sockets, MSG_PEEK|MSG_WAITALL may yield
+                // EAGAIN until the full record arrives. Retry until deadline.
+                std::thread::sleep(RETRY_BACKOFF);
+                continue;
             }
             return Err(err);
         }
@@ -820,7 +850,7 @@ fn peek_exact(fd: i32, buf: &mut [u8], timeout: Duration) -> io::Result<()> {
                 ));
             }
             // MSG_PEEK|MSG_WAITALL may return short on some kernels; sleep briefly and retry
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            std::thread::sleep(RETRY_BACKOFF);
             continue;
         }
         return Ok(());
@@ -1429,6 +1459,7 @@ impl DeferredSession {
             u16,         // cipher_suite
             bool,        // ktls_tx
             bool,        // ktls_rx
+            u64,         // rx_seq_start
             *mut c_void, // state_handle
             Vec<u8>,     // tx base traffic secret
             Vec<u8>,     // rx base traffic secret
@@ -1544,6 +1575,7 @@ impl DeferredSession {
             cipher_suite,
             ktls_tx,
             ktls_rx,
+            rx_seq,
             state_handle,
             tx_secret,
             rx_secret,
@@ -2154,11 +2186,21 @@ pub extern "C" fn xray_deferred_enable_ktls_into(
         // Consume the handle — take ownership back from the raw pointer
         let session = unsafe { Box::from_raw(handle as *mut DeferredSession) };
         match session.enable_ktls() {
-            Ok((cipher_suite, ktls_tx, ktls_rx, state_handle, tx_secret, rx_secret, drained)) => {
+            Ok((
+                cipher_suite,
+                ktls_tx,
+                ktls_rx,
+                rx_seq_start,
+                state_handle,
+                tx_secret,
+                rx_secret,
+                drained,
+            )) => {
                 out.version = 0x0304;
                 out.cipher_suite = cipher_suite;
                 out.ktls_tx = ktls_tx;
                 out.ktls_rx = ktls_rx;
+                out.rx_seq_start = rx_seq_start;
                 out.state_handle = state_handle;
 
                 if !tx_secret.is_empty() {
@@ -2723,7 +2765,7 @@ pub extern "C" fn xray_reality_client_connect(
     client_hello_ptr: *mut u8,
     client_hello_len: usize,
     ecdh_privkey_ptr: *const u8,
-    _privkey_len: usize,
+    privkey_len: usize,
     cfg: *const RealityConfig,
     out: *mut XrayTlsResult,
 ) -> i32 {
@@ -2746,9 +2788,13 @@ pub extern "C" fn xray_reality_client_connect(
             out.set_error(-1, "client_hello_len exceeds TLS record limit");
             return -1;
         }
+        if privkey_len != 32 {
+            out.set_error(-1, "invalid ecdh private key length");
+            return -1;
+        }
 
         let ch = unsafe { std::slice::from_raw_parts_mut(client_hello_ptr, client_hello_len) };
-        let pk = unsafe { std::slice::from_raw_parts(ecdh_privkey_ptr, 32) };
+        let pk = unsafe { std::slice::from_raw_parts(ecdh_privkey_ptr, privkey_len) };
         let mut privkey = [0u8; 32];
         privkey.copy_from_slice(pk);
 
@@ -2772,6 +2818,7 @@ pub extern "C" fn xray_reality_client_connect(
             Ok(result) => {
                 out.version = 0x0304; // TLS 1.3
                 out.cipher_suite = result.tls_state.cipher_suite;
+                out.rx_seq_start = result.tls_state.server_post_hs_records;
 
                 // Copy base traffic secrets for Go-side KeyUpdate handler
                 // Client: TX = client secret, RX = server secret
@@ -3020,6 +3067,20 @@ mod tests {
         assert!(server_name_allowed(&names, "example.com"));
         assert!(!server_name_allowed(&names, "EXAMPLE.COM"));
         assert!(!server_name_allowed(&names, "unknown.example"));
+    }
+
+    #[test]
+    fn test_server_name_allowed_length_mismatch_rejected() {
+        let names = vec!["example.com".to_string()];
+        assert!(!server_name_allowed(&names, "example.co"));
+        assert!(!server_name_allowed(&names, "example.com."));
+    }
+
+    #[test]
+    fn test_server_name_allowed_oversized_rejected() {
+        let oversized = "a".repeat(MAX_SERVER_NAME_LEN + 1);
+        let names = vec![oversized.clone()];
+        assert!(!server_name_allowed(&names, &oversized));
     }
 
     #[test]

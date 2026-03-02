@@ -40,6 +40,10 @@ pub struct XrayTlsResult {
     pub secret_len: u8,
     pub drained_ptr: *mut u8,
     pub drained_len: u32,
+    // kTLS RX starting sequence number used during installation.
+    // For TLS 1.3 client flows this includes post-handshake records
+    // (e.g. NewSessionTicket) already consumed before handoff.
+    pub rx_seq_start: u64,
 }
 
 impl XrayTlsResult {
@@ -58,6 +62,7 @@ impl XrayTlsResult {
             secret_len: 0,
             drained_ptr: std::ptr::null_mut(),
             drained_len: 0,
+            rx_seq_start: 0,
         }
     }
 
@@ -1719,6 +1724,7 @@ pub extern "C" fn xray_tls_handshake_into(
         // Pipeline dropped: dup'd fd closed, O_NONBLOCK restored.
         out.ktls_tx = tx;
         out.ktls_rx = rx;
+        out.rx_seq_start = output.rx_seq;
 
         // Create TlsState (metadata only — KeyUpdate is handled on the Go side)
         let state = Box::new(TlsState::new(fd, out.cipher_suite));
