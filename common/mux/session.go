@@ -193,6 +193,7 @@ func (s *Session) Close(locked bool) error {
 		if s.XUDP.Status == Active {
 			s.XUDP.Expire = time.Now().Add(time.Minute)
 			s.XUDP.Status = Expiring
+			recordXUDPPut()
 			errors.LogDebug(context.Background(), "XUDP put ", s.XUDP.GlobalID)
 		}
 		XUDPManager.Unlock()
@@ -254,6 +255,7 @@ func xudpEvictExpiring() bool {
 	if found {
 		XUDPManager.Map[oldestID].Interrupt()
 		delete(XUDPManager.Map, oldestID)
+		recordXUDPEvictExpiring()
 		errors.LogDebug(context.Background(), "XUDP evict expiring ", oldestID)
 		return true
 	}
@@ -269,6 +271,7 @@ func xudpEvictExpiring() bool {
 	if found {
 		XUDPManager.Map[oldestID].Interrupt()
 		delete(XUDPManager.Map, oldestID)
+		recordXUDPEvictActive()
 		errors.LogDebug(context.Background(), "XUDP evict active ", oldestID)
 		return true
 	}
@@ -286,6 +289,7 @@ func init() {
 				if x.Status == Expiring && now.After(x.Expire) {
 					x.Interrupt()
 					delete(XUDPManager.Map, id)
+					recordXUDPDelExpired()
 					errors.LogDebug(context.Background(), "XUDP del ", id)
 				}
 			}

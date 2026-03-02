@@ -111,6 +111,7 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
 	if err := buf.Copy(s.input, writer); err != nil {
+		recordMuxSessionEnd(err)
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
 	}
@@ -203,6 +204,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			if len(XUDPManager.Map) >= maxXUDPSessions {
 				if !xudpEvictExpiring() {
 					XUDPManager.Unlock()
+					recordXUDPMapFull()
 					errors.LogWarning(ctx, "XUDP session map full (", maxXUDPSessions, "), rejecting new session")
 					return errors.New("XUDP session limit reached")
 				}
@@ -210,9 +212,11 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			x = &XUDP{GlobalID: meta.GlobalID, CreatedAt: time.Now()}
 			XUDPManager.Map[meta.GlobalID] = x
 			XUDPManager.Unlock()
+			recordXUDPNew()
 		} else {
 			if x.Status == Initializing { // nearly impossible
 				XUDPManager.Unlock()
+				recordXUDPConflict()
 				errors.LogWarningInner(ctx, errors.New("conflict"), "XUDP hit ", meta.GlobalID)
 				// It's not a good idea to return an err here, so just let client wait.
 				// Client will receive an End frame after sending a Keep frame.
@@ -220,6 +224,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			}
 			x.Status = Initializing
 			XUDPManager.Unlock()
+			recordXUDPHit()
 			x.Mux.Close(false) // detach from previous Mux
 			b := buf.New()
 			b.Write(mb[0].Bytes())
@@ -241,6 +246,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 				XUDPManager.Lock()
 				delete(XUDPManager.Map, x.GlobalID)
 				XUDPManager.Unlock()
+				recordXUDPDispatchFail()
 				err = errors.New("XUDP new ", meta.GlobalID).Base(errors.New("failed to dispatch request to ", meta.Target).Base(err))
 				return err // it will break the whole Mux connection
 			}
