@@ -616,8 +616,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
 				if t != nil {
-					i, _ := t.FieldByName("input")
-					r, _ := t.FieldByName("rawInput")
+					i, iOK := t.FieldByName("input")
+					r, rOK := t.FieldByName("rawInput")
+					if !iOK || !rOK {
+						return errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+					}
 					input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
 					rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 				}

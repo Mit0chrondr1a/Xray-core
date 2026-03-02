@@ -10,6 +10,7 @@ import (
 
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/pipeline"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 )
@@ -166,6 +167,7 @@ func TestXHTTPKREALITYListenerEligible(t *testing.T) {
 				tc.nativeAvailable,
 				tc.fullKTLSSupported,
 				tc.deferredPromotionDisabled,
+				pipeline.CapabilitySummary{KTLSSupported: true, SockmapSupported: true, SpliceSupported: true},
 			)
 			if got != tc.want {
 				t.Fatalf("xhttpKREALITYListenerEligible() = %v, want %v", got, tc.want)

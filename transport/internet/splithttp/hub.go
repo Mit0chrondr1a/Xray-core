@@ -23,9 +23,12 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/pipeline"
+	"github.com/xtls/xray-core/common/platform"
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/ebpf"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -545,12 +548,114 @@ type kREALITYListener struct {
 
 const xhttpMaxConcurrentRealityHandshakes = 4096
 const xhttpRealityAcceptRetryDelay = 100 * time.Millisecond
+const xhttpRealityMarkerLogInterval = 30 * time.Second
+
+var (
+	xhttpRealityMarkerLastLogUnix atomic.Int64
+
+	xhttpRealityMarkerRustAttempt             atomic.Uint64
+	xhttpRealityMarkerRustSuccess             atomic.Uint64
+	xhttpRealityMarkerRustFDExtractFailed     atomic.Uint64
+	xhttpRealityMarkerRustAuthFallback        atomic.Uint64
+	xhttpRealityMarkerRustPeekTimeoutFallback atomic.Uint64
+	xhttpRealityMarkerRustWrapFailed          atomic.Uint64
+	xhttpRealityMarkerRustHandshakeFailed     atomic.Uint64
+	xhttpRealityMarkerRustDurationNanosTotal  atomic.Uint64
+	xhttpRealityMarkerRustDurationSamples     atomic.Uint64
+
+	xhttpRealityMarkerKTLSPromoteAttempt atomic.Uint64
+	xhttpRealityMarkerKTLSPromoteSuccess atomic.Uint64
+	xhttpRealityMarkerKTLSPromoteFailed  atomic.Uint64
+
+	xhttpRealityMarkerGoFallbackAttempt    atomic.Uint64
+	xhttpRealityMarkerGoFallbackSuccess    atomic.Uint64
+	xhttpRealityMarkerGoFallbackFailed     atomic.Uint64
+	xhttpRealityMarkerGoFallbackNanosTotal atomic.Uint64
+	xhttpRealityMarkerGoFallbackSamples    atomic.Uint64
+	xhttpDecisionRustKTLS                  atomic.Uint64
+	xhttpDecisionGoFallback                atomic.Uint64
+	xhttpDecisionDrop                      atomic.Uint64
+
+	xhttpRealityMarkerLastRustAttempt             atomic.Uint64
+	xhttpRealityMarkerLastRustSuccess             atomic.Uint64
+	xhttpRealityMarkerLastRustFDExtractFailed     atomic.Uint64
+	xhttpRealityMarkerLastRustAuthFallback        atomic.Uint64
+	xhttpRealityMarkerLastRustPeekTimeoutFallback atomic.Uint64
+	xhttpRealityMarkerLastRustWrapFailed          atomic.Uint64
+	xhttpRealityMarkerLastRustHandshakeFailed     atomic.Uint64
+	xhttpRealityMarkerLastRustDurationNanosTotal  atomic.Uint64
+	xhttpRealityMarkerLastRustDurationSamples     atomic.Uint64
+	xhttpRealityMarkerLastKTLSPromoteAttempt      atomic.Uint64
+	xhttpRealityMarkerLastKTLSPromoteSuccess      atomic.Uint64
+	xhttpRealityMarkerLastKTLSPromoteFailed       atomic.Uint64
+	xhttpRealityMarkerLastGoFallbackAttempt       atomic.Uint64
+	xhttpRealityMarkerLastGoFallbackSuccess       atomic.Uint64
+	xhttpRealityMarkerLastGoFallbackFailed        atomic.Uint64
+	xhttpRealityMarkerLastGoFallbackNanosTotal    atomic.Uint64
+	xhttpRealityMarkerLastGoFallbackSamples       atomic.Uint64
+	xhttpDecisionLastRustKTLS                     atomic.Uint64
+	xhttpDecisionLastGoFallback                   atomic.Uint64
+	xhttpDecisionLastDrop                         atomic.Uint64
+)
+
+func xhttpTelemetryV2Enabled() bool {
+	return platform.NewEnvFlag("xray.pipeline.telemetry.v2").GetValue(func() string { return "" }) != "off"
+}
+
+func xhttpCapabilitiesSummary() pipeline.CapabilitySummary {
+	summary := native.CapabilitiesSummary()
+	if goCaps := ebpf.GetCapabilities(); goCaps.SockmapSupported {
+		summary.SockmapSupported = true
+	}
+	if tls.NativeFullKTLSSupported() {
+		summary.KTLSSupported = true
+	}
+	if !summary.SpliceSupported {
+		summary.SpliceSupported = true
+	}
+	return summary
+}
+
+func logXHTTPDecision(ctx context.Context, path, reason string, caps pipeline.CapabilitySummary, rustNs, fallbackNs int64, ktlsAttempt, ktlsSuccess bool) {
+	errors.LogInfo(ctx, "reality markers[kind=xhttp-handover-summary]: ",
+		"path=", path,
+		" reason=", reason,
+		" rust_duration_ns=", rustNs,
+		" fallback_duration_ns=", fallbackNs,
+		" ktls_attempt=", ktlsAttempt,
+		" ktls_success=", ktlsSuccess,
+		" ktls_supported=", caps.KTLSSupported,
+		" sockmap_supported=", caps.SockmapSupported,
+		" splice_supported=", caps.SpliceSupported,
+	)
+}
+
+func logXHTTPSummary(ctx context.Context, snap pipeline.DecisionSnapshot) {
+	kind := snap.Kind
+	if kind == "" {
+		kind = "xhttp"
+	}
+	errors.LogInfo(ctx, "reality markers[kind=xhttp-pipeline-summary]: ",
+		"kind=", kind,
+		" path=", string(snap.Path),
+		" reason=", snap.Reason,
+		" splice_bytes=", snap.SpliceBytes,
+		" splice_duration_ns=", snap.SpliceDurationNs,
+		" userspace_bytes=", snap.UserspaceBytes,
+		" userspace_duration_ns=", snap.UserspaceDurationNs,
+		" sockmap_success=", snap.SockmapSuccess,
+		" ktls_supported=", snap.Caps.KTLSSupported,
+		" sockmap_supported=", snap.Caps.SockmapSupported,
+		" splice_supported=", snap.Caps.SpliceSupported,
+	)
+}
 
 func xhttpKREALITYListenerEligible(
 	port net.Port,
 	socketSettings *internet.SocketConfig,
 	realityConfig *reality.Config,
 	nativeAvailable, fullKTLSSupported, deferredPromotionDisabled bool,
+	caps pipeline.CapabilitySummary,
 ) bool {
 	if port == 0 || !nativeAvailable || !fullKTLSSupported || deferredPromotionDisabled || realityConfig == nil {
 		return false
@@ -563,7 +668,96 @@ func xhttpKREALITYListenerEligible(
 	if len(realityConfig.Mldsa65Seed) > 0 {
 		return false
 	}
+	// Require capability cache to say kTLS is supported before enabling acceleration listener.
+	if !caps.KTLSSupported {
+		return false
+	}
 	return true
+}
+
+func xhttpMarkerSnapshot(total *atomic.Uint64, last *atomic.Uint64) (current uint64, delta uint64) {
+	current = total.Load()
+	previous := last.Swap(current)
+	return current, current - previous
+}
+
+func maybeLogXHTTPRealityHandoverMarkers(ctx context.Context) {
+	if xhttpTelemetryV2Enabled() {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := xhttpRealityMarkerLastLogUnix.Load()
+	if last != 0 && now-last < int64(xhttpRealityMarkerLogInterval) {
+		return
+	}
+	if !xhttpRealityMarkerLastLogUnix.CompareAndSwap(last, now) {
+		return
+	}
+
+	rustAttempt, rustAttemptDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustAttempt, &xhttpRealityMarkerLastRustAttempt)
+	rustSuccess, rustSuccessDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustSuccess, &xhttpRealityMarkerLastRustSuccess)
+	rustFDExtractFailed, rustFDExtractFailedDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustFDExtractFailed, &xhttpRealityMarkerLastRustFDExtractFailed)
+	rustAuthFallback, rustAuthFallbackDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustAuthFallback, &xhttpRealityMarkerLastRustAuthFallback)
+	rustPeekFallback, rustPeekFallbackDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustPeekTimeoutFallback, &xhttpRealityMarkerLastRustPeekTimeoutFallback)
+	rustWrapFailed, rustWrapFailedDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustWrapFailed, &xhttpRealityMarkerLastRustWrapFailed)
+	rustHandshakeFailed, rustHandshakeFailedDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustHandshakeFailed, &xhttpRealityMarkerLastRustHandshakeFailed)
+	rustNanos, rustNanosDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustDurationNanosTotal, &xhttpRealityMarkerLastRustDurationNanosTotal)
+	rustSamples, rustSamplesDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerRustDurationSamples, &xhttpRealityMarkerLastRustDurationSamples)
+
+	ktlsAttempt, ktlsAttemptDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerKTLSPromoteAttempt, &xhttpRealityMarkerLastKTLSPromoteAttempt)
+	ktlsSuccess, ktlsSuccessDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerKTLSPromoteSuccess, &xhttpRealityMarkerLastKTLSPromoteSuccess)
+	ktlsFailed, ktlsFailedDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerKTLSPromoteFailed, &xhttpRealityMarkerLastKTLSPromoteFailed)
+
+	goFallbackAttempt, goFallbackAttemptDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerGoFallbackAttempt, &xhttpRealityMarkerLastGoFallbackAttempt)
+	goFallbackSuccess, goFallbackSuccessDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerGoFallbackSuccess, &xhttpRealityMarkerLastGoFallbackSuccess)
+	goFallbackFailed, goFallbackFailedDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerGoFallbackFailed, &xhttpRealityMarkerLastGoFallbackFailed)
+	goFallbackNanos, goFallbackNanosDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerGoFallbackNanosTotal, &xhttpRealityMarkerLastGoFallbackNanosTotal)
+	goFallbackSamples, goFallbackSamplesDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerGoFallbackSamples, &xhttpRealityMarkerLastGoFallbackSamples)
+	decisionRustKTLS, decisionRustKTLSDelta := xhttpMarkerSnapshot(&xhttpDecisionRustKTLS, &xhttpDecisionLastRustKTLS)
+	decisionGoFallback, decisionGoFallbackDelta := xhttpMarkerSnapshot(&xhttpDecisionGoFallback, &xhttpDecisionLastGoFallback)
+	decisionDrop, decisionDropDelta := xhttpMarkerSnapshot(&xhttpDecisionDrop, &xhttpDecisionLastDrop)
+
+	var rustAvgNs uint64
+	if rustSamples > 0 {
+		rustAvgNs = rustNanos / rustSamples
+	}
+	var rustAvgNsDelta uint64
+	if rustSamplesDelta > 0 {
+		rustAvgNsDelta = rustNanosDelta / rustSamplesDelta
+	}
+	var goFallbackAvgNs uint64
+	if goFallbackSamples > 0 {
+		goFallbackAvgNs = goFallbackNanos / goFallbackSamples
+	}
+	var goFallbackAvgNsDelta uint64
+	if goFallbackSamplesDelta > 0 {
+		goFallbackAvgNsDelta = goFallbackNanosDelta / goFallbackSamplesDelta
+	}
+
+	errors.LogInfo(ctx, "reality markers[kind=xhttp-handover]: ",
+		"rust_attempt=", rustAttempt, "(+", rustAttemptDelta, ") ",
+		"rust_success=", rustSuccess, "(+", rustSuccessDelta, ") ",
+		"rust_fd_extract_failed=", rustFDExtractFailed, "(+", rustFDExtractFailedDelta, ") ",
+		"rust_auth_fallback=", rustAuthFallback, "(+", rustAuthFallbackDelta, ") ",
+		"rust_peek_timeout_fallback=", rustPeekFallback, "(+", rustPeekFallbackDelta, ") ",
+		"rust_wrap_failed=", rustWrapFailed, "(+", rustWrapFailedDelta, ") ",
+		"rust_handshake_failed=", rustHandshakeFailed, "(+", rustHandshakeFailedDelta, ") ",
+		"rust_duration_ns=", rustNanos, "(+", rustNanosDelta, ") ",
+		"rust_samples=", rustSamples, "(+", rustSamplesDelta, ") ",
+		"rust_avg_ns=", rustAvgNs, "(+", rustAvgNsDelta, ") ",
+		"ktls_promote_attempt=", ktlsAttempt, "(+", ktlsAttemptDelta, ") ",
+		"ktls_promote_success=", ktlsSuccess, "(+", ktlsSuccessDelta, ") ",
+		"ktls_promote_failed=", ktlsFailed, "(+", ktlsFailedDelta, ") ",
+		"go_fallback_attempt=", goFallbackAttempt, "(+", goFallbackAttemptDelta, ") ",
+		"go_fallback_success=", goFallbackSuccess, "(+", goFallbackSuccessDelta, ") ",
+		"go_fallback_failed=", goFallbackFailed, "(+", goFallbackFailedDelta, ") ",
+		"go_fallback_duration_ns=", goFallbackNanos, "(+", goFallbackNanosDelta, ") ",
+		"go_fallback_samples=", goFallbackSamples, "(+", goFallbackSamplesDelta, ") ",
+		"go_fallback_avg_ns=", goFallbackAvgNs, "(+", goFallbackAvgNsDelta, ") ",
+		"decision_rust_ktls=", decisionRustKTLS, "(+", decisionRustKTLSDelta, ") ",
+		"decision_go_fallback=", decisionGoFallback, "(+", decisionGoFallbackDelta, ") ",
+		"decision_drop=", decisionDrop, "(+", decisionDropDelta, ")",
+	)
 }
 
 func newKREALITYListener(inner net.Listener, realityConfig *goreality.Config, realityXrayConfig *reality.Config, timeout time.Duration) *kREALITYListener {
@@ -672,60 +866,129 @@ func (l *kREALITYListener) handshakeAndEnqueue(rawConn net.Conn) {
 }
 
 func (l *kREALITYListener) processConn(rawConn net.Conn) (net.Conn, error) {
+	caps := xhttpCapabilitiesSummary()
+	decision := pipeline.DecisionSnapshot{
+		Path:   pipeline.PathUserspace,
+		Reason: "default",
+		Caps:   caps,
+		Kind:   "xhttp",
+	}
+	var rustDurationNs int64
+	var fallbackDurationNs int64
+	var ktlsAttempt bool
+	var ktlsSuccess bool
+	defer func() {
+		logXHTTPDecision(context.Background(), string(decision.Path), decision.Reason, caps, rustDurationNs, fallbackDurationNs, ktlsAttempt, ktlsSuccess)
+		logXHTTPSummary(context.Background(), decision)
+	}()
+
 	tryGoFallback := false
+	defer maybeLogXHTTPRealityHandoverMarkers(context.Background())
 	fd, fdErr := tls.ExtractFd(rawConn)
 	if fdErr != nil {
-		errors.LogDebugInner(context.Background(), fdErr, "XHTTP Rust REALITY path skipped: failed to extract fd")
+		xhttpRealityMarkerRustFDExtractFailed.Add(1)
+		errors.LogDebugInner(context.Background(), fdErr, "[kind=xhttp-handover.rust_fd_extract_failed] XHTTP Rust REALITY path skipped: failed to extract fd")
 		tryGoFallback = true
+		decision.Reason = "fd_extract_failed"
 	} else {
+		xhttpRealityMarkerRustAttempt.Add(1)
 		if err := rawConn.SetDeadline(time.Now().Add(l.timeout)); err != nil {
 			return nil, errors.New("XHTTP Rust REALITY path: failed to set handshake deadline").Base(err)
 		}
+		rustStart := time.Now()
 		deferredResult, deferredErr := l.doRustRealityDeferred(fd)
+		rustDurationNs = time.Since(rustStart).Nanoseconds()
+		xhttpRealityMarkerRustDurationNanosTotal.Add(uint64(time.Since(rustStart).Nanoseconds()))
+		xhttpRealityMarkerRustDurationSamples.Add(1)
 		if err := rawConn.SetDeadline(time.Time{}); err != nil {
 			errors.LogWarningInner(context.Background(), err, "XHTTP Rust REALITY path: failed to clear handshake deadline")
 		}
 		if deferredErr == nil {
 			deferredConn, wrapErr := tls.NewDeferredRustConn(rawConn, deferredResult)
 			if wrapErr != nil {
+				xhttpRealityMarkerRustWrapFailed.Add(1)
+				errors.LogWarningInner(context.Background(), wrapErr, "[kind=xhttp-handover.rust_wrap_failed] XHTTP Rust REALITY deferred handshake succeeded but wrap failed")
 				if deferredResult != nil && deferredResult.Handle != nil {
 					native.DeferredFree(deferredResult.Handle)
 				}
 				return nil, errors.New("XHTTP Rust REALITY deferred handshake succeeded but wrap failed").Base(wrapErr)
 			}
+			decision = pipeline.DecideVisionPath(pipeline.DecisionInput{
+				DeferredTLSActive: false,
+				LoopbackPair:      false, // listener already detached; loopback not relevant here.
+				Caps:              caps,
+			})
+			xhttpRealityMarkerKTLSPromoteAttempt.Add(1)
+			ktlsAttempt = true
 			if err := deferredConn.EnableKTLS(); err != nil {
+				xhttpRealityMarkerKTLSPromoteFailed.Add(1)
+				errors.LogWarningInner(context.Background(), err, "[kind=xhttp-handover.ktls_promote_failed] XHTTP Rust REALITY deferred kTLS promotion failed")
 				// Rust REALITY handshake already consumed TLS bytes; Go fallback
 				// cannot safely re-handshake on this socket. Don't close deferredConn
 				// here — the handle is already consumed by EnableKTLS FFI, and
 				// handshakeAndEnqueue closes rawConn on error return.
 				return nil, errors.New("XHTTP Rust REALITY deferred kTLS promotion failed").Base(err)
 			}
+			xhttpRealityMarkerKTLSPromoteSuccess.Add(1)
+			ktlsSuccess = true
+			xhttpRealityMarkerRustSuccess.Add(1)
+			decision.Path = pipeline.PathSockmap // accelerated path via kTLS’d listener; treat as zero-copy
+			decision.Reason = "ktls_success"
+			xhttpDecisionRustKTLS.Add(1)
+			// No splice/userspace accounting on the kTLS listener path; set spliceDuration to rustDuration.
+			decision.SpliceDurationNs = rustDurationNs
 			return tls.NewKTLSPlaintextConn(deferredConn), nil
 		}
 		if stderrors.Is(deferredErr, native.ErrRealityAuthFailed) {
-			errors.LogInfo(context.Background(), "XHTTP Rust REALITY auth failed, falling back to Go REALITY camouflage")
+			xhttpRealityMarkerRustAuthFallback.Add(1)
+			errors.LogInfo(context.Background(), "[kind=xhttp-handover.rust_auth_fallback] XHTTP Rust REALITY auth failed, falling back to Go REALITY camouflage")
 			errors.LogDebug(context.Background(), "XHTTP REALITY auth detail: ", deferredErr)
 			tryGoFallback = true
+			decision.Reason = "rust_auth_failed"
 		} else if xhttpIsDeferredRealityPeekTimeout(deferredErr) {
+			xhttpRealityMarkerRustPeekTimeoutFallback.Add(1)
 			// Timeout happened before auth/handshake consumed bytes.
-			errors.LogDebugInner(context.Background(), deferredErr, "XHTTP Rust REALITY deferred peek timed out, falling back to Go REALITY")
+			errors.LogDebugInner(context.Background(), deferredErr, "[kind=xhttp-handover.rust_peek_timeout] XHTTP Rust REALITY deferred peek timed out, falling back to Go REALITY")
 			tryGoFallback = true
+			decision.Reason = "rust_peek_timeout"
 		} else {
+			xhttpRealityMarkerRustHandshakeFailed.Add(1)
+			errors.LogWarningInner(context.Background(), deferredErr, "[kind=xhttp-handover.rust_deferred_failed] XHTTP Rust REALITY deferred handshake failed")
+			decision.Reason = "rust_handshake_failed"
 			return nil, errors.New("XHTTP Rust REALITY deferred handshake failed").Base(deferredErr)
 		}
 	}
 
 	if tryGoFallback {
+		xhttpRealityMarkerGoFallbackAttempt.Add(1)
 		// Keep fallback behavior aligned with upstream REALITY listener: no extra
 		// deadline wrapper around reality.Server(), so camouflage timing/flow
 		// matches the main Go path.
+		goFallbackStart := time.Now()
 		realityConn, fallbackErr := reality.Server(rawConn, l.realityConfig)
+		fallbackDurationNs = time.Since(goFallbackStart).Nanoseconds()
+		xhttpRealityMarkerGoFallbackNanosTotal.Add(uint64(time.Since(goFallbackStart).Nanoseconds()))
+		xhttpRealityMarkerGoFallbackSamples.Add(1)
 		if fallbackErr != nil {
+			xhttpRealityMarkerGoFallbackFailed.Add(1)
+			errors.LogInfo(context.Background(), "[kind=xhttp-handover.go_fallback_failed] ", fallbackErr.Error())
+			decision.Path = pipeline.PathUserspace
+			decision.Reason = "fallback_failed"
+			xhttpDecisionGoFallback.Add(1)
 			return nil, fallbackErr
 		}
+		xhttpRealityMarkerGoFallbackSuccess.Add(1)
+		decision.Path = pipeline.PathUserspace
+		decision.Reason = "fallback_success"
+		xhttpDecisionGoFallback.Add(1)
 		return realityConn, nil
 	}
 
+	decision.Path = pipeline.PathUserspace
+	if decision.Reason == "default" {
+		decision.Reason = "unexpected_drop"
+	}
+	xhttpDecisionDrop.Add(1)
 	return nil, io.EOF
 }
 
@@ -860,6 +1123,11 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		maxSessions:    getMaxConcurrentSessions(),
 		socketSettings: streamSettings.SocketSettings,
 	}
+	caps := xhttpCapabilitiesSummary()
+	errors.LogInfo(ctx, "reality markers[kind=xhttp-capabilities]: ",
+		"ktls_supported=", caps.KTLSSupported,
+		" sockmap_supported=", caps.SockmapSupported,
+		" splice_supported=", caps.SpliceSupported)
 	tlsConfig := getTLSConfig(streamSettings)
 	l.isH3 = len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "h3"
 
@@ -943,6 +1211,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 				native.Available(),
 				tls.NativeFullKTLSSupported(),
 				tls.DeferredKTLSPromotionDisabled(),
+				caps,
 			) {
 				l.listener = newKREALITYListener(l.listener, config.GetREALITYConfig(), config, 8*time.Second)
 				errors.LogInfo(ctx, "XHTTP using kTLS-accelerated REALITY listener")

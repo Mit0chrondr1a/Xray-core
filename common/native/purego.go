@@ -9,11 +9,17 @@ import (
 	"unsafe"
 
 	"lukechampine.com/blake3"
+
+	"github.com/xtls/xray-core/common/pipeline"
 )
 
 // Available returns false when the native Rust library is not linked.
 func Available() bool {
 	return false
+}
+
+func CapabilitiesSummary() pipeline.CapabilitySummary {
+	return pipeline.CapabilitySummary{SpliceSupported: true}
 }
 
 // EbpfAvailable reports whether native eBPF support is available.
@@ -63,6 +69,7 @@ type TlsResult struct {
 	Version     uint16
 	CipherSuite uint16
 	ALPN        string
+	RxSeqStart  uint64
 	StateHandle *TlsStateHandle
 	TxSecret    []byte
 	RxSecret    []byte

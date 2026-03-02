@@ -633,20 +633,20 @@ func TestIsExpectedSpliceReadFromError(t *testing.T) {
 	}
 }
 
-func TestDeferredWriterRequiresTLS(t *testing.T) {
-	if deferredWriterRequiresTLS(nil) {
+func TestDeferredConnRequiresTLS(t *testing.T) {
+	if deferredConnRequiresTLS(nil) {
 		t.Fatal("nil conn should not require deferred TLS")
 	}
 
 	left, right := mustTCPPair(t)
 	defer left.Close()
 	defer right.Close()
-	if deferredWriterRequiresTLS(left) {
+	if deferredConnRequiresTLS(left) {
 		t.Fatal("raw TCP conn should not require deferred TLS")
 	}
 
 	// Zero-value DeferredRustConn is non-detached and not kTLS-active.
-	if !deferredWriterRequiresTLS(&tls.DeferredRustConn{}) {
+	if !deferredConnRequiresTLS(&tls.DeferredRustConn{}) {
 		t.Fatal("DeferredRustConn should require TLS while non-detached and non-kTLS")
 	}
 }

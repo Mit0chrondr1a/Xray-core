@@ -25,6 +25,7 @@ struct xray_tls_result {
     uint8_t  secret_len;
     uint8_t* drained_ptr;
     uint32_t drained_len;
+    uint64_t rx_seq_start;
 };
 
 // TLS config builder
@@ -213,12 +214,20 @@ extern void xray_geoip_result_free(struct xray_geoip_result* result);
 extern int32_t xray_geosite_load(const uint8_t* path, size_t path_len, const uint8_t** codes, const size_t* code_lens, size_t num_codes, struct xray_geosite_result* result);
 extern void xray_geosite_result_free(struct xray_geosite_result* result);
 
-// eBPF sockmap management
-extern int32_t xray_ebpf_available();
-extern int32_t xray_ebpf_setup(const char* pin_path, uint32_t max_entries, uint32_t cork_threshold);
-extern int32_t xray_ebpf_teardown();
-extern int32_t xray_ebpf_register_pair(int32_t inbound_fd, int32_t outbound_fd, uint64_t inbound_cookie, uint64_t outbound_cookie, uint32_t policy_flags);
-extern int32_t xray_ebpf_unregister_pair(uint64_t inbound_cookie, uint64_t outbound_cookie);
+	// eBPF sockmap management
+	extern int32_t xray_ebpf_available();
+	extern int32_t xray_ebpf_setup(const char* pin_path, uint32_t max_entries, uint32_t cork_threshold);
+	extern int32_t xray_ebpf_teardown();
+	extern int32_t xray_ebpf_register_pair(int32_t inbound_fd, int32_t outbound_fd, uint64_t inbound_cookie, uint64_t outbound_cookie, uint32_t policy_flags);
+	extern int32_t xray_ebpf_unregister_pair(uint64_t inbound_cookie, uint64_t outbound_cookie);
+
+	// Pipeline capability summary
+	struct xray_capability_summary {
+	    bool ktls_supported;
+	    bool sockmap_supported;
+	    bool splice_supported;
+	};
+	extern int32_t xray_capabilities_summary(struct xray_capability_summary* out);
 */
 import "C"
 
@@ -234,6 +243,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/xtls/xray-core/common/pipeline"
 	"lukechampine.com/blake3"
 )
 
@@ -246,6 +256,20 @@ func init() {
 // Available reports whether the native Rust implementations are linked.
 func Available() bool {
 	return true
+}
+
+// CapabilitiesSummary fetches the cached capability view from Rust (one-shot probe later).
+func CapabilitiesSummary() pipeline.CapabilitySummary {
+	var out C.struct_xray_capability_summary
+	rc := C.xray_capabilities_summary(&out)
+	if rc != 0 {
+		return pipeline.CapabilitySummary{SpliceSupported: true}
+	}
+	return pipeline.CapabilitySummary{
+		KTLSSupported:    bool(out.ktls_supported),
+		SockmapSupported: bool(out.sockmap_supported),
+		SpliceSupported:  bool(out.splice_supported),
+	}
 }
 
 // EbpfAvailable reports whether Rust eBPF bytecode support is compiled in.
@@ -346,6 +370,7 @@ type TlsResult struct {
 	Version     uint16
 	CipherSuite uint16
 	ALPN        string
+	RxSeqStart  uint64
 	StateHandle *TlsStateHandle
 	TxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
 	RxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
@@ -721,8 +746,11 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 	if cfg == nil {
 		return nil, errors.New("native: nil reality config handle")
 	}
-	if len(clientHelloRaw) == 0 || len(ecdhPrivkey) == 0 {
-		return nil, errors.New("native: empty client hello or privkey")
+	if len(clientHelloRaw) == 0 {
+		return nil, errors.New("native: empty client hello")
+	}
+	if len(ecdhPrivkey) != 32 {
+		return nil, fmt.Errorf("native: invalid reality ecdh privkey length: got %d want 32", len(ecdhPrivkey))
 	}
 	var cResult C.struct_xray_tls_result
 	rc := C.xray_reality_client_connect(
@@ -1112,6 +1140,7 @@ func extractTlsResultWithInline(cResult *C.struct_xray_tls_result, drainedInline
 		KtlsRx:      bool(cResult.ktls_rx),
 		Version:     uint16(cResult.version),
 		CipherSuite: uint16(cResult.cipher_suite),
+		RxSeqStart:  uint64(cResult.rx_seq_start),
 	}
 	// Extract ALPN (null-terminated string in 32-byte buffer)
 	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
