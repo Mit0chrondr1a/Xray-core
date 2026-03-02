@@ -1271,10 +1271,7 @@ impl DeferredSession {
                 let mut cursor = io::Cursor::new(&record);
                 match conn.read_tls(&mut cursor) {
                     Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "peer closed",
-                        ));
+                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
                     }
                     Ok(_) => {
                         conn.process_new_packets()
@@ -1376,7 +1373,10 @@ impl DeferredSession {
         // once it sees detached=true — the fd must be non-blocking by then
         // or Go's runtime will block the OS thread.
         {
-            let mut guard = self.blocking_guard.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self
+                .blocking_guard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             guard.restore_nonblock_early();
         }
         self.detached.store(true, Ordering::Release);
@@ -1412,7 +1412,10 @@ impl DeferredSession {
         if self.detached.load(Ordering::Acquire) {
             return Ok(()); // already detached, O_NONBLOCK already restored
         }
-        let mut guard = self.blocking_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .blocking_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.restore_nonblock_early();
         Ok(())
     }
@@ -1487,8 +1490,10 @@ impl DeferredSession {
         );
 
         tls::setup_ulp(original_fd).map_err(|e| (2, format!("ULP: {}", e)))?;
-        let tx_result = tls::install_ktls(original_fd, tls::TLS_TX, tls_version, &tx_secrets, tx_seq);
-        let rx_result = tls::install_ktls(original_fd, tls::TLS_RX, tls_version, &rx_secrets, rx_seq);
+        let tx_result =
+            tls::install_ktls(original_fd, tls::TLS_TX, tls_version, &tx_secrets, tx_seq);
+        let rx_result =
+            tls::install_ktls(original_fd, tls::TLS_RX, tls_version, &rx_secrets, rx_seq);
 
         #[cfg(debug_assertions)]
         {
@@ -1510,8 +1515,16 @@ impl DeferredSession {
                     "kTLS incomplete (tx={}, rx={}, tx_err={}, rx_err={})",
                     ktls_tx,
                     ktls_rx,
-                    tx_result.err().map(|e| e.to_string()).as_deref().unwrap_or("none"),
-                    rx_result.err().map(|e| e.to_string()).as_deref().unwrap_or("none"),
+                    tx_result
+                        .err()
+                        .map(|e| e.to_string())
+                        .as_deref()
+                        .unwrap_or("none"),
+                    rx_result
+                        .err()
+                        .map(|e| e.to_string())
+                        .as_deref()
+                        .unwrap_or("none"),
                 ),
             ));
         }
@@ -2009,6 +2022,94 @@ pub extern "C" fn xray_deferred_drain_and_detach(
     })
 }
 
+#[inline]
+unsafe fn write_or_export_bytes(
+    mut data: Vec<u8>,
+    dst_buf: *mut u8,
+    dst_cap: usize,
+    out_len: *mut usize,
+    out_ptr: *mut *mut u8,
+) {
+    *out_len = data.len();
+    *out_ptr = std::ptr::null_mut();
+    if data.is_empty() {
+        return;
+    }
+    if !dst_buf.is_null() && dst_cap >= data.len() {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), dst_buf, data.len());
+        data.zeroize();
+        return;
+    }
+    let boxed = std::mem::take(&mut data).into_boxed_slice();
+    *out_ptr = Box::into_raw(boxed) as *mut u8;
+}
+
+/// Drain buffered plaintext and raw read-ahead bytes, then detach the deferred
+/// rustls session from the socket.
+///
+/// Preferred fast path:
+/// - If caller-provided output buffers are large enough, bytes are copied
+///   directly into those buffers (Go-owned memory).
+///
+/// Fallback path:
+/// - If a caller buffer is null or too small, Rust allocates that output and
+///   returns ownership via out_*_ptr + out_*_len. Caller must free using
+///   `xray_tls_drained_free`.
+#[no_mangle]
+pub extern "C" fn xray_deferred_drain_and_detach_into(
+    handle: *mut c_void,
+    plaintext_buf: *mut u8,
+    plaintext_cap: usize,
+    out_plaintext_len: *mut usize,
+    out_plaintext_ptr: *mut *mut u8,
+    raw_buf: *mut u8,
+    raw_cap: usize,
+    out_raw_len: *mut usize,
+    out_raw_ptr: *mut *mut u8,
+) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null()
+            || out_plaintext_len.is_null()
+            || out_plaintext_ptr.is_null()
+            || out_raw_len.is_null()
+            || out_raw_ptr.is_null()
+        {
+            return -1;
+        }
+        if (plaintext_cap > 0 && plaintext_buf.is_null()) || (raw_cap > 0 && raw_buf.is_null()) {
+            return -1;
+        }
+
+        unsafe {
+            *out_plaintext_len = 0;
+            *out_plaintext_ptr = std::ptr::null_mut();
+            *out_raw_len = 0;
+            *out_raw_ptr = std::ptr::null_mut();
+        }
+
+        let session = unsafe { &*(handle as *const DeferredSession) };
+        match session.drain_and_detach() {
+            Ok((plaintext, raw_ahead)) => {
+                unsafe {
+                    write_or_export_bytes(
+                        plaintext,
+                        plaintext_buf,
+                        plaintext_cap,
+                        out_plaintext_len,
+                        out_plaintext_ptr,
+                    );
+                    write_or_export_bytes(raw_ahead, raw_buf, raw_cap, out_raw_len, out_raw_ptr);
+                }
+                0
+            }
+            Err((_, msg)) => {
+                eprintln!("xray_deferred_drain_and_detach_into: {}", msg);
+                -1
+            }
+        }
+    })
+}
+
 /// Restore O_NONBLOCK on the deferred session's fd without detaching.
 /// Returns 0 on success, -1 on error. Idempotent.
 #[unsafe(no_mangle)]
@@ -2033,6 +2134,16 @@ pub extern "C" fn xray_deferred_restore_nonblock(handle: *mut c_void) -> i32 {
 /// Results are written to the XrayTlsResult struct (same as full handshake).
 #[no_mangle]
 pub extern "C" fn xray_deferred_enable_ktls(handle: *mut c_void, out: *mut XrayTlsResult) -> i32 {
+    xray_deferred_enable_ktls_into(handle, out, std::ptr::null_mut(), 0)
+}
+
+#[no_mangle]
+pub extern "C" fn xray_deferred_enable_ktls_into(
+    handle: *mut c_void,
+    out: *mut XrayTlsResult,
+    drained_buf: *mut u8,
+    drained_cap: usize,
+) -> i32 {
     ffi_catch_i32!({
         if handle.is_null() || out.is_null() {
             return -1;
@@ -2060,12 +2171,7 @@ pub extern "C" fn xray_deferred_enable_ktls(handle: *mut c_void, out: *mut XrayT
                     out.rx_secret[..len].copy_from_slice(&rx_secret[..len]);
                 }
 
-                if !drained.is_empty() {
-                    let len = drained.len();
-                    let boxed = drained.into_boxed_slice();
-                    out.drained_ptr = Box::into_raw(boxed) as *mut u8;
-                    out.drained_len = len as u32;
-                }
+                unsafe { tls::write_drained_to_result(out, drained, drained_buf, drained_cap) };
                 0
             }
             Err((code, msg)) => {
@@ -2777,6 +2883,18 @@ pub extern "C" fn xray_reality_server_handshake(
     handshake_timeout_ms: u32,
     out: *mut XrayTlsResult,
 ) -> i32 {
+    xray_reality_server_handshake_into(fd, cfg, handshake_timeout_ms, out, std::ptr::null_mut(), 0)
+}
+
+#[no_mangle]
+pub extern "C" fn xray_reality_server_handshake_into(
+    fd: i32,
+    cfg: *const RealityConfig,
+    handshake_timeout_ms: u32,
+    out: *mut XrayTlsResult,
+    drained_buf: *mut u8,
+    drained_cap: usize,
+) -> i32 {
     ffi_catch_i32!({
         if out.is_null() {
             return -1;
@@ -2810,13 +2928,8 @@ pub extern "C" fn xray_reality_server_handshake(
                     out.rx_secret[..len].copy_from_slice(&rx_secret[..len]);
                 }
 
-                // Forward drained data to Go
-                if !drained.is_empty() {
-                    let len = drained.len();
-                    let boxed = drained.into_boxed_slice();
-                    out.drained_ptr = Box::into_raw(boxed) as *mut u8;
-                    out.drained_len = len as u32;
-                }
+                // Forward drained data to Go (Go buffer first, Rust allocation fallback)
+                unsafe { tls::write_drained_to_result(out, drained, drained_buf, drained_cap) };
                 0
             }
             Err((code, msg)) => {

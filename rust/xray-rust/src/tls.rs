@@ -79,6 +79,29 @@ impl XrayTlsResult {
     }
 }
 
+pub(crate) unsafe fn write_drained_to_result(
+    out: &mut XrayTlsResult,
+    mut drained: Vec<u8>,
+    drained_buf: *mut u8,
+    drained_cap: usize,
+) {
+    out.drained_ptr = std::ptr::null_mut();
+    out.drained_len = 0;
+    if drained.is_empty() {
+        return;
+    }
+    let len = drained.len();
+    if !drained_buf.is_null() && drained_cap >= len {
+        std::ptr::copy_nonoverlapping(drained.as_ptr(), drained_buf, len);
+        drained.zeroize();
+        out.drained_len = len as u32;
+        return;
+    }
+    let boxed = drained.into_boxed_slice();
+    out.drained_ptr = Box::into_raw(boxed) as *mut u8;
+    out.drained_len = len as u32;
+}
+
 // ---------------------------------------------------------------------------
 // TlsState — kept alive across FFI boundary for KeyUpdate
 // ---------------------------------------------------------------------------
@@ -1597,9 +1620,30 @@ pub extern "C" fn xray_tls_config_free(cfg: *mut TlsConfig) {
 pub extern "C" fn xray_tls_handshake(
     fd: i32,
     cfg: *const TlsConfig,
+    is_client: bool,
+    handshake_timeout_ms: u32,
+    out: *mut XrayTlsResult,
+) -> i32 {
+    xray_tls_handshake_into(
+        fd,
+        cfg,
+        is_client,
+        handshake_timeout_ms,
+        out,
+        std::ptr::null_mut(),
+        0,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn xray_tls_handshake_into(
+    fd: i32,
+    cfg: *const TlsConfig,
     _is_client: bool,
     handshake_timeout_ms: u32,
     out: *mut XrayTlsResult,
+    drained_buf: *mut u8,
+    drained_cap: usize,
 ) -> i32 {
     ffi_catch_i32!({
         if out.is_null() {
@@ -1691,13 +1735,8 @@ pub extern "C" fn xray_tls_handshake(
             out.rx_secret[..len].copy_from_slice(&rx_secret[..len]);
         }
 
-        // Forward drained data to Go
-        if !output.drained.is_empty() {
-            let len = output.drained.len();
-            let boxed = output.drained.into_boxed_slice();
-            out.drained_ptr = Box::into_raw(boxed) as *mut u8;
-            out.drained_len = len as u32;
-        }
+        // Forward drained data to Go (Go buffer first, Rust allocation fallback)
+        unsafe { write_drained_to_result(out, output.drained, drained_buf, drained_cap) };
 
         0
     })
@@ -1795,7 +1834,9 @@ pub extern "C" fn xray_tls_state_free(state: *mut TlsState) {
 pub extern "C" fn xray_tls_drained_free(ptr: *mut u8, len: usize) {
     ffi_catch_void!({
         if !ptr.is_null() && len > 0 {
-            let _ = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)) };
+            let drained = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            drained.zeroize();
+            let _ = unsafe { Box::from_raw(drained) };
         }
     })
 }

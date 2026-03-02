@@ -46,6 +46,8 @@ const (
 	keyUpdateThreshold            = 1 << 24 // ~16.7M records, conservative limit below AES-GCM 2^24.5
 	maxRotationFailures           = 3       // close connection after this many consecutive kTLS key rotation failures
 	deferredKTLSPromotionCooldown = 10 * time.Minute
+	deferredReadBatchCap          = 16 * 1024 // 16 KiB read-ahead for deferred rustls reads
+	deferredReadBatchThreshold    = 2 * 1024  // batch only for small app reads to amortize cgo crossings
 )
 
 // deferredKTLSPromotionDisabledUntilUnixNano stores a cooldown deadline.
@@ -757,6 +759,10 @@ type DeferredRustConn struct {
 	writeRecords     atomic.Uint64
 	rotationFailures atomic.Uint32
 	detached         atomic.Bool // true after DrainAndDetach()
+	deferredReadMu   sync.Mutex
+	deferredReadBuf  []byte
+	deferredReadOff  int
+	deferredReadLen  int
 }
 
 // NewDeferredRustConn creates a DeferredRustConn from native deferred handshake results.
@@ -782,6 +788,13 @@ func NewDeferredRustConn(rawConn gonet.Conn, result *native.DeferredResult) (*De
 }
 
 func (c *DeferredRustConn) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if n := c.consumeDeferredReadCache(b); n > 0 {
+		return n, nil
+	}
+
 	for {
 		if c.closed.Load() {
 			return 0, gonet.ErrClosed
@@ -847,10 +860,70 @@ func (c *DeferredRustConn) Read(b []byte) (int, error) {
 			c.deferredMu.RUnlock()
 			return 0, gonet.ErrClosed
 		}
-		n, err := native.DeferredRead(h, b)
+		var n int
+		var err error
+		if len(b) < deferredReadBatchThreshold {
+			n, err = c.deferredReadBatched(h, b)
+		} else {
+			n, err = native.DeferredRead(h, b)
+		}
 		c.deferredMu.RUnlock()
 		return n, err
 	}
+}
+
+func (c *DeferredRustConn) consumeDeferredReadCache(dst []byte) int {
+	c.deferredReadMu.Lock()
+	defer c.deferredReadMu.Unlock()
+	if c.deferredReadOff >= c.deferredReadLen {
+		return 0
+	}
+	n := copy(dst, c.deferredReadBuf[c.deferredReadOff:c.deferredReadLen])
+	c.deferredReadOff += n
+	if c.deferredReadOff >= c.deferredReadLen {
+		c.deferredReadOff = 0
+		c.deferredReadLen = 0
+	}
+	return n
+}
+
+// deferredReadBatched reads into an internal read-ahead buffer and serves `dst`
+// from that buffer. This amortizes cgo call overhead for small reads.
+// Caller must hold c.deferredMu.RLock while invoking this method.
+func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, dst []byte) (int, error) {
+	c.deferredReadMu.Lock()
+	defer c.deferredReadMu.Unlock()
+
+	if c.deferredReadOff < c.deferredReadLen {
+		n := copy(dst, c.deferredReadBuf[c.deferredReadOff:c.deferredReadLen])
+		c.deferredReadOff += n
+		if c.deferredReadOff >= c.deferredReadLen {
+			c.deferredReadOff = 0
+			c.deferredReadLen = 0
+		}
+		return n, nil
+	}
+
+	if cap(c.deferredReadBuf) < deferredReadBatchCap {
+		c.deferredReadBuf = make([]byte, deferredReadBatchCap)
+	}
+	buf := c.deferredReadBuf[:deferredReadBatchCap]
+	n, err := native.DeferredRead(h, buf)
+	if n <= 0 {
+		return n, err
+	}
+
+	outN := copy(dst, buf[:n])
+	if outN < n {
+		c.deferredReadOff = outN
+		c.deferredReadLen = n
+		// Surface buffered plaintext first; the next read will drain cache,
+		// then observe EOF/close status from native.DeferredRead.
+		if err != nil {
+			return outN, nil
+		}
+	}
+	return outN, err
 }
 
 func (c *DeferredRustConn) Write(b []byte) (int, error) {
@@ -1015,7 +1088,18 @@ func (c *DeferredRustConn) Close() error {
 		c.drainedData[i] = 0
 	}
 	c.drainedData = nil
+	c.drainedOff = 0
 	c.deferredMu.Unlock()
+
+	// Zero and release deferred read-ahead plaintext.
+	c.deferredReadMu.Lock()
+	for i := range c.deferredReadBuf {
+		c.deferredReadBuf[i] = 0
+	}
+	c.deferredReadBuf = nil
+	c.deferredReadOff = 0
+	c.deferredReadLen = 0
+	c.deferredReadMu.Unlock()
 
 	return c.rawConn.Close()
 }
