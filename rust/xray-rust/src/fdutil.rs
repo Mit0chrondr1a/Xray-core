@@ -293,7 +293,13 @@ impl HandshakePipeline {
     pub fn into_parts(
         self,
     ) -> Result<
-        (tls::RecordReader, TcpStream, BlockingGuard, SocketTimeoutGuard, i32),
+        (
+            tls::RecordReader,
+            TcpStream,
+            BlockingGuard,
+            SocketTimeoutGuard,
+            i32,
+        ),
         std::io::Error,
     > {
         let write_stream = self.reader.tcp.try_clone()?; // dup() for write half
@@ -320,7 +326,11 @@ impl HandshakePipeline {
         #[cfg(debug_assertions)]
         eprintln!(
             "kTLS install: fd={} version=0x{:04x} cipher=0x{:04x} tx_seq={} rx_seq={}",
-            self.original_fd, tls_version, tls::cipher_suite_to_u16(tx_secrets), tx_seq, rx_seq,
+            self.original_fd,
+            tls_version,
+            tls::cipher_suite_to_u16(tx_secrets),
+            tx_seq,
+            rx_seq,
         );
 
         tls::setup_ulp(self.original_fd).map_err(|e| format!("ULP: {}", e))?;

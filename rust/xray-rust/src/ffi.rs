@@ -1,8 +1,11 @@
 //! Shared FFI safety macros and error constants.
 //!
 //! Every `extern "C"` function exposed to Go must be wrapped in one of
-//! these macros so that a Rust panic is caught instead of unwinding into
-//! the Go runtime (which would abort the process).
+//! these macros.
+//!
+//! - `panic = "unwind"` builds: panic is caught and converted to an FFI error.
+//! - `panic = "abort"` builds: body runs directly (no unwind wrapper), and any
+//!   panic aborts the process immediately.
 
 // ---------------------------------------------------------------------------
 // Error‐code constants (shared between Rust and Go)
@@ -24,16 +27,23 @@ pub const FFI_ERR_PANIC: i32 = -99;
 /// The macro must be the tail expression of the enclosing function.
 macro_rules! ffi_catch_i32 {
     ($body:block) => {{
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = e
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
-                eprintln!("xray-rust FFI panic (i32): {}", msg.unwrap_or("unknown"));
-                $crate::ffi::FFI_ERR_PANIC
+        #[cfg(panic = "unwind")]
+        {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                    eprintln!("xray-rust FFI panic (i32): {}", msg.unwrap_or("unknown"));
+                    $crate::ffi::FFI_ERR_PANIC
+                }
             }
+        }
+        #[cfg(not(panic = "unwind"))]
+        {
+            (|| -> i32 { $body })()
         }
     }};
 }
@@ -41,16 +51,23 @@ macro_rules! ffi_catch_i32 {
 /// Wrap an FFI body that returns `*mut T`. On panic returns null.
 macro_rules! ffi_catch_ptr {
     ($body:block) => {{
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = e
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
-                eprintln!("xray-rust FFI panic (ptr): {}", msg.unwrap_or("unknown"));
-                std::ptr::null_mut()
+        #[cfg(panic = "unwind")]
+        {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                    eprintln!("xray-rust FFI panic (ptr): {}", msg.unwrap_or("unknown"));
+                    std::ptr::null_mut()
+                }
             }
+        }
+        #[cfg(not(panic = "unwind"))]
+        {
+            (|| $body)()
         }
     }};
 }
@@ -58,16 +75,23 @@ macro_rules! ffi_catch_ptr {
 /// Wrap an FFI body that returns `bool`. On panic returns `false`.
 macro_rules! ffi_catch_bool {
     ($body:block) => {{
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = e
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
-                eprintln!("xray-rust FFI panic (bool): {}", msg.unwrap_or("unknown"));
-                false
+        #[cfg(panic = "unwind")]
+        {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                    eprintln!("xray-rust FFI panic (bool): {}", msg.unwrap_or("unknown"));
+                    false
+                }
             }
+        }
+        #[cfg(not(panic = "unwind"))]
+        {
+            (|| -> bool { $body })()
         }
     }};
 }
@@ -75,16 +99,23 @@ macro_rules! ffi_catch_bool {
 /// Wrap an FFI body that returns `u8`. On panic returns `default`.
 macro_rules! ffi_catch_u8 {
     ($default:expr, $body:block) => {{
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = e
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
-                eprintln!("xray-rust FFI panic (u8): {}", msg.unwrap_or("unknown"));
-                $default
+        #[cfg(panic = "unwind")]
+        {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                    eprintln!("xray-rust FFI panic (u8): {}", msg.unwrap_or("unknown"));
+                    $default
+                }
             }
+        }
+        #[cfg(not(panic = "unwind"))]
+        {
+            (|| -> u8 { $body })()
         }
     }};
 }
@@ -92,12 +123,19 @@ macro_rules! ffi_catch_u8 {
 /// Wrap a void FFI body. On panic the error is logged to stderr.
 macro_rules! ffi_catch_void {
     ($body:block) => {{
-        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            let msg = e
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
-            eprintln!("xray-rust FFI panic (void): {}", msg.unwrap_or("unknown"));
+        #[cfg(panic = "unwind")]
+        {
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+                let msg = e
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()));
+                eprintln!("xray-rust FFI panic (void): {}", msg.unwrap_or("unknown"));
+            }
+        }
+        #[cfg(not(panic = "unwind"))]
+        {
+            (|| $body)();
         }
     }};
 }
