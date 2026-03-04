@@ -39,6 +39,7 @@ type dialerConf struct {
 var (
 	globalDialerMap    map[dialerConf]*XmuxManager
 	globalDialerAccess sync.Mutex
+	getHTTPClientFn    = getHTTPClient
 )
 
 const xhttpMaxInFlightPacketPosts = 16
@@ -286,7 +287,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	requestURL.Path = transportConfiguration.GetNormalizedPath()
 	requestURL.RawQuery = transportConfiguration.GetNormalizedQuery()
 
-	httpClient, xmuxClient := getHTTPClient(ctx, dest, streamSettings)
+	httpClient, xmuxClient := getHTTPClientFn(ctx, dest, streamSettings)
 
 	mode := transportConfiguration.Mode
 	if mode == "" || mode == "auto" {
@@ -345,7 +346,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		requestURL2.Path = config2.GetNormalizedPath()
 		requestURL2.RawQuery = config2.GetNormalizedQuery()
-		httpClient2, xmuxClient2 = getHTTPClient(ctx, dest2, memory2)
+		httpClient2, xmuxClient2 = getHTTPClientFn(ctx, dest2, memory2)
 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
 	}
 
@@ -354,6 +355,19 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 	if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
 		xmuxClient2.OpenUsage.Add(1)
+	}
+	xmuxUsageReleased := false
+	releaseXmuxUsage := func() {
+		if xmuxUsageReleased {
+			return
+		}
+		xmuxUsageReleased = true
+		if xmuxClient != nil {
+			xmuxClient.OpenUsage.Add(-1)
+		}
+		if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
+			xmuxClient2.OpenUsage.Add(-1)
+		}
 	}
 	uploadCtx, cancelUpload := context.WithCancel(ctx)
 	var closed atomic.Int32
@@ -366,13 +380,17 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 				return
 			}
 			cancelUpload()
-			if xmuxClient != nil {
-				xmuxClient.OpenUsage.Add(-1)
-			}
-			if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
-				xmuxClient2.OpenUsage.Add(-1)
-			}
+			releaseXmuxUsage()
 		},
+	}
+	cleanupDialError := func() {
+		cancelUpload()
+		releaseXmuxUsage()
+		_ = reader.Close()
+		_ = writer.Close()
+		if conn.reader != nil {
+			_ = conn.reader.Close()
+		}
 	}
 
 	var err error
@@ -383,6 +401,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, false)
 		if err != nil { // browser dialer only
+			cleanupDialError()
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
@@ -392,6 +411,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(ctx, requestURL2.String(), sessionId, nil, false)
 		if err != nil { // browser dialer only
+			cleanupDialError()
 			return nil, err
 		}
 	}
@@ -401,6 +421,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		_, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, true)
 		if err != nil { // browser dialer only
+			cleanupDialError()
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
@@ -410,6 +431,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	scMinPostsIntervalMs := transportConfiguration.GetNormalizedScMinPostsIntervalMs()
 
 	if scMaxEachPostBytes.From <= buf.Size {
+		cleanupDialError()
 		return nil, errors.New("`scMaxEachPostBytes` should be bigger than " + strconv.Itoa(buf.Size))
 	}
 
@@ -453,7 +475,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 			if xmuxClient != nil && (xmuxClient.LeftRequests.Add(-1) <= 0 ||
 				(xmuxClient.UnreusableAt != time.Time{} && lastWrite.After(xmuxClient.UnreusableAt))) {
-				httpClient, xmuxClient = getHTTPClient(chunkCtx, dest, streamSettings)
+				httpClient, xmuxClient = getHTTPClientFn(chunkCtx, dest, streamSettings)
 			}
 
 			select {
