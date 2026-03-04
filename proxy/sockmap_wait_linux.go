@@ -13,14 +13,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// sockmapPollTimeoutMs is the idle timeout for sockmap forwarding detection.
-// If no events arrive within this window, we assume forwarding is stalled and
-// fall back to splice/readv.
-const sockmapPollTimeoutMs = 30_000 // 30 seconds
+// sockmapPollTimeoutMs is the base idle timeout for sockmap forwarding detection.
+// Keep tight but not overly aggressive; callers extend only when progress is seen.
+const sockmapPollTimeoutMs = 5_000 // 5 seconds
 
 const (
-	sockmapIdleTimeout  = time.Duration(sockmapPollTimeoutMs) * time.Millisecond
-	writerProbeInterval = time.Second
+	sockmapIdleTimeout   = time.Duration(sockmapPollTimeoutMs) * time.Millisecond
+	sockmapMaxIdleRounds = 3 // tolerate quiet periods before declaring no-progress
+	writerProbeInterval  = 500 * time.Millisecond
 )
 
 // waitForSockmapForwarding waits for sockmap forwarding completion without
@@ -50,19 +50,48 @@ func waitForSockmapForwarding(readerConn, writerConn net.Conn) (fallback bool, e
 		_ = readerTCPConn.SetReadDeadline(time.Time{})
 	}()
 
+	progressCursor, progressAvailable, err := readForwardProgressCursor(readerRawConn, writerRawConn)
+	if err != nil {
+		return true, err
+	}
+
 	idleDeadline := time.Now().Add(sockmapIdleTimeout)
+	idleRounds := 0
 	for {
-		closed, err := probeSocketClosed(writerRawConn)
+		readerState, err := probeSocketState(readerRawConn)
 		if err != nil {
 			return true, err
 		}
-		if closed {
+		writerState, err := probeSocketState(writerRawConn)
+		if err != nil {
+			return true, err
+		}
+		if readerState.closed || writerState.closed {
 			return false, nil
+		}
+		// Any readable payload on reader means sockmap is not forwarding this
+		// direction; caller should return to userspace/splice path.
+		if readerState.hasData {
+			return true, nil
 		}
 
 		remaining := time.Until(idleDeadline)
 		if remaining <= 0 {
-			return true, nil
+			progressed, err := forwardProgressAdvanced(readerRawConn, writerRawConn, &progressCursor, &progressAvailable)
+			if err != nil {
+				return true, err
+			}
+			if progressed {
+				idleRounds = 0
+				idleDeadline = time.Now().Add(sockmapIdleTimeout)
+				continue
+			}
+			idleRounds++
+			if idleRounds >= sockmapMaxIdleRounds {
+				return true, nil
+			}
+			idleDeadline = time.Now().Add(sockmapIdleTimeout)
+			continue
 		}
 		waitWindow := writerProbeInterval
 		if remaining < waitWindow {
@@ -75,6 +104,14 @@ func waitForSockmapForwarding(readerConn, writerConn net.Conn) (fallback bool, e
 
 		event, err := waitForReadableOrClose(readerRawConn)
 		if isTimeoutError(err) {
+			progressed, perr := forwardProgressAdvanced(readerRawConn, writerRawConn, &progressCursor, &progressAvailable)
+			if perr != nil {
+				return true, perr
+			}
+			if progressed {
+				idleRounds = 0
+				idleDeadline = time.Now().Add(sockmapIdleTimeout)
+			}
 			continue
 		}
 		if err != nil {
@@ -98,6 +135,25 @@ const (
 	readerEventData readerEvent = iota + 1
 	readerEventClosed
 )
+
+type socketProbe struct {
+	hasData bool
+	closed  bool
+}
+
+type forwardProgressCursor struct {
+	readerBytesAcked    uint64
+	readerBytesReceived uint64
+	writerBytesAcked    uint64
+	writerBytesReceived uint64
+}
+
+func (p forwardProgressCursor) advancedFrom(prev forwardProgressCursor) bool {
+	return p.readerBytesAcked > prev.readerBytesAcked ||
+		p.readerBytesReceived > prev.readerBytesReceived ||
+		p.writerBytesAcked > prev.writerBytesAcked ||
+		p.writerBytesReceived > prev.writerBytesReceived
+}
 
 func waitForReadableOrClose(rawConn syscall.RawConn) (readerEvent, error) {
 	var (
@@ -141,11 +197,11 @@ func waitForReadableOrClose(rawConn syscall.RawConn) (readerEvent, error) {
 	return event, nil
 }
 
-func probeSocketClosed(rawConn syscall.RawConn) (bool, error) {
+func probeSocketState(rawConn syscall.RawConn) (socketProbe, error) {
 	var (
-		closed bool
-		opErr  error
-		peek   [1]byte
+		out   socketProbe
+		opErr error
+		peek  [1]byte
 	)
 
 	// Use a non-blocking MSG_PEEK probe to detect hangup without consuming
@@ -156,16 +212,17 @@ func probeSocketClosed(rawConn syscall.RawConn) (bool, error) {
 			n, _, recvErr := unix.Recvfrom(int(fd), peek[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
 			switch {
 			case recvErr == nil && n == 0:
-				closed = true
+				out.closed = true
 				return
 			case recvErr == nil && n > 0:
+				out.hasData = true
 				return
 			case recvErr == unix.EINTR:
 				continue
 			case recvErr == unix.EAGAIN || recvErr == unix.EWOULDBLOCK:
 				return
 			case isTerminalSocketError(recvErr):
-				closed = true
+				out.closed = true
 				return
 			default:
 				opErr = recvErr
@@ -174,12 +231,78 @@ func probeSocketClosed(rawConn syscall.RawConn) (bool, error) {
 		}
 	})
 	if err != nil {
-		return false, err
+		return socketProbe{}, err
 	}
 	if opErr != nil {
-		return false, opErr
+		return socketProbe{}, opErr
 	}
-	return closed, nil
+	return out, nil
+}
+
+func forwardProgressAdvanced(readerRawConn, writerRawConn syscall.RawConn, cursor *forwardProgressCursor, available *bool) (bool, error) {
+	current, currentAvailable, err := readForwardProgressCursor(readerRawConn, writerRawConn)
+	if err != nil {
+		return false, err
+	}
+	if !currentAvailable {
+		*available = false
+		return false, nil
+	}
+	if !*available {
+		*cursor = current
+		*available = true
+		return true, nil
+	}
+	progressed := current.advancedFrom(*cursor)
+	*cursor = current
+	return progressed, nil
+}
+
+func readForwardProgressCursor(readerRawConn, writerRawConn syscall.RawConn) (forwardProgressCursor, bool, error) {
+	readerAcked, readerRecv, readerAvailable, err := readSocketTCPProgress(readerRawConn)
+	if err != nil {
+		return forwardProgressCursor{}, false, err
+	}
+	writerAcked, writerRecv, writerAvailable, err := readSocketTCPProgress(writerRawConn)
+	if err != nil {
+		return forwardProgressCursor{}, false, err
+	}
+	if !readerAvailable || !writerAvailable {
+		return forwardProgressCursor{}, false, nil
+	}
+	return forwardProgressCursor{
+		readerBytesAcked:    readerAcked,
+		readerBytesReceived: readerRecv,
+		writerBytesAcked:    writerAcked,
+		writerBytesReceived: writerRecv,
+	}, true, nil
+}
+
+func readSocketTCPProgress(rawConn syscall.RawConn) (bytesAcked uint64, bytesReceived uint64, available bool, err error) {
+	var opErr error
+	err = rawConn.Control(func(fd uintptr) {
+		info, serr := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
+		if serr != nil {
+			switch serr {
+			case unix.ENOPROTOOPT, unix.EOPNOTSUPP:
+				available = false
+				return
+			default:
+				opErr = serr
+				return
+			}
+		}
+		available = true
+		bytesAcked = info.Bytes_acked
+		bytesReceived = info.Bytes_received
+	})
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if opErr != nil {
+		return 0, 0, false, opErr
+	}
+	return bytesAcked, bytesReceived, available, nil
 }
 
 func isTimeoutError(err error) bool {

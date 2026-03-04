@@ -42,7 +42,7 @@ func probeCapabilities() Capabilities {
 	// Sockmap support: kernel 4.17+
 	// Full sk_skb stream parser/verdict: kernel 5.4+
 	if caps.KernelVersion.AtLeast(4, 17, 0) {
-		caps.SockmapSupported = probeSockmapSupport()
+		caps.SockmapSupported, caps.sockmapProbeStage, caps.sockmapProbeErrno = probeSockmapSupport()
 		if caps.KernelVersion.AtLeast(5, 4, 0) {
 			caps.SockmapSKSkbSupported = caps.SockmapSupported
 		}
@@ -195,7 +195,7 @@ func probXDPSupport() bool {
 // probeSockmapSupport checks if sockmap is available.
 // Probes both SOCKMAP creation and SK_SKB program loading, since the
 // implementation requires sk_skb (stream parser + verdict) programs.
-func probeSockmapSupport() bool {
+func probeSockmapSupport() (supported bool, stage sockmapProbeStage, errno syscall.Errno) {
 	// Try to create a SOCKMAP
 	mapAttr := struct {
 		mapType    uint32
@@ -217,18 +217,22 @@ func probeSockmapSupport() bool {
 	)
 
 	if errno != 0 {
-		return false
+		return false, sockmapProbeStageMapCreate, errno
 	}
 	syscall.Close(int(mapFD))
 
 	// Also verify we can load BPF_PROG_TYPE_SK_SKB (type 14).
 	// A kernel that supports SOCKMAP but not sk_skb programs would
 	// fail at setup time; detect this early to avoid noisy fallback logs.
-	return probeSKSkbSupport()
+	ok, progErrno := probeSKSkbSupport()
+	if !ok {
+		return false, sockmapProbeStageSKSkbLoad, progErrno
+	}
+	return true, sockmapProbeStageNone, 0
 }
 
 // probeSKSkbSupport checks if BPF_PROG_TYPE_SK_SKB programs can be loaded.
-func probeSKSkbSupport() bool {
+func probeSKSkbSupport() (bool, syscall.Errno) {
 	// Minimal sk_skb program: r0 = 1 (SK_PASS); exit
 	insns := []uint64{
 		0x00000001000000b7, // mov r0, 1
@@ -262,10 +266,10 @@ func probeSKSkbSupport() bool {
 
 	if errno == 0 {
 		syscall.Close(int(fd))
-		return true
+		return true, 0
 	}
 
-	return false
+	return false, errno
 }
 
 // probeTCBPFSupport checks if TC BPF classifier is available.

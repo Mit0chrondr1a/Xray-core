@@ -2,7 +2,8 @@ package internet
 
 import (
 	"context"
-	"math/rand"
+	crand "crypto/rand"
+	"fmt"
 	"syscall"
 	"time"
 
@@ -48,6 +49,54 @@ func hasBindAddr(sockopt *SocketConfig) bool {
 	return sockopt != nil && len(sockopt.BindAddress) > 0 && sockopt.BindPort > 0
 }
 
+func outboundSocketSummary(sockopt *SocketConfig) string {
+	if sockopt == nil {
+		return "sockopt=nil"
+	}
+	return fmt.Sprintf(
+		"mark=%d interface=%q bind=%v:%d tproxy=%v tcpUserTimeout=%d dialerProxy=%q",
+		sockopt.Mark,
+		sockopt.Interface,
+		sockopt.BindAddress,
+		sockopt.BindPort,
+		sockopt.Tproxy,
+		sockopt.TcpUserTimeout,
+		sockopt.DialerProxy,
+	)
+}
+
+func hasMixedSignKeepAliveValues(idle, interval int32) bool {
+	return (idle < 0 && interval > 0) || (idle > 0 && interval < 0)
+}
+
+func buildTCPKeepAliveConfig(sockopt *SocketConfig) (time.Duration, net.KeepAliveConfig, error) {
+	// Keep idle/interval aligned with browser-like behavior while leaving probe
+	// count to the OS default for cross-platform compatibility.
+	keepAliveConfig := net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     45 * time.Second,
+		Interval: 45 * time.Second,
+		Count:    -1,
+	}
+	keepAlive := time.Duration(0)
+	if sockopt != nil {
+		if hasMixedSignKeepAliveValues(sockopt.TcpKeepAliveIdle, sockopt.TcpKeepAliveInterval) {
+			return 0, net.KeepAliveConfig{}, errors.New("invalid TcpKeepAliveIdle or TcpKeepAliveInterval value: ", sockopt.TcpKeepAliveIdle, " ", sockopt.TcpKeepAliveInterval)
+		}
+		if sockopt.TcpKeepAliveIdle < 0 || sockopt.TcpKeepAliveInterval < 0 {
+			keepAlive = -1
+			keepAliveConfig.Enable = false
+		}
+		if sockopt.TcpKeepAliveIdle > 0 {
+			keepAliveConfig.Idle = time.Duration(sockopt.TcpKeepAliveIdle) * time.Second
+		}
+		if sockopt.TcpKeepAliveInterval > 0 {
+			keepAliveConfig.Interval = time.Duration(sockopt.TcpKeepAliveInterval) * time.Second
+		}
+	}
+	return keepAlive, keepAliveConfig, nil
+}
+
 func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
 	errors.LogDebug(ctx, "dialing to "+dest.String())
 
@@ -87,28 +136,9 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 			Dest: destAddr,
 		}, nil
 	}
-	// Chrome defaults
-	keepAliveConfig := net.KeepAliveConfig{
-		Enable:   true,
-		Idle:     45 * time.Second,
-		Interval: 45 * time.Second,
-		Count:    -1,
-	}
-	keepAlive := time.Duration(0)
-	if sockopt != nil {
-		if sockopt.TcpKeepAliveIdle*sockopt.TcpKeepAliveInterval < 0 {
-			return nil, errors.New("invalid TcpKeepAliveIdle or TcpKeepAliveInterval value: ", sockopt.TcpKeepAliveIdle, " ", sockopt.TcpKeepAliveInterval)
-		}
-		if sockopt.TcpKeepAliveIdle < 0 || sockopt.TcpKeepAliveInterval < 0 {
-			keepAlive = -1
-			keepAliveConfig.Enable = false
-		}
-		if sockopt.TcpKeepAliveIdle > 0 {
-			keepAliveConfig.Idle = time.Duration(sockopt.TcpKeepAliveIdle) * time.Second
-		}
-		if sockopt.TcpKeepAliveInterval > 0 {
-			keepAliveConfig.Interval = time.Duration(sockopt.TcpKeepAliveInterval) * time.Second
-		}
+	keepAlive, keepAliveConfig, err := buildTCPKeepAliveConfig(sockopt)
+	if err != nil {
+		return nil, err
 	}
 	dialer := &net.Dialer{
 		Timeout:         time.Second * 16,
@@ -142,7 +172,12 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		}
 	}
 
-	return dialer.DialContext(ctx, dest.Network.SystemString(), dest.NetAddr())
+	conn, err := dialer.DialContext(ctx, dest.Network.SystemString(), dest.NetAddr())
+	if err != nil {
+		errors.LogInfoInner(ctx, err, "system dial failed to ", dest, ", source ", src, ", ", outboundSocketSummary(sockopt))
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (d *DefaultSystemDialer) DestIpAddress() net.IP {
@@ -269,9 +304,11 @@ func (c *FakePacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 }
 
 func (c *FakePacketConn) LocalAddr() net.Addr {
+	var b [6]byte
+	crand.Read(b[:])
 	return &net.TCPAddr{
-		IP:   net.IP{byte(rand.Intn(256)), byte(rand.Intn(256)), byte(rand.Intn(256)), byte(rand.Intn(256))},
-		Port: rand.Intn(65536),
+		IP:   net.IP{b[0], b[1], b[2], b[3]},
+		Port: int(b[4])<<8 | int(b[5]),
 	}
 }
 

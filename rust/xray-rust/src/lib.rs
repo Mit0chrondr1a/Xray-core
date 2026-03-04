@@ -1,4 +1,8 @@
 #![allow(dead_code)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 
 #[macro_use]
 pub mod ffi;
@@ -14,6 +18,8 @@ pub(crate) mod fdutil;
 pub mod geodata;
 mod geoip;
 mod mph;
+pub mod pipeline;
+mod ktls_probe;
 pub mod reality;
 pub mod tls;
 /// SAFETY: This module is pub(crate) by design. The TLS 1.3 engine

@@ -26,6 +26,7 @@ const (
 	fullHandlerKey            ctx.SessionKey = 10 // outbound gets full handler
 	mitmAlpn11Key             ctx.SessionKey = 11 // used by TLS dialer
 	mitmServerNameKey         ctx.SessionKey = 12 // used by TLS dialer
+	visionFlowKey             ctx.SessionKey = 13 // VLESS Vision flow active — skip kTLS-producing Rust paths
 )
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -190,4 +191,19 @@ func MitmServerNameFromContext(ctx context.Context) string {
 		return val
 	}
 	return ""
+}
+
+// ContextWithVisionFlow marks the context as carrying a VLESS Vision flow.
+// Transport layers check this to skip kTLS-producing Rust native paths,
+// since Vision strips outer TLS and kTLS is incompatible.
+func ContextWithVisionFlow(ctx context.Context, vision bool) context.Context {
+	return context.WithValue(ctx, visionFlowKey, vision)
+}
+
+// VisionFlowFromContext reports whether the context carries a Vision flow.
+func VisionFlowFromContext(ctx context.Context) bool {
+	if val, ok := ctx.Value(visionFlowKey).(bool); ok {
+		return val
+	}
+	return false
 }

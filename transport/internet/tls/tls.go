@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"fmt"
 	"math/big"
 	gonet "net"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -43,7 +45,76 @@ const (
 	maxRecordPayload              = 16384   // TLS max record payload size
 	keyUpdateThreshold            = 1 << 24 // ~16.7M records, conservative limit below AES-GCM 2^24.5
 	maxRotationFailures           = 3       // close connection after this many consecutive kTLS key rotation failures
+	deferredKTLSPromotionCooldown = 3 * time.Minute
+	deferredReadBatchCap          = 16 * 1024 // 16 KiB read-ahead for deferred rustls reads
+	deferredReadBatchThreshold    = 2 * 1024  // batch only for small app reads to amortize cgo crossings
 )
+
+// deferredKTLSPromotionDisabledUntilUnixNano stores a cooldown deadline.
+// During this window, deferred kTLS promotion is skipped to avoid repeated
+// per-connection failures while preserving automatic recovery later.
+// Scoped by a string key to avoid penalizing all listeners on a single blip.
+// Key examples: "global" (default), "xhttp:<addr>", "vision".
+var deferredKTLSPromotionDisabledUntilUnixNano atomic.Int64
+
+const ktlsScopeDefault = "global"
+
+var deferredKTLSPromotionScopes sync.Map // key string -> int64 unixNano until
+
+func deferredKTLSPromotionDisabledAt(now time.Time) bool {
+	return deferredKTLSPromotionDisabledForScope(now, ktlsScopeDefault)
+}
+
+func deferredKTLSPromotionDisabledForScope(now time.Time, scope string) bool {
+	if scope == "" {
+		scope = ktlsScopeDefault
+	}
+	if val, ok := deferredKTLSPromotionScopes.Load(scope); ok {
+		if until, ok2 := val.(int64); ok2 && now.UnixNano() < until {
+			return true
+		}
+	}
+	// Always honor the legacy global gate for backward compatibility.
+	if now.UnixNano() < deferredKTLSPromotionDisabledUntilUnixNano.Load() {
+		return true
+	}
+	return false
+}
+
+// DeferredKTLSPromotionDisabled reports whether deferred kTLS promotion is
+// currently in cooldown due to recent promotion failures (default scope).
+func DeferredKTLSPromotionDisabled() bool {
+	return deferredKTLSPromotionDisabledAt(time.Now())
+}
+
+// DeferredKTLSPromotionDisabledFor reports cooldown state for a specific scope.
+func DeferredKTLSPromotionDisabledFor(scope string) bool {
+	return deferredKTLSPromotionDisabledForScope(time.Now(), scope)
+}
+
+func deferKTLSPromotionForCooldownScope(scope string) {
+	if scope == "" {
+		scope = ktlsScopeDefault
+	}
+	until := time.Now().Add(deferredKTLSPromotionCooldown).UnixNano()
+	deferredKTLSPromotionScopes.Store(scope, until)
+	// Maintain legacy global cooldown for callers that still consult the global atomic.
+	for {
+		current := deferredKTLSPromotionDisabledUntilUnixNano.Load()
+		if current >= until {
+			return
+		}
+		if deferredKTLSPromotionDisabledUntilUnixNano.CompareAndSwap(current, until) {
+			return
+		}
+	}
+}
+
+// deferKTLSPromotionForCooldown keeps backward compatibility for tests/callers
+// that still use the global cooldown helper.
+func deferKTLSPromotionForCooldown() {
+	deferKTLSPromotionForCooldownScope(ktlsScopeDefault)
+}
 
 // Read overrides tls.Conn.Read. When kTLS RX is active, reads bypass the
 // Go TLS record layer (the kernel already decrypted) and handle EKEYEXPIRED
@@ -88,11 +159,20 @@ func (c *Conn) Close() error {
 	if c.ktls.TxReady {
 		return c.Conn.NetConn().Close()
 	}
-	timer := time.AfterFunc(tlsCloseTimeout, func() {
-		c.Conn.NetConn().Close()
-	})
-	defer timer.Stop()
+	// Set a write deadline to bound the close_notify write.
+	// If SetWriteDeadline fails (conn already closed by another goroutine),
+	// skip the TLS close_notify and close the raw socket directly.
+	if err := c.Conn.NetConn().SetWriteDeadline(time.Now().Add(tlsCloseTimeout)); err != nil {
+		return c.Conn.NetConn().Close()
+	}
 	return c.Conn.Close()
+}
+
+// KTLSActive reports whether kernel TLS is active on this connection
+// (either TX or RX direction). Used by VLESS to reject Vision flow on
+// kTLS connections — see docs/ktls-vision-incompatibility.md.
+func (c *Conn) KTLSActive() bool {
+	return c.ktls.TxReady || c.ktls.RxReady
 }
 
 // KTLSKeyUpdateHandler returns the KeyUpdate handler for this connection,
@@ -200,10 +280,7 @@ type UConn struct {
 var _ Interface = (*UConn)(nil)
 
 func (c *UConn) Close() error {
-	timer := time.AfterFunc(tlsCloseTimeout, func() {
-		c.Conn.NetConn().Close()
-	})
-	defer timer.Stop()
+	_ = c.Conn.NetConn().SetWriteDeadline(time.Now().Add(tlsCloseTimeout))
 	return c.Conn.Close()
 }
 
@@ -258,7 +335,7 @@ func GeneraticUClient(c net.Conn, config *tls.Config) *utls.UConn {
 // ktlsAfterWrite handles key rotation bookkeeping after a successful kTLS write.
 // Both Conn and RustConn delegate to this to avoid duplicating the rotation logic.
 func ktlsAfterWrite(n int, handler *KTLSKeyUpdateHandler, writeRecords *atomic.Uint64, rotationFailures *atomic.Uint32, closeConn func() error) {
-	if handler == nil {
+	if handler == nil || handler.IsClosed() {
 		return
 	}
 	records := uint64((n + maxRecordPayload - 1) / maxRecordPayload)
@@ -286,9 +363,11 @@ func ktlsAfterWrite(n int, handler *KTLSKeyUpdateHandler, writeRecords *atomic.U
 // The kernel handles TLS encryption/decryption via kTLS, so Read/Write go directly
 // to the underlying connection.
 type RustConn struct {
+	mu               sync.RWMutex
 	rawConn          net.Conn
 	state            *native.TlsStateHandle
 	ktls             KTLSState
+	closed           atomic.Bool // atomic: Close() may race with concurrent Read()/Write()
 	initErr          error
 	alpn             string
 	version          uint16
@@ -298,6 +377,8 @@ type RustConn struct {
 	rotationFailures atomic.Uint32
 	drainedData      []byte
 	drainedOff       int
+	readRecords      atomic.Uint64 // kTLS RX record counter for EBADMSG diagnostics
+	readBytes        atomic.Int64  // total kTLS RX bytes for EBADMSG diagnostics
 }
 
 var _ Interface = (*RustConn)(nil)
@@ -306,101 +387,164 @@ func (c *RustConn) Read(b []byte) (int, error) {
 	if c.initErr != nil {
 		return 0, c.initErr
 	}
-	if c.rawConn == nil {
-		return 0, errors.New("tls: RustConn is closed")
+
+	c.mu.Lock()
+	if c.closed.Load() || c.rawConn == nil {
+		c.mu.Unlock()
+		return 0, gonet.ErrClosed
 	}
-	// Serve any drained plaintext from the handshake first
+	// Serve any drained plaintext from the handshake first.
 	if c.drainedOff < len(c.drainedData) {
 		n := copy(b, c.drainedData[c.drainedOff:])
 		c.drainedOff += n
 		if c.drainedOff >= len(c.drainedData) {
-			c.drainedData = nil // release buffer
+			c.drainedData = nil
+			c.drainedOff = 0
 		}
+		c.mu.Unlock()
 		return n, nil
 	}
-	if c.ktls.RxReady {
+	rawConn := c.rawConn
+	ktlsRxReady := c.ktls.RxReady
+	handler := c.ktls.keyUpdateHandler
+	c.mu.Unlock()
+
+	if ktlsRxReady {
 		// Full kTLS RX path — kernel decrypts.
-		n, err := c.rawConn.Read(b)
-		if err != nil && isKeyExpired(err) && c.ktls.keyUpdateHandler != nil {
-			if herr := c.ktls.keyUpdateHandler.Handle(); herr != nil {
+		n, err := rawConn.Read(b)
+		if n > 0 {
+			c.readRecords.Add(1)
+			c.readBytes.Add(int64(n))
+		}
+		if err != nil && isKeyExpired(err) && handler != nil {
+			if herr := handler.Handle(); herr != nil {
 				return 0, herr
 			}
-			return c.rawConn.Read(b)
+			n2, err2 := rawConn.Read(b)
+			if n2 > 0 {
+				c.readRecords.Add(1)
+				c.readBytes.Add(int64(n2))
+			}
+			return n2, err2
+		}
+		if err != nil && isBadMessage(err) {
+			c.logKTLSBadMessage()
+		}
+		if err != nil && isEIO(err) {
+			c.logKTLSEIO()
 		}
 		return n, err
 	}
-	return c.rawConn.Read(b)
+
+	return rawConn.Read(b)
 }
 
 func (c *RustConn) Write(b []byte) (int, error) {
 	if c.initErr != nil {
 		return 0, c.initErr
 	}
-	if c.rawConn == nil {
-		return 0, errors.New("tls: RustConn is closed")
+
+	c.mu.RLock()
+	if c.closed.Load() || c.rawConn == nil {
+		c.mu.RUnlock()
+		return 0, gonet.ErrClosed
 	}
-	n, err := c.rawConn.Write(b)
+	rawConn := c.rawConn
+	handler := c.ktls.keyUpdateHandler
+	c.mu.RUnlock()
+
+	n, err := rawConn.Write(b)
 	if err == nil {
-		ktlsAfterWrite(n, c.ktls.keyUpdateHandler, &c.writeRecords, &c.rotationFailures, c.rawConn.Close)
+		ktlsAfterWrite(n, handler, &c.writeRecords, &c.rotationFailures, rawConn.Close)
 	}
 	return n, err
 }
 
 func (c *RustConn) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil // already closed by another goroutine
+	}
+
+	c.mu.Lock()
 	// Close keyUpdateHandler before rawConn — a concurrent Read() may call
 	// handler.Handle() (sendmsg on fd) between rawConn.Close() and handler.Close(),
 	// operating on a closed or reused fd. This matches Conn.Close() ordering.
-	if c.ktls.keyUpdateHandler != nil {
-		c.ktls.keyUpdateHandler.Close()
-		c.ktls.keyUpdateHandler = nil
+	handler := c.ktls.keyUpdateHandler
+	c.ktls.keyUpdateHandler = nil
+	rawConn := c.rawConn
+	c.rawConn = nil
+	state := c.state
+	c.state = nil
+	drained := c.drainedData
+	c.drainedData = nil
+	c.drainedOff = 0
+	c.mu.Unlock()
+
+	if handler != nil {
+		handler.Close()
 	}
-	var err error
-	if c.rawConn != nil {
-		err = c.rawConn.Close()
-		c.rawConn = nil
-	}
-	if c.state != nil {
-		native.TlsStateFree(c.state)
-		c.state = nil
+	if state != nil {
+		native.TlsStateFree(state)
 	}
 	// Zero drainedData (may contain handshake plaintext).
-	for i := range c.drainedData {
-		c.drainedData[i] = 0
+	for i := range drained {
+		drained[i] = 0
 	}
-	c.drainedData = nil
-	return err
+	if rawConn != nil {
+		return rawConn.Close()
+	}
+	return nil
 }
 
-func (c *RustConn) NetConn() gonet.Conn { return c.rawConn }
+func (c *RustConn) NetConn() gonet.Conn {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rawConn
+}
 func (c *RustConn) LocalAddr() gonet.Addr {
-	if c.rawConn == nil {
+	c.mu.RLock()
+	rawConn := c.rawConn
+	c.mu.RUnlock()
+	if rawConn == nil {
 		return nil
 	}
-	return c.rawConn.LocalAddr()
+	return rawConn.LocalAddr()
 }
 func (c *RustConn) RemoteAddr() gonet.Addr {
-	if c.rawConn == nil {
+	c.mu.RLock()
+	rawConn := c.rawConn
+	c.mu.RUnlock()
+	if rawConn == nil {
 		return nil
 	}
-	return c.rawConn.RemoteAddr()
+	return rawConn.RemoteAddr()
 }
 func (c *RustConn) SetDeadline(t time.Time) error {
-	if c.rawConn == nil {
+	c.mu.RLock()
+	rawConn := c.rawConn
+	c.mu.RUnlock()
+	if rawConn == nil {
 		return errors.New("tls: RustConn is closed")
 	}
-	return c.rawConn.SetDeadline(t)
+	return rawConn.SetDeadline(t)
 }
 func (c *RustConn) SetReadDeadline(t time.Time) error {
-	if c.rawConn == nil {
+	c.mu.RLock()
+	rawConn := c.rawConn
+	c.mu.RUnlock()
+	if rawConn == nil {
 		return errors.New("tls: RustConn is closed")
 	}
-	return c.rawConn.SetReadDeadline(t)
+	return rawConn.SetReadDeadline(t)
 }
 func (c *RustConn) SetWriteDeadline(t time.Time) error {
-	if c.rawConn == nil {
+	c.mu.RLock()
+	rawConn := c.rawConn
+	c.mu.RUnlock()
+	if rawConn == nil {
 		return errors.New("tls: RustConn is closed")
 	}
-	return c.rawConn.SetWriteDeadline(t)
+	return rawConn.SetWriteDeadline(t)
 }
 func (c *RustConn) HandshakeContext(ctx context.Context) error { return c.initErr }
 func (c *RustConn) VerifyHostname(host string) error {
@@ -424,6 +568,20 @@ func (c *RustConn) NegotiatedProtocol() string {
 	return c.alpn
 }
 
+// ConnectionState returns a crypto/tls.ConnectionState with the negotiated
+// TLS session parameters. This allows http2.Transport to populate request.TLS
+// and verify ALPN. For server-side XHTTP, kTLSPlaintextConn hides this method
+// so http.Server takes the h2c path instead.
+func (c *RustConn) ConnectionState() tls.ConnectionState {
+	return tls.ConnectionState{
+		HandshakeComplete:  true,
+		Version:            c.version,
+		NegotiatedProtocol: c.alpn,
+		CipherSuite:        c.cipher,
+		ServerName:         c.serverName,
+	}
+}
+
 func (c *RustConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	mb = buf.Compact(mb)
 	mb, err := buf.WriteMultiBuffer(c, mb)
@@ -432,13 +590,98 @@ func (c *RustConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 func (c *RustConn) KTLSEnabled() KTLSState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.ktls
 }
 
 // KTLSKeyUpdateHandler returns the KeyUpdate handler for this connection,
 // or nil if kTLS RX is not active or the connection uses TLS 1.2.
 func (c *RustConn) KTLSKeyUpdateHandler() *KTLSKeyUpdateHandler {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.ktls.keyUpdateHandler
+}
+
+// logKTLSBadMessage logs diagnostic information when kTLS RX returns EBADMSG
+// (AEAD authentication tag verification failure). This captures the connection
+// state at the point of failure to help determine whether the cause is a kernel
+// bug, reverse proxy corruption, or sequence number desynchronization.
+func (c *RustConn) logKTLSBadMessage() {
+	readRecs := c.readRecords.Load()
+	readB := c.readBytes.Load()
+	writeRecs := c.writeRecords.Load()
+	c.mu.RLock()
+	rawConn := c.rawConn
+	cipher := c.cipher
+	version := c.version
+	c.mu.RUnlock()
+	local := "<nil>"
+	remote := "<nil>"
+	if rawConn != nil {
+		if a := rawConn.LocalAddr(); a != nil {
+			local = a.String()
+		}
+		if a := rawConn.RemoteAddr(); a != nil {
+			remote = a.String()
+		}
+	}
+
+	// Try to read kernel-side RX sequence number for desync detection
+	var seqInfo string
+	if rawConn != nil {
+		if fd, err := ExtractFd(rawConn); err == nil {
+			if seq, serr := ktlsRxDiagnostics(fd, cipher); serr == nil {
+				seqInfo = fmt.Sprintf(" kernelRxSeq=%d", seq)
+			} else {
+				seqInfo = " kernelRxSeq=err:" + serr.Error()
+			}
+		} else {
+			seqInfo = " fd=err:" + err.Error()
+		}
+	}
+
+	errors.LogWarning(context.Background(),
+		fmt.Sprintf("kTLS EBADMSG on RustConn: cipher=0x%04x version=0x%04x readRecords=%d readBytes=%d writeRecords=%d%s local=%s remote=%s",
+			cipher, version, readRecs, readB, writeRecs, seqInfo, local, remote),
+	)
+}
+
+func (c *RustConn) logKTLSEIO() {
+	readRecs := c.readRecords.Load()
+	readB := c.readBytes.Load()
+	writeRecs := c.writeRecords.Load()
+	c.mu.RLock()
+	rawConn := c.rawConn
+	cipher := c.cipher
+	version := c.version
+	c.mu.RUnlock()
+	local := "<nil>"
+	remote := "<nil>"
+	if rawConn != nil {
+		if a := rawConn.LocalAddr(); a != nil {
+			local = a.String()
+		}
+		if a := rawConn.RemoteAddr(); a != nil {
+			remote = a.String()
+		}
+	}
+
+	var seqInfo string
+	if rawConn != nil {
+		if fd, err := ExtractFd(rawConn); err == nil {
+			if seq, serr := ktlsRxDiagnostics(fd, cipher); serr == nil {
+				seqInfo = fmt.Sprintf(" kernelRxSeq=%d", seq)
+			} else {
+				seqInfo = " kernelRxSeq=err:" + serr.Error()
+			}
+		}
+	}
+
+	errors.LogWarning(context.Background(),
+		fmt.Sprintf("kTLS EIO on RustConn: cipher=0x%04x version=0x%04x readRecords=%d readBytes=%d writeRecords=%d%s local=%s remote=%s",
+			cipher, version, readRecs, readB, writeRecs, seqInfo, local, remote),
+	)
 }
 
 // NewRustConn creates a RustConn from native handshake results.
@@ -528,6 +771,765 @@ func NewRustConnChecked(rawConn net.Conn, result *native.TlsResult, serverName s
 
 	return rc, nil
 }
+
+// ---------------------------------------------------------------------------
+// DeferredRustConn — deferred kTLS promotion for REALITY
+// ---------------------------------------------------------------------------
+
+// DeferredRustConn wraps a deferred REALITY session. During the deferred phase,
+// reads/writes go through rustls (Rust FFI). After EnableKTLS(), the connection
+// transparently switches to kernel-level kTLS I/O on the raw socket.
+type DeferredRustConn struct {
+	rawConn          gonet.Conn
+	deferredMu       sync.RWMutex
+	handle           *native.DeferredSessionHandle
+	alpn             string
+	version          uint16
+	cipher           uint16
+	sni              string
+	ktlsScope        string
+	closed           atomic.Bool           // atomic: Close() may race with concurrent Read()/Write()
+	ktlsActive       bool                  // true after EnableKTLS()
+	ktlsState        KTLSState             // populated after EnableKTLS()
+	ktlsHandler      *KTLSKeyUpdateHandler // populated after EnableKTLS()
+	state            *native.TlsStateHandle
+	drainedData      []byte // from enable_ktls drain
+	drainedOff       int
+	writeRecords     atomic.Uint64
+	rotationFailures atomic.Uint32
+	detached         atomic.Bool // true after DrainAndDetach()
+	deferredReadMu   sync.Mutex
+	deferredReadBuf  []byte
+	deferredReadOff  int
+	deferredReadLen  int
+	readRecords      atomic.Uint64 // kTLS RX record counter for EBADMSG diagnostics
+	readBytes        atomic.Int64  // total kTLS RX bytes for EBADMSG diagnostics
+}
+
+// NewDeferredRustConn creates a DeferredRustConn from native deferred handshake results.
+func NewDeferredRustConn(rawConn gonet.Conn, result *native.DeferredResult) (*DeferredRustConn, error) {
+	if result == nil || result.Handle == nil {
+		if rawConn != nil {
+			_ = rawConn.Close()
+		}
+		return nil, errors.New("tls: DeferredRustConn init: nil handshake result")
+	}
+	if rawConn == nil {
+		native.DeferredFree(result.Handle)
+		return nil, errors.New("tls: DeferredRustConn init: nil raw connection")
+	}
+	return &DeferredRustConn{
+		rawConn:   rawConn,
+		handle:    result.Handle,
+		alpn:      result.ALPN,
+		version:   result.Version,
+		cipher:    result.CipherSuite,
+		sni:       result.SNI,
+		ktlsScope: ktlsScopeDefault,
+	}, nil
+}
+
+// SetKTLSPromotionScope allows callers to scope cooldowns to a listener / cipher / kernel path.
+// Empty scope falls back to a shared default.
+func (c *DeferredRustConn) SetKTLSPromotionScope(scope string) {
+	if scope == "" {
+		c.ktlsScope = ktlsScopeDefault
+		return
+	}
+	c.ktlsScope = scope
+}
+
+func (c *DeferredRustConn) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if n := c.consumeDeferredReadCache(b); n > 0 {
+		return n, nil
+	}
+
+	for {
+		if c.closed.Load() {
+			return 0, gonet.ErrClosed
+		}
+
+		c.deferredMu.RLock()
+		ktlsActive := c.ktlsActive
+		detached := c.detached.Load()
+		c.deferredMu.RUnlock()
+
+		if ktlsActive {
+			// Serve any plaintext drained during deferred->kTLS promotion first.
+			var handler *KTLSKeyUpdateHandler
+			c.deferredMu.Lock()
+			if c.drainedOff < len(c.drainedData) {
+				n := copy(b, c.drainedData[c.drainedOff:])
+				c.drainedOff += n
+				if c.drainedOff >= len(c.drainedData) {
+					// Zero and release drained data.
+					for i := range c.drainedData {
+						c.drainedData[i] = 0
+					}
+					c.drainedData = nil
+					c.drainedOff = 0
+				}
+				c.deferredMu.Unlock()
+				return n, nil
+			}
+			handler = c.ktlsHandler
+			c.deferredMu.Unlock()
+
+			n, err := c.rawConn.Read(b)
+			if err != nil && isKeyExpired(err) && handler != nil {
+				if herr := handler.Handle(); herr != nil {
+					return 0, herr
+				}
+				return c.rawConn.Read(b)
+			}
+			return n, err
+		}
+
+		if detached {
+			return 0, gonet.ErrClosed
+		}
+
+		// Hold read lock across DeferredRead so EnableKTLS/Drain/Free cannot
+		// consume the handle concurrently.
+		c.deferredMu.RLock()
+		if c.closed.Load() {
+			c.deferredMu.RUnlock()
+			return 0, gonet.ErrClosed
+		}
+		if c.ktlsActive {
+			c.deferredMu.RUnlock()
+			continue
+		}
+		if c.detached.Load() {
+			c.deferredMu.RUnlock()
+			return 0, gonet.ErrClosed
+		}
+		h := c.handle
+		if h == nil {
+			c.deferredMu.RUnlock()
+			return 0, gonet.ErrClosed
+		}
+		var n int
+		var err error
+		if len(b) < deferredReadBatchThreshold {
+			n, err = c.deferredReadBatched(h, b)
+		} else {
+			n, err = native.DeferredRead(h, b)
+			c.logDeferredKTLSError(err)
+		}
+		if err == nil && n > 0 {
+			c.readRecords.Add(1)
+			c.readBytes.Add(int64(n))
+		}
+		c.deferredMu.RUnlock()
+		return n, err
+	}
+}
+
+func (c *DeferredRustConn) consumeDeferredReadCache(dst []byte) int {
+	c.deferredReadMu.Lock()
+	defer c.deferredReadMu.Unlock()
+	if c.deferredReadOff >= c.deferredReadLen {
+		return 0
+	}
+	n := copy(dst, c.deferredReadBuf[c.deferredReadOff:c.deferredReadLen])
+	c.deferredReadOff += n
+	if c.deferredReadOff >= c.deferredReadLen {
+		c.deferredReadOff = 0
+		c.deferredReadLen = 0
+	}
+	return n
+}
+
+// deferredReadBatched reads into an internal read-ahead buffer and serves `dst`
+// from that buffer. This amortizes cgo call overhead for small reads.
+// Caller must hold c.deferredMu.RLock while invoking this method.
+func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, dst []byte) (int, error) {
+	c.deferredReadMu.Lock()
+	defer c.deferredReadMu.Unlock()
+
+	if c.deferredReadOff < c.deferredReadLen {
+		n := copy(dst, c.deferredReadBuf[c.deferredReadOff:c.deferredReadLen])
+		c.deferredReadOff += n
+		if c.deferredReadOff >= c.deferredReadLen {
+			c.deferredReadOff = 0
+			c.deferredReadLen = 0
+		}
+		return n, nil
+	}
+
+	if cap(c.deferredReadBuf) < deferredReadBatchCap {
+		c.deferredReadBuf = make([]byte, deferredReadBatchCap)
+	}
+	buf := c.deferredReadBuf[:deferredReadBatchCap]
+	n, err := native.DeferredRead(h, buf)
+	if n <= 0 {
+		return n, err
+	}
+
+	outN := copy(dst, buf[:n])
+	if outN < n {
+		c.deferredReadOff = outN
+		c.deferredReadLen = n
+		// Surface buffered plaintext first; the next read will drain cache,
+		// then observe EOF/close status from native.DeferredRead.
+		if err != nil {
+			return outN, nil
+		}
+	}
+	return outN, err
+}
+
+func (c *DeferredRustConn) Write(b []byte) (int, error) {
+	for {
+		if c.closed.Load() {
+			return 0, gonet.ErrClosed
+		}
+
+		c.deferredMu.RLock()
+		ktlsActive := c.ktlsActive
+		detached := c.detached.Load()
+		handler := c.ktlsHandler
+		c.deferredMu.RUnlock()
+
+		// Fast path after promotion: no native deferred handle involved.
+		if ktlsActive {
+			n, err := c.rawConn.Write(b)
+			if err == nil {
+				ktlsAfterWrite(n, handler, &c.writeRecords, &c.rotationFailures, c.rawConn.Close)
+			}
+			return n, err
+		}
+		// If detached (Vision command=2 completed): write plaintext to raw socket.
+		if detached {
+			return c.rawConn.Write(b)
+		}
+
+		// Hold read lock across DeferredWrite so EnableKTLS/Drain/Free cannot
+		// consume the handle concurrently.
+		c.deferredMu.RLock()
+		if c.closed.Load() {
+			c.deferredMu.RUnlock()
+			return 0, gonet.ErrClosed
+		}
+		if c.ktlsActive {
+			c.deferredMu.RUnlock()
+			continue
+		}
+		if c.detached.Load() {
+			c.deferredMu.RUnlock()
+			return c.rawConn.Write(b)
+		}
+		h := c.handle
+		if h == nil {
+			c.deferredMu.RUnlock()
+			if c.detached.Load() {
+				return c.rawConn.Write(b)
+			}
+			return 0, gonet.ErrClosed
+		}
+		n, err := native.DeferredWrite(h, b)
+		c.logDeferredKTLSError(err)
+		if err == nil && n > 0 {
+			c.writeRecords.Add(1)
+		}
+		c.deferredMu.RUnlock()
+		// Transition race: reader may detach while writer is still on rustls path.
+		// Retry on raw socket once detached.
+		if err != nil && c.detached.Load() {
+			return c.rawConn.Write(b)
+		}
+		return n, err
+	}
+}
+
+func (c *DeferredRustConn) logDeferredKTLSError(err error) {
+	if err == nil {
+		return
+	}
+	if isBadMessage(err) {
+		c.logDeferredKTLSBadMessage()
+		return
+	}
+	if isEIO(err) {
+		c.logDeferredKTLSEIO()
+	}
+}
+
+// DeferredRustConn mirrors RustConn diagnostics for kTLS errors during deferred paths.
+func (c *DeferredRustConn) logDeferredKTLSBadMessage() {
+	readRecs := c.readRecords.Load()
+	readB := c.readBytes.Load()
+	writeRecs := c.writeRecords.Load()
+	c.deferredMu.RLock()
+	rawConn := c.rawConn
+	cipher := c.cipher
+	version := c.version
+	c.deferredMu.RUnlock()
+	local := "<nil>"
+	remote := "<nil>"
+	if rawConn != nil {
+		if a := rawConn.LocalAddr(); a != nil {
+			local = a.String()
+		}
+		if a := rawConn.RemoteAddr(); a != nil {
+			remote = a.String()
+		}
+	}
+	var seqInfo string
+	if rawConn != nil {
+		if fd, err := ExtractFd(rawConn); err == nil {
+			if seq, serr := ktlsRxDiagnostics(fd, cipher); serr == nil {
+				seqInfo = fmt.Sprintf(" kernelRxSeq=%d", seq)
+			} else {
+				seqInfo = " kernelRxSeq=err:" + serr.Error()
+			}
+		} else {
+			seqInfo = " fd=err:" + err.Error()
+		}
+	}
+	errors.LogWarning(context.Background(),
+		fmt.Sprintf("kTLS EBADMSG on DeferredRustConn: cipher=0x%04x version=0x%04x readRecords=%d readBytes=%d writeRecords=%d%s local=%s remote=%s",
+			cipher, version, readRecs, readB, writeRecs, seqInfo, local, remote),
+	)
+}
+
+func (c *DeferredRustConn) logDeferredKTLSEIO() {
+	readRecs := c.readRecords.Load()
+	readB := c.readBytes.Load()
+	writeRecs := c.writeRecords.Load()
+	c.deferredMu.RLock()
+	rawConn := c.rawConn
+	cipher := c.cipher
+	version := c.version
+	c.deferredMu.RUnlock()
+	local := "<nil>"
+	remote := "<nil>"
+	if rawConn != nil {
+		if a := rawConn.LocalAddr(); a != nil {
+			local = a.String()
+		}
+		if a := rawConn.RemoteAddr(); a != nil {
+			remote = a.String()
+		}
+	}
+	var seqInfo string
+	if rawConn != nil {
+		if fd, err := ExtractFd(rawConn); err == nil {
+			if seq, serr := ktlsRxDiagnostics(fd, cipher); serr == nil {
+				seqInfo = fmt.Sprintf(" kernelRxSeq=%d", seq)
+			} else {
+				seqInfo = " kernelRxSeq=err:" + serr.Error()
+			}
+		}
+	}
+	errors.LogWarning(context.Background(),
+		fmt.Sprintf("kTLS EIO on DeferredRustConn: cipher=0x%04x version=0x%04x readRecords=%d readBytes=%d writeRecords=%d%s local=%s remote=%s",
+			cipher, version, readRecs, readB, writeRecs, seqInfo, local, remote),
+	)
+}
+
+// DrainAndDetach drains rustls buffered plaintext and read-ahead bytes, then
+// detaches the deferred session. After success, callers must use NetConn().
+func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, err error) {
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+	if c.closed.Load() {
+		return nil, nil, gonet.ErrClosed
+	}
+	if c.ktlsActive {
+		return nil, nil, errors.New("tls: DeferredRustConn: kTLS already active")
+	}
+	if c.detached.Load() {
+		return nil, nil, nil
+	}
+	h := c.handle
+	if h == nil {
+		return nil, nil, errors.New("tls: DeferredRustConn: already consumed or freed")
+	}
+	plaintext, rawAhead, err = native.DeferredDrainAndDetach(h)
+	if err != nil {
+		// Keep handle for fallback-to-rustls behavior.
+		return nil, nil, err
+	}
+	native.DeferredFree(h) // free Rust DeferredSession — restores fd state, closes dup'd fds
+	c.handle = nil
+	c.detached.Store(true)
+	return plaintext, rawAhead, nil
+}
+
+// KTLSPromotionStatus is a typed outcome for deferred promotion.
+type KTLSPromotionStatus uint8
+
+const (
+	KTLSPromotionEnabled KTLSPromotionStatus = iota
+	KTLSPromotionCooldown
+	KTLSPromotionUnsupported
+	KTLSPromotionFailed
+)
+
+func (s KTLSPromotionStatus) String() string {
+	switch s {
+	case KTLSPromotionEnabled:
+		return "enabled"
+	case KTLSPromotionCooldown:
+		return "cooldown"
+	case KTLSPromotionUnsupported:
+		return "unsupported"
+	case KTLSPromotionFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+type KTLSPromotionOutcome struct {
+	Status KTLSPromotionStatus
+	State  KTLSState
+}
+
+// EnableKTLS installs kTLS on the socket in-place and returns a typed outcome.
+// Existing callers can continue using the legacy error-return contract via EnableKTLS().
+func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
+	out := KTLSPromotionOutcome{Status: KTLSPromotionFailed}
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+	if c.detached.Load() {
+		return out, errors.New("tls: DeferredRustConn: already detached")
+	}
+	if c.handle == nil {
+		return out, errors.New("tls: DeferredRustConn: already consumed or freed")
+	}
+	scope := c.ktlsScope
+	if scope == "" {
+		scope = ktlsScopeDefault
+	}
+	if DeferredKTLSPromotionDisabledFor(scope) {
+		out.Status = KTLSPromotionCooldown
+		return out, nil
+	}
+	result, err := native.DeferredEnableKTLS(c.handle)
+	// FFI consumes the deferred session handle; clear local reference to avoid reuse.
+	c.handle = nil
+
+	var (
+		handler *KTLSKeyUpdateHandler
+		state   *native.TlsStateHandle
+		drained []byte
+	)
+	rollbackPromotionFailure := func() {
+		if handler != nil {
+			handler.Close()
+			handler = nil
+		}
+		if state != nil {
+			native.TlsStateFree(state)
+			state = nil
+		}
+		for i := range drained {
+			drained[i] = 0
+		}
+		drained = nil
+		if c.ktlsHandler != nil {
+			c.ktlsHandler.Close()
+			c.ktlsHandler = nil
+		}
+		if c.state != nil {
+			native.TlsStateFree(c.state)
+			c.state = nil
+		}
+		for i := range c.drainedData {
+			c.drainedData[i] = 0
+		}
+		c.drainedData = nil
+		c.drainedOff = 0
+		c.deferredReadMu.Lock()
+		for i := range c.deferredReadBuf {
+			c.deferredReadBuf[i] = 0
+		}
+		c.deferredReadBuf = nil
+		c.deferredReadOff = 0
+		c.deferredReadLen = 0
+		c.deferredReadMu.Unlock()
+		c.ktlsState = KTLSState{}
+		c.ktlsActive = false
+	}
+	failPromotion := func(err error) error {
+		rollbackPromotionFailure()
+		deferKTLSPromotionForCooldownScope(scope)
+		return err
+	}
+
+	if err != nil {
+		return out, failPromotion(err)
+	}
+	defer result.ZeroSecrets()
+
+	state = result.StateHandle
+	result.StateHandle = nil
+	drained = result.DrainedData
+	result.DrainedData = nil
+
+	// Deferred handover must be full TX/RX kTLS; otherwise rustls state is
+	// already consumed and this connection can no longer safely carry TLS I/O.
+	if !result.KtlsTx || !result.KtlsRx {
+		rollbackPromotionFailure()
+		out.Status = KTLSPromotionUnsupported
+		return out, nil
+	}
+
+	// Extract secrets and create KeyUpdateHandler first, then zero secrets
+	// via defer to minimize the window where key material lives on the Go heap.
+	if len(result.TxSecret) > 0 && result.Version == 0x0304 {
+		if fd, err := ExtractFd(c.rawConn); err == nil {
+			handler = newKTLSKeyUpdateHandler(fd, result.CipherSuite, result.RxSecret, result.TxSecret)
+		}
+	}
+
+	// Optional post-install sanity check: read a zero-length MSG_PEEK to confirm
+	// kTLS stack is responsive. If it returns EAGAIN/OK, proceed; if it returns
+	// EBADMSG/errno, mark promotion as failed and terminate the consumed session.
+	if fd, err := ExtractFd(c.rawConn); err == nil {
+		var buf [0]byte
+		_, _, serr := syscall.Recvfrom(fd, buf[:], syscall.MSG_PEEK)
+		if serr != nil && serr != syscall.EAGAIN && serr != syscall.EWOULDBLOCK {
+			return out, failPromotion(errors.New("tls: kTLS post-install sanity failed").Base(serr))
+		}
+	}
+
+	// Publish new state only after all promotion checks succeed.
+	if c.ktlsHandler != nil {
+		c.ktlsHandler.Close()
+	}
+	c.ktlsHandler = handler
+	handler = nil
+	if c.state != nil {
+		native.TlsStateFree(c.state)
+	}
+	c.state = state
+	state = nil
+	for i := range c.drainedData {
+		c.drainedData[i] = 0
+	}
+	c.drainedData = drained
+	drained = nil
+	c.drainedOff = 0
+	c.ktlsState = KTLSState{Enabled: true, TxReady: true, RxReady: true}
+	c.ktlsActive = true
+	c.cipher = result.CipherSuite
+
+	// Native handle is now fully consumed; zero and clear local reference.
+	if c.handle != nil {
+		native.DeferredFree(c.handle)
+		c.handle = nil
+	}
+
+	out.Status = KTLSPromotionEnabled
+	out.State = c.ktlsState
+	return out, nil
+}
+
+// EnableKTLS preserves the legacy signature; on cooldown/unsupported it returns nil.
+func (c *DeferredRustConn) EnableKTLS() error {
+	out, err := c.EnableKTLSOutcome()
+	if err != nil {
+		return err
+	}
+	if out.Status == KTLSPromotionEnabled {
+		return nil
+	}
+	if out.Status == KTLSPromotionCooldown || out.Status == KTLSPromotionUnsupported {
+		return nil
+	}
+	return errors.New("tls: deferred kTLS promotion did not complete (" + out.Status.String() + ")")
+}
+
+func (c *DeferredRustConn) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil // already closed by another goroutine
+	}
+	// DeferredSession uses dup'd socket FDs on the Rust side. Shutdown the
+	// original fd first so blocked deferred reads/writes wake up promptly.
+	if fd, err := ExtractFd(c.rawConn); err == nil {
+		_ = syscall.Shutdown(fd, syscall.SHUT_RDWR)
+	}
+
+	c.deferredMu.Lock()
+	if c.handle != nil {
+		native.DeferredFree(c.handle)
+		c.handle = nil
+	}
+	if c.ktlsHandler != nil {
+		c.ktlsHandler.Close()
+		c.ktlsHandler = nil
+	}
+	if c.state != nil {
+		native.TlsStateFree(c.state)
+		c.state = nil
+	}
+	// Zero and release drained data
+	for i := range c.drainedData {
+		c.drainedData[i] = 0
+	}
+	c.drainedData = nil
+	c.drainedOff = 0
+	c.deferredMu.Unlock()
+
+	// Zero and release deferred read-ahead plaintext.
+	c.deferredReadMu.Lock()
+	for i := range c.deferredReadBuf {
+		c.deferredReadBuf[i] = 0
+	}
+	c.deferredReadBuf = nil
+	c.deferredReadOff = 0
+	c.deferredReadLen = 0
+	c.deferredReadMu.Unlock()
+
+	return c.rawConn.Close()
+}
+
+// NetConn returns the underlying raw connection.
+// Used by UnwrapRawConn to access the raw TCP socket.
+func (c *DeferredRustConn) NetConn() gonet.Conn {
+	c.deferredMu.RLock()
+	defer c.deferredMu.RUnlock()
+	return c.rawConn
+}
+
+// KTLSEnabled returns the kTLS state (empty before EnableKTLS, populated after).
+func (c *DeferredRustConn) KTLSEnabled() KTLSState {
+	c.deferredMu.RLock()
+	defer c.deferredMu.RUnlock()
+	return c.ktlsState
+}
+
+// KTLSKeyUpdateHandler returns the key update handler (nil before EnableKTLS).
+func (c *DeferredRustConn) KTLSKeyUpdateHandler() *KTLSKeyUpdateHandler {
+	c.deferredMu.RLock()
+	defer c.deferredMu.RUnlock()
+	return c.ktlsHandler
+}
+
+// IsDetached reports whether the deferred rustls session has been detached and
+// the caller should use NetConn() directly.
+func (c *DeferredRustConn) IsDetached() bool {
+	return c.detached.Load()
+}
+
+// RestoreNonBlock restores O_NONBLOCK on the underlying fd without detaching.
+// After this call, Go can safely write to the raw socket (via UnwrapRawConn)
+// without blocking the OS thread, while Rust's reader/writer handle EAGAIN
+// via poll(2).
+func (c *DeferredRustConn) RestoreNonBlock() error {
+	if c.detached.Load() {
+		return nil // already detached, O_NONBLOCK already restored
+	}
+	c.deferredMu.RLock()
+	defer c.deferredMu.RUnlock()
+	if c.handle == nil {
+		return nil
+	}
+	return native.DeferredRestoreNonBlock(c.handle)
+}
+
+// ConnectionState returns a tls.ConnectionState with REALITY session metadata.
+func (c *DeferredRustConn) ConnectionState() tls.ConnectionState {
+	c.deferredMu.RLock()
+	defer c.deferredMu.RUnlock()
+	return tls.ConnectionState{
+		HandshakeComplete:  true,
+		Version:            c.version,
+		NegotiatedProtocol: c.alpn,
+		ServerName:         c.sni,
+		CipherSuite:        c.cipher,
+	}
+}
+
+// HandshakeContext is a no-op — handshake already completed in Rust.
+func (c *DeferredRustConn) HandshakeContext(ctx context.Context) error {
+	return nil
+}
+
+// VerifyHostname is a no-op — REALITY has its own auth mechanism.
+func (c *DeferredRustConn) VerifyHostname(host string) error {
+	return nil
+}
+
+// HandshakeContextServerName returns the SNI from the REALITY handshake.
+func (c *DeferredRustConn) HandshakeContextServerName(ctx context.Context) string {
+	return c.sni
+}
+
+// NegotiatedProtocol returns the ALPN protocol from the REALITY handshake.
+func (c *DeferredRustConn) NegotiatedProtocol() string {
+	return c.alpn
+}
+
+// LocalAddr delegates to the underlying connection.
+func (c *DeferredRustConn) LocalAddr() gonet.Addr {
+	return c.rawConn.LocalAddr()
+}
+
+// RemoteAddr delegates to the underlying connection.
+func (c *DeferredRustConn) RemoteAddr() gonet.Addr {
+	return c.rawConn.RemoteAddr()
+}
+
+// SetDeadline delegates to the underlying connection.
+func (c *DeferredRustConn) SetDeadline(t time.Time) error {
+	return c.rawConn.SetDeadline(t)
+}
+
+// SetReadDeadline delegates to the underlying connection.
+func (c *DeferredRustConn) SetReadDeadline(t time.Time) error {
+	return c.rawConn.SetReadDeadline(t)
+}
+
+// SetWriteDeadline delegates to the underlying connection.
+func (c *DeferredRustConn) SetWriteDeadline(t time.Time) error {
+	return c.rawConn.SetWriteDeadline(t)
+}
+
+// Verify DeferredRustConn implements the required interfaces.
+var _ gonet.Conn = (*DeferredRustConn)(nil)
+var _ Interface = (*DeferredRustConn)(nil)
+
+// ---------------------------------------------------------------------------
+// KTLSPlaintextConn — hides ConnectionState() from http.Server
+// ---------------------------------------------------------------------------
+
+// KTLSPlaintextConn wraps a kTLS-enabled connection, hiding ConnectionState()
+// so http.Server treats it as plaintext and uses h2c detection. On the wire,
+// kTLS still handles encryption transparently in the kernel.
+type KTLSPlaintextConn struct {
+	inner gonet.Conn
+}
+
+// NewKTLSPlaintextConn wraps a kTLS-enabled connection for server-side h2c use.
+func NewKTLSPlaintextConn(conn gonet.Conn) *KTLSPlaintextConn {
+	return &KTLSPlaintextConn{inner: conn}
+}
+
+func (c *KTLSPlaintextConn) Read(b []byte) (int, error)  { return c.inner.Read(b) }
+func (c *KTLSPlaintextConn) Write(b []byte) (int, error) { return c.inner.Write(b) }
+func (c *KTLSPlaintextConn) Close() error                { return c.inner.Close() }
+func (c *KTLSPlaintextConn) LocalAddr() gonet.Addr       { return c.inner.LocalAddr() }
+func (c *KTLSPlaintextConn) RemoteAddr() gonet.Addr      { return c.inner.RemoteAddr() }
+func (c *KTLSPlaintextConn) SetDeadline(t time.Time) error {
+	return c.inner.SetDeadline(t)
+}
+func (c *KTLSPlaintextConn) SetReadDeadline(t time.Time) error {
+	return c.inner.SetReadDeadline(t)
+}
+func (c *KTLSPlaintextConn) SetWriteDeadline(t time.Time) error {
+	return c.inner.SetWriteDeadline(t)
+}
+
+// Verify KTLSPlaintextConn implements net.Conn but NOT connectionStater.
+var _ gonet.Conn = (*KTLSPlaintextConn)(nil)
 
 // configToNative translates an Xray TLS Config to a native Rust TLS config handle.
 func configToNative(config *Config, dest net.Destination, isServer bool) *native.TlsConfigHandle {
@@ -743,6 +1745,29 @@ func RustServerWithTimeout(c net.Conn, config *Config, handshakeTimeout time.Dur
 		return nil, errors.New("native TLS server handshake failed: ").Base(err)
 	}
 	return rc, nil
+}
+
+// RustServerDeferred performs a TLS server handshake via Rust rustls but does
+// NOT install kTLS. Returns a DeferredRustConn that reads/writes through rustls.
+// The protocol handler later calls EnableKTLS() (non-Vision) or keeps rustls (Vision).
+func RustServerDeferred(c net.Conn, config *Config, handshakeTimeout time.Duration) (*DeferredRustConn, error) {
+	h := configToNative(config, net.Destination{}, true)
+	if h == nil {
+		return nil, errors.New("failed to create native TLS config")
+	}
+	defer native.TlsConfigFree(h)
+
+	fd, err := ExtractFd(c)
+	if err != nil {
+		return nil, errors.New("failed to extract fd").Base(err)
+	}
+
+	result, err := native.TlsServerDeferred(fd, h, normalizeNativeHandshakeTimeout(handshakeTimeout))
+	if err != nil {
+		return nil, errors.New("native TLS server deferred handshake failed").Base(err)
+	}
+
+	return NewDeferredRustConn(c, result)
 }
 
 func copyConfig(c *tls.Config) *utls.Config {

@@ -104,6 +104,9 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 			if custom.Level != "" {
 				level, _ = strconv.Atoi(custom.Level)
 			}
+			if err := validateCustomSockopt(level, opt); err != nil {
+				return err
+			}
 			if custom.Type == "int" {
 				value, _ := strconv.Atoi(custom.Value)
 				if err := syscall.SetsockoptInt(syscall.Handle(fd), level, opt, value); err != nil {
@@ -164,6 +167,9 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 			}
 			if custom.Level != "" {
 				level, _ = strconv.Atoi(custom.Level)
+			}
+			if err := validateCustomSockopt(level, opt); err != nil {
+				return err
 			}
 			if custom.Type == "int" {
 				value, _ := strconv.Atoi(custom.Value)

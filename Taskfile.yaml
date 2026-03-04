@@ -62,6 +62,20 @@ tasks:
             - echo ">> Updating Rust (eBPF) dependencies..."
             - "{{.CARGO}} update"
 
+    lint-rust-ffi-panics:
+        desc: "Enforce panic-free Rust FFI data-plane (no unwrap/expect in non-test lib code)"
+        dir: "{{.RUST_LIB_SRC}}"
+        preconditions:
+            - sh: test -x "{{.CARGO}}"
+              msg: "cargo not found — install Rust via https://rustup.rs or run: mise install"
+        cmds:
+            - >
+                "{{.CARGO}}" clippy --lib --
+                -Aclippy::not_unsafe_ptr_arg_deref
+                -Dclippy::unwrap_used
+                -Dclippy::expect_used
+                -Dclippy::panic
+
     update-nightly:
         desc: "Bump eBPF nightly pin to today and rebuild bpf-linker"
         dir: "{{.EBPF_SRC}}"

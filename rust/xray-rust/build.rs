@@ -11,7 +11,10 @@ fn main() {
     } else {
         // Warn if missing but feature enabled
         if env::var("CARGO_FEATURE_EBPF_BYTECODE").is_ok() {
-            println!("cargo:warning=eBPF bytecode not found at {}", bpf_path.display());
+            println!(
+                "cargo:warning=eBPF bytecode not found at {}",
+                bpf_path.display()
+            );
         }
     }
 

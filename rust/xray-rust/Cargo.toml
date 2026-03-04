@@ -46,9 +46,12 @@ libc = "0.2"
 default = []
 ebpf-bytecode = ["aya"]
 
+[dev-dependencies]
+rcgen = "0.13"
+
 [profile.release]
 lto = true
 codegen-units = 1
 opt-level = 3
 strip = true
-panic = "unwind"
+panic = "abort"

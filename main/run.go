@@ -21,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/main/commands/base"
+	"github.com/xtls/xray-core/proxy"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -91,6 +92,8 @@ func executeRun(cmd *base.Command, args []string) {
 		// Configuration error. Exit with a special value to prevent systemd from restarting.
 		os.Exit(23)
 	}
+	// Probe acceleration capabilities once at startup; can be refreshed later via SIGHUP reload.
+	proxy.RefreshPipelineCapabilities()
 
 	if *test {
 		fmt.Println("Configuration OK.")
@@ -113,12 +116,17 @@ func executeRun(cmd *base.Command, args []string) {
 	debug.FreeOSMemory()
 
 	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1)
 
 	for {
 		sig := <-osSignals
 
-		if sig == syscall.SIGHUP {
+		switch sig {
+		case syscall.SIGUSR1:
+			errors.LogInfo(context.Background(), "received SIGUSR1, refreshing acceleration capability cache...")
+			proxy.RefreshPipelineCapabilities()
+			continue
+		case syscall.SIGHUP:
 			errors.LogInfo(context.Background(), "received SIGHUP, reloading configuration...")
 			newConfig, err := loadXrayConfig()
 			if err != nil {
@@ -159,6 +167,8 @@ func executeRun(cmd *base.Command, args []string) {
 
 			server = newServer
 			activeConfig = cloneXrayConfig(newConfig)
+			// Refresh capability cache after potential privilege/config changes.
+			proxy.RefreshPipelineCapabilities()
 			runtime.GC()
 			errors.LogInfo(context.Background(), "configuration reloaded successfully")
 			continue

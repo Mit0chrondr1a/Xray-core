@@ -158,9 +158,7 @@ impl IpSet {
 /// Create a new empty IP set.
 #[no_mangle]
 pub extern "C" fn xray_ipset_new() -> *mut IpSet {
-    ffi_catch_ptr!({
-        Box::into_raw(Box::new(IpSet::new()))
-    })
+    ffi_catch_ptr!({ Box::into_raw(Box::new(IpSet::new())) })
 }
 
 /// Add a CIDR prefix to the IP set.

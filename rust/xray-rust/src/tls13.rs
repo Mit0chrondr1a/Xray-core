@@ -21,14 +21,15 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::FromRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::{aead::Aead, Aes128Gcm, Aes256Gcm, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384};
-use x25519_dalek::{PublicKey, StaticSecret};
 use subtle::ConstantTimeEq;
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,10 @@ pub struct Tls13State {
     pub cipher_suite: u16,
     pub server_cert_chain: Vec<Vec<u8>>,
     pub transcript_hash: Vec<u8>,
+    /// Number of server application-data records consumed after the handshake
+    /// (typically NewSessionTicket records). This is the correct starting
+    /// sequence number for kTLS RX on the client side.
+    pub server_post_hs_records: u64,
 }
 
 #[derive(Debug)]
@@ -102,9 +107,10 @@ impl HashAlg {
     fn from_cipher_suite(cs: u16) -> Result<Self, Tls13Error> {
         match cs {
             0x1301 | 0x1303 => Ok(HashAlg::Sha256), // TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256
-            0x1302 => Ok(HashAlg::Sha384),           // TLS_AES_256_GCM_SHA384
+            0x1302 => Ok(HashAlg::Sha384),          // TLS_AES_256_GCM_SHA384
             _ => Err(Tls13Error::Protocol(format!(
-                "unsupported cipher suite: 0x{:04x}", cs
+                "unsupported cipher suite: 0x{:04x}",
+                cs
             ))),
         }
     }
@@ -189,7 +195,12 @@ fn hkdf_expand_label(
     Ok(out)
 }
 
-fn derive_secret(alg: HashAlg, secret: &[u8], label: &str, transcript_hash: &[u8]) -> Result<Vec<u8>, Tls13Error> {
+fn derive_secret(
+    alg: HashAlg,
+    secret: &[u8],
+    label: &str,
+    transcript_hash: &[u8],
+) -> Result<Vec<u8>, Tls13Error> {
     hkdf_expand_label(alg, secret, label, transcript_hash, alg.output_len())
 }
 
@@ -198,7 +209,12 @@ fn derive_secret(alg: HashAlg, secret: &[u8], label: &str, transcript_hash: &[u8
 // ---------------------------------------------------------------------------
 
 fn make_nonce(iv: &[u8], seq: u64) -> [u8; 12] {
-    assert_eq!(iv.len(), 12, "TLS 1.3 IV must be 12 bytes, got {}", iv.len());
+    assert_eq!(
+        iv.len(),
+        12,
+        "TLS 1.3 IV must be 12 bytes, got {}",
+        iv.len()
+    );
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(iv);
     let seq_bytes = seq.to_be_bytes();
@@ -221,56 +237,89 @@ impl CachedCipher {
         match cipher_suite {
             0x1301 => Ok(CachedCipher::Aes128(
                 Aes128Gcm::new_from_slice(key)
-                    .map_err(|e| Tls13Error::Crypto(format!("aes128gcm: {}", e)))?
+                    .map_err(|e| Tls13Error::Crypto(format!("aes128gcm: {}", e)))?,
             )),
             0x1302 => Ok(CachedCipher::Aes256(
                 Aes256Gcm::new_from_slice(key)
-                    .map_err(|e| Tls13Error::Crypto(format!("aes256gcm: {}", e)))?
+                    .map_err(|e| Tls13Error::Crypto(format!("aes256gcm: {}", e)))?,
             )),
             0x1303 => Ok(CachedCipher::ChaCha(
                 ChaCha20Poly1305::new_from_slice(key)
-                    .map_err(|e| Tls13Error::Crypto(format!("chacha20: {}", e)))?
+                    .map_err(|e| Tls13Error::Crypto(format!("chacha20: {}", e)))?,
             )),
-            _ => Err(Tls13Error::Protocol(format!("unsupported cipher: 0x{:04x}", cipher_suite))),
+            _ => Err(Tls13Error::Protocol(format!(
+                "unsupported cipher: 0x{:04x}",
+                cipher_suite
+            ))),
         }
     }
 
-    fn decrypt(&self, iv: &[u8], seq: u64, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Tls13Error> {
+    fn decrypt(
+        &self,
+        iv: &[u8],
+        seq: u64,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, Tls13Error> {
         let nonce = make_nonce(iv, seq);
         match self {
             CachedCipher::Aes128(c) => {
-                let payload = aes_gcm::aead::Payload { msg: ciphertext, aad };
+                let payload = aes_gcm::aead::Payload {
+                    msg: ciphertext,
+                    aad,
+                };
                 c.decrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
                     .map_err(|e| Tls13Error::Crypto(format!("aes128gcm decrypt: {}", e)))
             }
             CachedCipher::Aes256(c) => {
-                let payload = aes_gcm::aead::Payload { msg: ciphertext, aad };
+                let payload = aes_gcm::aead::Payload {
+                    msg: ciphertext,
+                    aad,
+                };
                 c.decrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
                     .map_err(|e| Tls13Error::Crypto(format!("aes256gcm decrypt: {}", e)))
             }
             CachedCipher::ChaCha(c) => {
-                let payload = chacha20poly1305::aead::Payload { msg: ciphertext, aad };
+                let payload = chacha20poly1305::aead::Payload {
+                    msg: ciphertext,
+                    aad,
+                };
                 c.decrypt(chacha20poly1305::Nonce::from_slice(&nonce), payload)
                     .map_err(|e| Tls13Error::Crypto(format!("chacha20 decrypt: {}", e)))
             }
         }
     }
 
-    fn encrypt(&self, iv: &[u8], seq: u64, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Tls13Error> {
+    fn encrypt(
+        &self,
+        iv: &[u8],
+        seq: u64,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, Tls13Error> {
         let nonce = make_nonce(iv, seq);
         match self {
             CachedCipher::Aes128(c) => {
-                let payload = aes_gcm::aead::Payload { msg: plaintext, aad };
+                let payload = aes_gcm::aead::Payload {
+                    msg: plaintext,
+                    aad,
+                };
                 c.encrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
                     .map_err(|e| Tls13Error::Crypto(format!("aes128gcm encrypt: {}", e)))
             }
             CachedCipher::Aes256(c) => {
-                let payload = aes_gcm::aead::Payload { msg: plaintext, aad };
+                let payload = aes_gcm::aead::Payload {
+                    msg: plaintext,
+                    aad,
+                };
                 c.encrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
                     .map_err(|e| Tls13Error::Crypto(format!("aes256gcm encrypt: {}", e)))
             }
             CachedCipher::ChaCha(c) => {
-                let payload = chacha20poly1305::aead::Payload { msg: plaintext, aad };
+                let payload = chacha20poly1305::aead::Payload {
+                    msg: plaintext,
+                    aad,
+                };
                 c.encrypt(chacha20poly1305::Nonce::from_slice(&nonce), payload)
                     .map_err(|e| Tls13Error::Crypto(format!("chacha20 encrypt: {}", e)))
             }
@@ -284,7 +333,8 @@ fn key_length(cipher_suite: u16) -> Result<usize, Tls13Error> {
         0x1302 => Ok(32), // AES-256-GCM
         0x1303 => Ok(32), // ChaCha20-Poly1305
         _ => Err(Tls13Error::Protocol(format!(
-            "unsupported cipher suite for key derivation: 0x{:04x}", cipher_suite
+            "unsupported cipher suite for key derivation: 0x{:04x}",
+            cipher_suite
         ))),
     }
 }
@@ -303,7 +353,10 @@ fn send_tls_record(
     record.push(content_type);
     record.extend_from_slice(&[0x03, 0x01]); // legacy TLS 1.0 for compatibility
     if data.len() > 16384 {
-        return Err(Tls13Error::Protocol(format!("record too large: {}", data.len())));
+        return Err(Tls13Error::Protocol(format!(
+            "record too large: {}",
+            data.len()
+        )));
     }
     record.extend_from_slice(&(data.len() as u16).to_be_bytes());
     record.extend_from_slice(data);
@@ -340,7 +393,10 @@ fn encrypt_tls13_record(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Tls13Error> {
     if plaintext.len() > 16384 {
-        return Err(Tls13Error::Protocol(format!("plaintext too large for TLS record: {}", plaintext.len())));
+        return Err(Tls13Error::Protocol(format!(
+            "plaintext too large for TLS record: {}",
+            plaintext.len()
+        )));
     }
     // Inner plaintext: content + content_type byte
     let mut inner = Vec::with_capacity(plaintext.len() + 1);
@@ -350,7 +406,10 @@ fn encrypt_tls13_record(
     // AAD is the record header with outer content type 0x17 (application data)
     let outer_len_usize = inner.len() + 16; // +16 for AEAD tag
     if outer_len_usize > u16::MAX as usize {
-        return Err(Tls13Error::Protocol(format!("AAD outer_len overflow: {}", outer_len_usize)));
+        return Err(Tls13Error::Protocol(format!(
+            "AAD outer_len overflow: {}",
+            outer_len_usize
+        )));
     }
     let outer_len = outer_len_usize as u16;
     let aad = [0x17, 0x03, 0x03, (outer_len >> 8) as u8, outer_len as u8];
@@ -558,7 +617,11 @@ fn extract_certificates(cert_msg: &[u8]) -> Vec<Vec<u8>> {
     certs
 }
 
-fn compute_finished_verify_data(alg: HashAlg, base_key: &[u8], transcript_hash: &[u8]) -> Result<Vec<u8>, Tls13Error> {
+fn compute_finished_verify_data(
+    alg: HashAlg,
+    base_key: &[u8],
+    transcript_hash: &[u8],
+) -> Result<Vec<u8>, Tls13Error> {
     let finished_key = hkdf_expand_label(alg, base_key, "finished", &[], alg.output_len())?;
 
     match alg {
@@ -575,6 +638,54 @@ fn compute_finished_verify_data(alg: HashAlg, base_key: &[u8], transcript_hash: 
             Ok(mac.finalize().into_bytes().to_vec())
         }
     }
+}
+
+/// Consume post-handshake TLS records (NewSessionTicket) from the server.
+///
+/// After the TLS 1.3 handshake completes, the server typically sends one or
+/// more NewSessionTicket records. These are application-data records (outer
+/// content type 0x17) that advance the server's TX sequence counter. The
+/// client must consume them before installing kTLS RX so that the RX
+/// sequence number accounts for these records.
+///
+/// Uses a 200ms read timeout — the NST arrives in the same TCP flight as
+/// the server's Finished message, so it's either already in the receive
+/// buffer or arriving within milliseconds.
+fn consume_post_handshake_records_tls13(stream: &mut TcpStream) -> u64 {
+    // Save current timeout
+    let saved_timeout = stream.read_timeout().ok().flatten();
+
+    // Set short timeout for NST drain
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+
+    let mut count: u64 = 0;
+    loop {
+        match recv_tls_record(stream) {
+            Ok((ct, _data)) => {
+                if ct == 0x14 {
+                    // ChangeCipherSpec (compatibility) — ignore, don't count
+                    continue;
+                }
+                // Application data record (0x17) = likely NST
+                count += 1;
+            }
+            Err(_) => {
+                // Timeout or error — no more records pending
+                break;
+            }
+        }
+    }
+
+    // Restore original timeout
+    let _ = stream.set_read_timeout(saved_timeout);
+
+    if count > 0 {
+        eprintln!(
+            "tls13: consumed {} post-handshake record(s) (rx_seq correction)",
+            count
+        );
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +730,9 @@ pub fn complete_tls13_handshake(
     let mut transcript = Vec::with_capacity(client_hello_raw.len() + sh_data.len() + 8192);
     transcript.extend_from_slice(client_hello_raw);
     if transcript.len() + sh_data.len() > MAX_TRANSCRIPT_SIZE {
-        return Err(Tls13Error::Protocol("transcript size limit exceeded".into()));
+        return Err(Tls13Error::Protocol(
+            "transcript size limit exceeded".into(),
+        ));
     }
     transcript.extend_from_slice(&sh_data);
 
@@ -660,9 +773,21 @@ pub fn complete_tls13_handshake(
     )?;
 
     // Derive handshake traffic keys and pre-construct AEAD ciphers (once per key)
-    let s_hs_key = hkdf_expand_label(alg, &server_hs_secret, "key", &[], key_length(cipher_suite)?)?;
+    let s_hs_key = hkdf_expand_label(
+        alg,
+        &server_hs_secret,
+        "key",
+        &[],
+        key_length(cipher_suite)?,
+    )?;
     let s_hs_iv = hkdf_expand_label(alg, &server_hs_secret, "iv", &[], 12)?;
-    let c_hs_key = hkdf_expand_label(alg, &client_hs_secret, "key", &[], key_length(cipher_suite)?)?;
+    let c_hs_key = hkdf_expand_label(
+        alg,
+        &client_hs_secret,
+        "key",
+        &[],
+        key_length(cipher_suite)?,
+    )?;
     let c_hs_iv = hkdf_expand_label(alg, &client_hs_secret, "iv", &[], 12)?;
     let s_hs_cipher = CachedCipher::new(cipher_suite, &s_hs_key)?;
     let c_hs_cipher = CachedCipher::new(cipher_suite, &c_hs_key)?;
@@ -690,7 +815,9 @@ pub fn complete_tls13_handshake(
             // ChangeCipherSpec (compatibility) -- ignore, but cap to prevent flooding
             ccs_count += 1;
             if ccs_count > 4 {
-                return Err(Tls13Error::Protocol("too many ChangeCipherSpec records".into()));
+                return Err(Tls13Error::Protocol(
+                    "too many ChangeCipherSpec records".into(),
+                ));
             }
             continue;
         }
@@ -732,7 +859,9 @@ pub fn complete_tls13_handshake(
         let msgs = parse_handshake_messages(&inner_data);
         for (msg_type, msg_data) in &msgs {
             if transcript.len() + msg_data.len() > MAX_TRANSCRIPT_SIZE {
-                return Err(Tls13Error::Protocol("transcript size limit exceeded".into()));
+                return Err(Tls13Error::Protocol(
+                    "transcript size limit exceeded".into(),
+                ));
             }
             match *msg_type {
                 0x08 => {
@@ -763,9 +892,8 @@ pub fn complete_tls13_handshake(
                             //
                             // 3. CertificateVerify bytes ARE included in the transcript hash,
                             //    so they still bind to the Finished value.
-                        }
-                        // Future: CertVerifyPolicy::Verify could validate the signature
-                        // against the certificate's public key per RFC 8446.
+                        } // Future: CertVerifyPolicy::Verify could validate the signature
+                          // against the certificate's public key per RFC 8446.
                     }
                     transcript.extend_from_slice(msg_data);
                 }
@@ -845,7 +973,10 @@ pub fn complete_tls13_handshake(
 
     // Send as application data record
     if encrypted.len() > 16384 + 256 {
-        return Err(Tls13Error::Protocol(format!("encrypted record too large: {}", encrypted.len())));
+        return Err(Tls13Error::Protocol(format!(
+            "encrypted record too large: {}",
+            encrypted.len()
+        )));
     }
     let outer_len = encrypted.len() as u16;
     let mut record = Vec::with_capacity(5 + encrypted.len());
@@ -869,6 +1000,13 @@ pub fn complete_tls13_handshake(
     let server_app_secret =
         derive_secret(alg, &master_secret, "s ap traffic", &full_transcript_hash)?;
 
+    // Step 10: Consume post-handshake records (NewSessionTicket) so that
+    // the kTLS RX sequence number accounts for them. Without this, the
+    // client installs kTLS RX with seq=0 while the server's kTLS TX starts
+    // at seq=N (where N = number of NST records), causing AEAD nonce
+    // mismatch and EBADMSG on every read. See docs/ktls-nst-sequence-bug.md.
+    let server_post_hs_records = consume_post_handshake_records_tls13(&mut stream);
+
     // Drop the dup'd stream (closes dup'd fd)
     drop(stream);
 
@@ -878,6 +1016,7 @@ pub fn complete_tls13_handshake(
         cipher_suite,
         server_cert_chain,
         transcript_hash: full_transcript_hash,
+        server_post_hs_records,
     })
 }
 
@@ -888,14 +1027,18 @@ pub fn complete_tls13_handshake(
 #[repr(C)]
 pub struct XrayTls13Result {
     pub cipher_suite: u16,
-    pub client_secret: [u8; 48],    // copied inline (max SHA-384 = 48 bytes)
+    pub client_secret: [u8; 48], // copied inline (max SHA-384 = 48 bytes)
     pub client_secret_len: u8,
     pub server_secret: [u8; 48],
     pub server_secret_len: u8,
+    // Correct starting RX sequence for kTLS installation.
+    // Equals the number of post-handshake server records (e.g. NST)
+    // consumed by the handshake engine.
+    pub rx_seq_start: u64,
     pub transcript_hash: [u8; 48],
     pub transcript_hash_len: u8,
-    pub cert_chain_written: usize,  // bytes written to Go-provided cert buffer
-    pub cert_chain_needed: usize,   // total bytes needed
+    pub cert_chain_written: usize, // bytes written to Go-provided cert buffer
+    pub cert_chain_needed: usize,  // total bytes needed
     pub error_code: i32,
     pub error_msg: [u8; 256],
 }
@@ -908,6 +1051,7 @@ impl XrayTls13Result {
             client_secret_len: 0,
             server_secret: [0u8; 48],
             server_secret_len: 0,
+            rx_seq_start: 0,
             transcript_hash: [0u8; 48],
             transcript_hash_len: 0,
             cert_chain_written: 0,
@@ -929,6 +1073,11 @@ impl XrayTls13Result {
 /// Install kTLS for a TLS 1.3 connection using secrets from the minimal
 /// handshake engine. Called internally from the REALITY client path.
 /// Returns (ktls_tx, ktls_rx).
+///
+/// The RX sequence number is set to `state.server_post_hs_records` to
+/// account for NewSessionTicket records consumed by the handshake engine
+/// before kTLS installation. Without this, the client's kTLS RX nonce
+/// would be desynchronized from the server's kTLS TX nonce.
 pub(crate) fn install_ktls_from_tls13_state(fd: i32, state: &Tls13State) -> (bool, bool) {
     let inner = || -> Result<(bool, bool), Tls13Error> {
         let cs = state.cipher_suite;
@@ -943,8 +1092,11 @@ pub(crate) fn install_ktls_from_tls13_state(fd: i32, state: &Tls13State) -> (boo
             return Ok((false, false));
         }
 
+        // TX seq=0: client hasn't sent any application data yet
         let tx_ok = install_ktls_raw(fd, 1, cs, &tx_key, &tx_iv, 0).is_ok();
-        let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, 0).is_ok();
+        // RX seq=N: account for N post-handshake records (NSTs) the server sent
+        let rx_seq = state.server_post_hs_records;
+        let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, rx_seq).is_ok();
         Ok((tx_ok, rx_ok))
     };
     inner().unwrap_or((false, false))
@@ -961,7 +1113,9 @@ pub extern "C" fn xray_tls13_handshake(
     out: *mut XrayTls13Result,
 ) -> i32 {
     ffi_catch_i32!({
-        if out.is_null() { return -1; }
+        if out.is_null() {
+            return -1;
+        }
         if client_hello_ptr.is_null() || ecdh_privkey_ptr.is_null() {
             let out = unsafe { &mut *out };
             *out = XrayTls13Result::new();
@@ -993,6 +1147,7 @@ pub extern "C" fn xray_tls13_handshake(
                 let ss_len = state.server_app_secret.len().min(48);
                 out.server_secret[..ss_len].copy_from_slice(&state.server_app_secret[..ss_len]);
                 out.server_secret_len = ss_len as u8;
+                out.rx_seq_start = state.server_post_hs_records;
 
                 let th_len = state.transcript_hash.len().min(48);
                 out.transcript_hash[..th_len].copy_from_slice(&state.transcript_hash[..th_len]);
@@ -1033,17 +1188,93 @@ pub extern "C" fn xray_tls13_state_free(_state: *mut std::ffi::c_void) {
     })
 }
 
+static TLS13_INSTALL_CALLS: AtomicU64 = AtomicU64::new(0);
+static TLS13_INSTALL_RX_SEQ_NONZERO: AtomicU64 = AtomicU64::new(0);
+static TLS13_INSTALL_LEGACY_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+fn maybe_log_tls13_install_markers(calls: u64) {
+    if calls == 1 || calls % 64 == 0 {
+        let nonzero = TLS13_INSTALL_RX_SEQ_NONZERO.load(Ordering::Relaxed);
+        let rejected = TLS13_INSTALL_LEGACY_REJECTED.load(Ordering::Relaxed);
+        eprintln!(
+            "tls13 markers[kind=tls13-install]: calls={} rx_seq_nonzero={} legacy_api_rejected={}",
+            calls, nonzero, rejected
+        );
+    }
+}
+
+fn install_ktls_from_secrets(
+    fd: i32,
+    cipher_suite: u16,
+    client_secret: &[u8],
+    server_secret: &[u8],
+    rx_seq_start: u64,
+) -> Result<(bool, bool), Tls13Error> {
+    let alg = HashAlg::from_cipher_suite(cipher_suite)?;
+    let tx_key = hkdf_expand_label(alg, client_secret, "key", &[], key_length(cipher_suite)?)?;
+    let tx_iv = hkdf_expand_label(alg, client_secret, "iv", &[], 12)?;
+    let rx_key = hkdf_expand_label(alg, server_secret, "key", &[], key_length(cipher_suite)?)?;
+    let rx_iv = hkdf_expand_label(alg, server_secret, "iv", &[], 12)?;
+
+    if crate::tls::setup_ulp_pub(fd).is_err() {
+        return Ok((false, false));
+    }
+
+    let tx_ok = install_ktls_raw(fd, 1, cipher_suite, &tx_key, &tx_iv, 0).is_ok();
+    let rx_ok = install_ktls_raw(fd, 2, cipher_suite, &rx_key, &rx_iv, rx_seq_start).is_ok();
+    Ok((tx_ok, rx_ok))
+}
+
 /// Install kTLS using application traffic secrets directly.
 /// Called after xray_tls13_handshake succeeds — secrets are passed from Go
 /// (which copied them from the XrayTls13Result inline arrays).
+///
+/// Legacy API note: this function lacks RX sequence input and therefore cannot
+/// safely install TLS RX for TLS 1.3 when post-handshake records were consumed.
+/// It fails closed and instructs callers to use
+/// `xray_tls13_install_ktls_with_rx_seq`.
 #[no_mangle]
 pub extern "C" fn xray_tls13_install_ktls(
+    _fd: i32,
+    _cipher_suite: u16,
+    _client_secret_ptr: *const u8,
+    _client_secret_len: usize,
+    _server_secret_ptr: *const u8,
+    _server_secret_len: usize,
+    out_ktls_tx: *mut bool,
+    out_ktls_rx: *mut bool,
+) -> i32 {
+    ffi_catch_i32!({
+        if out_ktls_tx.is_null() || out_ktls_rx.is_null() {
+            return -1;
+        }
+        unsafe {
+            *out_ktls_tx = false;
+            *out_ktls_rx = false;
+        }
+        let calls = TLS13_INSTALL_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let rejected = TLS13_INSTALL_LEGACY_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        maybe_log_tls13_install_markers(calls);
+        if rejected <= 3 || rejected % 64 == 0 {
+            eprintln!(
+                "[kind=tls13.rx_seq_missing] xray_tls13_install_ktls called without rx_seq_start; refusing install. use xray_tls13_install_ktls_with_rx_seq"
+            );
+        }
+        -1
+    })
+}
+
+/// Install kTLS using TLS 1.3 application traffic secrets and explicit RX
+/// sequence start (post-handshake record count).
+#[no_mangle]
+pub extern "C" fn xray_tls13_install_ktls_with_rx_seq(
     fd: i32,
     cipher_suite: u16,
     client_secret_ptr: *const u8,
     client_secret_len: usize,
     server_secret_ptr: *const u8,
     server_secret_len: usize,
+    rx_seq_start: u64,
     out_ktls_tx: *mut bool,
     out_ktls_rx: *mut bool,
 ) -> i32 {
@@ -1054,28 +1285,21 @@ pub extern "C" fn xray_tls13_install_ktls(
         if client_secret_ptr.is_null() || server_secret_ptr.is_null() {
             return -1;
         }
-        let client_secret = unsafe { std::slice::from_raw_parts(client_secret_ptr, client_secret_len) };
-        let server_secret = unsafe { std::slice::from_raw_parts(server_secret_ptr, server_secret_len) };
-        let cs = cipher_suite;
 
-        let inner = || -> Result<(bool, bool), Tls13Error> {
-            let alg = HashAlg::from_cipher_suite(cs)?;
-            let tx_key = hkdf_expand_label(alg, client_secret, "key", &[], key_length(cs)?)?;
-            let tx_iv = hkdf_expand_label(alg, client_secret, "iv", &[], 12)?;
-            let rx_key = hkdf_expand_label(alg, server_secret, "key", &[], key_length(cs)?)?;
-            let rx_iv = hkdf_expand_label(alg, server_secret, "iv", &[], 12)?;
+        let calls = TLS13_INSTALL_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if rx_seq_start > 0 {
+            TLS13_INSTALL_RX_SEQ_NONZERO.fetch_add(1, Ordering::Relaxed);
+        }
+        maybe_log_tls13_install_markers(calls);
 
-            // ULP setup
-            if crate::tls::setup_ulp_pub(fd).is_err() {
-                return Ok((false, false));
-            }
+        let client_secret =
+            unsafe { std::slice::from_raw_parts(client_secret_ptr, client_secret_len) };
+        let server_secret =
+            unsafe { std::slice::from_raw_parts(server_secret_ptr, server_secret_len) };
 
-            let tx_ok = install_ktls_raw(fd, 1, cs, &tx_key, &tx_iv, 0).is_ok();
-            let rx_ok = install_ktls_raw(fd, 2, cs, &rx_key, &rx_iv, 0).is_ok();
-            Ok((tx_ok, rx_ok))
-        };
-
-        let (tx_ok, rx_ok) = inner().unwrap_or((false, false));
+        let (tx_ok, rx_ok) =
+            install_ktls_from_secrets(fd, cipher_suite, client_secret, server_secret, rx_seq_start)
+                .unwrap_or((false, false));
         unsafe {
             *out_ktls_tx = tx_ok;
             *out_ktls_rx = rx_ok;

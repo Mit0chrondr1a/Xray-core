@@ -172,8 +172,7 @@ fn parse_geoip_entry(data: &[u8]) -> Option<(String, IpSet)> {
 
 /// Parse a GeoIPList and return IpSet handles for requested codes.
 fn parse_geoip_list(data: &[u8], codes: &[String]) -> HashMap<String, IpSet> {
-    let code_set: std::collections::HashSet<&str> =
-        codes.iter().map(|s| s.as_str()).collect();
+    let code_set: std::collections::HashSet<&str> = codes.iter().map(|s| s.as_str()).collect();
     let mut result = HashMap::new();
     let mut pos = 0;
 
@@ -321,8 +320,7 @@ fn parse_geosite_entry(data: &[u8]) -> Option<(String, Vec<(u8, String)>)> {
 
 /// Parse a GeoSiteList and return domain lists for requested codes.
 fn parse_geosite_list(data: &[u8], codes: &[String]) -> HashMap<String, Vec<(u8, String)>> {
-    let code_set: std::collections::HashSet<&str> =
-        codes.iter().map(|s| s.as_str()).collect();
+    let code_set: std::collections::HashSet<&str> = codes.iter().map(|s| s.as_str()).collect();
     let mut result = HashMap::new();
     let mut pos = 0;
 
@@ -473,8 +471,9 @@ pub unsafe extern "C" fn xray_geoip_result_free(result: *mut GeoIpResult) {
         if !r.handles.is_null() && r.count > 0 {
             // Note: don't free the IpSet handles themselves — Go owns them
             // via SetFinalizer. Only free the handles array.
-            let layout = std::alloc::Layout::array::<*mut IpSet>(r.count).unwrap();
-            std::alloc::dealloc(r.handles as *mut u8, layout);
+            if let Ok(layout) = std::alloc::Layout::array::<*mut IpSet>(r.count) {
+                std::alloc::dealloc(r.handles as *mut u8, layout);
+            }
         }
         (*result).handles = std::ptr::null_mut();
         (*result).count = 0;
@@ -607,10 +606,11 @@ pub unsafe extern "C" fn xray_geosite_load(
                     for j in 0..i {
                         let prev = &*entries_ptr.add(j);
                         if !prev.domains.is_null() {
-                            let prev_layout =
+                            if let Ok(prev_layout) =
                                 std::alloc::Layout::array::<GeoSiteDomain>(prev.domain_count)
-                                    .unwrap();
-                            std::alloc::dealloc(prev.domains as *mut u8, prev_layout);
+                            {
+                                std::alloc::dealloc(prev.domains as *mut u8, prev_layout);
+                            }
                         }
                     }
                     std::alloc::dealloc(entries_ptr as *mut u8, entries_layout);
@@ -624,10 +624,11 @@ pub unsafe extern "C" fn xray_geosite_load(
                 for j in 0..i {
                     let prev = &*entries_ptr.add(j);
                     if !prev.domains.is_null() {
-                        let prev_layout =
+                        if let Ok(prev_layout) =
                             std::alloc::Layout::array::<GeoSiteDomain>(prev.domain_count)
-                                .unwrap();
-                        std::alloc::dealloc(prev.domains as *mut u8, prev_layout);
+                        {
+                            std::alloc::dealloc(prev.domains as *mut u8, prev_layout);
+                        }
                     }
                 }
                 std::alloc::dealloc(entries_ptr as *mut u8, entries_layout);
@@ -670,15 +671,16 @@ pub unsafe extern "C" fn xray_geosite_result_free(result: *mut GeoSiteResult) {
             for i in 0..r.count {
                 let entry = &*r.entries.add(i);
                 if !entry.domains.is_null() && entry.domain_count > 0 {
-                    let layout =
+                    if let Ok(layout) =
                         std::alloc::Layout::array::<GeoSiteDomain>(entry.domain_count)
-                            .unwrap();
-                    std::alloc::dealloc(entry.domains as *mut u8, layout);
+                    {
+                        std::alloc::dealloc(entry.domains as *mut u8, layout);
+                    }
                 }
             }
-            let entries_layout =
-                std::alloc::Layout::array::<GeoSiteCodeResult>(r.count).unwrap();
-            std::alloc::dealloc(r.entries as *mut u8, entries_layout);
+            if let Ok(entries_layout) = std::alloc::Layout::array::<GeoSiteCodeResult>(r.count) {
+                std::alloc::dealloc(r.entries as *mut u8, entries_layout);
+            }
         }
         if !r._owned_data.is_null() {
             drop(Box::from_raw(r._owned_data));
@@ -790,10 +792,7 @@ mod tests {
         assert!(!us_ipset.contains_ip(&[172, 16, 0, 1]));
 
         // Parse requesting both
-        let result = parse_geoip_list(
-            &geoip_list,
-            &["US".to_string(), "CN".to_string()],
-        );
+        let result = parse_geoip_list(&geoip_list, &["US".to_string(), "CN".to_string()]);
         assert_eq!(result.len(), 2);
 
         let cn_ipset = result.get("CN").unwrap();

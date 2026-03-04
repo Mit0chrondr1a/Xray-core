@@ -122,6 +122,9 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	dataPlacement := c.transportConfig.GetNormalizedUplinkDataPlacement()
 
 	if dataPlacement != PlacementBody {
+		if dataBody, ok := body.(io.ReadCloser); ok {
+			defer dataBody.Close()
+		}
 		maxPost := int64(c.transportConfig.GetNormalizedScMaxEachPostBytes().To)
 		if maxPost <= 0 {
 			maxPost = 1 << 20 // 1 MiB default
@@ -244,12 +247,18 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 				if h1UploadConn.UnreadedResponsesCount > 0 {
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
+						_ = h1UploadConn.Close()
 						c.closed.Store(true)
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
-					io.Copy(io.Discard, resp.Body)
-					defer resp.Body.Close()
+					_, _ = io.Copy(io.Discard, resp.Body)
+					if closeErr := resp.Body.Close(); closeErr != nil {
+						_ = h1UploadConn.Close()
+						c.closed.Store(true)
+						return fmt.Errorf("error while closing response body: %s", closeErr.Error())
+					}
 					if resp.StatusCode != 200 {
+						_ = h1UploadConn.Close()
 						return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
 					}
 				}
@@ -262,7 +271,9 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 			// the connection has been closed in the meantime.
 			if err == nil {
 				break
-			} else if newConnection {
+			}
+			_ = h1UploadConn.Close()
+			if newConnection {
 				return err
 			}
 		}

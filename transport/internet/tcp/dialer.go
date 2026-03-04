@@ -139,11 +139,21 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			} else {
 				err = conn.(*tls.UConn).HandshakeContext(ctx)
 			}
-		} else if shouldUseNativeTLSClient(nativeTLSConfig) {
+		} else if shouldUseNativeTLSClient(nativeTLSConfig) && !session.VisionFlowFromContext(ctx) {
 			conn, err = rustClientWithContext(ctx, conn, nativeTLSConfig, dest)
 		} else {
+			if shouldUseNativeTLSClient(nativeTLSConfig) {
+				errors.LogDebug(ctx, "Rust native TLS client skipped: Vision flow active — kTLS incompatible")
+			}
 			conn = tls.Client(conn, tlsConfig)
-			err = conn.(*tls.Conn).HandshakeAndEnableKTLS(ctx)
+			if session.VisionFlowFromContext(ctx) || (dest.Network == net.Network_TCP && (dest.Port == net.Port(53) || dest.Port == net.Port(853))) {
+				// Vision flows and DNS control paths are latency-sensitive and
+				// short-lived; skip kTLS promotion to avoid kernel handover
+				// stalls/cork-pop on small early packets.
+				err = conn.(*tls.Conn).HandshakeContext(ctx)
+			} else {
+				err = conn.(*tls.Conn).HandshakeAndEnableKTLS(ctx)
+			}
 		}
 		if err != nil {
 			if isFromMitmVerify {

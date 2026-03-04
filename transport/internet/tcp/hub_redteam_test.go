@@ -263,13 +263,13 @@ func TestVuln_CWE_252_RealityAuthFallbackSocketState(t *testing.T) {
 
 	oldGetRealityBlacklistFn := getRealityBlacklistFn
 	oldRealityServerFn := realityServerFn
-	oldDoRustRealityServerFn := doRustRealityServerFn
+	oldDoRustRealityDeferredFn := doRustRealityDeferredFn
 	oldUseNativeRealityServerFn := useNativeRealityServerFn
 	defer func() {
 		_ = ln.Close()
 		getRealityBlacklistFn = oldGetRealityBlacklistFn
 		realityServerFn = oldRealityServerFn
-		doRustRealityServerFn = oldDoRustRealityServerFn
+		doRustRealityDeferredFn = oldDoRustRealityDeferredFn
 		useNativeRealityServerFn = oldUseNativeRealityServerFn
 	}()
 
@@ -285,7 +285,7 @@ func TestVuln_CWE_252_RealityAuthFallbackSocketState(t *testing.T) {
 
 	var fallbackCalls atomic.Int32
 	var addConnCalls atomic.Int32
-	doRustRealityServerFn = func(*Listener, int) (*native.TlsResult, error) {
+	doRustRealityDeferredFn = func(*Listener, int) (*native.DeferredResult, error) {
 		return nil, fmt.Errorf("wrapped rust auth failure: %w", native.ErrRealityAuthFailed)
 	}
 	realityServerFn = func(net.Conn, *goreality.Config) (net.Conn, error) {

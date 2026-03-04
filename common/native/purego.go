@@ -4,15 +4,22 @@ package native
 
 import (
 	"errors"
+	"strings"
 	"time"
 	"unsafe"
 
 	"lukechampine.com/blake3"
+
+	"github.com/xtls/xray-core/common/pipeline"
 )
 
 // Available returns false when the native Rust library is not linked.
 func Available() bool {
 	return false
+}
+
+func CapabilitiesSummary() pipeline.CapabilitySummary {
+	return pipeline.CapabilitySummary{SpliceSupported: true}
 }
 
 // EbpfAvailable reports whether native eBPF support is available.
@@ -24,6 +31,29 @@ var errNotAvailable = errors.New("native TLS not available (build without CGO or
 
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
 var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
+
+// ErrRealityDeferredPeekTimeout indicates deferred REALITY failed during the
+// pre-auth MSG_PEEK phase and callers may safely fall back to Go REALITY.
+var ErrRealityDeferredPeekTimeout = errors.New("REALITY deferred peek timeout: needs fallback")
+
+func isRealityDeferredPeekTimeoutMsg(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "peek_exact: receive timeout") ||
+		strings.Contains(m, "peek_exact: handshake timeout exceeded") ||
+		strings.Contains(m, "peek_exact: short read after")
+}
+
+// IsRealityDeferredPeekTimeout reports whether err represents a deferred
+// REALITY pre-auth MSG_PEEK timeout/short-read condition.
+func IsRealityDeferredPeekTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRealityDeferredPeekTimeout) {
+		return true
+	}
+	return isRealityDeferredPeekTimeoutMsg(err.Error())
+}
 
 // --- TLS Types ---
 
@@ -39,6 +69,7 @@ type TlsResult struct {
 	Version     uint16
 	CipherSuite uint16
 	ALPN        string
+	RxSeqStart  uint64
 	StateHandle *TlsStateHandle
 	TxSecret    []byte
 	RxSecret    []byte
@@ -132,6 +163,34 @@ func RealityServerHandshake(int, *RealityConfigHandle) (*TlsResult, error) {
 func RealityServerHandshakeWithTimeout(int, *RealityConfigHandle, time.Duration) (*TlsResult, error) {
 	return nil, errNotAvailable
 }
+
+// --- Deferred REALITY Session Stubs ---
+
+type DeferredSessionHandle struct{}
+type DeferredResult struct {
+	Handle      *DeferredSessionHandle
+	Version     uint16
+	CipherSuite uint16
+	ALPN        string
+	SNI         string
+}
+
+func RealityServerDeferred(int, *RealityConfigHandle, time.Duration) (*DeferredResult, error) {
+	return nil, errNotAvailable
+}
+func TlsServerDeferred(int, *TlsConfigHandle, time.Duration) (*DeferredResult, error) {
+	return nil, errNotAvailable
+}
+func DeferredRead(*DeferredSessionHandle, []byte) (int, error)  { return 0, errNotAvailable }
+func DeferredWrite(*DeferredSessionHandle, []byte) (int, error) { return 0, errNotAvailable }
+func DeferredDrainAndDetach(*DeferredSessionHandle) ([]byte, []byte, error) {
+	return nil, nil, errNotAvailable
+}
+func DeferredEnableKTLS(*DeferredSessionHandle) (*TlsResult, error) {
+	return nil, errNotAvailable
+}
+func DeferredRestoreNonBlock(*DeferredSessionHandle) error { return nil }
+func DeferredFree(*DeferredSessionHandle)                  {}
 
 // --- Blake3 (delegates to lukechampine.com/blake3) ---
 
@@ -271,6 +330,18 @@ func GeoIPLoad(string, []string) ([]*IpSetHandle, error)     { return nil, errNo
 func GeoSiteLoad(string, []string) ([][]GeoSiteEntry, error) { return nil, errNotAvailable }
 
 // --- eBPF Stubs ---
+
+// SkMsgCapability indicates which SK_MSG tier the Rust/Aya loader achieved.
+type SkMsgCapability int
+
+const (
+	SkMsgFull     SkMsgCapability = 0
+	SkMsgCorkOnly SkMsgCapability = 1
+	SkMsgNone     SkMsgCapability = 2
+)
+
+// EbpfSkMsgCapability returns SkMsgNone when native eBPF is not available.
+func EbpfSkMsgCapability() SkMsgCapability { return SkMsgNone }
 
 func EbpfSetup(string, uint32, uint32) error                  { return errNotAvailable }
 func EbpfTeardown() error                                     { return errNotAvailable }

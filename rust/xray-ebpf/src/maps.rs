@@ -27,3 +27,10 @@ pub static POLICY_MAP: HashMap<u64, u32> = HashMap::with_max_entries(65536, 0);
 // Policy flag constants (must match Go's PolicyAllowRedirect etc.)
 pub const POLICY_ALLOW_REDIRECT: u32 = 1 << 0;
 pub const POLICY_USE_INGRESS: u32 = 1 << 1;
+
+/// Cork threshold: batch small writes into chunks of this size.
+/// 1400 bytes is just under typical MTU (1500) minus TCP/IP headers,
+/// ensuring batched data fits in a single TCP segment.
+///
+/// Shared by both xray_sk_msg (full) and xray_sk_msg_cork (fallback).
+pub const CORK_THRESHOLD: u32 = 1400;

@@ -83,9 +83,7 @@ impl MphTable {
 /// Create a new empty MPH table.
 #[no_mangle]
 pub extern "C" fn xray_mph_new() -> *mut MphTable {
-    ffi_catch_ptr!({
-        Box::into_raw(Box::new(MphTable::new()))
-    })
+    ffi_catch_ptr!({ Box::into_raw(Box::new(MphTable::new())) })
 }
 
 /// Add a pattern to the MPH table.
@@ -192,8 +190,14 @@ mod tests {
         let mut t = MphTable::new();
         t.add_pattern("Example.COM", PATTERN_FULL);
         t.build();
-        assert!(t.match_input("example.com"), "lowered input matches lowered pattern");
-        assert!(!t.match_input("EXAMPLE.COM"), "uppercase input does not match (expected)");
+        assert!(
+            t.match_input("example.com"),
+            "lowered input matches lowered pattern"
+        );
+        assert!(
+            !t.match_input("EXAMPLE.COM"),
+            "uppercase input does not match (expected)"
+        );
     }
 
     #[test]

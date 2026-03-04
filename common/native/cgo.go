@@ -25,6 +25,7 @@ struct xray_tls_result {
     uint8_t  secret_len;
     uint8_t* drained_ptr;
     uint32_t drained_len;
+    uint64_t rx_seq_start;
 };
 
 // TLS config builder
@@ -43,6 +44,7 @@ extern void    xray_tls_config_free(void* cfg);
 
 // TLS handshake + kTLS
 extern int32_t xray_tls_handshake(int fd, const void* cfg, bool is_client, uint32_t handshake_timeout_ms, struct xray_tls_result* out);
+extern int32_t xray_tls_handshake_into(int fd, const void* cfg, bool is_client, uint32_t handshake_timeout_ms, struct xray_tls_result* out, uint8_t* drained_buf, size_t drained_cap);
 extern int32_t xray_tls_key_update(void* state_handle);
 extern void    xray_tls_state_free(void* state_handle);
 extern void    xray_tls_drained_free(uint8_t* ptr, size_t len);
@@ -69,6 +71,33 @@ extern void    xray_reality_config_add_short_id(void* cfg, const uint8_t* id, si
 extern int32_t xray_reality_client_connect(int fd, const uint8_t* client_hello_raw, size_t hello_len, const uint8_t* ecdh_privkey, size_t privkey_len, const void* reality_config, struct xray_tls_result* out);
 extern int32_t xray_reality_server_accept(int fd, const void* reality_config, struct xray_tls_result* out);
 extern int32_t xray_reality_server_handshake(int fd, const void* reality_config, uint32_t handshake_timeout_ms, struct xray_tls_result* out);
+extern int32_t xray_reality_server_handshake_into(int fd, const void* reality_config, uint32_t handshake_timeout_ms, struct xray_tls_result* out, uint8_t* drained_buf, size_t drained_cap);
+
+// Deferred REALITY handshake (no kTLS install)
+struct xray_deferred_result {
+    void*    handle;
+    uint16_t version;
+    uint16_t cipher_suite;
+    uint8_t  alpn[32];
+    uint8_t  sni[256];
+    int32_t  error_code;
+    char     error_msg[256];
+};
+
+extern int32_t xray_reality_server_deferred(int fd, const void* reality_config, uint32_t handshake_timeout_ms, struct xray_deferred_result* out);
+extern int32_t xray_tls_server_deferred(int fd, const void* cfg, uint32_t handshake_timeout_ms, struct xray_deferred_result* out);
+extern int32_t xray_deferred_read(void* handle, uint8_t* buf, size_t len, size_t* out_n);
+extern int32_t xray_deferred_write(void* handle, const uint8_t* buf, size_t len, size_t* out_n);
+extern int32_t xray_deferred_drain_and_detach(void* handle, uint8_t** out_plaintext_ptr, size_t* out_plaintext_len, uint8_t** out_raw_ptr, size_t* out_raw_len);
+extern int32_t xray_deferred_drain_and_detach_into(
+    void* handle,
+    uint8_t* plaintext_buf, size_t plaintext_cap, size_t* out_plaintext_len, uint8_t** out_plaintext_ptr,
+    uint8_t* raw_buf, size_t raw_cap, size_t* out_raw_len, uint8_t** out_raw_ptr
+);
+extern int32_t xray_deferred_enable_ktls(void* handle, struct xray_tls_result* out);
+extern int32_t xray_deferred_enable_ktls_into(void* handle, struct xray_tls_result* out, uint8_t* drained_buf, size_t drained_cap);
+extern int32_t xray_deferred_restore_nonblock(void* handle);
+extern void    xray_deferred_free(void* handle);
 
 // Blake3
 extern void xray_blake3_derive_key(uint8_t* out, size_t out_len,
@@ -185,25 +214,36 @@ extern void xray_geoip_result_free(struct xray_geoip_result* result);
 extern int32_t xray_geosite_load(const uint8_t* path, size_t path_len, const uint8_t** codes, const size_t* code_lens, size_t num_codes, struct xray_geosite_result* result);
 extern void xray_geosite_result_free(struct xray_geosite_result* result);
 
-// eBPF sockmap management
-extern int32_t xray_ebpf_available();
-extern int32_t xray_ebpf_setup(const char* pin_path, uint32_t max_entries, uint32_t cork_threshold);
-extern int32_t xray_ebpf_teardown();
-extern int32_t xray_ebpf_register_pair(int32_t inbound_fd, int32_t outbound_fd, uint64_t inbound_cookie, uint64_t outbound_cookie, uint32_t policy_flags);
-extern int32_t xray_ebpf_unregister_pair(uint64_t inbound_cookie, uint64_t outbound_cookie);
+	// eBPF sockmap management
+	extern int32_t xray_ebpf_available();
+	extern int32_t xray_ebpf_setup(const char* pin_path, uint32_t max_entries, uint32_t cork_threshold);
+	extern int32_t xray_ebpf_teardown();
+	extern int32_t xray_ebpf_register_pair(int32_t inbound_fd, int32_t outbound_fd, uint64_t inbound_cookie, uint64_t outbound_cookie, uint32_t policy_flags);
+	extern int32_t xray_ebpf_unregister_pair(uint64_t inbound_cookie, uint64_t outbound_cookie);
+
+	// Pipeline capability summary
+	struct xray_capability_summary {
+	    bool ktls_supported;
+	    bool sockmap_supported;
+	    bool splice_supported;
+	};
+	extern int32_t xray_capabilities_summary(struct xray_capability_summary* out);
 */
 import "C"
 
 import (
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/xtls/xray-core/common/pipeline"
 	"lukechampine.com/blake3"
 )
 
@@ -218,6 +258,20 @@ func Available() bool {
 	return true
 }
 
+// CapabilitiesSummary fetches the cached capability view from Rust (one-shot probe later).
+func CapabilitiesSummary() pipeline.CapabilitySummary {
+	var out C.struct_xray_capability_summary
+	rc := C.xray_capabilities_summary(&out)
+	if rc != 0 {
+		return pipeline.CapabilitySummary{SpliceSupported: true}
+	}
+	return pipeline.CapabilitySummary{
+		KTLSSupported:    bool(out.ktls_supported),
+		SockmapSupported: bool(out.sockmap_supported),
+		SpliceSupported:  bool(out.splice_supported),
+	}
+}
+
 // EbpfAvailable reports whether Rust eBPF bytecode support is compiled in.
 func EbpfAvailable() bool {
 	return C.xray_ebpf_available() != 0
@@ -226,7 +280,30 @@ func EbpfAvailable() bool {
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
 var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 
+// ErrRealityDeferredPeekTimeout indicates deferred REALITY failed during the
+// pre-auth MSG_PEEK phase and callers may safely fall back to Go REALITY.
+var ErrRealityDeferredPeekTimeout = errors.New("REALITY deferred peek timeout: needs fallback")
+
 const defaultNativeHandshakeTimeout = 30 * time.Second
+
+func isRealityDeferredPeekTimeoutMsg(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "peek_exact: receive timeout") ||
+		strings.Contains(m, "peek_exact: handshake timeout exceeded") ||
+		strings.Contains(m, "peek_exact: short read after")
+}
+
+// IsRealityDeferredPeekTimeout reports whether err represents a deferred
+// REALITY pre-auth MSG_PEEK timeout/short-read condition.
+func IsRealityDeferredPeekTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRealityDeferredPeekTimeout) {
+		return true
+	}
+	return isRealityDeferredPeekTimeoutMsg(err.Error())
+}
 
 func timeoutMillis(timeout time.Duration) C.uint32_t {
 	if timeout <= 0 {
@@ -242,9 +319,37 @@ func timeoutMillis(timeout time.Duration) C.uint32_t {
 	return C.uint32_t(ms)
 }
 
+func cleanupTLSResultOnError(cResult *C.struct_xray_tls_result) {
+	if cResult == nil {
+		return
+	}
+	if cResult.state_handle != nil {
+		C.xray_tls_state_free(cResult.state_handle)
+		cResult.state_handle = nil
+	}
+	if cResult.drained_ptr != nil {
+		C.xray_tls_drained_free(cResult.drained_ptr, C.size_t(cResult.drained_len))
+		cResult.drained_ptr = nil
+		cResult.drained_len = 0
+	}
+}
+
+func cleanupDeferredResultOnError(cResult *C.struct_xray_deferred_result) {
+	if cResult == nil {
+		return
+	}
+	if cResult.handle != nil {
+		C.xray_deferred_free(cResult.handle)
+		cResult.handle = nil
+	}
+}
+
 // emptyCodeSentinel is a non-null address for empty country-code entries
 // in GeoIP/GeoSite FFI arrays, preventing UB from NULL in from_raw_parts.
 var emptyCodeSentinel byte
+
+const deferredDrainInlineCap = 4 * 1024
+const tlsResultDrainedInlineCap = 4 * 1024
 
 // --- TLS Types ---
 
@@ -265,6 +370,7 @@ type TlsResult struct {
 	Version     uint16
 	CipherSuite uint16
 	ALPN        string
+	RxSeqStart  uint64
 	StateHandle *TlsStateHandle
 	TxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
 	RxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
@@ -432,20 +538,25 @@ func TlsHandshakeWithTimeout(fd int, cfg *TlsConfigHandle, isClient bool, handsh
 	if cfg == nil {
 		return nil, errors.New("native: nil config handle")
 	}
+	var drainedInline [tlsResultDrainedInlineCap]byte
 	var cResult C.struct_xray_tls_result
-	rc := C.xray_tls_handshake(
+	rc := C.xray_tls_handshake_into(
 		C.int(fd),
 		cfg.ptr,
 		C.bool(isClient),
 		timeoutMillis(handshakeTimeout),
 		&cResult,
+		(*C.uint8_t)(unsafe.Pointer(&drainedInline[0])),
+		C.size_t(tlsResultDrainedInlineCap),
 	)
 	runtime.KeepAlive(cfg)
+	runtime.KeepAlive(drainedInline)
 	if rc != 0 {
+		cleanupTLSResultOnError(&cResult)
 		errMsg := C.GoString(&cResult.error_msg[0])
 		return nil, errors.New("native TLS handshake: " + errMsg)
 	}
-	return extractTlsResult(&cResult), nil
+	return extractTlsResultWithInline(&cResult, drainedInline[:]), nil
 }
 
 func TlsKeyUpdate(h *TlsStateHandle) error {
@@ -635,8 +746,11 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 	if cfg == nil {
 		return nil, errors.New("native: nil reality config handle")
 	}
-	if len(clientHelloRaw) == 0 || len(ecdhPrivkey) == 0 {
-		return nil, errors.New("native: empty client hello or privkey")
+	if len(clientHelloRaw) == 0 {
+		return nil, errors.New("native: empty client hello")
+	}
+	if len(ecdhPrivkey) != 32 {
+		return nil, fmt.Errorf("native: invalid reality ecdh privkey length: got %d want 32", len(ecdhPrivkey))
 	}
 	var cResult C.struct_xray_tls_result
 	rc := C.xray_reality_client_connect(
@@ -650,6 +764,7 @@ func RealityClientConnect(fd int, clientHelloRaw []byte, ecdhPrivkey []byte, cfg
 	runtime.KeepAlive(ecdhPrivkey)
 	runtime.KeepAlive(cfg)
 	if rc != 0 {
+		cleanupTLSResultOnError(&cResult)
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
 		if code == 1 {
@@ -668,6 +783,7 @@ func RealityServerAccept(fd int, cfg *RealityConfigHandle) (*TlsResult, error) {
 	rc := C.xray_reality_server_accept(C.int(fd), cfg.ptr, &cResult)
 	runtime.KeepAlive(cfg)
 	if rc != 0 {
+		cleanupTLSResultOnError(&cResult)
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
 		if code == 1 {
@@ -686,10 +802,20 @@ func RealityServerHandshakeWithTimeout(fd int, cfg *RealityConfigHandle, handsha
 	if cfg == nil {
 		return nil, errors.New("native: nil reality config handle")
 	}
+	var drainedInline [tlsResultDrainedInlineCap]byte
 	var cResult C.struct_xray_tls_result
-	rc := C.xray_reality_server_handshake(C.int(fd), cfg.ptr, timeoutMillis(handshakeTimeout), &cResult)
+	rc := C.xray_reality_server_handshake_into(
+		C.int(fd),
+		cfg.ptr,
+		timeoutMillis(handshakeTimeout),
+		&cResult,
+		(*C.uint8_t)(unsafe.Pointer(&drainedInline[0])),
+		C.size_t(tlsResultDrainedInlineCap),
+	)
 	runtime.KeepAlive(cfg)
+	runtime.KeepAlive(drainedInline)
 	if rc != 0 {
+		cleanupTLSResultOnError(&cResult)
 		errMsg := C.GoString(&cResult.error_msg[0])
 		code := int32(cResult.error_code)
 		if code == 1 {
@@ -697,17 +823,324 @@ func RealityServerHandshakeWithTimeout(fd int, cfg *RealityConfigHandle, handsha
 		}
 		return nil, errors.New("native REALITY server handshake: " + errMsg)
 	}
-	return extractTlsResult(&cResult), nil
+	return extractTlsResultWithInline(&cResult, drainedInline[:]), nil
+}
+
+// --- Deferred REALITY Session ---
+
+// DeferredSessionHandle is an opaque handle to a Rust deferred REALITY session.
+type DeferredSessionHandle struct {
+	ptr unsafe.Pointer
+}
+
+// DeferredResult contains the result of a deferred REALITY handshake.
+type DeferredResult struct {
+	Handle      *DeferredSessionHandle
+	Version     uint16
+	CipherSuite uint16
+	ALPN        string
+	SNI         string
+}
+
+// RealityServerDeferred performs REALITY auth + handshake without installing kTLS.
+// Returns a deferred session that supports Read/Write through rustls.
+func RealityServerDeferred(fd int, cfg *RealityConfigHandle, timeout time.Duration) (*DeferredResult, error) {
+	if cfg == nil {
+		return nil, errors.New("native: nil reality config handle")
+	}
+	var cResult C.struct_xray_deferred_result
+	rc := C.xray_reality_server_deferred(C.int(fd), cfg.ptr, timeoutMillis(timeout), &cResult)
+	runtime.KeepAlive(cfg)
+	if rc != 0 {
+		cleanupDeferredResultOnError(&cResult)
+		errMsg := C.GoString(&cResult.error_msg[0])
+		code := int32(cResult.error_code)
+		if code == 1 {
+			return nil, fmt.Errorf("%w: %s", ErrRealityAuthFailed, errMsg)
+		}
+		if isRealityDeferredPeekTimeoutMsg(errMsg) {
+			return nil, fmt.Errorf("%w: %s", ErrRealityDeferredPeekTimeout, errMsg)
+		}
+		return nil, errors.New("native REALITY deferred: " + errMsg)
+	}
+
+	result := &DeferredResult{
+		Version:     uint16(cResult.version),
+		CipherSuite: uint16(cResult.cipher_suite),
+	}
+	if cResult.handle != nil {
+		result.Handle = &DeferredSessionHandle{ptr: cResult.handle}
+	}
+
+	// Extract ALPN (null-terminated string in 32-byte buffer)
+	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
+	for i, b := range alpnBytes {
+		if b == 0 {
+			result.ALPN = string(alpnBytes[:i])
+			break
+		}
+	}
+
+	// Extract SNI (null-terminated string in 256-byte buffer)
+	sniBytes := C.GoBytes(unsafe.Pointer(&cResult.sni[0]), 256)
+	for i, b := range sniBytes {
+		if b == 0 {
+			result.SNI = string(sniBytes[:i])
+			break
+		}
+	}
+
+	return result, nil
+}
+
+// TlsServerDeferred performs a regular TLS server handshake via rustls without
+// installing kTLS. Returns a deferred session (same type as REALITY deferred)
+// that the protocol handler can later promote to kTLS or keep as rustls.
+func TlsServerDeferred(fd int, cfg *TlsConfigHandle, timeout time.Duration) (*DeferredResult, error) {
+	if cfg == nil {
+		return nil, errors.New("native: nil TLS config handle")
+	}
+	var cResult C.struct_xray_deferred_result
+	rc := C.xray_tls_server_deferred(C.int(fd), cfg.ptr, timeoutMillis(timeout), &cResult)
+	runtime.KeepAlive(cfg)
+	if rc != 0 {
+		cleanupDeferredResultOnError(&cResult)
+		errMsg := C.GoString(&cResult.error_msg[0])
+		return nil, errors.New("native TLS server deferred: " + errMsg)
+	}
+
+	result := &DeferredResult{
+		Version:     uint16(cResult.version),
+		CipherSuite: uint16(cResult.cipher_suite),
+	}
+	if cResult.handle != nil {
+		result.Handle = &DeferredSessionHandle{ptr: cResult.handle}
+	}
+
+	// Extract ALPN (null-terminated string in 32-byte buffer)
+	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
+	for i, b := range alpnBytes {
+		if b == 0 {
+			result.ALPN = string(alpnBytes[:i])
+			break
+		}
+	}
+
+	// Extract SNI (null-terminated string in 256-byte buffer)
+	sniBytes := C.GoBytes(unsafe.Pointer(&cResult.sni[0]), 256)
+	for i, b := range sniBytes {
+		if b == 0 {
+			result.SNI = string(sniBytes[:i])
+			break
+		}
+	}
+
+	return result, nil
+}
+
+// DeferredRead reads decrypted data through the deferred session's rustls connection.
+func DeferredRead(handle *DeferredSessionHandle, buf []byte) (int, error) {
+	if handle == nil || handle.ptr == nil {
+		return 0, errors.New("native: nil deferred session handle")
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	var outN C.size_t
+	rc := C.xray_deferred_read(
+		handle.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+		C.size_t(len(buf)),
+		&outN,
+	)
+	runtime.KeepAlive(handle)
+	runtime.KeepAlive(buf)
+	if rc != 0 {
+		switch rc {
+		case 1:
+			return int(outN), io.EOF
+		case 2:
+			return int(outN), io.ErrClosedPipe
+		default:
+			return 0, errors.New("native: deferred read failed")
+		}
+	}
+	return int(outN), nil
+}
+
+// DeferredWrite writes plaintext data through the deferred session's rustls connection.
+func DeferredWrite(handle *DeferredSessionHandle, buf []byte) (int, error) {
+	if handle == nil || handle.ptr == nil {
+		return 0, errors.New("native: nil deferred session handle")
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	var outN C.size_t
+	rc := C.xray_deferred_write(
+		handle.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+		C.size_t(len(buf)),
+		&outN,
+	)
+	runtime.KeepAlive(handle)
+	runtime.KeepAlive(buf)
+	if rc != 0 {
+		switch rc {
+		case 1:
+			return int(outN), io.EOF
+		case 2:
+			return int(outN), io.ErrClosedPipe
+		default:
+			return 0, io.ErrClosedPipe
+		}
+	}
+	return int(outN), nil
+}
+
+// DeferredDrainAndDetach drains rustls buffered plaintext and raw read-ahead
+// bytes from a deferred session, then detaches the rustls state from the
+// socket. On success, the handle remains allocated but detached; callers should
+// stop using it and switch to the raw socket.
+func DeferredDrainAndDetach(handle *DeferredSessionHandle) ([]byte, []byte, error) {
+	if handle == nil || handle.ptr == nil {
+		return nil, nil, errors.New("native: nil deferred session handle")
+	}
+	var plaintextInline [deferredDrainInlineCap]byte
+	var rawInline [deferredDrainInlineCap]byte
+	var plaintextPtr *C.uint8_t
+	var plaintextLen C.size_t
+	var rawPtr *C.uint8_t
+	var rawLen C.size_t
+	rc := C.xray_deferred_drain_and_detach_into(
+		handle.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&plaintextInline[0])),
+		C.size_t(deferredDrainInlineCap),
+		&plaintextLen,
+		&plaintextPtr,
+		(*C.uint8_t)(unsafe.Pointer(&rawInline[0])),
+		C.size_t(deferredDrainInlineCap),
+		&rawLen,
+		&rawPtr,
+	)
+	runtime.KeepAlive(handle)
+	runtime.KeepAlive(plaintextInline)
+	runtime.KeepAlive(rawInline)
+	if rc != 0 {
+		// Defensive cleanup in case Rust returned partially populated outputs.
+		if plaintextPtr != nil && plaintextLen > 0 {
+			C.xray_tls_drained_free(plaintextPtr, plaintextLen)
+		}
+		if rawPtr != nil && rawLen > 0 {
+			C.xray_tls_drained_free(rawPtr, rawLen)
+		}
+		return nil, nil, errors.New("native: deferred drain_and_detach failed")
+	}
+	var plaintext []byte
+	if plaintextPtr != nil {
+		plaintext = drainBytesFromNative(plaintextPtr, plaintextLen)
+	} else if plaintextLen > 0 {
+		if int(plaintextLen) > len(plaintextInline) {
+			return nil, nil, errors.New("native: deferred drain_and_detach plaintext length overflow")
+		}
+		n := int(plaintextLen)
+		plaintext = plaintextInline[:n:n]
+	}
+
+	var rawAhead []byte
+	if rawPtr != nil {
+		rawAhead = drainBytesFromNative(rawPtr, rawLen)
+	} else if rawLen > 0 {
+		if int(rawLen) > len(rawInline) {
+			return nil, nil, errors.New("native: deferred drain_and_detach raw length overflow")
+		}
+		n := int(rawLen)
+		rawAhead = rawInline[:n:n]
+	}
+	return plaintext, rawAhead, nil
+}
+
+// DeferredEnableKTLS consumes the deferred session and installs kTLS on the socket.
+// After this call, the handle is invalid and must not be used.
+func DeferredEnableKTLS(handle *DeferredSessionHandle) (*TlsResult, error) {
+	if handle == nil || handle.ptr == nil {
+		return nil, errors.New("native: nil deferred session handle")
+	}
+	ptr := handle.ptr
+	handle.ptr = nil // consumed — prevent double-free
+	var drainedInline [tlsResultDrainedInlineCap]byte
+	var cResult C.struct_xray_tls_result
+	rc := C.xray_deferred_enable_ktls_into(
+		ptr,
+		&cResult,
+		(*C.uint8_t)(unsafe.Pointer(&drainedInline[0])),
+		C.size_t(tlsResultDrainedInlineCap),
+	)
+	runtime.KeepAlive(drainedInline)
+	if rc != 0 {
+		cleanupTLSResultOnError(&cResult)
+		errMsg := C.GoString(&cResult.error_msg[0])
+		return nil, errors.New("native: deferred enable_ktls: " + errMsg)
+	}
+	return extractTlsResultWithInline(&cResult, drainedInline[:]), nil
+}
+
+// DeferredRestoreNonBlock restores O_NONBLOCK on the deferred session's fd
+// without detaching. After this call, Rust's reader/writer handle EAGAIN via
+// poll(2), and Go can safely write to the raw socket without blocking.
+func DeferredRestoreNonBlock(handle *DeferredSessionHandle) error {
+	if handle == nil || handle.ptr == nil {
+		return errors.New("native: nil deferred session handle")
+	}
+	rc := C.xray_deferred_restore_nonblock(handle.ptr)
+	runtime.KeepAlive(handle)
+	if rc != 0 {
+		return errors.New("native: deferred restore_nonblock failed")
+	}
+	return nil
+}
+
+// DeferredFree releases a deferred session without enabling kTLS.
+// Used for Vision flows where kTLS is not wanted.
+func DeferredFree(handle *DeferredSessionHandle) {
+	if handle == nil {
+		return
+	}
+	ptr := handle.ptr
+	handle.ptr = nil
+	if ptr != nil {
+		C.xray_deferred_free(ptr)
+	}
+}
+
+func drainBytesFromNative(ptr *C.uint8_t, n C.size_t) []byte {
+	if ptr == nil || n == 0 {
+		return nil
+	}
+	if n > C.size_t(1<<30) {
+		C.xray_tls_drained_free(ptr, n)
+		return nil
+	}
+	out := C.GoBytes(unsafe.Pointer(ptr), C.int(n))
+	C.xray_tls_drained_free(ptr, n)
+	return out
 }
 
 // extractTlsResult populates a TlsResult from the C struct, extracting ALPN,
 // state handle, secrets, and drained data. Consolidates duplicated extraction logic.
 func extractTlsResult(cResult *C.struct_xray_tls_result) *TlsResult {
+	return extractTlsResultWithInline(cResult, nil)
+}
+
+// extractTlsResultWithInline is extractTlsResult plus optional inline drained
+// bytes that were written directly into a Go-owned buffer by Rust.
+func extractTlsResultWithInline(cResult *C.struct_xray_tls_result, drainedInline []byte) *TlsResult {
 	result := &TlsResult{
 		KtlsTx:      bool(cResult.ktls_tx),
 		KtlsRx:      bool(cResult.ktls_rx),
 		Version:     uint16(cResult.version),
 		CipherSuite: uint16(cResult.cipher_suite),
+		RxSeqStart:  uint64(cResult.rx_seq_start),
 	}
 	// Extract ALPN (null-terminated string in 32-byte buffer)
 	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
@@ -722,7 +1155,7 @@ func extractTlsResult(cResult *C.struct_xray_tls_result) *TlsResult {
 		runtime.SetFinalizer(result.StateHandle, (*TlsStateHandle).release)
 	}
 	extractSecrets(result, cResult)
-	extractDrained(result, cResult)
+	extractDrained(result, cResult, drainedInline)
 	return result
 }
 
@@ -747,11 +1180,27 @@ func extractSecrets(result *TlsResult, cResult *C.struct_xray_tls_result) {
 }
 
 // extractDrained copies drained plaintext from the C result and frees the Rust buffer.
-func extractDrained(result *TlsResult, cResult *C.struct_xray_tls_result) {
-	if cResult.drained_ptr != nil && cResult.drained_len > 0 && cResult.drained_len <= 1<<30 {
-		result.DrainedData = C.GoBytes(unsafe.Pointer(cResult.drained_ptr), C.int(cResult.drained_len))
-		C.xray_tls_drained_free(cResult.drained_ptr, C.size_t(cResult.drained_len))
+func extractDrained(result *TlsResult, cResult *C.struct_xray_tls_result, drainedInline []byte) {
+	if cResult.drained_len == 0 {
+		return
 	}
+	if cResult.drained_ptr == nil {
+		if len(drainedInline) >= int(cResult.drained_len) {
+			n := int(cResult.drained_len)
+			result.DrainedData = drainedInline[:n:n]
+		}
+		return
+	}
+	if cResult.drained_len > 1<<30 {
+		C.xray_tls_drained_free(cResult.drained_ptr, C.size_t(cResult.drained_len))
+		cResult.drained_ptr = nil
+		cResult.drained_len = 0
+		return
+	}
+	result.DrainedData = C.GoBytes(unsafe.Pointer(cResult.drained_ptr), C.int(cResult.drained_len))
+	C.xray_tls_drained_free(cResult.drained_ptr, C.size_t(cResult.drained_len))
+	cResult.drained_ptr = nil
+	cResult.drained_len = 0
 }
 
 // --- Blake3 ---
@@ -1239,6 +1688,7 @@ func AeadOpen(h *AeadHandle, nonce, aad, ciphertext []byte) ([]byte, error) {
 
 // AeadSealTo encrypts plaintext directly into dst.
 // dst must have len >= len(plaintext)+overhead.
+// dst may alias plaintext (in-place mutation is supported).
 // Returns the number of bytes written.
 func AeadSealTo(h *AeadHandle, nonce, aad, plaintext, dst []byte) (int, error) {
 	if h == nil {
@@ -1288,6 +1738,7 @@ func AeadSealTo(h *AeadHandle, nonce, aad, plaintext, dst []byte) (int, error) {
 
 // AeadOpenTo decrypts ciphertext directly into dst.
 // dst must have len >= len(ciphertext) (for in-place decryption).
+// dst may alias ciphertext (in-place mutation is supported).
 // Returns the number of plaintext bytes written.
 func AeadOpenTo(h *AeadHandle, nonce, aad, ciphertext, dst []byte) (int, error) {
 	if h == nil {
@@ -1586,6 +2037,21 @@ func GeoSiteLoad(path string, codes []string) ([][]GeoSiteEntry, error) {
 
 // --- eBPF FFI ---
 
+// SkMsgCapability indicates which SK_MSG tier the Rust/Aya loader achieved.
+type SkMsgCapability int
+
+const (
+	SkMsgFull     SkMsgCapability = 0 // cork + cookie lookup + redirect
+	SkMsgCorkOnly SkMsgCapability = 1 // cork batching only, no redirect
+	SkMsgNone     SkMsgCapability = 2 // no SK_MSG loaded
+)
+
+// ebpfSkMsgCapability records the SK_MSG tier from the last successful setup.
+var ebpfSkMsgCapability SkMsgCapability = SkMsgNone
+
+// EbpfSkMsgCapability returns the SK_MSG capability level from the Rust loader.
+func EbpfSkMsgCapability() SkMsgCapability { return ebpfSkMsgCapability }
+
 // EbpfSetup initializes eBPF sockmap with pinned maps for zero-downtime recovery.
 func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {
 	if pinPath == "" {
@@ -1601,9 +2067,10 @@ func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {
 	cPath := C.CString(pinPath)
 	defer C.free(unsafe.Pointer(cPath))
 	rc := C.xray_ebpf_setup(cPath, C.uint32_t(maxEntries), C.uint32_t(corkThreshold))
-	if rc != 0 {
+	if rc < 0 {
 		return fmt.Errorf("native: ebpf setup failed: %s (rc=%d)", ebpfSetupErrorDetail(rc), rc)
 	}
+	ebpfSkMsgCapability = SkMsgCapability(rc)
 	return nil
 }
 

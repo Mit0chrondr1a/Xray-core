@@ -13,16 +13,18 @@ import (
 	"time"
 
 	xerrors "github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 )
 
 // SockmapManager manages sockmap-based zero-copy TCP proxying.
 // It enables direct data transfer between sockets without copying
 // through userspace.
 type SockmapManager struct {
-	mu      sync.RWMutex // read lock guards pair ops; write lock guards setup/teardown
-	config  SockmapConfig
-	enabled atomic.Bool
-	pairs   sync.Map // SockPairKey → *SockPair
+	mu              sync.RWMutex // read lock guards pair ops; write lock guards setup/teardown
+	config          SockmapConfig
+	enabled         atomic.Bool
+	useNativeLoader bool     // true when Rust/Aya eBPF loader is active
+	pairs           sync.Map // SockPairKey → *SockPair
 
 	// Capacity monitoring
 	activePairs   atomic.Int64
@@ -65,6 +67,8 @@ type SockmapStats struct {
 	KTLSSpliceFallbacks int64
 	Enabled             bool
 	MaxEntries          uint32
+	NativeLoader        bool // true when Rust/Aya eBPF loader is active
+	SkMsgCapability     int  // 0=full, 1=cork-only, 2=none
 }
 
 // SockPairKey identifies a socket pair for proxying.
@@ -159,6 +163,9 @@ func NewSockmapManager(config SockmapConfig) *SockmapManager {
 }
 
 // Enable activates sockmap-based proxying.
+// If the Rust/Aya eBPF loader is available (native.EbpfAvailable()), it is
+// tried first — providing SK_SKB parser + verdict + SK_MSG cork (3 programs).
+// On failure, falls back transparently to the Go-native loader (SK_SKB only, 2 programs).
 func (m *SockmapManager) Enable() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -168,8 +175,20 @@ func (m *SockmapManager) Enable() error {
 		return ErrSockmapNotSupported
 	}
 
-	if err := m.setupSockmap(); err != nil {
-		return err
+	if nativeEbpfAvailable() {
+		m.useNativeLoader = true
+		if err := m.setupSockmap(); err != nil {
+			xerrors.LogWarning(context.Background(),
+				"sockmap: Rust/Aya eBPF loader failed (", err, "), falling back to Go-native")
+			m.useNativeLoader = false
+			if err2 := m.setupSockmap(); err2 != nil {
+				return err2
+			}
+		}
+	} else {
+		if err := m.setupSockmap(); err != nil {
+			return err
+		}
 	}
 
 	done := make(chan struct{})
@@ -184,6 +203,10 @@ func (m *SockmapManager) Enable() error {
 	m.sweepStaleRatio.Store(0)
 
 	m.enabled.Store(true)
+
+	// Re-probe kTLS+SOCKHASH after maps are ready to avoid latched-false from early probes.
+	_ = forceProbeKTLSSockhashCompat("post-enable")
+
 	return nil
 }
 
@@ -214,6 +237,7 @@ func (m *SockmapManager) Disable() error {
 		return err
 	}
 
+	m.useNativeLoader = false
 	m.enabled.Store(false)
 	return nil
 }
@@ -265,28 +289,49 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 			"sockmap: asymmetric crypto redirect (",
 			inboundCrypto.String(), " <-> ", outboundCrypto.String(), ")")
 	}
-
-	// Write policy entries before forwarding registration so the verdict program
-	// can consult them as soon as data arrives.
-	if err := setPolicyEntry(inboundCookie, policy); err != nil {
-		return err
-	}
-	if err := setPolicyEntry(outboundCookie, policy); err != nil {
-		_ = deletePolicyEntry(inboundCookie) // best-effort cleanup
-		return err
+	if policy&PolicyKTLSActive != 0 {
+		// Ensure probe is fresh for kTLS flows.
+		_ = refreshKTLSSockhashCompat(false, "register-ktls")
 	}
 
-	// Setup forwarding — inserts both sockets into SOCKHASH.
-	// On capacity error, attempt LRU eviction and retry.
-	if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie); err != nil {
-		m.regFailures.Add(1)
-		m.recordRegistrationAttempt(true)
-		_ = deletePolicyEntry(inboundCookie)  // best-effort cleanup
-		_ = deletePolicyEntry(outboundCookie) // best-effort cleanup
-		if isSockmapFull(err) {
-			m.fullRejects.Add(1)
+	if m.useNativeLoader {
+		// Rust/Aya path: register_pair_impl handles policy map writes internally,
+		// so skip Go-side setPolicyEntry() calls.
+		if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie, policy); err != nil {
+			m.regFailures.Add(1)
+			m.recordRegistrationAttempt(true)
+			if isSockmapFull(err) {
+				m.fullRejects.Add(1)
+			}
+			if policy&PolicyKTLSActive != 0 {
+				_ = forceProbeKTLSSockhashCompat("register-ktls-fail")
+			}
+			return err
 		}
-		return err
+	} else {
+		// Go-native path: write policy entries before forwarding registration so
+		// the verdict program can consult them as soon as data arrives.
+		if err := setPolicyEntry(inboundCookie, policy); err != nil {
+			return err
+		}
+		if err := setPolicyEntry(outboundCookie, policy); err != nil {
+			_ = deletePolicyEntry(inboundCookie) // best-effort cleanup
+			return err
+		}
+
+		if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie, 0); err != nil {
+			m.regFailures.Add(1)
+			m.recordRegistrationAttempt(true)
+			_ = deletePolicyEntry(inboundCookie)  // best-effort cleanup
+			_ = deletePolicyEntry(outboundCookie) // best-effort cleanup
+			if isSockmapFull(err) {
+				m.fullRejects.Add(1)
+			}
+			if policy&PolicyKTLSActive != 0 {
+				_ = forceProbeKTLSSockhashCompat("register-ktls-fail")
+			}
+			return err
+		}
 	}
 	m.recordRegistrationAttempt(false)
 
@@ -324,8 +369,9 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 
 // setupForwardingWithEviction attempts setupForwarding, evicting LRU pairs
 // on ENOSPC/E2BIG errors (up to maxEvictRetries attempts).
-func (m *SockmapManager) setupForwardingWithEviction(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
-	err := m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie)
+// policyFlags is passed through to the Rust loader; the Go-native path ignores it.
+func (m *SockmapManager) setupForwardingWithEviction(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64, policyFlags uint32) error {
+	err := m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie, policyFlags)
 	if err == nil {
 		return nil
 	}
@@ -337,7 +383,7 @@ func (m *SockmapManager) setupForwardingWithEviction(inboundFD, outboundFD int, 
 		if !m.evictLRU() {
 			return err // nothing to evict
 		}
-		err = m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie)
+		err = m.setupForwarding(inboundFD, outboundFD, inboundCookie, outboundCookie, policyFlags)
 		if err == nil {
 			return nil
 		}
@@ -416,8 +462,12 @@ func (m *SockmapManager) unregisterPairLocked(key SockPairKey) error {
 	if err := m.removeForwarding(key.InboundFD, key.OutboundFD, pair.InboundCookie, pair.OutboundCookie); err != nil {
 		firstErr = err
 	}
-	deletePolicyEntry(pair.InboundCookie)
-	deletePolicyEntry(pair.OutboundCookie)
+	// Rust/Aya unregister_pair_impl deletes policy entries internally;
+	// only the Go-native path needs explicit Go-side cleanup.
+	if !m.useNativeLoader {
+		deletePolicyEntry(pair.InboundCookie)
+		deletePolicyEntry(pair.OutboundCookie)
+	}
 
 	m.activePairs.Add(-1)
 	return firstErr
@@ -460,7 +510,14 @@ func (m *SockmapManager) GetSockmapStats() SockmapStats {
 		KTLSSpliceFallbacks: m.ktlsSpliceFallbacks.Load(),
 		Enabled:             m.enabled.Load(),
 		MaxEntries:          m.config.MaxEntries,
+		NativeLoader:        m.useNativeLoader,
+		SkMsgCapability:     int(native.EbpfSkMsgCapability()),
 	}
+}
+
+// UsingNativeLoader returns true if the Rust/Aya eBPF loader is active.
+func (m *SockmapManager) UsingNativeLoader() bool {
+	return m.useNativeLoader
 }
 
 // IsEnabled returns true if sockmap proxying is active.
@@ -512,8 +569,16 @@ func CanUseZeroCopy(inbound, outbound net.Conn) bool {
 }
 
 var (
-	ktlsSockhashProbeOnce sync.Once
-	ktlsSockhashOK        bool
+	ktlsSockhashCompatFn = KTLSSockhashCompatible
+)
+
+const ktlsSockhashProbeTTL = 5 * time.Minute
+
+var (
+	ktlsProbeMu     sync.Mutex
+	ktlsProbeResult atomic.Bool
+	ktlsProbeLastNs atomic.Int64
+	ktlsProbeForced atomic.Bool
 )
 
 // KTLSSockhashCompatible reports whether the running kernel supports inserting
@@ -524,15 +589,7 @@ var (
 // this path. When/if a future kernel restores the callback, this probe will
 // automatically detect it — no code changes or version gates needed.
 func KTLSSockhashCompatible() bool {
-	ktlsSockhashProbeOnce.Do(func() {
-		ktlsSockhashOK = probeKTLSSockhashCompat()
-		if ktlsSockhashOK {
-			xerrors.LogDebug(context.Background(), "sockmap: kTLS+SOCKHASH probe passed")
-		} else {
-			xerrors.LogInfo(context.Background(), "sockmap: kTLS+SOCKHASH probe failed (kernel ", unameRelease(), ") — kTLS sockets will use splice instead of sockmap")
-		}
-	})
-	return ktlsSockhashOK
+	return refreshKTLSSockhashCompat(false, "compat-check")
 }
 
 // IncrementKTLSSpliceFallback records that a kTLS-eligible connection pair was
@@ -562,10 +619,46 @@ func CanUseZeroCopyWithCrypto(inbound, outbound net.Conn, inCrypto, outCrypto Cr
 		return false
 	}
 	// If either side is kTLS, verify this kernel supports kTLS+SOCKHASH.
-	if policy&PolicyKTLSActive != 0 && !KTLSSockhashCompatible() {
+	if policy&PolicyKTLSActive != 0 && !ktlsSockhashCompatFn() {
 		return false
 	}
 	return true
+}
+
+// refreshKTLSSockhashCompat refreshes the probe result. When force is true, TTL is ignored.
+func refreshKTLSSockhashCompat(force bool, reason string) bool {
+	now := time.Now().UnixNano()
+	last := ktlsProbeLastNs.Load()
+	if !force && last != 0 && now-last < int64(ktlsSockhashProbeTTL) {
+		return ktlsProbeResult.Load()
+	}
+
+	ktlsProbeMu.Lock()
+	defer ktlsProbeMu.Unlock()
+
+	// Re-check after acquiring lock.
+	last = ktlsProbeLastNs.Load()
+	if !force && last != 0 && time.Duration(now-last) < ktlsSockhashProbeTTL {
+		return ktlsProbeResult.Load()
+	}
+
+	result := probeKTLSSockhashCompat()
+	ktlsProbeResult.Store(result)
+	ktlsProbeLastNs.Store(time.Now().UnixNano())
+
+	if result {
+		xerrors.LogDebug(context.Background(), "sockmap: kTLS+SOCKHASH probe passed (reason=", reason, ")")
+	} else {
+		xerrors.LogInfo(context.Background(), "sockmap: kTLS+SOCKHASH probe failed (kernel ", unameRelease(), ", reason=", reason, ") — kTLS sockets will use splice instead of sockmap")
+	}
+
+	return result
+}
+
+// forceProbeKTLSSockhashCompat ignores TTL and reprobes immediately.
+func forceProbeKTLSSockhashCompat(reason string) bool {
+	ktlsProbeForced.Store(true)
+	return refreshKTLSSockhashCompat(true, reason)
 }
 
 // computeRedirectPolicy determines the redirect policy flags for a pair of
@@ -682,6 +775,18 @@ const (
 // >5% stale → halve interval (floor 5s), <1% stale → double interval (ceiling 60s).
 func (m *SockmapManager) sweepStaleEntries(done <-chan struct{}) {
 	defer m.sweepWG.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			xerrors.LogWarning(context.Background(), "sockmap sweeper panic: ", r, " — restarting in 5s")
+			select {
+			case <-done:
+				return
+			case <-time.After(5 * time.Second):
+			}
+			m.sweepWG.Add(1)
+			go m.sweepStaleEntries(done)
+		}
+	}()
 
 	interval := sweepIntervalMax
 	timer := time.NewTimer(interval)
@@ -748,11 +853,13 @@ func (m *SockmapManager) doSweep() (int, int) {
 		}
 
 		// Verify socket cookies haven't changed (FD reuse detection).
-		if cookie, err := getSocketCookie(key.InboundFD); err == nil && cookie != pair.InboundCookie {
+		// Fail-closed: if getSocketCookie errors, treat pair as stale to prevent
+		// data leakage from FD reuse between the liveness check and cookie check.
+		if cookie, err := getSocketCookie(key.InboundFD); err != nil || cookie != pair.InboundCookie {
 			staleKeys = append(staleKeys, key)
 			return true
 		}
-		if cookie, err := getSocketCookie(key.OutboundFD); err == nil && cookie != pair.OutboundCookie {
+		if cookie, err := getSocketCookie(key.OutboundFD); err != nil || cookie != pair.OutboundCookie {
 			staleKeys = append(staleKeys, key)
 			return true
 		}
@@ -806,19 +913,31 @@ func isSockmapFull(err error) bool {
 	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.E2BIG)
 }
 
-// Platform-specific implementations
+// Platform-specific implementations with Rust/Aya ↔ Go-native dispatch.
 func (m *SockmapManager) setupSockmap() error {
+	if m.useNativeLoader {
+		return setupSockmapNative(m.config)
+	}
 	return setupSockmapImpl(m.config)
 }
 
 func (m *SockmapManager) teardownSockmap() error {
+	if m.useNativeLoader {
+		return teardownSockmapNative()
+	}
 	return teardownSockmapImpl()
 }
 
-func (m *SockmapManager) setupForwarding(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
+func (m *SockmapManager) setupForwarding(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64, policyFlags uint32) error {
+	if m.useNativeLoader {
+		return setupForwardingNative(inboundFD, outboundFD, inboundCookie, outboundCookie, policyFlags)
+	}
 	return setupForwardingImpl(inboundFD, outboundFD, inboundCookie, outboundCookie)
 }
 
 func (m *SockmapManager) removeForwarding(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64) error {
+	if m.useNativeLoader {
+		return removeForwardingNative(inboundCookie, outboundCookie)
+	}
 	return removeForwardingImpl(inboundFD, outboundFD, inboundCookie, outboundCookie)
 }

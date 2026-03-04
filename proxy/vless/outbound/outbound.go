@@ -71,6 +71,15 @@ type ConnExpire struct {
 	Expire time.Time
 }
 
+func contextWithOutboundVisionFlow(ctx context.Context, flow string) context.Context {
+	if strings.HasPrefix(flow, vless.XRV) {
+		// Vision must be marked before dialing so the transport layer can
+		// avoid kTLS-producing native TLS/REALITY paths for this connection.
+		return session.ContextWithVisionFlow(ctx, true)
+	}
+	return ctx
+}
+
 func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, input *bytes.Reader, rawInput *bytes.Buffer, err error) {
 	if flow != vless.XRV {
 		return false, nil, nil, nil
@@ -79,8 +88,13 @@ func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, in
 	if !ok {
 		return false, nil, nil, nil
 	}
+	// This path should be unreachable now: the Vision flow gate in outbound.go
+	// sets ContextWithVisionFlow(ctx, true) before dialing, which skips Rust
+	// native paths in the transport layer.  If we reach here, a code path
+	// bypassed the gate (e.g., pre-connect without VisionFlow propagation).
+	errors.LogWarning(context.Background(), "Vision flow on RustConn — VisionFlow context gate may have been bypassed; kTLS+Vision is incompatible")
 	if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
-		return true, nil, nil, errors.New("RustConn without full kTLS cannot use "+flow).AtWarning()
+		return true, nil, nil, errors.New("RustConn without full kTLS cannot use " + flow).AtWarning()
 	}
 	return true, &bytes.Reader{}, &bytes.Buffer{}, nil
 }
@@ -170,11 +184,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	rec := h.server
 	var conn stat.Connection
+	accountFlow := rec.User.Account.(*vless.MemoryAccount).Flow
+	ctx = contextWithOutboundVisionFlow(ctx, accountFlow)
 
 	if h.testpre > 0 && h.reverse == nil {
 		h.initpre.Do(func() {
 			h.preConns = make(chan *ConnExpire)
 			h.preCtx, h.preCancel = context.WithCancel(context.Background())
+			// Keep pre-connect transport selection consistent with normal dials.
+			h.preCtx = contextWithOutboundVisionFlow(h.preCtx, accountFlow)
 			for range h.testpre {
 				h.preWG.Add(1)
 				go func() {
@@ -220,7 +238,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		})
 		for {
-			connTime := <-h.preConns
+			var connTime *ConnExpire
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-h.preCtx.Done():
+				return errors.New("closed handler").AtWarning()
+			case connTime = <-h.preConns:
+			}
 			if connTime == nil {
 				return errors.New("closed handler").AtWarning()
 			}
@@ -298,7 +323,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		requestAddons.Flow = requestAddons.Flow[:16]
 		fallthrough
 	case vless.XRV:
-		ob.CanSpliceCopy = 2
+		ob.SetCanSpliceCopy(2)
 		switch request.Command {
 		case protocol.RequestCommandUDP:
 			if !allowUDP443 && request.Port == 443 {
@@ -311,7 +336,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			var p uintptr
 			if commonConn, ok := conn.(*encryption.CommonConn); ok {
 				if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
-					ob.CanSpliceCopy = 3 // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
+					ob.SetCanSpliceCopy(3) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 				}
 				t = reflect.TypeOf(commonConn).Elem()
 				p = uintptr(unsafe.Pointer(commonConn))
@@ -337,8 +362,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 			}
 			if t != nil {
-				i, _ := t.FieldByName("input")
-				r, _ := t.FieldByName("rawInput")
+				i, iOK := t.FieldByName("input")
+				r, rOK := t.FieldByName("rawInput")
+				if !iOK || !rOK {
+					return errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+				}
 				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
 				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 			}
@@ -346,7 +374,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			return errors.New("unknown VLESS request command: ", request.Command)
 		}
 	default:
-		ob.CanSpliceCopy = 3
+		ob.SetCanSpliceCopy(3)
 	}
 
 	var newCtx context.Context
@@ -376,13 +404,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	postRequest := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
+		bypassVision := requestAddons.Flow == vless.XRV &&
+			(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
+				encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
+
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
 		if err := encoding.EncodeRequestHeader(bufferWriter, request, requestAddons); err != nil {
 			return errors.New("failed to encode request header").Base(err).AtWarning()
 		}
 
 		// default: serverWriter := bufferWriter
-		serverWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, true, ctx, conn, ob)
+		var serverWriter buf.Writer
+		if bypassVision {
+			serverWriter = bufferWriter
+		} else {
+			serverWriter = encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, true, ctx, conn, ob)
+		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
 			serverWriter = xudp.NewPacketWriter(serverWriter, target, xudp.GetGlobalID(ctx))
 		}
@@ -436,6 +473,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	getResponse := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
+		bypassVision := requestAddons.Flow == vless.XRV &&
+			(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
+				encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
+
 		responseAddons, err := encoding.DecodeResponseHeader(conn, request)
 		if err != nil {
 			return errors.New("failed to decode response header").Base(err).AtInfo()
@@ -443,7 +484,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		// default: serverReader := buf.NewReader(conn)
 		serverReader := encoding.DecodeBodyAddons(conn, request, responseAddons)
-		if requestAddons.Flow == vless.XRV {
+		if requestAddons.Flow == vless.XRV && !bypassVision {
 			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, input, rawInput, ob)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
@@ -454,7 +495,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if requestAddons.Flow == vless.XRV {
+		if requestAddons.Flow == vless.XRV && !bypassVision {
 			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
 		} else {
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer

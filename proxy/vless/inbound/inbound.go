@@ -295,7 +295,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if errR != nil {
 		return errR
 	}
-	errors.LogInfo(ctx, "firstLen = ", firstLen)
 
 	reader := &buf.BufferedReader{
 		Reader: buf.NewReader(connection),
@@ -337,6 +336,17 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				alpn = cs.NegotiatedProtocol
 				errors.LogInfo(ctx, "realName = "+name)
 				errors.LogInfo(ctx, "realAlpn = "+alpn)
+			} else if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+				cs := dc.ConnectionState()
+				name = cs.ServerName
+				alpn = cs.NegotiatedProtocol
+				errors.LogInfo(ctx, "realName = "+name)
+				errors.LogInfo(ctx, "realAlpn = "+alpn)
+				if ktlsErr := dc.EnableKTLS(); ktlsErr != nil {
+					// Deferred handle is consumed by FFI even on failure, so
+					// this connection cannot safely continue rustls I/O.
+					return errors.New("deferred kTLS enable failed in fallback").Base(ktlsErr).AtWarning()
+				}
 			}
 			name = strings.ToLower(name)
 			alpn = strings.ToLower(alpn)
@@ -555,22 +565,23 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	var input *bytes.Reader
 	var rawInput *bytes.Buffer
+	deferredVisionPath := false
 	switch requestAddons.Flow {
 	case vless.XRV:
 		if account.Flow == requestAddons.Flow {
-			inbound.CanSpliceCopy = 2
+			inbound.SetCanSpliceCopy(2)
 			switch request.Command {
 			case protocol.RequestCommandUDP:
 				return errors.New(requestAddons.Flow + " doesn't support UDP").AtWarning()
 			case protocol.RequestCommandMux, protocol.RequestCommandRvs:
-				inbound.CanSpliceCopy = 3
+				inbound.SetCanSpliceCopy(3)
 				fallthrough // we will break Mux connections that contain TCP requests
 			case protocol.RequestCommandTCP:
 				var t reflect.Type
 				var p uintptr
 				if commonConn, ok := connection.(*encryption.CommonConn); ok {
 					if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
-						inbound.CanSpliceCopy = 3 // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
+						inbound.SetCanSpliceCopy(3) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 					}
 					t = reflect.TypeOf(commonConn).Elem()
 					p = uintptr(unsafe.Pointer(commonConn))
@@ -587,15 +598,29 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
 						return errors.New("RustConn without full kTLS cannot use " + requestAddons.Flow).AtWarning()
 					}
-					// kTLS handles TLS 1.3 in kernel; no input/rawInput to extract.
+					// kTLS + Vision is a configuration error: kTLS should have been
+					// gated upstream (hub.go). Vision is the priority optimization.
+					// Proceed anyway — will likely EBADMSG if peer lacks kTLS.
+					// See docs/ktls-vision-incompatibility.md.
+					errors.LogWarning(ctx, requestAddons.Flow, " on RustConn with kTLS: ",
+						"outer TLS cannot be stripped after command=2 — kTLS should be gated upstream")
 					input = &bytes.Reader{}
 					rawInput = &bytes.Buffer{}
+				} else if _, ok := iConn.(*tls.DeferredRustConn); ok {
+					// Deferred kTLS: rustls handles TLS. Vision will strip at command=2.
+					// VisionReader will call DeferredRustConn.DrainAndDetach().
+					deferredVisionPath = true
+					input = nil
+					rawInput = nil
 				} else {
 					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
 				if t != nil {
-					i, _ := t.FieldByName("input")
-					r, _ := t.FieldByName("rawInput")
+					i, iOK := t.FieldByName("input")
+					r, rOK := t.FieldByName("rawInput")
+					if !iOK || !rOK {
+						return errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+					}
 					input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
 					rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 				}
@@ -604,9 +629,20 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
 		}
 	case "":
-		inbound.CanSpliceCopy = 3
+		inbound.SetCanSpliceCopy(3)
 		if account.Flow == vless.XRV && (request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) {
 			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
+		}
+		if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+			if err := dc.EnableKTLS(); err != nil {
+				return errors.New("deferred kTLS enable failed for non-Vision VLESS").Base(err).AtWarning()
+			} else {
+				errors.LogDebug(ctx, "non-Vision VLESS: kTLS enabled on DeferredRustConn")
+			}
+		} else if tlsConn, ok := iConn.(*tls.Conn); ok {
+			if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
+				return errors.New("kTLS enable failed for non-Vision VLESS TLS connection").Base(err).AtWarning()
+			}
 		}
 	default:
 		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
@@ -625,6 +661,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 
 	trafficState := proxy.NewTrafficState(userSentID)
+	if deferredVisionPath {
+		trafficState.NumberOfPacketToFilter = 32
+	}
 	visionReaderCtx := ctx
 	visionWriterCtx := ctx
 	// Vision uplink/downlink processing can run concurrently, so each direction
@@ -637,8 +676,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer readerArena.Close()
 		defer writerArena.Close()
 	}
+	bypassVision := requestAddons.Flow == vless.XRV &&
+		(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
+			encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
+
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
-	if requestAddons.Flow == vless.XRV {
+	if requestAddons.Flow == vless.XRV && !bypassVision {
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, connection, input, rawInput, nil)
 	}
 
@@ -646,7 +689,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if err := encoding.EncodeResponseHeader(bufferWriter, request, responseAddons); err != nil {
 		return errors.New("failed to encode response header").Base(err).AtWarning()
 	}
-	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, visionWriterCtx, connection, nil)
+	var clientWriter buf.Writer
+	if bypassVision {
+		clientWriter = bufferWriter
+	} else {
+		clientWriter = encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, visionWriterCtx, connection, nil)
+	}
 	bufferWriter.SetFlushNext()
 
 	if request.Command == protocol.RequestCommandRvs {

@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/uuid"
@@ -38,7 +39,10 @@ type dialerConf struct {
 var (
 	globalDialerMap    map[dialerConf]*XmuxManager
 	globalDialerAccess sync.Mutex
+	getHTTPClientFn    = getHTTPClient
 )
+
+const xhttpMaxInFlightPacketPosts = 16
 
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
@@ -127,8 +131,16 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				if err := conn.(*tls.UConn).HandshakeContext(ctxInner); err != nil {
 					return nil, err
 				}
+			} else if native.Available() && tls.NativeFullKTLSSupportedForTLSConfig(tlsConfig) {
+				conn, err = tls.RustClientWithTimeout(conn, tlsConfig, dest, 0)
+				if err != nil {
+					return nil, err
+				}
 			} else {
 				conn = tls.Client(conn, gotlsConfig)
+				if err := conn.(*tls.Conn).HandshakeAndEnableKTLS(ctxInner); err != nil {
+					return nil, err
+				}
 			}
 		}
 
@@ -275,7 +287,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	requestURL.Path = transportConfiguration.GetNormalizedPath()
 	requestURL.RawQuery = transportConfiguration.GetNormalizedQuery()
 
-	httpClient, xmuxClient := getHTTPClient(ctx, dest, streamSettings)
+	httpClient, xmuxClient := getHTTPClientFn(ctx, dest, streamSettings)
 
 	mode := transportConfiguration.Mode
 	if mode == "" || mode == "auto" {
@@ -334,7 +346,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		requestURL2.Path = config2.GetNormalizedPath()
 		requestURL2.RawQuery = config2.GetNormalizedQuery()
-		httpClient2, xmuxClient2 = getHTTPClient(ctx, dest2, memory2)
+		httpClient2, xmuxClient2 = getHTTPClientFn(ctx, dest2, memory2)
 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
 	}
 
@@ -344,6 +356,20 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
 		xmuxClient2.OpenUsage.Add(1)
 	}
+	xmuxUsageReleased := false
+	releaseXmuxUsage := func() {
+		if xmuxUsageReleased {
+			return
+		}
+		xmuxUsageReleased = true
+		if xmuxClient != nil {
+			xmuxClient.OpenUsage.Add(-1)
+		}
+		if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
+			xmuxClient2.OpenUsage.Add(-1)
+		}
+	}
+	uploadCtx, cancelUpload := context.WithCancel(ctx)
 	var closed atomic.Int32
 
 	reader, writer := io.Pipe()
@@ -353,13 +379,18 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			if closed.Add(1) > 1 {
 				return
 			}
-			if xmuxClient != nil {
-				xmuxClient.OpenUsage.Add(-1)
-			}
-			if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
-				xmuxClient2.OpenUsage.Add(-1)
-			}
+			cancelUpload()
+			releaseXmuxUsage()
 		},
+	}
+	cleanupDialError := func() {
+		cancelUpload()
+		releaseXmuxUsage()
+		_ = reader.Close()
+		_ = writer.Close()
+		if conn.reader != nil {
+			_ = conn.reader.Close()
+		}
 	}
 
 	var err error
@@ -370,6 +401,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, false)
 		if err != nil { // browser dialer only
+			cleanupDialError()
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
@@ -379,6 +411,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(ctx, requestURL2.String(), sessionId, nil, false)
 		if err != nil { // browser dialer only
+			cleanupDialError()
 			return nil, err
 		}
 	}
@@ -388,6 +421,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		_, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, true)
 		if err != nil { // browser dialer only
+			cleanupDialError()
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
@@ -397,6 +431,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	scMinPostsIntervalMs := transportConfiguration.GetNormalizedScMinPostsIntervalMs()
 
 	if scMaxEachPostBytes.From <= buf.Size {
+		cleanupDialError()
 		return nil, errors.New("`scMaxEachPostBytes` should be bigger than " + strconv.Itoa(buf.Size))
 	}
 
@@ -407,11 +442,12 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	go func() {
 		var seq int64
 		var lastWrite time.Time
+		inFlight := make(chan struct{}, xhttpMaxInFlightPacketPosts)
 
 		for {
 			wroteRequest := done.New()
 
-			ctx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			chunkCtx := httptrace.WithClientTrace(uploadCtx, &httptrace.ClientTrace{
 				WroteRequest: func(httptrace.WroteRequestInfo) {
 					wroteRequest.Close()
 				},
@@ -439,24 +475,35 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 			if xmuxClient != nil && (xmuxClient.LeftRequests.Add(-1) <= 0 ||
 				(xmuxClient.UnreusableAt != time.Time{} && lastWrite.After(xmuxClient.UnreusableAt))) {
-				httpClient, xmuxClient = getHTTPClient(ctx, dest, streamSettings)
+				httpClient, xmuxClient = getHTTPClientFn(chunkCtx, dest, streamSettings)
 			}
 
-			go func() {
-				err := httpClient.PostPacket(
-					ctx,
-					url.String(),
-					sessionId,
+			select {
+			case inFlight <- struct{}{}:
+			case <-uploadCtx.Done():
+				buf.ReleaseMulti(chunk)
+				return
+			}
+
+			client := httpClient
+			chunkURL := url.String()
+			chunkLen := int64(chunk.Len())
+			go func(client DialerClient, chunkCtx context.Context, chunk buf.MultiBuffer, chunkURL, sessionID, seqStr string, chunkLen int64) {
+				defer func() { <-inFlight }()
+				err := client.PostPacket(
+					chunkCtx,
+					chunkURL,
+					sessionID,
 					seqStr,
 					&buf.MultiBufferContainer{MultiBuffer: chunk},
-					int64(chunk.Len()),
+					chunkLen,
 				)
 				wroteRequest.Close()
 				if err != nil {
-					errors.LogInfoInner(ctx, err, "failed to send upload")
+					errors.LogInfoInner(chunkCtx, err, "failed to send upload")
 					uploadPipeReader.Interrupt()
 				}
-			}()
+			}(client, chunkCtx, chunk, chunkURL, sessionId, seqStr, chunkLen)
 
 			if _, ok := httpClient.(*DefaultDialerClient); ok {
 				<-wroteRequest.Wait()
@@ -503,11 +550,12 @@ func (w uploadWriter) Write(b []byte) (int, error) {
 
 	var writed int
 	for _, buff := range buffer.MultiBuffer {
+		n := int(buff.Len())
 		err := w.WriteMultiBuffer(buf.MultiBuffer{buff})
 		if err != nil {
 			return writed, err
 		}
-		writed += int(buff.Len())
+		writed += n
 	}
 	return writed, nil
 }

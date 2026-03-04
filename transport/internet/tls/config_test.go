@@ -1,6 +1,7 @@
 package tls_test
 
 import (
+	"bytes"
 	gotls "crypto/tls"
 	"crypto/x509"
 	"testing"
@@ -70,6 +71,73 @@ func TestInsecureCertificates(t *testing.T) {
 	tlsConfig := c.GetTLSConfig()
 	if len(tlsConfig.CipherSuites) > 0 {
 		t.Fatal("Unexpected tls cipher suites list: ", tlsConfig.CipherSuites)
+	}
+}
+
+func TestBuildCertificatesDoesNotMutateInlineKey(t *testing.T) {
+	StopAllOcspTickers()
+	t.Cleanup(StopAllOcspTickers)
+
+	ct, _ := cert.MustGenerate(nil, cert.CommonName("www.example.com"), cert.DNSNames("www.example.com"))
+	certificate := ParseCertificate(ct)
+	certificate.Usage = Certificate_ENCIPHERMENT
+
+	originalKey := append([]byte(nil), certificate.Key...)
+	if len(originalKey) == 0 {
+		t.Fatal("generated key PEM should not be empty")
+	}
+
+	cfg := &Config{
+		Certificate: []*Certificate{certificate},
+	}
+
+	first := cfg.BuildCertificates()
+	if len(first) != 1 {
+		t.Fatalf("first BuildCertificates len=%d, want 1", len(first))
+	}
+	if first[0].Load() == nil {
+		t.Fatal("first BuildCertificates returned nil certificate pointer")
+	}
+
+	second := cfg.BuildCertificates()
+	if len(second) != 1 {
+		t.Fatalf("second BuildCertificates len=%d, want 1", len(second))
+	}
+	if second[0].Load() == nil {
+		t.Fatal("second BuildCertificates returned nil certificate pointer")
+	}
+
+	if !bytes.Equal(certificate.Key, originalKey) {
+		t.Fatal("BuildCertificates mutated source key bytes")
+	}
+}
+
+func TestGetTLSConfigRemainsUsableAcrossRepeatedBuilds(t *testing.T) {
+	StopAllOcspTickers()
+	t.Cleanup(StopAllOcspTickers)
+
+	ct, _ := cert.MustGenerate(nil, cert.CommonName("www.example.com"), cert.DNSNames("www.example.com"))
+	certificate := ParseCertificate(ct)
+	certificate.Usage = Certificate_ENCIPHERMENT
+
+	cfg := &Config{
+		Certificate: []*Certificate{certificate},
+	}
+
+	hello := &gotls.ClientHelloInfo{ServerName: "www.example.com"}
+
+	firstTLSConfig := cfg.GetTLSConfig()
+	firstCert, err := firstTLSConfig.GetCertificate(hello)
+	common.Must(err)
+	if firstCert == nil {
+		t.Fatal("first GetTLSConfig returned nil certificate")
+	}
+
+	secondTLSConfig := cfg.GetTLSConfig()
+	secondCert, err := secondTLSConfig.GetCertificate(hello)
+	common.Must(err)
+	if secondCert == nil {
+		t.Fatal("second GetTLSConfig returned nil certificate")
 	}
 }
 

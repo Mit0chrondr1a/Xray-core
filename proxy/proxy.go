@@ -10,10 +10,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	goerrors "errors"
 	"io"
+	gonet "net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -22,6 +29,8 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/pipeline"
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
@@ -58,7 +67,188 @@ const (
 	CommandPaddingContinue byte = 0x00
 	CommandPaddingEnd      byte = 0x01
 	CommandPaddingDirect   byte = 0x02
+
+	pipelineMarkerLogInterval = 30 * time.Second
 )
+
+// pipelineTelemetryV2Enabled gates legacy per-interval marker dumps.
+func pipelineTelemetryV2Enabled() bool {
+	return platform.NewEnvFlag("xray.pipeline.telemetry.v2").GetValue(func() string { return "" }) != "off"
+}
+
+func init() {
+	startupHealthOnce.Do(logStartupHealth)
+}
+
+var (
+	pipelineMarkerDeferredRawUnwrapWarning    atomic.Uint64
+	pipelineMarkerRawUnwrapToDetachNanosTotal atomic.Uint64
+	pipelineMarkerRawUnwrapToDetachSamples    atomic.Uint64
+	pipelineMarkerRawUnwrapToDetachLt5ms      atomic.Uint64
+	pipelineMarkerRawUnwrapToDetach5To20ms    atomic.Uint64
+	pipelineMarkerRawUnwrapToDetach20To100ms  atomic.Uint64
+	pipelineMarkerRawUnwrapToDetachGe100ms    atomic.Uint64
+	pipelineMarkerDeferredSpliceGuardHit      atomic.Uint64
+	pipelineMarkerVisionDrainDetachAttempt    atomic.Uint64
+	pipelineMarkerVisionDrainDetachSuccess    atomic.Uint64
+	pipelineMarkerVisionDrainDetachFail       atomic.Uint64
+	pipelineMarkerVisionRestoreNBAttempt      atomic.Uint64
+	pipelineMarkerVisionRestoreNBFail         atomic.Uint64
+	pipelineMarkerVisionPaddingPhaseNanos     atomic.Uint64
+	pipelineMarkerVisionPaddingPhaseCount     atomic.Uint64
+	pipelineMarkerVisionDetachPhaseNanos      atomic.Uint64
+	pipelineMarkerVisionDetachPhaseCount      atomic.Uint64
+	pipelineMarkerVisionPostDetachNanos       atomic.Uint64
+	pipelineMarkerVisionPostDetachCount       atomic.Uint64
+	pipelineMarkerVisionPostDetachSplice      atomic.Uint64
+	pipelineMarkerVisionPostDetachUserspace   atomic.Uint64
+	pipelineMarkerVisionPostDetachSockmap     atomic.Uint64
+	pipelineMarkerVisionDetachTimeout         atomic.Uint64
+	pipelineMarkerSockmapPolicyRefresh        atomic.Uint64
+	pipelineMarkerSockmapPolicyRefreshFail    atomic.Uint64
+	pipelineMarkerSpliceAttempts              atomic.Uint64
+	pipelineMarkerSpliceCompleted             atomic.Uint64
+	pipelineMarkerSpliceExpectedTeardown      atomic.Uint64
+	pipelineMarkerSpliceExpectedBrokenPipe    atomic.Uint64
+	pipelineMarkerSpliceExpectedConnReset     atomic.Uint64
+	pipelineMarkerSpliceExpectedClosedConn    atomic.Uint64
+	pipelineMarkerSpliceExpectedCanceled      atomic.Uint64
+	pipelineMarkerSpliceExpectedNotConn       atomic.Uint64
+	pipelineMarkerSpliceExpectedShutdown      atomic.Uint64
+	pipelineMarkerSpliceExpectedOther         atomic.Uint64
+	pipelineMarkerSpliceUnexpectedError       atomic.Uint64
+	pipelineMarkerSpliceBytesTotal            atomic.Uint64
+	pipelineMarkerSpliceDurationNanosTotal    atomic.Uint64
+	pipelineMarkerSpliceBytesLt4K             atomic.Uint64
+	pipelineMarkerSpliceBytes4KTo64K          atomic.Uint64
+	pipelineMarkerSpliceBytes64KTo1M          atomic.Uint64
+	pipelineMarkerSpliceBytesGe1M             atomic.Uint64
+	pipelineMarkerSpliceDurLt1ms              atomic.Uint64
+	pipelineMarkerSpliceDur1To5ms             atomic.Uint64
+	pipelineMarkerSpliceDur5To20ms            atomic.Uint64
+	pipelineMarkerSpliceDur20To100ms          atomic.Uint64
+	pipelineMarkerSpliceDurGe100ms            atomic.Uint64
+	pipelineMarkerUserspaceCopyReads          atomic.Uint64
+	pipelineMarkerUserspaceCopyBytesTotal     atomic.Uint64
+	pipelineMarkerUserspaceRawReaderHits      atomic.Uint64
+	pipelineMarkerUserspaceTLSReaderHits      atomic.Uint64
+	pipelineMarkerEnsureRawFailOS             atomic.Uint64
+	pipelineMarkerEnsureRawFailNilConn        atomic.Uint64
+	pipelineMarkerEnsureRawFailWriterType     atomic.Uint64
+	pipelineMarkerSockmapSkipMgr              atomic.Uint64
+	pipelineMarkerSockmapSkipContention       atomic.Uint64
+	pipelineMarkerSockmapSkipKTLSSockhash     atomic.Uint64
+	pipelineMarkerSockmapSkipUserspaceTLS     atomic.Uint64
+	pipelineMarkerSockmapSkipAsymmetric       atomic.Uint64
+	pipelineMarkerSockmapSkipLoopback         atomic.Uint64
+	pipelineMarkerSockmapSkipOther            atomic.Uint64
+	pipelineMarkerSockmapRegisterAttempt      atomic.Uint64
+	pipelineMarkerSockmapRegisterSuccess      atomic.Uint64
+	pipelineMarkerSockmapRegisterFail         atomic.Uint64
+	pipelineMarkerSockmapWaitSuccess          atomic.Uint64
+	pipelineMarkerSockmapWaitFallback         atomic.Uint64
+	pipelineMarkerSockmapWaitError            atomic.Uint64
+	pipelineMarkerFlowMuxUDP                  atomic.Uint64
+	pipelineMarkerFlowPureTCP                 atomic.Uint64
+	pipelineMarkerFlowMuxTCP                  atomic.Uint64
+	pipelineMarkerFlowOther                   atomic.Uint64
+
+	// previous snapshot totals for per-interval deltas
+	pipelineMarkerLastDeferredRawUnwrapWarning    atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetachNanosTotal atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetachSamples    atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetachLt5ms      atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetach5To20ms    atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetach20To100ms  atomic.Uint64
+	pipelineMarkerLastRawUnwrapToDetachGe100ms    atomic.Uint64
+	pipelineMarkerLastDeferredSpliceGuardHit      atomic.Uint64
+	pipelineMarkerLastVisionDrainDetachAttempt    atomic.Uint64
+	pipelineMarkerLastVisionDrainDetachSuccess    atomic.Uint64
+	pipelineMarkerLastVisionDrainDetachFail       atomic.Uint64
+	pipelineMarkerLastVisionRestoreNBAttempt      atomic.Uint64
+	pipelineMarkerLastVisionRestoreNBFail         atomic.Uint64
+	pipelineMarkerLastVisionPaddingPhaseNanos     atomic.Uint64
+	pipelineMarkerLastVisionPaddingPhaseCount     atomic.Uint64
+	pipelineMarkerLastVisionDetachPhaseNanos      atomic.Uint64
+	pipelineMarkerLastVisionDetachPhaseCount      atomic.Uint64
+	pipelineMarkerLastVisionPostDetachNanos       atomic.Uint64
+	pipelineMarkerLastVisionPostDetachCount       atomic.Uint64
+	pipelineMarkerLastVisionPostDetachSplice      atomic.Uint64
+	pipelineMarkerLastVisionPostDetachUserspace   atomic.Uint64
+	pipelineMarkerLastVisionPostDetachSockmap     atomic.Uint64
+	pipelineMarkerLastVisionDetachTimeout         atomic.Uint64
+	pipelineMarkerLastSockmapPolicyRefresh        atomic.Uint64
+	pipelineMarkerLastSockmapPolicyRefreshFail    atomic.Uint64
+	pipelineMarkerLastSpliceAttempts              atomic.Uint64
+	pipelineMarkerLastSpliceCompleted             atomic.Uint64
+	pipelineMarkerLastSpliceExpectedTeardown      atomic.Uint64
+	pipelineMarkerLastSpliceExpectedBrokenPipe    atomic.Uint64
+	pipelineMarkerLastSpliceExpectedConnReset     atomic.Uint64
+	pipelineMarkerLastSpliceExpectedClosedConn    atomic.Uint64
+	pipelineMarkerLastSpliceExpectedCanceled      atomic.Uint64
+	pipelineMarkerLastSpliceExpectedNotConn       atomic.Uint64
+	pipelineMarkerLastSpliceExpectedShutdown      atomic.Uint64
+	pipelineMarkerLastSpliceExpectedOther         atomic.Uint64
+	pipelineMarkerLastSpliceUnexpectedError       atomic.Uint64
+	pipelineMarkerLastSpliceBytesTotal            atomic.Uint64
+	pipelineMarkerLastSpliceDurationNanosTotal    atomic.Uint64
+	pipelineMarkerLastSpliceBytesLt4K             atomic.Uint64
+	pipelineMarkerLastSpliceBytes4KTo64K          atomic.Uint64
+	pipelineMarkerLastSpliceBytes64KTo1M          atomic.Uint64
+	pipelineMarkerLastSpliceBytesGe1M             atomic.Uint64
+	pipelineMarkerLastSpliceDurLt1ms              atomic.Uint64
+	pipelineMarkerLastSpliceDur1To5ms             atomic.Uint64
+	pipelineMarkerLastSpliceDur5To20ms            atomic.Uint64
+	pipelineMarkerLastSpliceDur20To100ms          atomic.Uint64
+	pipelineMarkerLastSpliceDurGe100ms            atomic.Uint64
+	pipelineMarkerLastUserspaceCopyReads          atomic.Uint64
+	pipelineMarkerLastUserspaceCopyBytesTotal     atomic.Uint64
+	pipelineMarkerLastUserspaceRawReaderHits      atomic.Uint64
+	pipelineMarkerLastUserspaceTLSReaderHits      atomic.Uint64
+	pipelineMarkerLastEnsureRawFailOS             atomic.Uint64
+	pipelineMarkerLastEnsureRawFailNilConn        atomic.Uint64
+	pipelineMarkerLastEnsureRawFailWriterType     atomic.Uint64
+	pipelineMarkerLastSockmapSkipMgr              atomic.Uint64
+	pipelineMarkerLastSockmapSkipContention       atomic.Uint64
+	pipelineMarkerLastSockmapSkipKTLSSockhash     atomic.Uint64
+	pipelineMarkerLastSockmapSkipUserspaceTLS     atomic.Uint64
+	pipelineMarkerLastSockmapSkipAsymmetric       atomic.Uint64
+	pipelineMarkerLastSockmapSkipLoopback         atomic.Uint64
+	pipelineMarkerLastSockmapSkipOther            atomic.Uint64
+	pipelineMarkerLastSockmapRegisterAttempt      atomic.Uint64
+	pipelineMarkerLastSockmapRegisterSuccess      atomic.Uint64
+	pipelineMarkerLastSockmapRegisterFail         atomic.Uint64
+	pipelineMarkerLastSockmapWaitSuccess          atomic.Uint64
+	pipelineMarkerLastSockmapWaitFallback         atomic.Uint64
+	pipelineMarkerLastSockmapWaitError            atomic.Uint64
+	pipelineMarkerLastFlowMuxUDP                  atomic.Uint64
+	pipelineMarkerLastFlowPureTCP                 atomic.Uint64
+	pipelineMarkerLastFlowMuxTCP                  atomic.Uint64
+	pipelineMarkerLastFlowOther                   atomic.Uint64
+
+	pipelineMarkerLastSummaryUnix     atomic.Int64
+	pipelineVisionDetachUnixByConn    sync.Map
+	pipelineVisionRawUnwrapUnixByConn sync.Map
+	pipelineVisionDetachFutureByConn  sync.Map
+	startupHealthOnce                 sync.Once
+)
+
+const visionDetachTimeout = 500 * time.Millisecond
+const loopbackDetachGuardPort = 2036
+
+type visionDetachResult struct {
+	plaintext []byte
+	rawAhead  []byte
+	err       error
+	duration  time.Duration
+}
+
+type visionDetachFuture struct {
+	once      sync.Once
+	startedAt time.Time
+	done      chan struct{}
+	result    visionDetachResult
+}
 
 // An Inbound processes inbound connections.
 type Inbound interface {
@@ -106,6 +296,7 @@ type GetOutbound interface {
 type TrafficState struct {
 	UserUUID               []byte
 	NumberOfPacketToFilter int
+	CreatedAtUnixNano      int64
 	EnableXtls             bool
 	IsTLS12orAbove         bool
 	IsTLS                  bool
@@ -141,10 +332,18 @@ type OutboundState struct {
 	UplinkWriterDirectCopy bool
 }
 
+const (
+	visionPacketsToFilterDefault  = 16
+	visionPacketsToFilterDeferred = 32
+)
+
 func NewTrafficState(userUUID []byte) *TrafficState {
 	return &TrafficState{
-		UserUUID:               userUUID,
-		NumberOfPacketToFilter: 8,
+		UserUUID: userUUID,
+		// Keep a moderate default filter budget for mixed workloads.
+		// Deferred REALITY paths can override this to a larger value.
+		NumberOfPacketToFilter: visionPacketsToFilterDefault,
+		CreatedAtUnixNano:      time.Now().UnixNano(),
 		EnableXtls:             false,
 		IsTLS12orAbove:         false,
 		IsTLS:                  false,
@@ -171,6 +370,58 @@ func NewTrafficState(userUUID []byte) *TrafficState {
 			UplinkWriterDirectCopy:   false,
 		},
 	}
+}
+
+func unwrapVisionDeferredConn(conn net.Conn) *tls.DeferredRustConn {
+	if conn == nil {
+		return nil
+	}
+	if dc, ok := conn.(*tls.DeferredRustConn); ok {
+		return dc
+	}
+	if sc := stat.TryUnwrapStatsConn(conn); sc != nil && sc != conn {
+		if dc, ok := sc.(*tls.DeferredRustConn); ok {
+			return dc
+		}
+	}
+	if cc, ok := conn.(*encryption.CommonConn); ok && cc != nil {
+		if dc, ok := cc.Conn.(*tls.DeferredRustConn); ok {
+			return dc
+		}
+	}
+	return nil
+}
+
+func startVisionDetach(dc *tls.DeferredRustConn) *visionDetachFuture {
+	if dc == nil {
+		return nil
+	}
+	futAny, _ := pipelineVisionDetachFutureByConn.LoadOrStore(dc, &visionDetachFuture{
+		done: make(chan struct{}),
+	})
+	fut := futAny.(*visionDetachFuture)
+
+	fut.once.Do(func() {
+		fut.startedAt = time.Now()
+		pipelineMarkerVisionDrainDetachAttempt.Add(1)
+		go func() {
+			plaintext, rawAhead, err := dc.DrainAndDetach()
+			duration := time.Since(fut.startedAt)
+			if err != nil {
+				pipelineMarkerVisionDrainDetachFail.Add(1)
+			} else {
+				pipelineMarkerVisionDrainDetachSuccess.Add(1)
+			}
+			fut.result = visionDetachResult{
+				plaintext: plaintext,
+				rawAhead:  rawAhead,
+				err:       err,
+				duration:  duration,
+			}
+			close(fut.done)
+		}()
+	})
+	return fut
 }
 
 // VisionReader is used to read xtls vision protocol
@@ -240,6 +491,8 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			newbuffer := XtlsUnpadding(b, w.trafficState, w.isUplink, w.ctx)
 			if newbuffer.Len() > 0 {
 				mb2 = append(mb2, newbuffer)
+			} else {
+				newbuffer.Release()
 			}
 		}
 		buffer = mb2
@@ -259,24 +512,97 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	if *switchToDirectCopy {
-		// XTLS Vision processes TLS-like conn's input and rawInput
-		if inputBuffer, err := buf.ReadFrom(w.input); err == nil && !inputBuffer.IsEmpty() {
-			buffer, _ = buf.MergeMulti(buffer, inputBuffer)
+		loopbackGuard := isLoopbackDetachGuardedConn(w.conn)
+		if loopbackGuard && isDNSPortOutbound(w.ctx) {
+			errors.LogInfo(w.ctx, "Vision: loopback DNS flow; keeping rustls (no detach/zero-copy)")
+			*switchToDirectCopy = false
+			return buffer, err
 		}
-		if rawInputBuffer, err := buf.ReadFrom(w.rawInput); err == nil && !rawInputBuffer.IsEmpty() {
-			buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
+		if loopbackGuard {
+			errors.LogInfo(w.ctx, "Vision: loopback guarded flow; detaching but pinning to userspace copy (no zero-copy)")
 		}
-		*w.input = bytes.Reader{} // release memory
-		w.input = nil
-		*w.rawInput = bytes.Buffer{} // release memory
-		w.rawInput = nil
+		if dc := unwrapVisionDeferredConn(w.conn); dc != nil {
+			fut := startVisionDetach(dc)
+			wait := visionDetachTimeout
+			if !fut.startedAt.IsZero() {
+				if elapsed := time.Since(fut.startedAt); elapsed < visionDetachTimeout {
+					wait = visionDetachTimeout - elapsed
+				} else {
+					wait = 0
+				}
+			}
+			select {
+			case <-fut.done:
+				detachDoneUnix := time.Now().UnixNano()
+				if fut.result.duration > 0 {
+					pipelineMarkerVisionDetachPhaseNanos.Add(uint64(fut.result.duration.Nanoseconds()))
+					pipelineMarkerVisionDetachPhaseCount.Add(1)
+				}
+				if fut.result.err != nil {
+					maybeLogPipelineRuntimeSummary(w.ctx)
+					// Cannot safely strip outer TLS. Keep rustls active for correctness.
+					errors.LogWarning(w.ctx, "[kind=vision.drain_detach_failed] DeferredRustConn drain failed, keeping rustls active: ", fut.result.err)
+					*switchToDirectCopy = false
+					pipelineVisionDetachFutureByConn.Delete(dc)
+					return buffer, err
+				}
+				if w.trafficState != nil && w.trafficState.CreatedAtUnixNano > 0 && detachDoneUnix > w.trafficState.CreatedAtUnixNano {
+					pipelineMarkerVisionPaddingPhaseNanos.Add(uint64(detachDoneUnix - w.trafficState.CreatedAtUnixNano))
+					pipelineMarkerVisionPaddingPhaseCount.Add(1)
+				}
+				if rawUnwrapUnix, ok := consumeVisionRawUnwrapWarningTimestamp(w.conn); ok && detachDoneUnix > rawUnwrapUnix {
+					unwrapToDetachNs := uint64(detachDoneUnix - rawUnwrapUnix)
+					pipelineMarkerRawUnwrapToDetachNanosTotal.Add(unwrapToDetachNs)
+					pipelineMarkerRawUnwrapToDetachSamples.Add(1)
+					recordRawUnwrapToDetachHistogram(unwrapToDetachNs)
+				}
+				storeVisionDetachTimestamp(w.conn, detachDoneUnix)
+				errors.LogDebug(w.ctx, "Vision: DeferredRustConn drained and detached; switching reader to raw socket")
+				if len(fut.result.plaintext) > 0 {
+					buffer = append(buffer, buf.FromBytes(fut.result.plaintext))
+				}
+				if len(fut.result.rawAhead) > 0 {
+					buffer = append(buffer, buf.FromBytes(fut.result.rawAhead))
+				}
+				pipelineVisionDetachFutureByConn.Delete(dc)
+			case <-time.After(wait):
+				pipelineMarkerVisionDetachTimeout.Add(1)
+				maybeLogPipelineRuntimeSummary(w.ctx)
+				errors.LogWarning(w.ctx, "[kind=vision.drain_detach_timeout] DeferredRustConn drain still pending; staying on rustls path")
+				*switchToDirectCopy = false
+				return buffer, err
+			}
+		} else {
+			// XTLS Vision processes TLS-like conn's input and rawInput
+			if w.input != nil {
+				if inputBuffer, err := buf.ReadFrom(w.input); err == nil && !inputBuffer.IsEmpty() {
+					buffer, _ = buf.MergeMulti(buffer, inputBuffer)
+				}
+				*w.input = bytes.Reader{} // release memory
+				w.input = nil
+			}
+			if w.rawInput != nil {
+				if rawInputBuffer, err := buf.ReadFrom(w.rawInput); err == nil && !rawInputBuffer.IsEmpty() {
+					buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
+				}
+				*w.rawInput = bytes.Buffer{} // release memory
+				w.rawInput = nil
+			}
+		}
+
+		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil && inbound.GetCanSpliceCopy() == 2 {
+			// Vision command=2 reached and reader switched to raw path. At this
+			// point TLS decryption is no longer required on this leg, so the
+			// response copy loop can safely transition to splice/readv-raw path.
+			inbound.SetCanSpliceCopy(1)
+		}
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
 			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
 			// 	inbound.CanSpliceCopy = 1
 			// }
-			if !w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // ob need to be passed in due to context can have more than one ob
-				w.ob.CanSpliceCopy = 1
+			if !w.isUplink && w.ob != nil && w.ob.GetCanSpliceCopy() == 2 { // ob need to be passed in due to context can have more than one ob
+				w.ob.SetCanSpliceCopy(1)
 			}
 		}
 		readerConn, readCounter, _, readerHandler := UnwrapRawConn(w.conn)
@@ -328,6 +654,7 @@ func NewVisionWriter(writer buf.Writer, trafficState *TrafficState, isUplink boo
 func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	var isPadding *bool
 	var switchToDirectCopy *bool
+	loopbackGuard := isLoopbackDetachGuardedConn(w.conn)
 	if w.isUplink {
 		isPadding = &w.trafficState.Outbound.IsPadding
 		switchToDirectCopy = &w.trafficState.Outbound.UplinkWriterDirectCopy
@@ -335,20 +662,43 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		isPadding = &w.trafficState.Inbound.IsPadding
 		switchToDirectCopy = &w.trafficState.Inbound.DownlinkWriterDirectCopy
 	}
+	switchNow := *switchToDirectCopy
+	if switchNow {
+		if loopbackGuard {
+			if isDNSPortOutbound(w.ctx) {
+				errors.LogInfo(w.ctx, "Vision: loopback DNS flow (writer); keeping rustls (no detach/zero-copy)")
+				switchNow = false
+				*switchToDirectCopy = false
+			} else {
+				errors.LogInfo(w.ctx, "Vision: loopback guarded flow (writer); detaching but disabling zero-copy")
+			}
+		}
+		dc := unwrapVisionDeferredConn(w.conn)
+		deferredReady := true
+		// Avoid raw unwrap while DeferredRustConn still owns unread rustls state.
+		// Wait until detach (or kTLS promotion) completes, then switch.
+		if dc != nil && !dc.IsDetached() && !dc.KTLSEnabled().Enabled {
+			deferredReady = false
+			switchNow = false
+		}
 
-	if *switchToDirectCopy {
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil {
-			if !w.isUplink && inbound.CanSpliceCopy == 2 {
-				inbound.CanSpliceCopy = 1
+			// NOTE: CanSpliceCopy stays at 2 while DeferredRustConn is active
+			// because CopyRawConn uses CanSpliceCopy==1 to gate rawUserspaceReader,
+			// which bypasses TLS decryption on the outbound — wrong for HTTPS targets.
+			if !w.isUplink && inbound.GetCanSpliceCopy() == 2 && deferredReady {
+				inbound.SetCanSpliceCopy(1)
 			}
 			// if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // TODO: enable uplink splice
 			// 	w.ob.CanSpliceCopy = 1
 			// }
 		}
-		rawConn, _, writerCounter, _ := UnwrapRawConn(w.conn)
-		w.Writer = buf.NewWriter(rawConn)
-		w.directWriteCounter = writerCounter
-		*switchToDirectCopy = false
+		if switchNow {
+			rawConn, _, writerCounter, _ := UnwrapRawConn(w.conn)
+			w.Writer = buf.NewWriter(rawConn)
+			w.directWriteCounter = writerCounter
+			*switchToDirectCopy = false
+		}
 	}
 	if !mb.IsEmpty() && w.directWriteCounter != nil {
 		w.directWriteCounter.Add(int64(mb.Len()))
@@ -367,7 +717,11 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		mb = ReshapeMultiBuffer(w.ctx, mb)
 		longPadding := w.trafficState.IsTLS
 		for i, b := range mb {
-			if w.trafficState.IsTLS && b.Len() >= 6 && bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) && isComplete {
+			allowDirectOnFragmentedTLS13 := w.trafficState.EnableXtls
+			if w.trafficState.IsTLS &&
+				b.Len() >= 6 &&
+				bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) &&
+				(isComplete || allowDirectOnFragmentedTLS13) {
 				if w.trafficState.EnableXtls {
 					*switchToDirectCopy = true
 				}
@@ -844,6 +1198,16 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 			} else if rc, ok := conn.(*tls.RustConn); ok {
 				handler = rc.KTLSKeyUpdateHandler()
 				conn = rc.NetConn()
+			} else if dc, ok := conn.(*tls.DeferredRustConn); ok {
+				if !dc.IsDetached() && !dc.KTLSEnabled().Enabled {
+					storeVisionRawUnwrapWarningTimestamp(dc, time.Now().UnixNano())
+					pipelineMarkerDeferredRawUnwrapWarning.Add(1)
+					maybeLogPipelineRuntimeSummary(context.Background())
+					errors.LogWarning(context.Background(),
+						"[kind=vision.deferred_raw_unwrap] UnwrapRawConn: DeferredRustConn is neither detached nor kTLS-active; unwrapping to raw socket may lose rustls-buffered data")
+				}
+				handler = dc.KTLSKeyUpdateHandler()
+				conn = dc.NetConn()
 			} else if utlsConn, ok := conn.(*tls.UConn); ok {
 				conn = utlsConn.NetConn()
 			} else if realityConn, ok := conn.(*reality.Conn); ok {
@@ -959,6 +1323,26 @@ func determineSocketCryptoHintRecurse(conn net.Conn, depth int) (net.Conn, ebpf.
 		return raw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.RustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
 	}
 
+	if dc, ok := conn.(*tls.DeferredRustConn); ok {
+		ktls := dc.KTLSEnabled()
+		raw := dc.NetConn()
+		if ktls.TxReady && ktls.RxReady {
+			return raw, ebpf.CryptoKTLSBoth, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
+		}
+		if ktls.TxReady {
+			return raw, ebpf.CryptoKTLSTxOnly, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
+		}
+		if ktls.RxReady {
+			return raw, ebpf.CryptoKTLSRxOnly, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
+		}
+		if dc.IsDetached() {
+			// After Vision command=2 drain+detach, outer rustls is removed and
+			// bytes flow on the raw socket. Classify as raw TCP for sockmap policy.
+			return raw, ebpf.CryptoNone, appendCryptoHintSource(source, "*tls.DeferredRustConn(detached)")
+		}
+		return raw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.DeferredRustConn("+ktlsStateName(ktls.TxReady, ktls.RxReady)+")")
+	}
+
 	if utlsConn, ok := conn.(*tls.UConn); ok {
 		if utlsConn == nil || utlsConn.UConn == nil {
 			return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*tls.UConn(nil)")
@@ -991,119 +1375,498 @@ func determineSocketCryptoHintRecurse(conn net.Conn, depth int) (net.Conn, ebpf.
 	return nil, ebpf.CryptoNone, appendCryptoHintSource(source, connTypeName(conn))
 }
 
+func isLoopbackConnPair(a, b gonet.Conn) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	la, lok := a.LocalAddr().(*net.TCPAddr)
+	ra, rok := a.RemoteAddr().(*net.TCPAddr)
+	lb, lbok := b.LocalAddr().(*net.TCPAddr)
+	rb, rbok := b.RemoteAddr().(*net.TCPAddr)
+	if !(lok && rok && lbok && rbok) {
+		return false
+	}
+	return la.IP.IsLoopback() && ra.IP.IsLoopback() && lb.IP.IsLoopback() && rb.IP.IsLoopback()
+}
+
+func buildVisionDecisionInput(readerConn gonet.Conn, writerConn gonet.Conn, caps pipeline.CapabilitySummary, deferredTLSActive bool) (pipeline.DecisionInput, ebpf.CryptoHint, ebpf.CryptoHint, string, string) {
+	rawReaderConn, readerCrypto, readerCryptoSource := determineSocketCryptoHintWithSource(readerConn)
+	rawWriterConn, writerCrypto, writerCryptoSource := determineSocketCryptoHintWithSource(writerConn)
+	input := pipeline.DecisionInput{
+		DeferredTLSActive: deferredTLSActive,
+		LoopbackPair:      isLoopbackConnPair(rawReaderConn, rawWriterConn),
+		Caps:              caps,
+		ReaderCrypto:      cryptoHintName(readerCrypto),
+		WriterCrypto:      cryptoHintName(writerCrypto),
+	}
+	return input, readerCrypto, writerCrypto, readerCryptoSource, writerCryptoSource
+}
+
+func isLoopbackConn(conn gonet.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	if la := conn.LocalAddr(); la != nil {
+		if ip := extractAddrIP(la); ip != nil && ip.IsLoopback() {
+			return true
+		}
+	}
+	if ra := conn.RemoteAddr(); ra != nil {
+		if ip := extractAddrIP(ra); ip != nil && ip.IsLoopback() {
+			return true
+		}
+	}
+	return false
+}
+
+func extractAddrIP(addr gonet.Addr) net.IP {
+	switch a := addr.(type) {
+	case *gonet.TCPAddr:
+		return a.IP
+	case *gonet.UDPAddr:
+		return a.IP
+	}
+	host, _, err := gonet.SplitHostPort(addr.String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseAddress(host).IP()
+}
+
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
 func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
-	// Capture crypto state and diagnostic source before unwrapping TLS wrappers.
-	// Source strings are computed once here and reused in the debug path below,
-	// avoiding a redundant second traversal of the connection wrapper chain.
-	_, readerCrypto, readerCryptoSource := determineSocketCryptoHintWithSource(readerConn)
-	_, writerCrypto, writerCryptoSource := determineSocketCryptoHintWithSource(writerConn)
+	disableAccel := os.Getenv("XRAY_DEBUG_DISABLE_ACCEL") == "1"
+	disableIdle := os.Getenv("XRAY_DEBUG_IDLE_INFINITE") == "1"
+	userspaceReader := buf.NewReader(readerConn)
 
-	readerConn, readCounter, _, readerHandler := UnwrapRawConn(readerConn)
-	writerConn, _, writeCounter, writerHandler := UnwrapRawConn(writerConn)
-	var readerForBuf net.Conn = readerConn
-	if readerHandler != nil {
-		readerForBuf = &ktlsReader{Conn: readerConn, handler: readerHandler}
+	decisionCaps := pipelineCapabilities()
+	decision := pipeline.DecisionSnapshot{
+		Path:   pipeline.PathUserspace,
+		Reason: pipeline.ReasonDefault,
+		Caps:   decisionCaps,
+		Kind:   "proxy",
 	}
-	reader := buf.NewReader(readerForBuf)
-	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
-		errors.LogDebug(ctx, "CopyRawConn fallback to readv: unsupported OS ", runtime.GOOS)
-		return readV(ctx, reader, writer, timer, readCounter)
+	defer func() {
+		logPipelineDecision(ctx, string(decision.Path), decision.Reason, decisionCaps)
+		logPipelineSummary(ctx, decision)
+	}()
+	defer clearVisionTelemetryTimestamps(readerConn, writerConn)
+
+	var (
+		rawReady                     bool
+		rawReaderConn, rawWriterConn net.Conn
+		readCounter, writeCounter    stats.Counter
+		readerHandler, writerHandler *tls.KTLSKeyUpdateHandler
+		rawWriterTCP                 *net.TCPConn
+		rawUserspaceReader           buf.Reader
+		readerCrypto                 ebpf.CryptoHint
+		writerCrypto                 ebpf.CryptoHint
+		readerCryptoSource           string
+		writerCryptoSource           string
+	)
+	ensureRaw := func() bool {
+		if rawReady {
+			return true
+		}
+		candidateReaderConn, candidateReadCounter, _, candidateReaderHandler := UnwrapRawConn(readerConn)
+		candidateWriterConn, _, candidateWriteCounter, candidateWriterHandler := UnwrapRawConn(writerConn)
+
+		if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+			pipelineMarkerEnsureRawFailOS.Add(1)
+			errors.LogDebug(ctx, "CopyRawConn fallback to readv: unsupported OS ", runtime.GOOS)
+			return false
+		}
+		if candidateReaderConn == nil || candidateWriterConn == nil {
+			pipelineMarkerEnsureRawFailNilConn.Add(1)
+			errors.LogDebug(ctx, "CopyRawConn fallback to readv: nil raw conn(s) readerType=", connTypeName(candidateReaderConn), " writerType=", connTypeName(candidateWriterConn))
+			return false
+		}
+		tc, ok := candidateWriterConn.(*net.TCPConn)
+		if !ok {
+			pipelineMarkerEnsureRawFailWriterType.Add(1)
+			errors.LogDebug(ctx, "CopyRawConn fallback to readv: writer is not *net.TCPConn (writerType=", connTypeName(candidateWriterConn), ")")
+			return false
+		}
+
+		readerForUserspace := candidateReaderConn
+		if candidateReaderHandler != nil {
+			readerForUserspace = &ktlsReader{Conn: candidateReaderConn, handler: candidateReaderHandler}
+		}
+
+		rawReaderConn = candidateReaderConn
+		rawWriterConn = candidateWriterConn
+		readCounter = candidateReadCounter
+		writeCounter = candidateWriteCounter
+		readerHandler = candidateReaderHandler
+		writerHandler = candidateWriterHandler
+		rawWriterTCP = tc
+		rawUserspaceReader = buf.NewReader(readerForUserspace)
+		rawReady = true
+		return true
 	}
-	if readerConn == nil || writerConn == nil {
-		errors.LogDebug(ctx, "CopyRawConn fallback to readv: nil raw conn(s) readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn))
-		return readV(ctx, reader, writer, timer, readCounter)
-	}
-	tc, ok := writerConn.(*net.TCPConn)
-	if !ok {
-		errors.LogDebug(ctx, "CopyRawConn fallback to readv: writer is not *net.TCPConn (writerType=", connTypeName(writerConn), ")")
-		return readV(ctx, reader, writer, timer, readCounter)
-	}
+
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: missing inbound metadata")
-		return readV(ctx, reader, writer, timer, readCounter)
+		decision.Reason = pipeline.ReasonMissingInboundMetadata
+		sc := &buf.SizeCounter{}
+		start := time.Now()
+		err := readV(ctx, userspaceReader, writer, timer, nil, sc)
+		decision.UserspaceBytes = sc.Size
+		decision.UserspaceDurationNs = time.Since(start).Nanoseconds()
+		decision.Path = pipeline.PathUserspace
+		return err
 	}
-	if inbound.CanSpliceCopy == 3 {
+	if inbound.GetCanSpliceCopy() == 3 {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: inbound.CanSpliceCopy=3")
-		return readV(ctx, reader, writer, timer, readCounter)
+		decision.Reason = pipeline.ReasonInboundForcedUserspace
+		sc := &buf.SizeCounter{}
+		start := time.Now()
+		err := readV(ctx, userspaceReader, writer, timer, nil, sc)
+		decision.UserspaceBytes = sc.Size
+		decision.UserspaceDurationNs = time.Since(start).Nanoseconds()
+		decision.Path = pipeline.PathUserspace
+		return err
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: no outbound metadata")
-		return readV(ctx, reader, writer, timer, readCounter)
+		decision.Reason = pipeline.ReasonMissingOutboundMetadata
+		sc := &buf.SizeCounter{}
+		start := time.Now()
+		err := readV(ctx, userspaceReader, writer, timer, nil, sc)
+		decision.UserspaceBytes = sc.Size
+		decision.UserspaceDurationNs = time.Since(start).Nanoseconds()
+		decision.Path = pipeline.PathUserspace
+		return err
 	}
 	for i, ob := range outbounds {
-		if ob.CanSpliceCopy == 3 {
+		if ob.GetCanSpliceCopy() == 3 {
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: outbounds[", i, "].CanSpliceCopy=3")
-			return readV(ctx, reader, writer, timer, readCounter)
+			sc := &buf.SizeCounter{}
+			start := time.Now()
+			err := readV(ctx, userspaceReader, writer, timer, nil, sc)
+			decision.UserspaceBytes = sc.Size
+			decision.UserspaceDurationNs = time.Since(start).Nanoseconds()
+			decision.Path = pipeline.PathUserspace
+			decision.Reason = pipeline.ReasonOutboundForcedUserspace
+			return err
+		}
+	}
+
+	loopbackDetachGuard := isLoopbackDetachGuardedConn(readerConn) || isLoopbackDetachGuardedConn(writerConn) || isLoopbackDetachGuardedConn(inbound.Conn)
+
+	if loopbackDetachGuard {
+		lr, rr := connAddrs(readerConn)
+		lw, rw := connAddrs(writerConn)
+		errors.LogInfo(ctx, "CopyRawConn loopback guard active: disabling splice/sockmap; reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw)
+		// For DNS (DoT) on the loopback ingress, align with main-branch behavior:
+		// bypass all acceleration (sockmap/splice/ktls) and stick to userspace
+		// copy to avoid startup cork/pop.
+		if dest := outbounds[len(outbounds)-1].Target; dest.Network == net.Network_TCP && (dest.Port == net.Port(53) || dest.Port == net.Port(853)) {
+			decision.Path = pipeline.PathUserspace
+			decision.Reason = pipeline.ReasonLoopbackDNSGuard
+			sc := &buf.SizeCounter{}
+			start := time.Now()
+			err := readV(ctx, userspaceReader, writer, timer, nil, sc)
+			decision.UserspaceBytes = sc.Size
+			decision.UserspaceDurationNs = time.Since(start).Nanoseconds()
+			return err
 		}
 	}
 
 	loggedUserspaceLoop := false
+	userspaceStart := time.Now()
+	forceUserspaceAfterSockmap := false
+
+	// Phase-aware idle policy:
+	// - preDetach: while deferred TLS still active; keep tight to surface jam early.
+	// - noDetach: deferred TLS continues without detach; enforce tighter timeout.
+	// - postDetach: after detach/promotion; give a bit more headroom.
+	// - streaming: once payload flows, grow gently up to a cap.
+	const (
+		userspacePhasePreDetach  = "pre_detach"
+		userspacePhaseNoDetach   = "no_detach"
+		userspacePhasePostDetach = "post_detach"
+		userspacePhaseStreaming  = "streaming"
+	)
+	var (
+		// Defaults tuned for fast stall surfacing.
+		idlePreDetach      = 2 * time.Second
+		idleNoDetach       = 10 * time.Second
+		idlePostDetach     = 20 * time.Second
+		idleStreamingMax   = 60 * time.Second
+		noDetachMinAge     = 5 * time.Second
+		noDetachMaxWallDur = 60 * time.Second
+		spliceProbeTimeout = 3 * time.Second
+		spliceProbeMinByte = int64(32)
+	)
+	if disableIdle {
+		// For debugging correctness: practically disable idle timeouts.
+		idlePreDetach = 10 * time.Minute
+		idleNoDetach = 10 * time.Minute
+		idlePostDetach = 10 * time.Minute
+		idleStreamingMax = 2 * time.Hour
+		noDetachMinAge = 10 * time.Minute
+		noDetachMaxWallDur = 2 * time.Hour
+	}
+	if loopbackDetachGuard && len(outbounds) > 0 {
+		dest := outbounds[len(outbounds)-1].Target
+		if dest.Network == net.Network_TCP && (dest.Port == net.Port(53) || dest.Port == net.Port(853)) {
+			// DNS on loopback ingress: disable userspace idle watchdog to avoid
+			// late DNS replies being cut off (matches baseline behavior).
+			disableIdle = true
+			idlePreDetach = 30 * time.Minute
+			idleNoDetach = 30 * time.Minute
+			idlePostDetach = 30 * time.Minute
+			idleStreamingMax = 30 * time.Minute
+			noDetachMinAge = 30 * time.Minute
+			noDetachMaxWallDur = 30 * time.Minute
+		}
+	}
+	idleTimeout := idlePreDetach
+	phase := userspacePhasePreDetach
+	deferredPayloadSeen := false
+	noDetachSince := time.Time{}
+	postDetachPhaseMarked := false
+	markPostDetachPhase := func(path string) {
+		if postDetachPhaseMarked {
+			return
+		}
+		detachUnix, ok := consumeVisionDetachTimestamp(writerConn)
+		if !ok {
+			detachUnix, ok = consumeVisionDetachTimestamp(readerConn)
+			if !ok {
+				return
+			}
+		}
+		nowUnix := time.Now().UnixNano()
+		if nowUnix > detachUnix {
+			pipelineMarkerVisionPostDetachNanos.Add(uint64(nowUnix - detachUnix))
+		}
+		pipelineMarkerVisionPostDetachCount.Add(1)
+		switch path {
+		case "splice":
+			pipelineMarkerVisionPostDetachSplice.Add(1)
+		case "sockmap":
+			pipelineMarkerVisionPostDetachSockmap.Add(1)
+		default:
+			pipelineMarkerVisionPostDetachUserspace.Add(1)
+		}
+		postDetachPhaseMarked = true
+	}
 	for {
-		var splice = inbound.CanSpliceCopy == 1
+		var splice = !disableAccel && !forceUserspaceAfterSockmap && !loopbackDetachGuard && inbound.GetCanSpliceCopy() != 0 && inbound.GetCanSpliceCopy() != 3
 		firstNonSpliceOutbound := -1
 		firstNonSpliceValue := 0
 		for i, ob := range outbounds {
-			if ob.CanSpliceCopy != 1 {
+			obSplice := ob.GetCanSpliceCopy()
+			if obSplice == 0 || obSplice == 3 {
 				splice = false
 				if firstNonSpliceOutbound == -1 {
 					firstNonSpliceOutbound = i
-					firstNonSpliceValue = ob.CanSpliceCopy
+					firstNonSpliceValue = obSplice
 				}
 			}
 		}
+		readerStillUsesDeferredTLS := deferredConnRequiresTLS(readerConn)
+		writerStillUsesDeferredTLS := deferredConnRequiresTLS(writerConn)
+		deferredTLSActive := readerStillUsesDeferredTLS || writerStillUsesDeferredTLS
+		if deferredTLSActive {
+			if phase == userspacePhasePreDetach && deferredPayloadSeen && time.Since(userspaceStart) >= noDetachMinAge {
+				phase = userspacePhaseNoDetach
+				idleTimeout = idleNoDetach
+				if noDetachSince.IsZero() {
+					noDetachSince = time.Now()
+				}
+			}
+		} else if phase == userspacePhasePreDetach || phase == userspacePhaseNoDetach {
+			phase = userspacePhasePostDetach
+			idleTimeout = idlePostDetach
+		}
+		if phase == userspacePhaseNoDetach && !noDetachSince.IsZero() && time.Since(noDetachSince) >= noDetachMaxWallDur {
+			decision.Path = pipeline.PathUserspace
+			decision.Reason = pipeline.ReasonUserspaceNoDetachIdleTimeout
+			decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
+			errors.LogWarning(ctx, "[kind=vision.no_detach_timeout] deferred userspace phase exceeded guard window")
+			return io.EOF
+		}
 		if splice {
+			input, currentReaderCrypto, currentWriterCrypto, currentReaderCryptoSource, currentWriterCryptoSource := buildVisionDecisionInput(readerConn, writerConn, decisionCaps, deferredTLSActive)
+			readerCrypto = currentReaderCrypto
+			writerCrypto = currentWriterCrypto
+			readerCryptoSource = currentReaderCryptoSource
+			writerCryptoSource = currentWriterCryptoSource
+			decision = pipeline.DecideVisionPath(input)
+			// Performance-first: keep loopback pairs on zero-copy instead of forcing
+			// the slow userspace guard. Retain the marker so telemetry still shows
+			// the guard trigger reason.
+			if decision.Path == pipeline.PathSplice && input.LoopbackPair {
+				decision.Reason = pipeline.ReasonLoopbackPairGuard
+			}
+			if decision.Path != pipeline.PathSplice {
+				splice = false
+				pipelineMarkerDeferredSpliceGuardHit.Add(1)
+				maybeLogPipelineRuntimeSummary(ctx)
+			}
+		}
+		var caps pipeline.CapabilitySummary
+		if splice {
+			caps = pipelineCapabilities()
+			decisionCaps = caps
+			decision.Path = pipeline.PathSplice
+			if decision.Reason == pipeline.ReasonDefault {
+				decision.Reason = pipeline.ReasonSplicePrimary
+			}
+			if !ensureRaw() {
+				decision.Path = pipeline.PathUserspace
+				decision.Reason = pipeline.ReasonEnsureRawFailed
+				sc := &buf.SizeCounter{}
+				start := time.Now()
+				err := readV(ctx, userspaceReader, writer, timer, nil, sc)
+				decision.UserspaceBytes = sc.Size
+				decision.UserspaceDurationNs = time.Since(start).Nanoseconds()
+				return err
+			}
+			// Re-evaluate crypto hints right before gating sockmap/splice so
+			// deferred detach or kTLS promotion transitions are reflected.
+			deferredTLSActive = deferredConnRequiresTLS(readerConn) || deferredConnRequiresTLS(writerConn)
+			input, currentReaderCrypto, currentWriterCrypto, currentReaderCryptoSource, currentWriterCryptoSource := buildVisionDecisionInput(readerConn, writerConn, decisionCaps, deferredTLSActive)
+			readerCrypto = currentReaderCrypto
+			writerCrypto = currentWriterCrypto
+			readerCryptoSource = currentReaderCryptoSource
+			writerCryptoSource = currentWriterCryptoSource
+			if input.LoopbackPair && deferredTLSActive {
+				decision.Path = pipeline.PathUserspace
+				decision.Reason = pipeline.ReasonLoopbackTLSGuard
+				sc := &buf.SizeCounter{}
+				start := time.Now()
+				err := readV(ctx, userspaceReader, writer, timer, nil, sc)
+				decision.UserspaceBytes = sc.Size
+				decision.UserspaceDurationNs = time.Since(start).Nanoseconds()
+				return err
+			}
+
 			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
-			if mgr := ebpf.GlobalSockmapManager(); mgr == nil {
+			if !caps.SockmapSupported {
+				pipelineMarkerSockmapSkipOther.Add(1)
+				decision.Path = pipeline.PathSplice
+				decision.Reason = pipeline.ReasonSockmapCapabilityUnsupported
+			} else if mgr := ebpf.GlobalSockmapManager(); mgr == nil {
+				pipelineMarkerSockmapSkipMgr.Add(1)
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: manager unavailable")
+				decision.Path = pipeline.PathSplice
+				decision.Reason = pipeline.ReasonSockmapManagerUnavailable
 			} else if mgr.ShouldFallbackToSplice() {
+				pipelineMarkerSockmapSkipContention.Add(1)
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: contention fallback active")
-			} else if !ebpf.CanUseZeroCopyWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto) {
+				decision.Path = pipeline.PathSplice
+				decision.Reason = pipeline.ReasonSockmapContention
+			} else if isLoopbackConn(rawReaderConn) || isLoopbackConn(rawWriterConn) {
+				pipelineMarkerSockmapSkipLoopback.Add(1)
+				lr, rr := connAddrs(rawReaderConn)
+				lw, rw := connAddrs(rawWriterConn)
+				errors.LogInfo(ctx, "CopyRawConn sockmap skipped: loopback endpoint; reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw)
+				decision.Path = pipeline.PathSplice
+				decision.Reason = pipeline.ReasonLoopbackPairGuard
+			} else if !ebpf.CanUseZeroCopyWithCrypto(rawReaderConn, rawWriterConn, readerCrypto, writerCrypto) {
 				errors.LogDebug(ctx, "CopyRawConn crypto hint: reader=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] source=", readerCryptoSource, " writer=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] source=", writerCryptoSource)
 				switch {
 				case !ebpf.KTLSSockhashCompatible() && (readerCrypto == ebpf.CryptoKTLSBoth || writerCrypto == ebpf.CryptoKTLSBoth):
+					pipelineMarkerSockmapSkipKTLSSockhash.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: kTLS+SOCKHASH not supported on this kernel, using splice")
 					mgr.IncrementKTLSSpliceFallback()
+					decision.Path = pipeline.PathSplice
+					decision.Reason = pipeline.ReasonSockmapKTLSSockhashIncompatible
 				case readerCrypto == ebpf.CryptoUserspaceTLS || writerCrypto == ebpf.CryptoUserspaceTLS:
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+					pipelineMarkerSockmapSkipUserspaceTLS.Add(1)
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
+					decision.Path = pipeline.PathSplice
+					decision.Reason = pipeline.ReasonSockmapUserspaceTLS
 				case (readerCrypto == ebpf.CryptoKTLSBoth) != (writerCrypto == ebpf.CryptoKTLSBoth):
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: asymmetric kTLS state (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+					pipelineMarkerSockmapSkipAsymmetric.Add(1)
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: asymmetric kTLS state (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
+					decision.Path = pipeline.PathSplice
+					decision.Reason = pipeline.ReasonSockmapAsymmetricKTLS
 				default:
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(readerConn), " writerType=", connTypeName(writerConn), ")")
+					pipelineMarkerSockmapSkipOther.Add(1)
+					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
+					decision.Path = pipeline.PathSplice
+					decision.Reason = pipeline.ReasonSockmapOtherPolicy
 				}
 			} else {
-				if err := mgr.RegisterPairWithCrypto(readerConn, writerConn, readerCrypto, writerCrypto); err == nil {
-					errors.LogDebug(ctx, "CopyRawConn sockmap (crypto: reader=", int(readerCrypto), " writer=", int(writerCrypto), ")")
-					writerMonitor := startKeyUpdateMonitor(writerConn, writerHandler)
+				if pair, ok := mgr.GetStats(rawReaderConn, rawWriterConn); ok && (pair.InboundCrypto != readerCrypto || pair.OutboundCrypto != writerCrypto) {
+					pipelineMarkerSockmapPolicyRefresh.Add(1)
+					if err := mgr.UnregisterPair(rawReaderConn, rawWriterConn); err != nil {
+						pipelineMarkerSockmapPolicyRefreshFail.Add(1)
+						decision.Path = pipeline.PathSplice
+						decision.Reason = pipeline.ReasonSockmapRegisterFail
+						errors.LogDebugInner(ctx, err, "CopyRawConn sockmap policy refresh (unregister) failed, falling back to splice")
+						maybeLogPipelineRuntimeSummary(ctx)
+						continue
+					}
+				}
+
+				pipelineMarkerSockmapRegisterAttempt.Add(1)
+				if err := mgr.RegisterPairWithCrypto(rawReaderConn, rawWriterConn, readerCrypto, writerCrypto); err == nil {
+					pipelineMarkerSockmapRegisterSuccess.Add(1)
+					markPostDetachPhase("sockmap")
+					decision.Path = pipeline.PathSockmap
+					decision.Reason = pipeline.ReasonSockmapActive
+					lr, rr := connAddrs(rawReaderConn)
+					lw, rw := connAddrs(rawWriterConn)
+					errors.LogInfo(ctx, "CopyRawConn sockmap start: crypto reader=", int(readerCrypto), " writer=", int(writerCrypto), " reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw, " loopback=", isLoopbackConnPair(rawReaderConn, rawWriterConn))
+					writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
 					timer.SetTimeout(24 * time.Hour)
 					if inTimer != nil {
 						inTimer.SetTimeout(24 * time.Hour)
 					}
-					fallbackToSplice, waitErr := waitForSockmapForwarding(readerConn, writerConn)
+					fallbackToSplice, waitErr := waitForSockmapForwarding(rawReaderConn, rawWriterConn)
 					writerMonitor.Stop()
-					if err := mgr.UnregisterPair(readerConn, writerConn); err != nil {
+					if err := mgr.UnregisterPair(rawReaderConn, rawWriterConn); err != nil {
 						errors.LogDebugInner(ctx, err, "CopyRawConn sockmap unregister failed")
 					}
 					// Prevent GC from finalizing connections while BPF ops used their FDs.
-					runtime.KeepAlive(readerConn)
-					runtime.KeepAlive(writerConn)
+					runtime.KeepAlive(rawReaderConn)
+					runtime.KeepAlive(rawWriterConn)
 					if waitErr != nil {
-						errors.LogDebugInner(ctx, waitErr, "CopyRawConn sockmap wait failed, falling back to splice")
+						pipelineMarkerSockmapWaitError.Add(1)
+						errors.LogWarningInner(ctx, waitErr, "CopyRawConn sockmap wait failed, switching to guarded userspace fallback; reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw)
+						decision.Path = pipeline.PathUserspace
+						decision.Reason = pipeline.ReasonSockmapWaitErrorUserspaceGuard
+						forceUserspaceAfterSockmap = true
+						continue
 					} else if !fallbackToSplice {
+						pipelineMarkerSockmapWaitSuccess.Add(1)
+						decision.Path = pipeline.PathSockmap
+						decision.Reason = pipeline.ReasonForwardSuccess
+						errors.LogInfo(ctx, "CopyRawConn sockmap forward success: reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw)
+						decision.SockmapSuccess = true
 						return nil
 					} else {
-						errors.LogDebug(ctx, "CopyRawConn sockmap inactive, falling back to splice")
+						pipelineMarkerSockmapWaitFallback.Add(1)
+						errors.LogWarning(ctx, "CopyRawConn sockmap inactive, switching to guarded userspace fallback; reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw)
+						decision.Path = pipeline.PathUserspace
+						decision.Reason = pipeline.ReasonSockmapWaitFallbackUserspaceGuard
+						forceUserspaceAfterSockmap = true
+						continue
 					}
 				} else {
+					pipelineMarkerSockmapRegisterFail.Add(1)
 					errors.LogDebugInner(ctx, err, "CopyRawConn sockmap register failed, falling back to splice")
+					decision.Path = pipeline.PathSplice
+					decision.Reason = pipeline.ReasonSockmapRegisterFail
 				}
 			}
 			// Fall through to splice on sockmap failure
 
+			decision.Path = pipeline.PathSplice
+			if decision.Reason == pipeline.ReasonDefault || decision.Reason == pipeline.ReasonSockmapActive {
+				decision.Reason = pipeline.ReasonSplicePrimary
+			}
+			postSockmapSpliceProbe := decision.Reason == pipeline.ReasonSockmapRegisterFail
 			errors.LogDebug(ctx, "CopyRawConn splice")
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
 			//runtime.Gosched() // necessary
@@ -1112,9 +1875,25 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
-			writerMonitor := startKeyUpdateMonitor(writerConn, writerHandler)
-			w, err := tc.ReadFrom(readerConn)
+			writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
+			pipelineMarkerSpliceAttempts.Add(1)
+			maybeLogPipelineRuntimeSummary(ctx)
+			spliceStart := time.Now()
+			markPostDetachPhase("splice")
+			if postSockmapSpliceProbe {
+				_ = rawReaderConn.SetReadDeadline(time.Now().Add(spliceProbeTimeout))
+			}
+			w, err := rawWriterTCP.ReadFrom(rawReaderConn)
+			if postSockmapSpliceProbe {
+				_ = rawReaderConn.SetReadDeadline(time.Time{})
+			}
+			decision.SpliceBytes = w
 			writerMonitor.Stop()
+			spliceDuration := time.Since(spliceStart)
+			decision.SpliceDurationNs = spliceDuration.Nanoseconds()
+			pipelineMarkerSpliceBytesTotal.Add(uint64(w))
+			pipelineMarkerSpliceDurationNanosTotal.Add(uint64(spliceDuration.Nanoseconds()))
+			recordSpliceHistogram(uint64(w), uint64(spliceDuration.Nanoseconds()))
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
 			}
@@ -1124,29 +1903,101 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if statWriter != nil {
 				statWriter.Counter.Add(w) // user stats
 			}
+			if postSockmapSpliceProbe && isNetTimeout(err) && w <= spliceProbeMinByte {
+				pipelineMarkerSpliceCompleted.Add(1)
+				decision.Reason = pipeline.ReasonSplicePostSockmapStall
+				maybeLogPipelineRuntimeSummary(ctx)
+				errors.LogWarning(ctx, "[kind=vision.splice_post_sockmap_stall] splice made no progress after sockmap fallback: bytes=", w, " timeout=", spliceProbeTimeout)
+				return io.EOF
+			}
 			if err != nil && readerHandler != nil && tls.IsKeyExpired(err) {
 				if herr := readerHandler.Handle(); herr != nil {
 					return herr
 				}
 				continue // retry splice after key update
 			}
-			if err != nil && errors.Cause(err) != io.EOF {
-				return err
+			if err == nil || errors.Cause(err) == io.EOF {
+				pipelineMarkerSpliceCompleted.Add(1)
+				maybeLogPipelineRuntimeSummary(ctx)
+				return nil
 			}
-			return nil
+			if isExpectedSpliceReadFromError(err) {
+				pipelineMarkerSpliceExpectedTeardown.Add(1)
+				recordSpliceExpectedTeardownClass(err)
+				pipelineMarkerSpliceCompleted.Add(1)
+				maybeLogPipelineRuntimeSummary(ctx)
+				errors.LogWarning(ctx, "[kind=vision.splice_expected_teardown] splice/readfrom closed by peer or stream teardown: ", err)
+				return nil
+			}
+			// Unexpected splice error: record and also flag as acceleration fault for learning.
+			recordSpliceUnexpectedReset(err)
+			pipelineMarkerSpliceUnexpectedError.Add(1)
+			maybeLogPipelineRuntimeSummary(ctx)
+			errors.LogWarning(ctx, "[kind=vision.splice_unexpected_error] splice/readfrom failed: ", err)
+			return err
 		}
 		if !loggedUserspaceLoop {
-			if inbound.CanSpliceCopy != 1 {
-				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: inbound.CanSpliceCopy=", inbound.CanSpliceCopy)
+			inboundSplice := inbound.GetCanSpliceCopy()
+			if inboundSplice != 1 {
+				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: inbound.CanSpliceCopy=", inboundSplice)
+			} else if readerStillUsesDeferredTLS || writerStillUsesDeferredTLS {
+				errors.LogDebug(ctx,
+					"CopyRawConn userspace copy loop: deferred rustls still active",
+					" reader=", readerStillUsesDeferredTLS,
+					" writer=", writerStillUsesDeferredTLS,
+				)
 			} else {
 				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: outbounds[", firstNonSpliceOutbound, "].CanSpliceCopy=", firstNonSpliceValue)
 			}
 			loggedUserspaceLoop = true
 		}
-		buffer, err := reader.ReadMultiBuffer()
+		currentReader := userspaceReader
+		usingRawUserspaceReader := false
+		// After Vision command=2, inbound switches to raw direct-copy mode.
+		// If splice is disabled by peer metadata, userspace fallback must read
+		// from the same unwrapped/raw layer to avoid waiting for TLS framing.
+		if inbound.GetCanSpliceCopy() == 1 && !readerStillUsesDeferredTLS && ensureRaw() && rawUserspaceReader != nil {
+			currentReader = rawUserspaceReader
+			usingRawUserspaceReader = true
+		}
+
+		_ = readerConn.SetReadDeadline(time.Now().Add(idleTimeout))
+		buffer, err := currentReader.ReadMultiBuffer()
+		_ = readerConn.SetReadDeadline(time.Time{})
 		if !buffer.IsEmpty() {
-			if readCounter != nil {
-				readCounter.Add(int64(buffer.Len()))
+			pipelineMarkerUserspaceCopyReads.Add(1)
+			pipelineMarkerUserspaceCopyBytesTotal.Add(uint64(buffer.Len()))
+			decision.UserspaceBytes += int64(buffer.Len())
+			if deferredTLSActive {
+				deferredPayloadSeen = true
+				if phase == userspacePhasePreDetach && time.Since(userspaceStart) >= noDetachMinAge {
+					phase = userspacePhaseNoDetach
+					idleTimeout = idleNoDetach
+					if noDetachSince.IsZero() {
+						noDetachSince = time.Now()
+					}
+				}
+				if phase == userspacePhaseNoDetach && idleTimeout > idleNoDetach {
+					idleTimeout = idleNoDetach
+				}
+			} else {
+				if phase != userspacePhaseStreaming {
+					phase = userspacePhaseStreaming
+					if idleTimeout < idlePostDetach {
+						idleTimeout = idlePostDetach
+					}
+				}
+				if idleTimeout < idleStreamingMax {
+					idleTimeout += 5 * time.Second
+					if idleTimeout > idleStreamingMax {
+						idleTimeout = idleStreamingMax
+					}
+				}
+			}
+			if usingRawUserspaceReader {
+				pipelineMarkerUserspaceRawReaderHits.Add(1)
+			} else {
+				pipelineMarkerUserspaceTLSReaderHits.Add(1)
 			}
 			timer.Update()
 			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
@@ -1154,11 +2005,27 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 		}
 		if err != nil {
+			decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if phase == userspacePhaseNoDetach {
+					decision.Reason = pipeline.ReasonUserspaceNoDetachIdleTimeout
+				} else {
+					decision.Reason = pipeline.ReasonUserspaceIdleTimeout
+				}
+				decision.Path = pipeline.PathUserspace
+				// Treat idle timeout as clean close to avoid marking failures upstream.
+				return io.EOF
+			}
 			if errors.Cause(err) == io.EOF {
+				if decision.Reason == pipeline.ReasonDefault {
+					decision.Reason = pipeline.ReasonUserspaceComplete
+					decision.Path = pipeline.PathUserspace
+				}
 				return nil
 			}
 			return err
 		}
+		decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
 	}
 }
 
@@ -1169,6 +2036,95 @@ func connTypeName(conn net.Conn) string {
 	return reflect.TypeOf(conn).String()
 }
 
+func connAddrs(conn net.Conn) (l, r string) {
+	if conn == nil {
+		return "<nil>", "<nil>"
+	}
+	if la := conn.LocalAddr(); la != nil {
+		l = la.String()
+	}
+	if ra := conn.RemoteAddr(); ra != nil {
+		r = ra.String()
+	}
+	return
+}
+
+func isNilConnValue(conn net.Conn) bool {
+	if conn == nil {
+		return true
+	}
+	v := reflect.ValueOf(conn)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Ptr, reflect.Slice, reflect.Interface:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+func isLoopbackDetachGuardedConn(conn net.Conn) bool {
+	if isNilConnValue(conn) {
+		return false
+	}
+	if drc, ok := conn.(*tls.DeferredRustConn); ok {
+		if drc == nil {
+			return false
+		}
+		if rc := drc.NetConn(); rc != nil {
+			conn = rc
+		} else {
+			return false
+		}
+	}
+	la := conn.LocalAddr()
+	ra := conn.RemoteAddr()
+	if la == nil || ra == nil {
+		return false
+	}
+	lip := extractAddrIP(la)
+	rip := extractAddrIP(ra)
+	if lip == nil || rip == nil {
+		return false
+	}
+	if !(lip.IsLoopback() || rip.IsLoopback()) {
+		return false
+	}
+	_, lport, _ := gonet.SplitHostPort(la.String())
+	_, rport, _ := gonet.SplitHostPort(ra.String())
+	return lport == strconv.Itoa(loopbackDetachGuardPort) || rport == strconv.Itoa(loopbackDetachGuardPort)
+}
+
+// isLoopbackDetachGuardedInbound mirrors the detach guard check but only uses
+// the inbound connection from context (safe for use in dispatcher).
+func isLoopbackDetachGuardedInbound(ctx context.Context) bool {
+	inb := session.InboundFromContext(ctx)
+	if inb == nil || inb.Conn == nil {
+		return false
+	}
+	return isLoopbackDetachGuardedConn(inb.Conn)
+}
+
+// isDNSPortOutbound returns true if the last outbound target is TCP:53 or TCP:853.
+func isDNSPortOutbound(ctx context.Context) bool {
+	outbounds := session.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 {
+		return false
+	}
+	dest := outbounds[len(outbounds)-1].Target
+	if dest.Network != net.Network_TCP {
+		return false
+	}
+	return dest.Port == net.Port(53) || dest.Port == net.Port(853)
+}
+
+func isNetTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne interface{ Timeout() bool }
+	return goerrors.As(err, &ne) && ne.Timeout()
+}
+
 func appendCryptoHintSource(source, step string) string {
 	if source == "" {
 		return step
@@ -1177,6 +2133,244 @@ func appendCryptoHintSource(source, step string) string {
 		return source
 	}
 	return source + " -> " + step
+}
+
+func RecordPipelineFlowMix(ctx context.Context, destNet net.Network, allowedNet net.Network) {
+	switch {
+	case destNet == net.Network_TCP && allowedNet == net.Network_UDP:
+		pipelineMarkerFlowMuxUDP.Add(1)
+	case destNet == net.Network_TCP && allowedNet == net.Network_Unknown:
+		pipelineMarkerFlowPureTCP.Add(1)
+	case destNet == net.Network_TCP && allowedNet == net.Network_TCP:
+		pipelineMarkerFlowMuxTCP.Add(1)
+	default:
+		pipelineMarkerFlowOther.Add(1)
+	}
+}
+
+func maybeLogPipelineRuntimeSummary(ctx context.Context) {
+	if pipelineTelemetryV2Enabled() {
+		return
+	}
+	// Legacy runtime summary logging has been replaced by v2 telemetry markers.
+}
+
+func logStartupHealth() {
+	ctx := context.Background()
+	bpffsMounted := false
+	if fi, err := os.Stat("/sys/fs/bpf"); err == nil && fi.IsDir() {
+		bpffsMounted = true
+	}
+	pinDir := ebpf.DefaultSockmapConfig().PinPath
+	pinsReady := false
+	if pinDir != "" {
+		if fi, err := os.Stat(pinDir); err == nil && fi.IsDir() {
+			_, errHash := os.Stat(filepath.Join(pinDir, "sockhash"))
+			_, errPolicy := os.Stat(filepath.Join(pinDir, "policy"))
+			pinsReady = errHash == nil && errPolicy == nil
+		}
+	}
+	sockmapEnabled := false
+	if mgr := ebpf.GlobalSockmapManager(); mgr != nil && mgr.IsEnabled() {
+		sockmapEnabled = true
+	}
+	ktlsSockhash := ebpf.KTLSSockhashCompatible()
+
+	errors.LogInfo(ctx,
+		"startup health: bpffs_mounted=", bpffsMounted,
+		" pin_dir=", pinDir,
+		" pins_ready=", pinsReady,
+		" sockmap_enabled=", sockmapEnabled,
+		" ktls_sockhash_compatible=", ktlsSockhash,
+		" vision_detach_mode=async timeout=", visionDetachTimeout,
+	)
+}
+
+func markerSnapshot(total *atomic.Uint64, last *atomic.Uint64) (current uint64, delta uint64) {
+	current = total.Load()
+	prev := last.Swap(current)
+	if current >= prev {
+		delta = current - prev
+	}
+	return current, delta
+}
+
+func fmtMarkerWithDelta(current, delta uint64) string {
+	if delta == 0 {
+		return strconv.FormatUint(current, 10)
+	}
+	return strconv.FormatUint(current, 10) + "(+" + strconv.FormatUint(delta, 10) + ")"
+}
+
+func fmtAverageNanos(total uint64, count uint64) string {
+	if count == 0 {
+		return "0"
+	}
+	return strconv.FormatUint(total/count, 10)
+}
+
+func recordSpliceHistogram(bytes uint64, durationNs uint64) {
+	switch {
+	case bytes < 4*1024:
+		pipelineMarkerSpliceBytesLt4K.Add(1)
+	case bytes < 64*1024:
+		pipelineMarkerSpliceBytes4KTo64K.Add(1)
+	case bytes < 1024*1024:
+		pipelineMarkerSpliceBytes64KTo1M.Add(1)
+	default:
+		pipelineMarkerSpliceBytesGe1M.Add(1)
+	}
+	switch {
+	case durationNs < uint64(time.Millisecond):
+		pipelineMarkerSpliceDurLt1ms.Add(1)
+	case durationNs < uint64(5*time.Millisecond):
+		pipelineMarkerSpliceDur1To5ms.Add(1)
+	case durationNs < uint64(20*time.Millisecond):
+		pipelineMarkerSpliceDur5To20ms.Add(1)
+	case durationNs < uint64(100*time.Millisecond):
+		pipelineMarkerSpliceDur20To100ms.Add(1)
+	default:
+		pipelineMarkerSpliceDurGe100ms.Add(1)
+	}
+}
+
+func recordRawUnwrapToDetachHistogram(durationNs uint64) {
+	switch {
+	case durationNs < uint64(5*time.Millisecond):
+		pipelineMarkerRawUnwrapToDetachLt5ms.Add(1)
+	case durationNs < uint64(20*time.Millisecond):
+		pipelineMarkerRawUnwrapToDetach5To20ms.Add(1)
+	case durationNs < uint64(100*time.Millisecond):
+		pipelineMarkerRawUnwrapToDetach20To100ms.Add(1)
+	default:
+		pipelineMarkerRawUnwrapToDetachGe100ms.Add(1)
+	}
+}
+
+func clearVisionTelemetryTimestamps(conns ...gonet.Conn) {
+	for _, conn := range conns {
+		dc := unwrapVisionDeferredConn(conn)
+		if dc == nil {
+			continue
+		}
+		pipelineVisionRawUnwrapUnixByConn.Delete(dc)
+		pipelineVisionDetachUnixByConn.Delete(dc)
+		pipelineVisionDetachFutureByConn.Delete(dc)
+	}
+}
+
+func storeVisionRawUnwrapWarningTimestamp(conn gonet.Conn, unixNano int64) {
+	if unixNano <= 0 {
+		return
+	}
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return
+	}
+	if _, loaded := pipelineVisionRawUnwrapUnixByConn.LoadOrStore(dc, unixNano); loaded {
+		return
+	}
+}
+
+func consumeVisionRawUnwrapWarningTimestamp(conn gonet.Conn) (int64, bool) {
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return 0, false
+	}
+	value, ok := pipelineVisionRawUnwrapUnixByConn.LoadAndDelete(dc)
+	if !ok {
+		return 0, false
+	}
+	unixNano, ok := value.(int64)
+	if !ok || unixNano <= 0 {
+		return 0, false
+	}
+	return unixNano, true
+}
+
+func storeVisionDetachTimestamp(conn gonet.Conn, unixNano int64) {
+	if unixNano <= 0 {
+		return
+	}
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return
+	}
+	pipelineVisionDetachUnixByConn.Store(dc, unixNano)
+}
+
+func consumeVisionDetachTimestamp(conn gonet.Conn) (int64, bool) {
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return 0, false
+	}
+	value, ok := pipelineVisionDetachUnixByConn.LoadAndDelete(dc)
+	if !ok {
+		return 0, false
+	}
+	unixNano, ok := value.(int64)
+	if !ok || unixNano <= 0 {
+		return 0, false
+	}
+	return unixNano, true
+}
+
+func deferredConnRequiresTLS(conn gonet.Conn) bool {
+	dc := unwrapVisionDeferredConn(conn)
+	if dc == nil {
+		return false
+	}
+	if dc.IsDetached() {
+		return false
+	}
+	return !dc.KTLSEnabled().Enabled
+}
+
+func isExpectedSpliceReadFromError(err error) bool {
+	cause := errors.Cause(err)
+	if cause == nil {
+		cause = err
+	}
+	return goerrors.Is(cause, io.ErrClosedPipe) ||
+		goerrors.Is(cause, gonet.ErrClosed) ||
+		goerrors.Is(cause, context.Canceled) ||
+		goerrors.Is(cause, syscall.EPIPE) ||
+		goerrors.Is(cause, syscall.ECONNRESET) ||
+		goerrors.Is(cause, syscall.ENOTCONN) ||
+		goerrors.Is(cause, syscall.ESHUTDOWN)
+}
+
+func recordSpliceExpectedTeardownClass(err error) {
+	cause := errors.Cause(err)
+	if cause == nil {
+		cause = err
+	}
+	switch {
+	case goerrors.Is(cause, io.ErrClosedPipe) || goerrors.Is(cause, syscall.EPIPE):
+		pipelineMarkerSpliceExpectedBrokenPipe.Add(1)
+	case goerrors.Is(cause, syscall.ECONNRESET):
+		pipelineMarkerSpliceExpectedConnReset.Add(1)
+	case goerrors.Is(cause, gonet.ErrClosed):
+		pipelineMarkerSpliceExpectedClosedConn.Add(1)
+	case goerrors.Is(cause, context.Canceled):
+		pipelineMarkerSpliceExpectedCanceled.Add(1)
+	case goerrors.Is(cause, syscall.ENOTCONN):
+		pipelineMarkerSpliceExpectedNotConn.Add(1)
+	case goerrors.Is(cause, syscall.ESHUTDOWN):
+		pipelineMarkerSpliceExpectedShutdown.Add(1)
+	default:
+		pipelineMarkerSpliceExpectedOther.Add(1)
+	}
+}
+
+func recordSpliceUnexpectedReset(err error) {
+	cause := errors.Cause(err)
+	if cause == nil {
+		cause = err
+	}
+	if goerrors.Is(cause, syscall.EPIPE) || goerrors.Is(cause, syscall.ECONNRESET) {
+		pipelineMarkerSpliceExpectedBrokenPipe.Add(1) // reuse existing counter for visibility
+	}
 }
 
 func ktlsStateName(txReady, rxReady bool) string {
@@ -1209,9 +2403,13 @@ func cryptoHintName(h ebpf.CryptoHint) string {
 	}
 }
 
-func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer signal.ActivityUpdater, readCounter stats.Counter) error {
+func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer signal.ActivityUpdater, readCounter stats.Counter, sizeCounter *buf.SizeCounter) error {
 	errors.LogDebug(ctx, "CopyRawConn (maybe) readv")
-	if err := buf.Copy(reader, writer, buf.UpdateActivity(timer), buf.AddToStatCounter(readCounter)); err != nil {
+	opts := []buf.CopyOption{buf.UpdateActivity(timer), buf.AddToStatCounter(readCounter)}
+	if sizeCounter != nil {
+		opts = append(opts, buf.CountSize(sizeCounter))
+	}
+	if err := buf.Copy(reader, writer, opts...); err != nil {
 		return errors.New("failed to process response").Base(err)
 	}
 	return nil

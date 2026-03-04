@@ -244,3 +244,68 @@ func TestValidateNativeKTLS(t *testing.T) {
 		t.Fatal("expected error for partial kTLS")
 	}
 }
+
+func TestDeferredRustConn_DrainAndDetachNilHandle(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+
+	dc := &DeferredRustConn{rawConn: client}
+	plain, raw, err := dc.DrainAndDetach()
+	if err == nil {
+		t.Fatal("expected error for nil deferred handle")
+	}
+	if len(plain) != 0 || len(raw) != 0 {
+		t.Fatal("expected no drained data on error")
+	}
+	if dc.IsDetached() {
+		t.Fatal("expected connection to remain attached after failed drain")
+	}
+	_ = dc.Close()
+}
+
+func TestDeferredRustConn_ReadWriteAfterDetached(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	dc := &DeferredRustConn{rawConn: client}
+	dc.detached.Store(true)
+
+	if _, err := dc.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected read error after detach")
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		var b [1]byte
+		_, err := server.Read(b[:])
+		readDone <- err
+	}()
+	if n, err := dc.Write([]byte{0x01}); err != nil {
+		t.Fatalf("expected detached write to use raw socket, got error: %v", err)
+	} else if n != 1 {
+		t.Fatalf("expected detached write to write 1 byte, got %d", n)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatalf("server read failed: %v", err)
+	}
+	if !dc.IsDetached() {
+		t.Fatal("expected IsDetached() to report true")
+	}
+}
+
+func TestDeferredRustConn_RestoreNonBlockNilHandle(t *testing.T) {
+	dc := &DeferredRustConn{rawConn: nil}
+	// Nil handle should be a no-op (returns nil).
+	if err := dc.RestoreNonBlock(); err != nil {
+		t.Fatalf("expected nil error for nil handle, got %v", err)
+	}
+}
+
+func TestDeferredRustConn_RestoreNonBlockAfterDetach(t *testing.T) {
+	dc := &DeferredRustConn{rawConn: nil}
+	dc.detached.Store(true)
+	// Already detached — should be a no-op.
+	if err := dc.RestoreNonBlock(); err != nil {
+		t.Fatalf("expected nil error after detach, got %v", err)
+	}
+}

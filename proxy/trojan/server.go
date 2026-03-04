@@ -161,7 +161,6 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	if err != nil {
 		return errors.New("failed to read first request").Base(err)
 	}
-	errors.LogInfo(ctx, "firstLen = ", firstLen)
 
 	bufferedReader := &buf.BufferedReader{
 		Reader: buf.NewReader(conn),
@@ -217,6 +216,15 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		})
 		return errors.New("failed to create request from: ", conn.RemoteAddr()).Base(err)
 	}
+	if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+		if err := dc.EnableKTLS(); err != nil {
+			return errors.New("deferred kTLS enable failed for Trojan connection").Base(err).AtWarning()
+		}
+	} else if tlsConn, ok := iConn.(*tls.Conn); ok {
+		if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
+			return errors.New("kTLS enable failed for Trojan TLS connection").Base(err).AtWarning()
+		}
+	}
 
 	destination := clientReader.Target
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
@@ -225,7 +233,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "trojan"
-	inbound.CanSpliceCopy = 2
+	inbound.SetCanSpliceCopy(2)
 	inbound.User = user
 	sessionPolicy = s.policyManager.ForLevel(user.Level)
 
@@ -336,8 +344,8 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 		return errors.New("failed to dispatch request to ", destination).Base(err)
 	}
 
-	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.CanSpliceCopy == 2 {
-		inbound.CanSpliceCopy = 1
+	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.GetCanSpliceCopy() == 2 {
+		inbound.SetCanSpliceCopy(1)
 	}
 
 	requestDone := func() error {
@@ -385,6 +393,17 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 		cs := realityConn.ConnectionState()
 		name = cs.ServerName
 		alpn = cs.NegotiatedProtocol
+		errors.LogInfo(ctx, "realName = "+name)
+		errors.LogInfo(ctx, "realAlpn = "+alpn)
+	} else if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+		cs := dc.ConnectionState()
+		name = cs.ServerName
+		alpn = cs.NegotiatedProtocol
+		if ktlsErr := dc.EnableKTLS(); ktlsErr != nil {
+			// Deferred handle is consumed by FFI even on failure, so
+			// this connection cannot safely continue rustls I/O.
+			return errors.New("deferred kTLS enable failed in Trojan fallback").Base(ktlsErr).AtWarning()
+		}
 		errors.LogInfo(ctx, "realName = "+name)
 		errors.LogInfo(ctx, "realAlpn = "+alpn)
 	}

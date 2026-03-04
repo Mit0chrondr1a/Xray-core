@@ -3,7 +3,11 @@ package freedom
 import (
 	"context"
 	"crypto/rand"
+	goerrors "errors"
 	"io"
+	gonet "net"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -75,15 +79,69 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 	return a != net.AnyIP && a != net.AnyIPv6
 }
 
+func classifyEgressDialFailure(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	cause := errors.Cause(err)
+	if cause == nil {
+		cause = err
+	}
+	if goerrors.Is(cause, context.Canceled) || goerrors.Is(cause, context.DeadlineExceeded) {
+		return "", false
+	}
+
+	msg := strings.ToLower(cause.Error())
+	if strings.Contains(msg, "no route to host") ||
+		goerrors.Is(cause, syscall.ENETUNREACH) ||
+		goerrors.Is(cause, syscall.EHOSTUNREACH) ||
+		goerrors.Is(cause, syscall.ENETDOWN) ||
+		goerrors.Is(cause, syscall.EHOSTDOWN) {
+		return "no_route", true
+	}
+	if strings.Contains(msg, "connection refused") || goerrors.Is(cause, syscall.ECONNREFUSED) {
+		return "refused", true
+	}
+
+	if netErr, ok := cause.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+		return "timeout", true
+	}
+	if strings.Contains(msg, "connection timed out") || strings.Contains(msg, "i/o timeout") {
+		return "timeout", true
+	}
+	return "", false
+}
+
+func isDNSDest(dest net.Destination) bool {
+	if dest.Port != net.Port(53) && dest.Port != net.Port(853) {
+		return false
+	}
+	switch dest.Network {
+	case net.Network_TCP, net.Network_UDP:
+		return true
+	default:
+		return false
+	}
+}
+
+// shouldBypassEgressFastFail is retained for interface compatibility; currently
+// all destinations use the normal dial path without fast-fail penalties.
+func shouldBypassEgressFastFail(net.Destination) bool {
+	return false
+}
+
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	outbounds := session.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 {
+		return errors.New("no outbound metadata in context")
+	}
 	ob := outbounds[len(outbounds)-1]
 	if !ob.Target.IsValid() {
 		return errors.New("target not specified.")
 	}
 	ob.Name = "freedom"
-	ob.CanSpliceCopy = 1
+	ob.SetCanSpliceCopy(1)
 	inbound := session.InboundFromContext(ctx)
 
 	destination := ob.Target
@@ -106,11 +164,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 
+	proxy.RecordPipelineFlowMix(ctx, destination.Network, session.AllowedNetworkFromContext(ctx))
+
 	input := link.Reader
 	output := link.Writer
 
 	var conn stat.Connection
-	err := retry.ExponentialBackoff(5, 100).On(func() error {
+
+	bypassFastFail := shouldBypassEgressFastFail(destination)
+
+	// Fast path for DNS/loopback control traffic: single-shot dial without
+	// penalty/backoff to avoid long startup corks.
+	if bypassFastFail {
 		dialDest := destination
 		if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
 			strategy := h.config.DomainStrategy
@@ -119,7 +184,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 			ips, err := internet.LookupForIP(dialDest.Address.Domain(), strategy, outGateway)
 			if err != nil {
-				errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
+				errors.LogDebugInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
 				if h.config.DomainStrategy.ForceIP() {
 					return err
 				}
@@ -129,15 +194,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					Address: net.IPAddress(ips[dice.Roll(len(ips))]),
 					Port:    dialDest.Port,
 				}
-				errors.LogInfo(ctx, "dialing to ", dialDest)
+				errors.LogDebug(ctx, "dialing to ", dialDest)
 			}
 		}
 
 		rawConn, err := dialer.Dial(ctx, dialDest)
 		if err != nil {
-			return err
+			return errors.New("failed to open connection to ", dialDest).Base(err)
 		}
-
 		if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
 			version := byte(h.config.ProxyProtocol)
 			srcAddr := inbound.Source.RawNetAddr()
@@ -150,13 +214,55 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		conn = rawConn
-		return nil
-	})
-	if err != nil {
-		return errors.New("failed to open connection to ", destination).Base(err)
+	} else {
+		err := retry.ExponentialBackoff(5, 100).On(func() error {
+			dialDest := destination
+			if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
+				strategy := h.config.DomainStrategy
+				if destination.Network == net.Network_UDP && origTargetAddr != nil && outGateway == nil {
+					strategy = strategy.GetDynamicStrategy(origTargetAddr.Family())
+				}
+				ips, err := internet.LookupForIP(dialDest.Address.Domain(), strategy, outGateway)
+				if err != nil {
+					errors.LogDebugInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
+					if h.config.DomainStrategy.ForceIP() {
+						return err
+					}
+				} else {
+					dialDest = net.Destination{
+						Network: dialDest.Network,
+						Address: net.IPAddress(ips[dice.Roll(len(ips))]),
+						Port:    dialDest.Port,
+					}
+					errors.LogDebug(ctx, "dialing to ", dialDest)
+				}
+			}
+
+			rawConn, err := dialer.Dial(ctx, dialDest)
+			if err != nil {
+				return err
+			}
+
+			if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
+				version := byte(h.config.ProxyProtocol)
+				srcAddr := inbound.Source.RawNetAddr()
+				dstAddr := rawConn.RemoteAddr()
+				header := proxyproto.HeaderProxyFromAddrs(version, srcAddr, dstAddr)
+				if _, err = header.WriteTo(rawConn); err != nil {
+					rawConn.Close()
+					return err
+				}
+			}
+
+			conn = rawConn
+			return nil
+		})
+		if err != nil {
+			return errors.New("failed to open connection to ", destination).Base(err)
+		}
 	}
 	defer conn.Close()
-	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
+	errors.LogDebug(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
 	var newCtx context.Context
 	var newCancel context.CancelFunc
@@ -197,12 +303,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					noises:      h.config.Noises,
 					firstWrite:  true,
 					UDPOverride: UDPOverride,
+					DestPort:    destination.Port,
 					remoteAddr:  net.DestinationFromAddr(conn.RemoteAddr()).Address,
 				}
 			}
 		}
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+			if isExpectedRequestReadError(err) {
+				errors.LogDebugInner(ctx, err, "freedom: request stream closed by peer")
+				return nil
+			}
 			return errors.New("failed to process request").Base(err)
 		}
 
@@ -241,6 +352,39 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	return nil
+}
+
+func isExpectedRequestReadError(err error) bool {
+	if err == nil || !buf.IsReadError(err) {
+		return false
+	}
+	cause := errors.Cause(err)
+	if cause == nil {
+		return false
+	}
+	if goerrors.Is(cause, io.EOF) ||
+		goerrors.Is(cause, io.ErrClosedPipe) ||
+		goerrors.Is(cause, context.Canceled) ||
+		goerrors.Is(cause, gonet.ErrClosed) {
+		return true
+	}
+	if isExpectedStreamCancel(cause) {
+		return true
+	}
+
+	return goerrors.Is(cause, syscall.ECONNRESET) ||
+		goerrors.Is(cause, syscall.EPIPE) ||
+		goerrors.Is(cause, syscall.ENOTCONN) ||
+		goerrors.Is(cause, syscall.ESHUTDOWN) ||
+		goerrors.Is(cause, syscall.EIO)
+}
+
+func isExpectedStreamCancel(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "stream error") && strings.Contains(msg, "cancel")
 }
 
 func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.Destination) buf.Reader {
@@ -425,7 +569,12 @@ type NoisePacketWriter struct {
 	noises      []*Noise
 	firstWrite  bool
 	UDPOverride net.Destination
+	DestPort    net.Port
 	remoteAddr  net.Address
+}
+
+func isDNSControlPort(port net.Port) bool {
+	return port == 53 || port == 853
 }
 
 // MultiBuffer writer with Noise before first packet
@@ -433,7 +582,7 @@ func (w *NoisePacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if w.firstWrite {
 		w.firstWrite = false
 		//Do not send Noise for dns requests(just to be safe)
-		if w.UDPOverride.Port == 53 {
+		if isDNSControlPort(w.UDPOverride.Port) || isDNSControlPort(w.DestPort) {
 			return w.Writer.WriteMultiBuffer(mb)
 		}
 		var noise []byte

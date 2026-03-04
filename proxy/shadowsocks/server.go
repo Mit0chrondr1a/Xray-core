@@ -90,7 +90,7 @@ func (s *Server) Network() []net.Network {
 func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "shadowsocks"
-	inbound.CanSpliceCopy = 3
+	inbound.SetCanSpliceCopy(3)
 
 	switch network {
 	case net.Network_TCP:

@@ -9,9 +9,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 
 	xerrors "github.com/xtls/xray-core/common/errors"
 	xlog "github.com/xtls/xray-core/common/log"
+	"github.com/xtls/xray-core/common/native"
 	"golang.org/x/sys/unix"
 )
 
@@ -32,10 +34,34 @@ func logAccelerationSummary(ctx context.Context) {
 		sockhashFD = st.sockhashFD
 	}
 
+	// Determine loader type and resolve sockhash FD for display.
+	loaderType := "go-native"
+	if nativeEbpfAvailable() && st != nil && st.sockmapPinPath != "" && sockhashFD < 0 {
+		// Rust/Aya loader is active — FDs are Rust-managed, so sockhashFD is -1.
+		loaderType = "rust-aya"
+		// Try to open pinned sockhash for FD display (best-effort).
+		if fd, err := openPinnedBPFMap(sockhashPinPath(st.sockmapPinPath)); err == nil {
+			sockhashFD = fd
+			defer syscall.Close(fd)
+		}
+	}
+
+	skMsgMode := "none"
+	if loaderType == "rust-aya" {
+		switch native.EbpfSkMsgCapability() {
+		case native.SkMsgFull:
+			skMsgMode = "full"
+		case native.SkMsgCorkOnly:
+			skMsgMode = "cork-only"
+		}
+	}
+
 	capacity := DefaultSockmapConfig().MaxEntries
 
 	xerrors.LogInfo(ctx,
-		"sockmap: acceleration summary — plain-TCP=sockmap kTLS=", ktlsPath,
+		"sockmap: acceleration summary — loader=", loaderType,
+		" sk_msg=", skMsgMode,
+		" plain-TCP=sockmap kTLS=", ktlsPath,
 		"(", ktlsDetail, ") kernel=", unameRelease(),
 		" sockhash-fd=", sockhashFD,
 		" capacity=", capacity,
@@ -57,15 +83,19 @@ func logSockmapDeploymentDebug(ctx context.Context, caps Capabilities, initErr e
 		" xdp=", caps.XDPSupported,
 		" btf=", caps.BTFSupported,
 		" kTLS+SOCKHASH=", KTLSSockhashCompatible(),
+		" sockmapProbe=", caps.sockmapProbeSummary(),
+		" sockmapProbeClass=", caps.sockmapFailureKind().String(),
 	)
 
 	if initErr != nil {
 		xerrors.LogDebug(ctx, "eBPF debug trigger: sockmap manager init failed")
 	} else {
 		xerrors.LogDebug(ctx, "eBPF debug trigger: sockmap capability gate")
-		// Capability-gated disable is expected on unsupported kernels. Avoid
-		// expensive /proc and /boot probing in this path.
-		return
+		// Capability-gated disable is expected on unsupported kernels. For
+		// permission/seccomp failures we continue gathering diagnostics.
+		if !shouldCollectCapabilityGateDiagnostics(caps) {
+			return
+		}
 	}
 
 	inContainer, containerHints := detectContainerHints()
@@ -102,6 +132,13 @@ func logSockmapDeploymentDebug(ctx context.Context, caps Capabilities, initErr e
 		" bpf_jit_harden=", jitHarden,
 	)
 
+	if initErr == nil && caps.sockmapFailureKind() == sockmapProbeFailurePermissionDenied {
+		xerrors.LogDebug(ctx,
+			"eBPF debug classification: sockmap EPERM likely=",
+			classifySockmapEPERMCause(seccomp, inContainer),
+		)
+	}
+
 	bpffsMounted, bpffsType, bpffsOpts := probeMountPoint("/proc/self/mountinfo", "/sys/fs/bpf")
 	xerrors.LogDebug(ctx,
 		"eBPF debug fs: bpffsMounted=", bpffsMounted,
@@ -117,6 +154,25 @@ func logSockmapDeploymentDebug(ctx context.Context, caps Capabilities, initErr e
 		" CONFIG_BPF_JIT=", bpfJit,
 		" CONFIG_BPF_STREAM_PARSER=", streamParser,
 	)
+}
+
+func shouldCollectCapabilityGateDiagnostics(caps Capabilities) bool {
+	switch caps.sockmapFailureKind() {
+	case sockmapProbeFailurePermissionDenied, sockmapProbeFailureTransient, sockmapProbeFailureUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func classifySockmapEPERMCause(seccomp string, inContainer bool) string {
+	if seccomp == "2" && inContainer {
+		return "docker/container seccomp filter"
+	}
+	if seccomp == "2" {
+		return "seccomp filter"
+	}
+	return "missing capabilities or LSM policy"
 }
 
 func detectContainerHints() (bool, []string) {

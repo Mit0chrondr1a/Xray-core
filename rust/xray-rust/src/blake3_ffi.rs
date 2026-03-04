@@ -51,11 +51,7 @@ pub unsafe extern "C" fn xray_blake3_derive_key(
 /// # Safety
 /// `out` must point to at least 32 writable bytes. `data`/`data_len` must be valid.
 #[no_mangle]
-pub unsafe extern "C" fn xray_blake3_sum256(
-    out: *mut u8,
-    data: *const u8,
-    data_len: usize,
-) {
+pub unsafe extern "C" fn xray_blake3_sum256(out: *mut u8, data: *const u8, data_len: usize) {
     ffi_catch_void!({
         if out.is_null() {
             return;

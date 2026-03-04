@@ -52,6 +52,25 @@ impl BlockingGuard {
             was_nonblock,
         }
     }
+
+    /// Restore O_NONBLOCK early (before drop). After calling this, drop
+    /// becomes a no-op for O_NONBLOCK restoration.
+    /// Used by DeferredSession::drain_and_detach() to restore non-blocking
+    /// mode BEFORE setting the detached flag visible to other goroutines.
+    pub fn restore_nonblock_early(&mut self) {
+        if !self.was_nonblock {
+            return;
+        }
+        self.was_nonblock = false;
+        let ret = unsafe { libc::fcntl(self.restore_fd, libc::F_SETFL, self.old_flags) };
+        if ret < 0 {
+            eprintln!(
+                "BlockingGuard: early restore O_NONBLOCK failed on fd={}: {}",
+                self.restore_fd,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 impl Drop for BlockingGuard {
@@ -78,6 +97,7 @@ pub(crate) struct SocketTimeoutGuard {
     restore_fd: i32,
     old_recv: libc::timeval,
     old_send: libc::timeval,
+    active: bool,
 }
 
 impl SocketTimeoutGuard {
@@ -149,12 +169,38 @@ impl SocketTimeoutGuard {
             restore_fd,
             old_recv,
             old_send,
+            active: true,
         })
+    }
+
+    /// Restore the original socket timeouts early (before drop).
+    /// After calling this, drop becomes a no-op for timeout restoration.
+    /// Used to clear the handshake timeout for the data-transfer phase.
+    pub fn restore_timeouts_early(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if let Err(e) = Self::set_timeout(self.restore_fd, libc::SO_RCVTIMEO, &self.old_recv) {
+            eprintln!(
+                "SocketTimeoutGuard: early restore SO_RCVTIMEO failed on fd={}: {}",
+                self.restore_fd, e
+            );
+        }
+        if let Err(e) = Self::set_timeout(self.restore_fd, libc::SO_SNDTIMEO, &self.old_send) {
+            eprintln!(
+                "SocketTimeoutGuard: early restore SO_SNDTIMEO failed on fd={}: {}",
+                self.restore_fd, e
+            );
+        }
     }
 }
 
 impl Drop for SocketTimeoutGuard {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         if let Err(e) = Self::set_timeout(self.restore_fd, libc::SO_RCVTIMEO, &self.old_recv) {
             eprintln!(
                 "SocketTimeoutGuard: restore SO_RCVTIMEO failed on fd={}: {}",
@@ -190,7 +236,7 @@ impl Drop for SocketTimeoutGuard {
 pub(crate) struct HandshakePipeline {
     original_fd: i32,
     reader: tls::RecordReader,
-    _timeout_guard: SocketTimeoutGuard,
+    timeout_guard: SocketTimeoutGuard,
     _guard: BlockingGuard,
 }
 
@@ -214,7 +260,7 @@ impl HandshakePipeline {
         Ok(Self {
             original_fd: fd,
             reader,
-            _timeout_guard: timeout_guard,
+            timeout_guard,
             _guard: guard,
         })
     }
@@ -228,6 +274,45 @@ impl HandshakePipeline {
         self.reader.first_record_hash()
     }
 
+    /// The original (Go-owned) fd this pipeline operates on.
+    pub fn original_fd(&self) -> i32 {
+        self.original_fd
+    }
+
+    /// Clear the handshake timeout for the data-transfer phase.
+    /// After the handshake completes, the 8s timeout must be cleared so
+    /// subsequent reads/writes on the deferred session don't time out.
+    pub fn clear_handshake_timeout(&mut self) {
+        self.timeout_guard.restore_timeouts_early();
+    }
+
+    /// Destructure the pipeline into its components for separate ownership.
+    /// The write half gets a dup'd TcpStream so reader and writer can be
+    /// locked independently. Returns (reader, write_stream, blocking_guard,
+    /// timeout_guard, original_fd).
+    pub fn into_parts(
+        self,
+    ) -> Result<
+        (
+            tls::RecordReader,
+            TcpStream,
+            BlockingGuard,
+            SocketTimeoutGuard,
+            i32,
+        ),
+        std::io::Error,
+    > {
+        let write_stream = self.reader.tcp.try_clone()?; // dup() for write half
+        let original_fd = self.original_fd;
+        let HandshakePipeline {
+            reader,
+            timeout_guard,
+            _guard,
+            ..
+        } = self;
+        Ok((reader, write_stream, _guard, timeout_guard, original_fd))
+    }
+
     /// Install kTLS on the original fd, then consume self.
     /// Self drops after this call, closing dup'd fd and restoring O_NONBLOCK.
     pub fn install_ktls_and_finish(
@@ -238,6 +323,16 @@ impl HandshakePipeline {
         rx_secrets: &ConnectionTrafficSecrets,
         rx_seq: u64,
     ) -> Result<KtlsInstallResult, String> {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "kTLS install: fd={} version=0x{:04x} cipher=0x{:04x} tx_seq={} rx_seq={}",
+            self.original_fd,
+            tls_version,
+            tls::cipher_suite_to_u16(tx_secrets),
+            tx_seq,
+            rx_seq,
+        );
+
         tls::setup_ulp(self.original_fd).map_err(|e| format!("ULP: {}", e))?;
         let tx_result = tls::install_ktls(
             self.original_fd,
@@ -253,6 +348,17 @@ impl HandshakePipeline {
             rx_secrets,
             rx_seq,
         );
+
+        #[cfg(debug_assertions)]
+        {
+            if let Err(ref e) = tx_result {
+                eprintln!("kTLS install TX failed: fd={} err={}", self.original_fd, e);
+            }
+            if let Err(ref e) = rx_result {
+                eprintln!("kTLS install RX failed: fd={} err={}", self.original_fd, e);
+            }
+        }
+
         // self drops here: reader closes dup'd fd, guard restores O_NONBLOCK
         Ok(KtlsInstallResult {
             tx_ok: tx_result.is_ok(),

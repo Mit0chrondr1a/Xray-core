@@ -29,6 +29,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -159,8 +160,15 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 	return nil
 }
 
-func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
+func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (conn net.Conn, err error) {
 	localAddr := c.LocalAddr().String()
+	closeConnOnError := true
+	defer func() {
+		if err != nil && closeConnOnError && c != nil {
+			_ = c.Close()
+		}
+	}()
+
 	uConn := &UConn{
 		Config: config,
 	}
@@ -222,7 +230,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	// Try Rust native path only when full bidirectional kTLS is available and
 	// no extra ML-DSA verification is configured.
 	fullKTLS := tls.NativeFullKTLSSupported()
-	nativePathEligible := native.Available() && fullKTLS && len(config.Mldsa65Verify) == 0
+	nativePathEligible := native.Available() && fullKTLS &&
+		len(config.Mldsa65Verify) == 0 &&
+		!session.VisionFlowFromContext(ctx) // Vision strips outer TLS — kTLS incompatible
 	if !nativePathEligible {
 		errors.LogDebug(ctx,
 			"REALITY native client path disabled: nativeAvailable=", native.Available(),
@@ -244,23 +254,32 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					native.RealityConfigSetServerPubkey(realityCfg, config.PublicKey)
 					native.RealityConfigSetShortId(realityCfg, config.ShortId)
 					native.RealityConfigSetVersion(realityCfg, core.Version_x, core.Version_y, core.Version_z)
-					result, rustErr := native.RealityClientConnect(fd, uConn.HandshakeState.Hello.Raw, ecdhe.Bytes(), realityCfg)
-					if rustErr == nil {
-						if result != nil && result.KtlsTx && result.KtlsRx {
-							errors.LogDebug(ctx, "REALITY native client path active: wrapped as *tls.RustConn")
-							return tls.NewRustConnChecked(c, result, uConn.ServerName)
+					ecdhPriv := ecdhe.Bytes()
+					if len(ecdhPriv) == 32 {
+						result, rustErr := native.RealityClientConnect(fd, uConn.HandshakeState.Hello.Raw, ecdhPriv, realityCfg)
+						if rustErr == nil {
+							if result != nil && result.KtlsTx && result.KtlsRx {
+								errors.LogDebug(ctx,
+									"[kind=reality.ktls_seq] native client kTLS install: rx_seq_start=", result.RxSeqStart,
+									" cipher_suite=", result.CipherSuite,
+									" tx=", result.KtlsTx, " rx=", result.KtlsRx,
+								)
+								errors.LogDebug(ctx, "REALITY native client path active: wrapped as *tls.RustConn")
+								return tls.NewRustConnChecked(c, result, uConn.ServerName)
+							}
+							// Handshake succeeded but kTLS incomplete — socket data
+							// already consumed by Rust TLS engine, Go/uTLS fallback
+							// would attempt a second handshake and fail.
+							if result != nil && result.StateHandle != nil {
+								native.TlsStateFree(result.StateHandle)
+							}
+							return nil, errors.New("REALITY: Rust handshake succeeded but kTLS incomplete")
 						}
-						// Handshake succeeded but kTLS incomplete — socket data
-						// already consumed by Rust TLS engine, Go/uTLS fallback
-						// would attempt a second handshake and fail.
-						if result != nil && result.StateHandle != nil {
-							native.TlsStateFree(result.StateHandle)
-						}
-						return nil, errors.New("REALITY: Rust handshake succeeded but kTLS incomplete")
+						// Rust native client path may have already consumed socket bytes.
+						// Do not fall back to Go/uTLS on this same connection.
+						return nil, rustErr
 					}
-					// Rust native client path may have already consumed socket bytes.
-					// Do not fall back to Go/uTLS on this same connection.
-					return nil, rustErr
+					errors.LogDebug(ctx, "REALITY native client path skipped: unsupported ECDHE private key length ", len(ecdhPriv))
 				}
 				errors.LogDebug(ctx, "REALITY native client path skipped: failed to allocate native reality config")
 			} else {
@@ -283,6 +302,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	}
 	if !uConn.Verified {
 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
+		// The camouflage spider goroutine owns this socket lifecycle.
+		// Avoid closing it in the generic error-return defer above.
+		closeConnOnError = false
 		go func() {
 			// Limit global concurrent Spider sessions to prevent DoS amplification.
 			select {

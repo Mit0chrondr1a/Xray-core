@@ -193,10 +193,22 @@ func deriveKeysFromCapture(capture *keyCapture, cipherSuite uint16, isClient boo
 		rxSecret = clientSecret
 	}
 
-	txKey := expandLabel(hashFunc, txSecret, "key", nil, keyLen)
-	txIV := expandLabel(hashFunc, txSecret, "iv", nil, 12)
-	rxKey := expandLabel(hashFunc, rxSecret, "key", nil, keyLen)
-	rxIV := expandLabel(hashFunc, rxSecret, "iv", nil, 12)
+	txKey, err := expandLabel(hashFunc, txSecret, "key", nil, keyLen)
+	if err != nil {
+		return nil, fmt.Errorf("HKDF-Expand-Label tx key: %w", err)
+	}
+	txIV, err := expandLabel(hashFunc, txSecret, "iv", nil, 12)
+	if err != nil {
+		return nil, fmt.Errorf("HKDF-Expand-Label tx iv: %w", err)
+	}
+	rxKey, err := expandLabel(hashFunc, rxSecret, "key", nil, keyLen)
+	if err != nil {
+		return nil, fmt.Errorf("HKDF-Expand-Label rx key: %w", err)
+	}
+	rxIV, err := expandLabel(hashFunc, rxSecret, "iv", nil, 12)
+	if err != nil {
+		return nil, fmt.Errorf("HKDF-Expand-Label rx iv: %w", err)
+	}
 
 	return &tlsKeys{
 		txKey:    txKey,
@@ -465,6 +477,11 @@ func NativeFullKTLSSupportedForTLSConfig(config *Config) bool {
 		return false
 	}
 	tls12Enabled, tls13Enabled := nativeTLSConfigVersions(config)
+	if !tls12Enabled && !tls13Enabled {
+		// No natively supported protocol versions remain after applying explicit
+		// bounds; caller should fall back to the Go TLS path.
+		return false
+	}
 
 	if tls12Enabled {
 		for _, suite := range []uint16{
@@ -519,11 +536,6 @@ func nativeTLSConfigVersions(config *Config) (tls12Enabled bool, tls13Enabled bo
 	}
 	tls12Enabled = lo <= tls.VersionTLS12 && hi >= tls.VersionTLS12
 	tls13Enabled = lo <= tls.VersionTLS13 && hi >= tls.VersionTLS13
-	// Keep consistent with Rust build_protocol_versions(): if the configured
-	// range maps to no supported versions, native TLS falls back to TLS 1.3.
-	if !tls12Enabled && !tls13Enabled {
-		tls13Enabled = true
-	}
 	return
 }
 

@@ -60,3 +60,28 @@ func probeKTLSSockhashCompat() bool {
 func unameRelease() string {
 	return "non-linux"
 }
+
+// nativeEbpfAvailable always returns false on non-Linux systems.
+func nativeEbpfAvailable() bool {
+	return false
+}
+
+// setupSockmapNative is not supported on non-Linux systems.
+func setupSockmapNative(config SockmapConfig) error {
+	return ErrSockmapNotSupported
+}
+
+// teardownSockmapNative is a no-op on non-Linux systems.
+func teardownSockmapNative() error {
+	return nil
+}
+
+// setupForwardingNative is not supported on non-Linux systems.
+func setupForwardingNative(inboundFD, outboundFD int, inboundCookie, outboundCookie uint64, policyFlags uint32) error {
+	return ErrSockmapNotSupported
+}
+
+// removeForwardingNative is a no-op on non-Linux systems.
+func removeForwardingNative(inboundCookie, outboundCookie uint64) error {
+	return nil
+}

@@ -133,7 +133,7 @@ func getTLSCacheSize() int {
 			return n
 		}
 	}
-	return 128
+	return 512
 }
 
 // ParseCertificate converts a cert.Certificate to Certificate.
@@ -168,7 +168,12 @@ func (c *Config) BuildCertificates() []*atomic.Pointer[tls.Certificate] {
 			continue
 		}
 		getX509KeyPair := func() *tls.Certificate {
-			keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
+			// Parse from a cloned key buffer so BuildCertificates never mutates
+			// shared config state when the same *Config is reused.
+			keyPEM := bytes.Clone(entry.Key)
+			defer clear(keyPEM)
+
+			keyPair, err := tls.X509KeyPair(entry.Certificate, keyPEM)
 			if err != nil {
 				errors.LogWarningInner(context.Background(), err, "ignoring invalid X509 key pair")
 				return nil
@@ -564,8 +569,10 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 
 	switch c.MinVersion {
 	case "1.0":
+		errors.LogWarning(context.Background(), "TLS 1.0 is deprecated (RFC 8996) but kept for explicit backward compatibility")
 		config.MinVersion = tls.VersionTLS10
 	case "1.1":
+		errors.LogWarning(context.Background(), "TLS 1.1 is deprecated (RFC 8996) but kept for explicit backward compatibility")
 		config.MinVersion = tls.VersionTLS11
 	case "1.2":
 		config.MinVersion = tls.VersionTLS12
@@ -577,8 +584,10 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 
 	switch c.MaxVersion {
 	case "1.0":
+		errors.LogWarning(context.Background(), "TLS MaxVersion 1.0 is deprecated (RFC 8996) but kept for explicit backward compatibility")
 		config.MaxVersion = tls.VersionTLS10
 	case "1.1":
+		errors.LogWarning(context.Background(), "TLS MaxVersion 1.1 is deprecated (RFC 8996) but kept for explicit backward compatibility")
 		config.MaxVersion = tls.VersionTLS11
 	case "1.2":
 		config.MaxVersion = tls.VersionTLS12

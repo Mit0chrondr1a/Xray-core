@@ -6,48 +6,62 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 )
 
-// TestNativeRealityServerGuard_ProxyProtocol verifies that the native Rust
-// REALITY path is disabled when AcceptProxyProtocol is enabled. ProxyProtocol
-// connections require buffered PROXY header parsing that raw fd reads skip.
-
-func TestNativeRealityServerGuard_ProxyProtocolDisablesNative(t *testing.T) {
-	saved := useNativeRealityServerFn
-	defer func() { useNativeRealityServerFn = saved }()
-
-	// Restore the real function so we test the actual guard logic.
-	useNativeRealityServerFn = func(v *Listener) bool {
-		// Simulate: native available, full kTLS, has reality config, no MLDSA65
-		// — only AcceptProxyProtocol should differ between the two sub-tests.
-		return v.realityXrayConfig != nil &&
-			(v.config == nil || !v.config.AcceptProxyProtocol)
+func TestNativeRealityServerEligible(t *testing.T) {
+	base := &Listener{
+		config:            &Config{AcceptProxyProtocol: false},
+		realityXrayConfig: &reality.Config{},
 	}
 
-	t.Run("ProxyProtocol=true disables native path", func(t *testing.T) {
+	t.Run("native unavailable", func(t *testing.T) {
+		if nativeRealityServerEligible(base, false, true, false) {
+			t.Fatal("nativeRealityServerEligible should be false when native is unavailable")
+		}
+	})
+
+	t.Run("full ktls unavailable", func(t *testing.T) {
+		if nativeRealityServerEligible(base, true, false, false) {
+			t.Fatal("nativeRealityServerEligible should be false when full kTLS is unavailable")
+		}
+	})
+
+	t.Run("deferred promotion cooldown active", func(t *testing.T) {
+		if nativeRealityServerEligible(base, true, true, true) {
+			t.Fatal("nativeRealityServerEligible should be false when deferred promotion cooldown is active")
+		}
+	})
+
+	t.Run("missing reality config", func(t *testing.T) {
+		l := &Listener{config: &Config{AcceptProxyProtocol: false}}
+		if nativeRealityServerEligible(l, true, true, false) {
+			t.Fatal("nativeRealityServerEligible should be false when reality config is nil")
+		}
+	})
+
+	t.Run("proxy protocol enabled", func(t *testing.T) {
 		l := &Listener{
 			config:            &Config{AcceptProxyProtocol: true},
 			realityXrayConfig: &reality.Config{},
 		}
-		if useNativeRealityServerFn(l) {
-			t.Fatal("useNativeRealityServerFn should return false when AcceptProxyProtocol is true")
+		if nativeRealityServerEligible(l, true, true, false) {
+			t.Fatal("nativeRealityServerEligible should be false when AcceptProxyProtocol is true")
 		}
 	})
 
-	t.Run("ProxyProtocol=false enables native path", func(t *testing.T) {
+	t.Run("mldsa65 seed configured", func(t *testing.T) {
 		l := &Listener{
-			config:            &Config{AcceptProxyProtocol: false},
-			realityXrayConfig: &reality.Config{},
+			config: &Config{AcceptProxyProtocol: false},
+			realityXrayConfig: &reality.Config{
+				Mldsa65Seed: make([]byte, 32),
+			},
 		}
-		if !useNativeRealityServerFn(l) {
-			t.Fatal("useNativeRealityServerFn should return true when AcceptProxyProtocol is false")
+		if nativeRealityServerEligible(l, true, true, false) {
+			t.Fatal("nativeRealityServerEligible should be false when mldsa65_seed is configured")
 		}
 	})
 
-	t.Run("nil config enables native path", func(t *testing.T) {
-		l := &Listener{
-			realityXrayConfig: &reality.Config{},
-		}
-		if !useNativeRealityServerFn(l) {
-			t.Fatal("useNativeRealityServerFn should return true when config is nil")
+	t.Run("eligible", func(t *testing.T) {
+		if !nativeRealityServerEligible(base, true, true, false) {
+			t.Fatal("nativeRealityServerEligible should be true when all requirements are met")
 		}
 	})
 }

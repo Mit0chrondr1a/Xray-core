@@ -86,6 +86,15 @@ fn reality_auth_key(shared_secret: &[u8], random_prefix: &[u8]) -> Result<Vec<u8
     Ok(key)
 }
 
+fn copy_secret_to_result_slot(dst: &mut [u8], secret: &mut Vec<u8>) -> usize {
+    let len = secret.len().min(dst.len());
+    if len > 0 {
+        dst[..len].copy_from_slice(&secret[..len]);
+    }
+    secret.zeroize();
+    len
+}
+
 // AES-256-GCM with 32-byte key from HKDF-SHA256. This matches the Go REALITY
 // implementation: Go derives a 32-byte AuthKey via HKDF and passes it to
 // aes.NewCipher(), which auto-selects AES-256 for 32-byte keys. The previous
@@ -294,7 +303,7 @@ pub fn reality_client_connect(
     let shared_secret = privkey.diffie_hellman(&pubkey);
 
     // Derive auth key
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])?;
+    let auth_key = Zeroizing::new(reality_auth_key(shared_secret.as_bytes(), &random[..20])?);
 
     // Build session_id plaintext: version(3) + reserved(1) + timestamp(4) + short_id(8)
     let mut session_id_plain = [0u8; 16];
@@ -312,13 +321,14 @@ pub fn reality_client_connect(
     let sid_len = short_id.len().min(8);
     session_id_plain[8..8 + sid_len].copy_from_slice(&short_id[..sid_len]);
 
-    // AES-GCM-128 seal: nonce=random[20:32], plaintext=session_id[0..16],
+    // AES-GCM seal: nonce=random[20:32], plaintext=session_id[0..16],
     // aad=ClientHello raw with session_id zeroed (matches Go's REALITY client).
     let nonce = &random[20..32];
     // Zero session_id in the raw buffer to build AAD (Go zeros it before Seal).
     client_hello_raw[39..71].fill(0);
-    let encrypted = aes_gcm_seal(&auth_key, nonce, &session_id_plain, client_hello_raw)
+    let encrypted = aes_gcm_seal(auth_key.as_ref(), nonce, &session_id_plain, client_hello_raw)
         .map_err(|e| RealityError::Protocol(e))?;
+    session_id_plain.zeroize();
 
     // Overwrite session_id in ClientHello (offset 39, 32 bytes)
     if encrypted.len() != 32 {
@@ -345,7 +355,7 @@ pub fn reality_client_connect(
     // This matches Go's VerifyPeerCertificate at reality.go:108-119.
     if !tls_state.server_cert_chain.is_empty() {
         let cert_der = &tls_state.server_cert_chain[0];
-        if !verify_reality_cert_hmac(cert_der, &auth_key) {
+        if !verify_reality_cert_hmac(cert_der, auth_key.as_ref()) {
             return Err(RealityError::AuthFailed(
                 "server cert HMAC verification failed".into(),
             ));
@@ -358,7 +368,7 @@ pub fn reality_client_connect(
 
     Ok(RealityResult {
         tls_state,
-        auth_key: Zeroizing::new(auth_key),
+        auth_key,
     })
 }
 
@@ -379,14 +389,26 @@ pub struct RealityServerResult {
 /// Constant-time server name check to prevent timing oracles.
 /// An active DPI adversary probing different SNI values must not be able to
 /// distinguish "matched" from "not matched" by measuring response time.
+const MAX_SERVER_NAME_LEN: usize = 255;
+
+fn pad_server_name_for_ct_eq(name: &[u8]) -> [u8; MAX_SERVER_NAME_LEN] {
+    let mut padded = [0u8; MAX_SERVER_NAME_LEN];
+    let copy_len = name.len().min(MAX_SERVER_NAME_LEN);
+    padded[..copy_len].copy_from_slice(&name[..copy_len]);
+    padded
+}
+
 fn server_name_allowed(server_names: &[String], sni: &str) -> bool {
     let sni_bytes = sni.as_bytes();
+    let padded_sni = pad_server_name_for_ct_eq(sni_bytes);
+    let sni_in_range = subtle::Choice::from((sni_bytes.len() <= MAX_SERVER_NAME_LEN) as u8);
     let mut matched: subtle::Choice = 0u8.into();
     for name in server_names {
         let name_bytes = name.as_bytes();
-        if name_bytes.len() == sni_bytes.len() {
-            matched |= name_bytes.ct_eq(sni_bytes);
-        }
+        let padded_name = pad_server_name_for_ct_eq(name_bytes);
+        let name_in_range = subtle::Choice::from((name_bytes.len() <= MAX_SERVER_NAME_LEN) as u8);
+        let same_len = (name_bytes.len() as u16).ct_eq(&(sni_bytes.len() as u16));
+        matched |= name_in_range & sni_in_range & same_len & padded_name.ct_eq(&padded_sni);
     }
     bool::from(matched)
 }
@@ -457,7 +479,7 @@ pub fn reality_server_accept(
     if session_id_len != 32 {
         return Err(RealityError::AuthFailed("session_id not 32 bytes".into()));
     }
-    let encrypted_session_id = ch_raw[39..71].to_vec();
+    let encrypted_session_id = &ch_raw[39..71];
 
     // Extract SNI from extensions
     let sni = parse_sni_from_client_hello(&ch_raw).unwrap_or_default();
@@ -478,15 +500,17 @@ pub fn reality_server_accept(
     let shared_secret = privkey.diffie_hellman(&client_pubkey);
 
     // Derive auth key
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])?;
+    let auth_key = Zeroizing::new(reality_auth_key(shared_secret.as_bytes(), &random[..20])?);
 
     // Decrypt session_id: nonce=random[20:32], ciphertext=encrypted_session_id,
     // aad=ClientHello raw with session_id zeroed (matches Go's REALITY server).
     let nonce = &random[20..32];
     let mut aad = ch_raw.clone();
     aad[39..71].fill(0);
-    let plaintext = aes_gcm_open(&auth_key, nonce, &encrypted_session_id, &aad)
-        .map_err(|e| RealityError::AuthFailed(format!("session_id decrypt: {}", e)))?;
+    let plaintext = Zeroizing::new(
+        aes_gcm_open(auth_key.as_ref(), nonce, encrypted_session_id, &aad)
+            .map_err(|e| RealityError::AuthFailed(format!("session_id decrypt: {}", e)))?,
+    );
 
     if plaintext.len() != 16 {
         return Err(RealityError::AuthFailed(
@@ -542,7 +566,7 @@ pub fn reality_server_accept(
         authenticated: true,
         client_version: client_ver,
         short_id,
-        auth_key: Zeroizing::new(auth_key),
+        auth_key,
         sni,
         client_hello_raw: ch_raw,
     })
@@ -773,13 +797,20 @@ fn peek_exact(fd: i32, buf: &mut [u8], timeout: Duration) -> io::Result<()> {
     // At 100us per retry, 100_000 retries = ~10 seconds. Wall-clock timeout is
     // still enforced by `timeout` and socket SO_RCVTIMEO.
     const MAX_RETRIES: u32 = 100_000;
+    const RETRY_BACKOFF: Duration = Duration::from_micros(100);
     let mut retries: u32 = 0;
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
     loop {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "peek_exact: handshake timeout exceeded",
+                format!(
+                    "peek_exact: handshake timeout exceeded after {:?} (retries={})",
+                    now.saturating_duration_since(start),
+                    retries
+                ),
             ));
         }
         let n = unsafe {
@@ -796,10 +827,21 @@ fn peek_exact(fd: i32, buf: &mut [u8], timeout: Duration) -> io::Result<()> {
                 continue;
             }
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "peek_exact: receive timeout",
-                ));
+                retries += 1;
+                if retries >= MAX_RETRIES || Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "peek_exact: receive timeout after {:?} (retries={})",
+                            Instant::now().saturating_duration_since(start),
+                            retries
+                        ),
+                    ));
+                }
+                // On nonblocking sockets, MSG_PEEK|MSG_WAITALL may yield
+                // EAGAIN until the full record arrives. Retry until deadline.
+                std::thread::sleep(RETRY_BACKOFF);
+                continue;
             }
             return Err(err);
         }
@@ -820,7 +862,7 @@ fn peek_exact(fd: i32, buf: &mut [u8], timeout: Duration) -> io::Result<()> {
                 ));
             }
             // MSG_PEEK|MSG_WAITALL may return short on some kernels; sleep briefly and retry
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            std::thread::sleep(RETRY_BACKOFF);
             continue;
         }
         return Ok(());
@@ -850,7 +892,7 @@ fn reality_server_handshake_full(
     ),
     (i32, String), // (error_code, message)
 > {
-    let private_key = cfg.private_key.ok_or((1, "private_key not set".into()))?;
+    let mut private_key = cfg.private_key.ok_or((1, "private_key not set".into()))?;
     let version_range = cfg.version_range.unwrap_or(((0, 0, 0), (255, 255, 255)));
 
     // Step 1: Peek at ClientHello using MSG_PEEK (non-consuming).
@@ -897,19 +939,24 @@ fn reality_server_handshake_full(
     let client_x25519 = parse_x25519_key_share(ch_raw).ok_or((1, "no X25519 key_share".into()))?;
 
     let privkey = StaticSecret::from(private_key);
+    private_key.zeroize();
     let client_pubkey = PublicKey::from(client_x25519);
     let shared_secret = privkey.diffie_hellman(&client_pubkey);
 
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])
-        .map_err(|e| (2, format!("auth key: {}", e)))?;
+    let auth_key = Zeroizing::new(
+        reality_auth_key(shared_secret.as_bytes(), &random[..20])
+            .map_err(|e| (2, format!("auth key: {}", e)))?,
+    );
 
     // Decrypt session_id with AAD = ClientHello raw with session_id zeroed
     // (matches Go's github.com/xtls/reality server behavior).
     let nonce = &random[20..32];
     let mut aad = ch_raw.to_vec();
     aad[39..71].fill(0);
-    let plaintext = aes_gcm_open(&auth_key, nonce, encrypted_session_id, &aad)
-        .map_err(|e| (1, format!("session_id decrypt: {}", e)))?;
+    let plaintext = Zeroizing::new(
+        aes_gcm_open(auth_key.as_ref(), nonce, encrypted_session_id, &aad)
+            .map_err(|e| (1, format!("session_id decrypt: {}", e)))?,
+    );
 
     if plaintext.len() != 16 {
         return Err((1, "decrypted session_id wrong size".into()));
@@ -917,7 +964,7 @@ fn reality_server_handshake_full(
 
     let client_ver = (plaintext[0], plaintext[1], plaintext[2]);
     let timestamp = u32::from_be_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
-    let short_id = plaintext[8..16].to_vec();
+    let short_id = &plaintext[8..16];
 
     let (min_ver, max_ver) = version_range;
     if client_ver < min_ver || client_ver > max_ver {
@@ -969,7 +1016,7 @@ fn reality_server_handshake_full(
     let ed25519_pub = ed25519_pair.public_key().as_ref();
 
     let cert_sni = if sni.is_empty() { "localhost" } else { &sni };
-    let cert_der = build_reality_cert(pkcs8_doc.as_ref(), ed25519_pub, &auth_key, cert_sni)
+    let cert_der = build_reality_cert(pkcs8_doc.as_ref(), ed25519_pub, auth_key.as_ref(), cert_sni)
         .map_err(|e| (2, format!("cert gen: {}", e)))?;
 
     // Step 4: Build rustls ServerConfig with the REALITY cert.
@@ -1069,16 +1116,8 @@ fn reality_server_handshake_full(
     let state_handle = Box::into_raw(state) as *mut c_void;
 
     // Server: TX = server secret, RX = client secret
-    let tx_secret = capture
-        .server_secret
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let rx_secret = capture
-        .client_secret
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let tx_secret = capture.take_server_secret();
+    let rx_secret = capture.take_client_secret();
 
     Ok((
         cipher_suite,
@@ -1089,6 +1128,1129 @@ fn reality_server_handshake_full(
         rx_secret,
         drained,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Deferred REALITY handshake (Phase 1: no kTLS install)
+// ---------------------------------------------------------------------------
+
+/// Write all bytes from `buf` to `fd`, handling EAGAIN via poll(2).
+/// Handles EINTR from both write() and poll() (SA_RESTART does not apply to poll on Linux).
+/// Used by DeferredSession::write() after RestoreNonBlock restores O_NONBLOCK.
+fn write_all_with_poll(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<()> {
+    let mut written = 0;
+    while written < buf.len() {
+        let ret = unsafe {
+            libc::write(
+                fd,
+                buf[written..].as_ptr() as *const libc::c_void,
+                buf.len() - written,
+            )
+        };
+        if ret > 0 {
+            written += ret as usize;
+        } else if ret == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_all_with_poll: zero-length write",
+            ));
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                poll_writable(fd)?;
+                continue;
+            }
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Block until `fd` is writable, handling EINTR.
+fn poll_writable(fd: std::os::unix::io::RawFd) -> io::Result<()> {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let pret = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if pret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue; // EINTR — retry poll
+            }
+            return Err(err);
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "poll_writable: poll error/hangup",
+            ));
+        }
+        return Ok(());
+    }
+}
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+/// DeferredSession holds a completed REALITY handshake without kTLS installed.
+/// The caller reads/writes through rustls, then either:
+/// - calls `enable_ktls()` to install kTLS in-place (non-Vision flows)
+/// - calls `drain_and_detach()` then free (Vision flows — outer TLS stripped)
+///
+/// Uses three independent locks so read() and write() never contend:
+/// - `tls`:    rustls ServerConnection (brief lock, no socket I/O)
+/// - `reader`: RecordReader (may block on socket read, independent)
+/// - `writer`: TcpStream dup (brief socket writes, independent)
+///
+/// No method ever holds two locks simultaneously — deadlock impossible.
+pub(crate) struct DeferredSession {
+    tls: Mutex<Option<ServerConnection>>,
+    reader: Mutex<Option<tls::RecordReader>>,
+    writer: Mutex<Option<std::net::TcpStream>>,
+    detached: AtomicBool,
+    capture: Mutex<Option<Arc<tls::SecretCapture>>>,
+    pub original_fd: i32,
+    blocking_guard: Mutex<crate::fdutil::BlockingGuard>,
+    _timeout_guard: crate::fdutil::SocketTimeoutGuard,
+    // Immutable metadata (set at construction, no lock needed)
+    pub cipher_suite: u16,
+    pub tls_version: u16,
+    pub alpn: Vec<u8>,
+    pub sni: String,
+}
+
+impl DeferredSession {
+    /// Construct a DeferredSession from a completed server handshake.
+    /// Used by both REALITY (reality.rs) and regular TLS (tls.rs) deferred paths.
+    /// Returns Result because `into_parts()` may fail on dup().
+    pub(crate) fn new(
+        conn: ServerConnection,
+        pipeline: crate::fdutil::HandshakePipeline,
+        capture: Arc<tls::SecretCapture>,
+        cipher_suite: u16,
+        tls_version: u16,
+        alpn: Vec<u8>,
+        sni: String,
+    ) -> Result<Self, std::io::Error> {
+        let (reader, write_stream, guard, timeout, original_fd) = pipeline.into_parts()?;
+        Ok(Self {
+            tls: Mutex::new(Some(conn)),
+            reader: Mutex::new(Some(reader)),
+            writer: Mutex::new(Some(write_stream)),
+            detached: AtomicBool::new(false),
+            capture: Mutex::new(Some(capture)),
+            original_fd,
+            blocking_guard: Mutex::new(guard),
+            _timeout_guard: timeout,
+            cipher_suite,
+            tls_version,
+            alpn,
+            sni,
+        })
+    }
+
+    /// Read decrypted plaintext through rustls.
+    /// Three-step lock protocol — no lock held during socket I/O:
+    /// 1. Lock tls (brief) → check rustls plaintext buffer → return if data → unlock
+    /// 2. Lock reader (may block) → read_one_record() → get record bytes → unlock
+    /// 3. Lock tls (brief) → feed record to rustls → read plaintext → unlock
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "deferred session detached",
+            ));
+        }
+        loop {
+            // Step 1: Check if rustls already has plaintext buffered
+            {
+                let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = tls_guard.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "deferred session closed")
+                })?;
+                match conn.reader().read(buf) {
+                    Ok(0) => {} // no plaintext yet
+                    Ok(n) => return Ok(n),
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
+                }
+            } // tls lock released
+
+            // Step 2: Read one TLS record from socket (may block)
+            let record = {
+                let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+                let reader = reader_guard.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "deferred session reader closed")
+                })?;
+                reader.read_one_record()?
+            }; // reader lock released
+
+            // Check detached between socket I/O and tls lock
+            if self.detached.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "deferred session detached",
+                ));
+            }
+
+            // Step 3: Feed record bytes to rustls and read plaintext.
+            // Save any bytes the Cursor didn't consume back into the reader
+            // (e.g., leftover from handshake containing multiple TLS records).
+            let leftover = {
+                let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = tls_guard.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "deferred session closed")
+                })?;
+                let mut cursor = io::Cursor::new(&record);
+                match conn.read_tls(&mut cursor) {
+                    Ok(0) => {
+                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
+                    }
+                    Ok(_) => {
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    }
+                    Err(e) => return Err(e),
+                }
+                // Capture any bytes the Cursor didn't consume
+                let pos = cursor.position() as usize;
+                if pos < record.len() {
+                    Some(record[pos..].to_vec())
+                } else {
+                    None
+                }
+            }; // tls lock released
+
+            // Push unconsumed bytes back into the reader so the next
+            // read_one_record() returns them before reading from the socket.
+            if let Some(leftover) = leftover {
+                let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(reader) = reader_guard.as_mut() {
+                    reader.push_back(&leftover);
+                }
+            }
+        }
+    }
+
+    /// Write plaintext through rustls (encrypts and sends on wire).
+    /// Two-step lock protocol — socket I/O under separate writer lock:
+    /// 1. Lock tls (brief) → encrypt plaintext → get ciphertext bytes → unlock
+    /// 2. Lock writer (brief) → write_all ciphertext → flush → unlock
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "deferred session detached",
+            ));
+        }
+
+        // Step 1: Encrypt plaintext through rustls → ciphertext buffer
+        let (n, ciphertext) = {
+            let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = tls_guard.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "deferred session closed")
+            })?;
+            let n = conn.writer().write(buf)?;
+            let mut ciphertext = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut ciphertext)?;
+            }
+            (n, ciphertext)
+        }; // tls lock released
+
+        // Step 2: Send ciphertext on wire (poll-based for non-blocking fd safety)
+        {
+            use std::os::unix::io::AsRawFd;
+            let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_guard.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "deferred session writer closed")
+            })?;
+            write_all_with_poll(writer.as_raw_fd(), &ciphertext)?;
+            writer.flush()?;
+        } // writer lock released
+
+        Ok(n)
+    }
+
+    /// Drain rustls plaintext buffers plus raw read-ahead bytes and detach.
+    /// After success, the deferred session no longer owns rustls/reader/writer state.
+    /// Sequential locks — never two at once.
+    pub fn drain_and_detach(&self) -> Result<(Vec<u8>, Vec<u8>), (i32, String)> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err((2, "deferred session already detached".into()));
+        }
+
+        // Step 1: Lock tls → process + drain plaintext → unlock
+        let plaintext = {
+            let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = tls_guard
+                .as_mut()
+                .ok_or_else(|| (2, "deferred session closed".to_string()))?;
+            conn.process_new_packets()
+                .map_err(|e| (2, format!("process new packets: {}", e)))?;
+            tls::drain_plaintext(conn)
+        }; // tls lock released
+
+        // Step 2: Lock reader → take pending bytes → unlock
+        let raw_ahead = {
+            let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(reader) = reader_guard.as_mut() {
+                reader.take_pending_bytes()
+            } else {
+                Vec::new()
+            }
+        }; // reader lock released
+
+        // Step 3: Restore O_NONBLOCK on the original fd BEFORE marking
+        // detached. The writer goroutine may race to use rawConn.Write()
+        // once it sees detached=true — the fd must be non-blocking by then
+        // or Go's runtime will block the OS thread.
+        {
+            let mut guard = self
+                .blocking_guard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.restore_nonblock_early();
+        }
+        self.detached.store(true, Ordering::Release);
+
+        // Step 4: Take all Options to None (drops rustls + dup'd fds)
+        {
+            let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+            tls_guard.take();
+        }
+        {
+            let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+            reader_guard.take();
+        }
+        {
+            let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            writer_guard.take();
+        }
+        {
+            let mut capture_guard = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+            capture_guard.take();
+        }
+
+        Ok((plaintext, raw_ahead))
+    }
+
+    /// Restore O_NONBLOCK on the underlying fd without detaching.
+    /// After this call, Rust's reader/writer use poll()-based I/O to handle
+    /// EAGAIN. This allows Go's VisionWriter to safely write to the raw socket
+    /// without blocking the OS thread during the window before DrainAndDetach.
+    ///
+    /// Idempotent — safe to call multiple times or after detach.
+    pub fn restore_nonblock(&self) -> io::Result<()> {
+        if self.detached.load(Ordering::Acquire) {
+            return Ok(()); // already detached, O_NONBLOCK already restored
+        }
+        let mut guard = self
+            .blocking_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.restore_nonblock_early();
+        Ok(())
+    }
+
+    /// Consume the session, install kTLS on the socket, and return the
+    /// same tuple as `reality_server_handshake_full`.
+    pub fn enable_ktls(
+        self,
+    ) -> Result<
+        (
+            u16,         // cipher_suite
+            bool,        // ktls_tx
+            bool,        // ktls_rx
+            u64,         // rx_seq_start
+            *mut c_void, // state_handle
+            Vec<u8>,     // tx base traffic secret
+            Vec<u8>,     // rx base traffic secret
+            Vec<u8>,     // drained plaintext data
+        ),
+        (i32, String),
+    > {
+        let tls_version = self.tls_version;
+        let original_fd = self.original_fd;
+
+        if self.detached.load(Ordering::Acquire) {
+            return Err((2, "deferred session already detached".into()));
+        }
+
+        // Extract all state from the three locks (self is consumed, so into_inner is safe)
+        let mut conn = self
+            .tls
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| (2, "deferred session closed".to_string()))?;
+        let reader = self
+            .reader
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| (2, "deferred session reader closed".to_string()))?;
+        let writer = self
+            .writer
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| (2, "deferred session writer closed".to_string()))?;
+        let capture = self
+            .capture
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| (2, "deferred session capture closed".to_string()))?;
+
+        // Drop reader + writer (closes dup'd fds) — but keep guards alive
+        // until after kTLS install (they restore O_NONBLOCK/timeouts on original fd)
+        drop(reader);
+        drop(writer);
+
+        // Drain any buffered plaintext
+        let drained = tls::drain_plaintext(&mut conn);
+
+        let secrets = conn
+            .dangerous_extract_secrets()
+            .map_err(|e| (2, format!("extract secrets: {}", e)))?;
+
+        let (tx_seq, tx_secrets) = secrets.tx;
+        let (rx_seq, rx_secrets) = secrets.rx;
+
+        let cipher_suite = tls::cipher_suite_to_u16(&tx_secrets);
+
+        // Install kTLS on the original fd
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "kTLS install: fd={} version=0x{:04x} cipher=0x{:04x} tx_seq={} rx_seq={}",
+            original_fd, tls_version, cipher_suite, tx_seq, rx_seq,
+        );
+
+        tls::setup_ulp(original_fd).map_err(|e| (2, format!("ULP: {}", e)))?;
+        let tx_result =
+            tls::install_ktls(original_fd, tls::TLS_TX, tls_version, &tx_secrets, tx_seq);
+        let rx_result =
+            tls::install_ktls(original_fd, tls::TLS_RX, tls_version, &rx_secrets, rx_seq);
+
+        #[cfg(debug_assertions)]
+        {
+            if let Err(ref e) = tx_result {
+                eprintln!("kTLS install TX failed: fd={} err={}", original_fd, e);
+            }
+            if let Err(ref e) = rx_result {
+                eprintln!("kTLS install RX failed: fd={} err={}", original_fd, e);
+            }
+        }
+
+        let ktls_tx = tx_result.is_ok();
+        let ktls_rx = rx_result.is_ok();
+
+        if !ktls_tx || !ktls_rx {
+            return Err((
+                2,
+                format!(
+                    "kTLS incomplete (tx={}, rx={}, tx_err={}, rx_err={})",
+                    ktls_tx,
+                    ktls_rx,
+                    tx_result
+                        .err()
+                        .map(|e| e.to_string())
+                        .as_deref()
+                        .unwrap_or("none"),
+                    rx_result
+                        .err()
+                        .map(|e| e.to_string())
+                        .as_deref()
+                        .unwrap_or("none"),
+                ),
+            ));
+        }
+
+        // Create TlsState (metadata for KeyUpdate on Go side)
+        let state = Box::new(TlsState::new(original_fd, cipher_suite));
+        let state_handle = Box::into_raw(state) as *mut c_void;
+
+        // Server: TX = server secret, RX = client secret
+        // Use take() to zero the source, matching the non-deferred path.
+        let tx_secret = capture.take_server_secret();
+        let rx_secret = capture.take_client_secret();
+
+        // self drops here: _blocking_guard restores O_NONBLOCK, _timeout_guard restores SO_RCVTIMEO
+
+        Ok((
+            cipher_suite,
+            ktls_tx,
+            ktls_rx,
+            rx_seq,
+            state_handle,
+            tx_secret,
+            rx_secret,
+            drained,
+        ))
+    }
+}
+
+/// Perform REALITY server auth + handshake but stop before kTLS installation.
+/// Returns a DeferredSession that can read/write through rustls, then later
+/// either enable kTLS (non-Vision) or be dropped (Vision).
+fn reality_server_handshake_deferred(
+    fd: i32,
+    cfg: &RealityConfig,
+    handshake_timeout: std::time::Duration,
+) -> Result<Box<DeferredSession>, (i32, String)> {
+    let mut private_key = cfg.private_key.ok_or((1, "private_key not set".into()))?;
+    let version_range = cfg.version_range.unwrap_or(((0, 0, 0), (255, 255, 255)));
+
+    // Step 1: Peek at ClientHello using MSG_PEEK (non-consuming).
+    let _peek_timeout_guard = crate::fdutil::SocketTimeoutGuard::install(fd, fd, handshake_timeout)
+        .map_err(|e| (2, format!("peek timeout guard: {}", e)))?;
+    let mut header = [0u8; 5];
+    peek_exact(fd, &mut header, handshake_timeout)
+        .map_err(|e| (2, format!("peek header: {}", e)))?;
+
+    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if record_len > 16384 {
+        return Err((2, "ClientHello record too large".into()));
+    }
+
+    let mut peek_buf = vec![0u8; 5 + record_len];
+    peek_exact(fd, &mut peek_buf, handshake_timeout)
+        .map_err(|e| (2, format!("peek record: {}", e)))?;
+
+    let ch_raw = &peek_buf[5..];
+
+    // Step 2: Validate REALITY auth
+    if ch_raw.len() < 71 || ch_raw[0] != 0x01 {
+        return Err((1, "not a ClientHello".into()));
+    }
+
+    let random: [u8; 32] = {
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&ch_raw[6..38]);
+        r
+    };
+
+    let session_id_len = ch_raw[38] as usize;
+    if session_id_len != 32 {
+        return Err((1, "session_id not 32 bytes".into()));
+    }
+    let encrypted_session_id = &ch_raw[39..71];
+
+    let sni = parse_sni_from_client_hello(ch_raw).unwrap_or_default();
+    if !server_name_allowed(&cfg.server_names, &sni) {
+        return Err((1, format!("server name mismatch: {}", sni)));
+    }
+
+    let client_x25519 = parse_x25519_key_share(ch_raw).ok_or((1, "no X25519 key_share".into()))?;
+
+    let privkey = StaticSecret::from(private_key);
+    private_key.zeroize();
+    let client_pubkey = PublicKey::from(client_x25519);
+    let shared_secret = privkey.diffie_hellman(&client_pubkey);
+
+    let auth_key = Zeroizing::new(
+        reality_auth_key(shared_secret.as_bytes(), &random[..20])
+            .map_err(|e| (2, format!("auth key: {}", e)))?,
+    );
+
+    let nonce = &random[20..32];
+    let mut aad = ch_raw.to_vec();
+    aad[39..71].fill(0);
+    let plaintext = Zeroizing::new(
+        aes_gcm_open(auth_key.as_ref(), nonce, encrypted_session_id, &aad)
+            .map_err(|e| (1, format!("session_id decrypt: {}", e)))?,
+    );
+
+    if plaintext.len() != 16 {
+        return Err((1, "decrypted session_id wrong size".into()));
+    }
+
+    let client_ver = (plaintext[0], plaintext[1], plaintext[2]);
+    let timestamp = u32::from_be_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
+    let short_id = &plaintext[8..16];
+
+    let (min_ver, max_ver) = version_range;
+    if client_ver < min_ver || client_ver > max_ver {
+        return Err((
+            1,
+            format!(
+                "client version {}.{}.{} out of range",
+                client_ver.0, client_ver.1, client_ver.2
+            ),
+        ));
+    }
+
+    if !timestamp_within_max_diff(timestamp, cfg.max_time_diff) {
+        return Err((
+            1,
+            format!("timestamp exceeds max_time_diff {}ms", cfg.max_time_diff),
+        ));
+    }
+
+    let mut padded_received = [0u8; 8];
+    let received_len = short_id.len().min(8);
+    padded_received[..received_len].copy_from_slice(&short_id[..received_len]);
+
+    let mut short_id_matched: subtle::Choice = 0u8.into();
+    for s in &cfg.short_ids {
+        let mut padded_configured = [0u8; 8];
+        let cfg_len = s.len().min(8);
+        padded_configured[..cfg_len].copy_from_slice(&s[..cfg_len]);
+        short_id_matched |= padded_configured.ct_eq(&padded_received);
+    }
+    if !bool::from(short_id_matched) {
+        return Err((1, "short_id not in allowed list".into()));
+    }
+
+    // Auth succeeded — hash peeked record for TOCTOU check
+    let peek_hash = ring::digest::digest(&ring::digest::SHA256, &peek_buf);
+
+    // Step 3: Generate REALITY certificate
+    let rng = SystemRandom::new();
+    let pkcs8_doc =
+        Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| (2, format!("ed25519 keygen: {}", e)))?;
+    let ed25519_pair = Ed25519KeyPair::from_pkcs8(pkcs8_doc.as_ref())
+        .map_err(|e| (2, format!("ed25519 parse: {}", e)))?;
+    let ed25519_pub = ed25519_pair.public_key().as_ref();
+
+    let cert_sni = if sni.is_empty() { "localhost" } else { &sni };
+    let cert_der = build_reality_cert(pkcs8_doc.as_ref(), ed25519_pub, auth_key.as_ref(), cert_sni)
+        .map_err(|e| (2, format!("cert gen: {}", e)))?;
+
+    // Step 4: Build rustls ServerConfig
+    let provider = tls::cached_provider();
+    let cert = CertificateDer::from(cert_der);
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_doc.as_ref().to_vec()));
+
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| (2, format!("private key: {}", e)))?;
+    let reality_key = Arc::new(RealitySigningKey(signing_key));
+    let certified_key = Arc::new(CertifiedKey::new(vec![cert], reality_key));
+
+    // Parse ALPN from config for server negotiation
+    let mut sc = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| (2, format!("protocol version: {}", e)))?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(RealityCertResolver(certified_key)));
+
+    sc.enable_secret_extraction = true;
+    let capture = Arc::new(tls::SecretCapture::new(None));
+    sc.key_log = capture.clone();
+
+    let mut conn = ServerConnection::new(Arc::new(sc))
+        .map_err(|e| (2, format!("server connection: {}", e)))?;
+
+    // Step 5: rustls handshake
+    let mut pipeline = crate::fdutil::HandshakePipeline::new(fd, handshake_timeout)
+        .map_err(|e| (2, format!("pipeline: {}", e)))?;
+
+    let hs_result = drive_handshake!(&mut conn, pipeline.reader_mut());
+    hs_result.map_err(|e| (2i32, format!("handshake: {}", e)))?;
+
+    // Step 6: TOCTOU verification
+    let consumed_hash = pipeline
+        .first_record_hash()
+        .ok_or_else(|| (2i32, "TOCTOU: no record consumed by rustls".to_string()))?;
+    if consumed_hash != peek_hash.as_ref() {
+        return Err((
+            2,
+            "TOCTOU: consumed ClientHello differs from peeked data".into(),
+        ));
+    }
+
+    // Step 7: Extract metadata and prepare for deferred phase
+    let tls_version = conn
+        .protocol_version()
+        .map(|v| match v {
+            rustls::ProtocolVersion::TLSv1_3 => 0x0304u16,
+            _ => 0u16,
+        })
+        .unwrap_or(0);
+
+    let negotiated_alpn: Vec<u8> = conn.alpn_protocol().map(|a| a.to_vec()).unwrap_or_default();
+
+    // Clear handshake timeout for the data-transfer phase
+    pipeline.clear_handshake_timeout();
+
+    let cipher_suite = conn
+        .negotiated_cipher_suite()
+        .map(|cs| {
+            // Map rustls CipherSuite to IANA u16 value
+            let suite = cs.suite();
+            // Use debug format to match since CipherSuite doesn't expose raw u16 directly
+            match suite {
+                rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => 0x1301u16,
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => 0x1302,
+                rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 0x1303,
+                _ => 0,
+            }
+        })
+        .unwrap_or(0);
+
+    let session = DeferredSession::new(
+        conn,
+        pipeline,
+        capture,
+        cipher_suite,
+        tls_version,
+        negotiated_alpn,
+        sni,
+    )
+    .map_err(|e| (2, format!("deferred session init: {}", e)))?;
+    Ok(Box::new(session))
+}
+
+// ---------------------------------------------------------------------------
+// FFI: Deferred REALITY handshake
+// ---------------------------------------------------------------------------
+
+/// FFI result struct for deferred REALITY handshake.
+#[repr(C)]
+pub struct XrayDeferredResult {
+    pub handle: *mut c_void,
+    pub version: u16,
+    pub cipher_suite: u16,
+    pub alpn: [u8; 32],
+    pub sni: [u8; 256],
+    pub error_code: i32,
+    pub error_msg: [u8; 256],
+}
+
+impl XrayDeferredResult {
+    pub(crate) fn new() -> Self {
+        Self {
+            handle: std::ptr::null_mut(),
+            version: 0,
+            cipher_suite: 0,
+            alpn: [0u8; 32],
+            sni: [0u8; 256],
+            error_code: 0,
+            error_msg: [0u8; 256],
+        }
+    }
+
+    pub(crate) fn set_error(&mut self, code: i32, msg: &str) {
+        self.error_code = code;
+        let bytes = msg.as_bytes();
+        let len = bytes.len().min(255);
+        self.error_msg[..len].copy_from_slice(&bytes[..len]);
+        self.error_msg[len] = 0;
+    }
+}
+
+/// Perform REALITY server auth + handshake, returning a deferred session handle.
+/// No kTLS is installed — the caller decides later via enable_ktls or free.
+#[no_mangle]
+pub extern "C" fn xray_reality_server_deferred(
+    fd: i32,
+    cfg: *const RealityConfig,
+    handshake_timeout_ms: u32,
+    out: *mut XrayDeferredResult,
+) -> i32 {
+    ffi_catch_i32!({
+        if out.is_null() {
+            return -1;
+        }
+        if cfg.is_null() {
+            let out = unsafe { &mut *out };
+            *out = XrayDeferredResult::new();
+            out.set_error(-1, "null config pointer");
+            return -1;
+        }
+        let out = unsafe { &mut *out };
+        *out = XrayDeferredResult::new();
+        let cfg = unsafe { &*cfg };
+
+        let handshake_timeout = tls::handshake_timeout_from_ms(handshake_timeout_ms);
+        match reality_server_handshake_deferred(fd, cfg, handshake_timeout) {
+            Ok(session) => {
+                out.version = session.tls_version;
+                out.cipher_suite = session.cipher_suite;
+
+                // Copy ALPN (null-terminated)
+                let alpn_len = session.alpn.len().min(31);
+                out.alpn[..alpn_len].copy_from_slice(&session.alpn[..alpn_len]);
+                out.alpn[alpn_len] = 0;
+
+                // Copy SNI (null-terminated)
+                let sni_bytes = session.sni.as_bytes();
+                let sni_len = sni_bytes.len().min(255);
+                out.sni[..sni_len].copy_from_slice(&sni_bytes[..sni_len]);
+                out.sni[sni_len] = 0;
+
+                out.handle = Box::into_raw(session) as *mut c_void;
+                0
+            }
+            Err((code, msg)) => {
+                out.set_error(code, &msg);
+                code
+            }
+        }
+    })
+}
+
+/// Read decrypted data through the deferred session's rustls connection.
+#[no_mangle]
+pub extern "C" fn xray_deferred_read(
+    handle: *mut c_void,
+    buf: *mut u8,
+    len: usize,
+    out_n: *mut usize,
+) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null() || buf.is_null() || out_n.is_null() {
+            return -1;
+        }
+        let session = unsafe { &*(handle as *const DeferredSession) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+        match session.read(slice) {
+            Ok(n) => {
+                unsafe { *out_n = n };
+                0
+            }
+            Err(e) => {
+                eprintln!("xray_deferred_read: {}", e);
+                match e.kind() {
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => {
+                        unsafe { *out_n = 0 };
+                        1 // EOF / peer closed
+                    }
+                    io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected => {
+                        unsafe { *out_n = 0 };
+                        2 // local closed / detached
+                    }
+                    _ => -1,
+                }
+            }
+        }
+    })
+}
+
+/// Write plaintext data through the deferred session's rustls connection.
+#[no_mangle]
+pub extern "C" fn xray_deferred_write(
+    handle: *mut c_void,
+    buf: *const u8,
+    len: usize,
+    out_n: *mut usize,
+) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null() || buf.is_null() || out_n.is_null() {
+            return -1;
+        }
+        let session = unsafe { &*(handle as *const DeferredSession) };
+        let slice = unsafe { std::slice::from_raw_parts(buf, len) };
+        match session.write(slice) {
+            Ok(n) => {
+                unsafe { *out_n = n };
+                0
+            }
+            Err(e) => {
+                eprintln!("xray_deferred_write: {}", e);
+                let mut code = match e.kind() {
+                    io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset => {
+                        1 // EOF / peer closed
+                    }
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::NotConnected => {
+                        2 // local closed / detached
+                    }
+                    _ => -1,
+                };
+                if code < 0 {
+                    if let Some(raw) = e.raw_os_error() {
+                        code = match raw {
+                            libc::EPIPE | libc::ECONNRESET | libc::ESHUTDOWN => 1,
+                            libc::ENOTCONN | libc::EBADF => 2,
+                            _ => -1,
+                        };
+                    }
+                }
+                if code < 0 {
+                    let msg = e.to_string().to_ascii_lowercase();
+                    if msg.contains("broken pipe")
+                        || msg.contains("connection reset")
+                        || msg.contains("peer closed")
+                        || msg.contains("close notify")
+                    {
+                        code = 1;
+                    } else if msg.contains("not connected")
+                        || msg.contains("closed")
+                        || msg.contains("detached")
+                    {
+                        code = 2;
+                    }
+                }
+                if code < 0 {
+                    // For streaming proxy semantics, unknown write-side I/O
+                    // errors are safest treated as connection-closure events.
+                    // This avoids surfacing transient close races as fatal
+                    // "deferred write failed" errors.
+                    code = 1;
+                }
+                if code > 0 {
+                    unsafe { *out_n = 0 };
+                }
+                code
+            }
+        }
+    })
+}
+
+/// Drain buffered plaintext and raw read-ahead bytes, then detach the deferred
+/// rustls session from the socket. On success, the handle becomes detached and
+/// subsequent read/write calls on it will fail.
+///
+/// Returns:
+/// - out_plaintext_ptr/out_plaintext_len: decrypted bytes buffered in rustls
+/// - out_raw_ptr/out_raw_len: bytes already read from socket but not yet
+///   consumed by rustls
+#[no_mangle]
+pub extern "C" fn xray_deferred_drain_and_detach(
+    handle: *mut c_void,
+    out_plaintext_ptr: *mut *mut u8,
+    out_plaintext_len: *mut usize,
+    out_raw_ptr: *mut *mut u8,
+    out_raw_len: *mut usize,
+) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null()
+            || out_plaintext_ptr.is_null()
+            || out_plaintext_len.is_null()
+            || out_raw_ptr.is_null()
+            || out_raw_len.is_null()
+        {
+            return -1;
+        }
+
+        unsafe {
+            *out_plaintext_ptr = std::ptr::null_mut();
+            *out_plaintext_len = 0;
+            *out_raw_ptr = std::ptr::null_mut();
+            *out_raw_len = 0;
+        }
+
+        let session = unsafe { &*(handle as *const DeferredSession) };
+        match session.drain_and_detach() {
+            Ok((plaintext, raw_ahead)) => {
+                if !plaintext.is_empty() {
+                    let len = plaintext.len();
+                    let boxed = plaintext.into_boxed_slice();
+                    unsafe {
+                        *out_plaintext_ptr = Box::into_raw(boxed) as *mut u8;
+                        *out_plaintext_len = len;
+                    }
+                }
+                if !raw_ahead.is_empty() {
+                    let len = raw_ahead.len();
+                    let boxed = raw_ahead.into_boxed_slice();
+                    unsafe {
+                        *out_raw_ptr = Box::into_raw(boxed) as *mut u8;
+                        *out_raw_len = len;
+                    }
+                }
+                0
+            }
+            Err((_, msg)) => {
+                eprintln!("xray_deferred_drain_and_detach: {}", msg);
+                -1
+            }
+        }
+    })
+}
+
+#[inline]
+unsafe fn write_or_export_bytes(
+    mut data: Vec<u8>,
+    dst_buf: *mut u8,
+    dst_cap: usize,
+    out_len: *mut usize,
+    out_ptr: *mut *mut u8,
+) {
+    *out_len = data.len();
+    *out_ptr = std::ptr::null_mut();
+    if data.is_empty() {
+        return;
+    }
+    if !dst_buf.is_null() && dst_cap >= data.len() {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), dst_buf, data.len());
+        data.zeroize();
+        return;
+    }
+    let boxed = std::mem::take(&mut data).into_boxed_slice();
+    *out_ptr = Box::into_raw(boxed) as *mut u8;
+}
+
+/// Drain buffered plaintext and raw read-ahead bytes, then detach the deferred
+/// rustls session from the socket.
+///
+/// Preferred fast path:
+/// - If caller-provided output buffers are large enough, bytes are copied
+///   directly into those buffers (Go-owned memory).
+///
+/// Fallback path:
+/// - If a caller buffer is null or too small, Rust allocates that output and
+///   returns ownership via out_*_ptr + out_*_len. Caller must free using
+///   `xray_tls_drained_free`.
+#[no_mangle]
+pub extern "C" fn xray_deferred_drain_and_detach_into(
+    handle: *mut c_void,
+    plaintext_buf: *mut u8,
+    plaintext_cap: usize,
+    out_plaintext_len: *mut usize,
+    out_plaintext_ptr: *mut *mut u8,
+    raw_buf: *mut u8,
+    raw_cap: usize,
+    out_raw_len: *mut usize,
+    out_raw_ptr: *mut *mut u8,
+) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null()
+            || out_plaintext_len.is_null()
+            || out_plaintext_ptr.is_null()
+            || out_raw_len.is_null()
+            || out_raw_ptr.is_null()
+        {
+            return -1;
+        }
+        if (plaintext_cap > 0 && plaintext_buf.is_null()) || (raw_cap > 0 && raw_buf.is_null()) {
+            return -1;
+        }
+
+        unsafe {
+            *out_plaintext_len = 0;
+            *out_plaintext_ptr = std::ptr::null_mut();
+            *out_raw_len = 0;
+            *out_raw_ptr = std::ptr::null_mut();
+        }
+
+        let session = unsafe { &*(handle as *const DeferredSession) };
+        match session.drain_and_detach() {
+            Ok((plaintext, raw_ahead)) => {
+                unsafe {
+                    write_or_export_bytes(
+                        plaintext,
+                        plaintext_buf,
+                        plaintext_cap,
+                        out_plaintext_len,
+                        out_plaintext_ptr,
+                    );
+                    write_or_export_bytes(raw_ahead, raw_buf, raw_cap, out_raw_len, out_raw_ptr);
+                }
+                0
+            }
+            Err((_, msg)) => {
+                eprintln!("xray_deferred_drain_and_detach_into: {}", msg);
+                -1
+            }
+        }
+    })
+}
+
+/// Restore O_NONBLOCK on the deferred session's fd without detaching.
+/// Returns 0 on success, -1 on error. Idempotent.
+#[unsafe(no_mangle)]
+pub extern "C" fn xray_deferred_restore_nonblock(handle: *mut c_void) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null() {
+            return -1;
+        }
+        let session = unsafe { &*(handle as *const DeferredSession) };
+        match session.restore_nonblock() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("xray_deferred_restore_nonblock: {}", e);
+                -1
+            }
+        }
+    })
+}
+
+/// Consume the deferred session handle and install kTLS.
+/// After this call, the handle is invalid — caller must not use it.
+/// Results are written to the XrayTlsResult struct (same as full handshake).
+#[no_mangle]
+pub extern "C" fn xray_deferred_enable_ktls(handle: *mut c_void, out: *mut XrayTlsResult) -> i32 {
+    xray_deferred_enable_ktls_into(handle, out, std::ptr::null_mut(), 0)
+}
+
+#[no_mangle]
+pub extern "C" fn xray_deferred_enable_ktls_into(
+    handle: *mut c_void,
+    out: *mut XrayTlsResult,
+    drained_buf: *mut u8,
+    drained_cap: usize,
+) -> i32 {
+    ffi_catch_i32!({
+        if handle.is_null() || out.is_null() {
+            return -1;
+        }
+        let out = unsafe { &mut *out };
+        *out = XrayTlsResult::new();
+
+        // Consume the handle — take ownership back from the raw pointer
+        let session = unsafe { Box::from_raw(handle as *mut DeferredSession) };
+        match session.enable_ktls() {
+            Ok((
+                cipher_suite,
+                ktls_tx,
+                ktls_rx,
+                rx_seq_start,
+                state_handle,
+                mut tx_secret,
+                mut rx_secret,
+                drained,
+            )) => {
+                out.version = 0x0304;
+                out.cipher_suite = cipher_suite;
+                out.ktls_tx = ktls_tx;
+                out.ktls_rx = ktls_rx;
+                out.rx_seq_start = rx_seq_start;
+                out.state_handle = state_handle;
+
+                let tx_len = copy_secret_to_result_slot(&mut out.tx_secret, &mut tx_secret);
+                out.secret_len = tx_len as u8;
+                let _ = copy_secret_to_result_slot(&mut out.rx_secret, &mut rx_secret);
+
+                unsafe { tls::write_drained_to_result(out, drained, drained_buf, drained_cap) };
+                0
+            }
+            Err((code, msg)) => {
+                out.set_error(code, &msg);
+                code
+            }
+        }
+    })
+}
+
+/// Free a deferred session handle without enabling kTLS.
+/// Used for Vision flows where kTLS is not wanted.
+/// Drains residual plaintext (defense-in-depth), then drops.
+#[no_mangle]
+pub extern "C" fn xray_deferred_free(handle: *mut c_void) {
+    ffi_catch_void!({
+        if !handle.is_null() {
+            let session = unsafe { Box::from_raw(handle as *mut DeferredSession) };
+            // Drain any residual plaintext for defense-in-depth
+            {
+                let mut tls_guard = session.tls.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(conn) = tls_guard.as_mut() {
+                    tls::drain_plaintext(conn);
+                }
+            }
+            // session drops here: reader/writer dup'd fds close,
+            // _blocking_guard restores O_NONBLOCK, _timeout_guard restores timeouts
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1611,7 +2773,7 @@ pub extern "C" fn xray_reality_client_connect(
     client_hello_ptr: *mut u8,
     client_hello_len: usize,
     ecdh_privkey_ptr: *const u8,
-    _privkey_len: usize,
+    privkey_len: usize,
     cfg: *const RealityConfig,
     out: *mut XrayTlsResult,
 ) -> i32 {
@@ -1634,9 +2796,13 @@ pub extern "C" fn xray_reality_client_connect(
             out.set_error(-1, "client_hello_len exceeds TLS record limit");
             return -1;
         }
+        if privkey_len != 32 {
+            out.set_error(-1, "invalid ecdh private key length");
+            return -1;
+        }
 
         let ch = unsafe { std::slice::from_raw_parts_mut(client_hello_ptr, client_hello_len) };
-        let pk = unsafe { std::slice::from_raw_parts(ecdh_privkey_ptr, 32) };
+        let pk = unsafe { std::slice::from_raw_parts(ecdh_privkey_ptr, privkey_len) };
         let mut privkey = [0u8; 32];
         privkey.copy_from_slice(pk);
 
@@ -1656,10 +2822,15 @@ pub extern "C" fn xray_reality_client_connect(
             }
         };
 
-        match reality_client_connect(fd, ch, &privkey, &server_pubkey, &cfg.short_id, cfg.version) {
+        let connect_result =
+            reality_client_connect(fd, ch, &privkey, &server_pubkey, &cfg.short_id, cfg.version);
+        privkey.zeroize();
+
+        match connect_result {
             Ok(result) => {
                 out.version = 0x0304; // TLS 1.3
                 out.cipher_suite = result.tls_state.cipher_suite;
+                out.rx_seq_start = result.tls_state.server_post_hs_records;
 
                 // Copy base traffic secrets for Go-side KeyUpdate handler
                 // Client: TX = client secret, RX = server secret
@@ -1723,7 +2894,7 @@ pub extern "C" fn xray_reality_server_accept(
         *out = XrayTlsResult::new();
 
         let cfg = unsafe { &*cfg };
-        let private_key = match cfg.private_key {
+        let mut private_key = match cfg.private_key {
             Some(k) => k,
             None => {
                 out.set_error(1, "private_key not set");
@@ -1733,14 +2904,17 @@ pub extern "C" fn xray_reality_server_accept(
 
         let version_range = cfg.version_range.unwrap_or(((0, 0, 0), (255, 255, 255)));
 
-        match reality_server_accept(
+        let accept_result = reality_server_accept(
             fd,
             &private_key,
             &cfg.short_ids,
             &cfg.server_names,
             cfg.max_time_diff,
             version_range,
-        ) {
+        );
+        private_key.zeroize();
+
+        match accept_result {
             Ok(_result) => {
                 out.version = 0x0304; // TLS 1.3
                 out.ktls_tx = false;
@@ -1771,6 +2945,18 @@ pub extern "C" fn xray_reality_server_handshake(
     handshake_timeout_ms: u32,
     out: *mut XrayTlsResult,
 ) -> i32 {
+    xray_reality_server_handshake_into(fd, cfg, handshake_timeout_ms, out, std::ptr::null_mut(), 0)
+}
+
+#[no_mangle]
+pub extern "C" fn xray_reality_server_handshake_into(
+    fd: i32,
+    cfg: *const RealityConfig,
+    handshake_timeout_ms: u32,
+    out: *mut XrayTlsResult,
+    drained_buf: *mut u8,
+    drained_cap: usize,
+) -> i32 {
     ffi_catch_i32!({
         if out.is_null() {
             return -1;
@@ -1787,30 +2973,27 @@ pub extern "C" fn xray_reality_server_handshake(
 
         let handshake_timeout = tls::handshake_timeout_from_ms(handshake_timeout_ms);
         match reality_server_handshake_full(fd, cfg, handshake_timeout) {
-            Ok((cipher_suite, ktls_tx, ktls_rx, state_handle, tx_secret, rx_secret, drained)) => {
+            Ok((
+                cipher_suite,
+                ktls_tx,
+                ktls_rx,
+                state_handle,
+                mut tx_secret,
+                mut rx_secret,
+                drained,
+            )) => {
                 out.version = 0x0304;
                 out.cipher_suite = cipher_suite;
                 out.ktls_tx = ktls_tx;
                 out.ktls_rx = ktls_rx;
                 out.state_handle = state_handle;
 
-                if !tx_secret.is_empty() {
-                    let len = tx_secret.len().min(48);
-                    out.tx_secret[..len].copy_from_slice(&tx_secret[..len]);
-                    out.secret_len = len as u8;
-                }
-                if !rx_secret.is_empty() {
-                    let len = rx_secret.len().min(48);
-                    out.rx_secret[..len].copy_from_slice(&rx_secret[..len]);
-                }
+                let tx_len = copy_secret_to_result_slot(&mut out.tx_secret, &mut tx_secret);
+                out.secret_len = tx_len as u8;
+                let _ = copy_secret_to_result_slot(&mut out.rx_secret, &mut rx_secret);
 
-                // Forward drained data to Go
-                if !drained.is_empty() {
-                    let len = drained.len();
-                    let boxed = drained.into_boxed_slice();
-                    out.drained_ptr = Box::into_raw(boxed) as *mut u8;
-                    out.drained_len = len as u32;
-                }
+                // Forward drained data to Go (Go buffer first, Rust allocation fallback)
+                unsafe { tls::write_drained_to_result(out, drained, drained_buf, drained_cap) };
                 0
             }
             Err((code, msg)) => {
@@ -1896,11 +3079,45 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_secret_to_result_slot_zeroizes_source() {
+        let mut dst = [0u8; 8];
+        let mut secret = vec![1u8, 2, 3, 4, 5, 6];
+        let copied = copy_secret_to_result_slot(&mut dst, &mut secret);
+        assert_eq!(copied, 6);
+        assert_eq!(&dst[..6], &[1, 2, 3, 4, 5, 6]);
+        assert!(secret.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_copy_secret_to_result_slot_truncates_and_zeroizes() {
+        let mut dst = [0u8; 4];
+        let mut secret = vec![9u8, 8, 7, 6, 5, 4];
+        let copied = copy_secret_to_result_slot(&mut dst, &mut secret);
+        assert_eq!(copied, 4);
+        assert_eq!(&dst, &[9, 8, 7, 6]);
+        assert!(secret.iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn test_server_name_allowed_exact_match() {
         let names = vec!["example.com".to_string(), "www.example.org".to_string()];
         assert!(server_name_allowed(&names, "example.com"));
         assert!(!server_name_allowed(&names, "EXAMPLE.COM"));
         assert!(!server_name_allowed(&names, "unknown.example"));
+    }
+
+    #[test]
+    fn test_server_name_allowed_length_mismatch_rejected() {
+        let names = vec!["example.com".to_string()];
+        assert!(!server_name_allowed(&names, "example.co"));
+        assert!(!server_name_allowed(&names, "example.com."));
+    }
+
+    #[test]
+    fn test_server_name_allowed_oversized_rejected() {
+        let oversized = "a".repeat(MAX_SERVER_NAME_LEN + 1);
+        let names = vec![oversized.clone()];
+        assert!(!server_name_allowed(&names, &oversized));
     }
 
     #[test]
@@ -1921,5 +3138,21 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500);
         assert!(timestamp_within_max_diff_at(101, 500, now));
         assert!(!timestamp_within_max_diff_at(101, 499, now));
+    }
+
+    #[test]
+    fn test_write_all_with_poll_basic() {
+        // Test write_all_with_poll on a pipe (always blocking-safe)
+        use std::os::unix::io::AsRawFd;
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = writer.as_raw_fd();
+        let data = b"hello from write_all_with_poll";
+        write_all_with_poll(fd, data).unwrap();
+
+        let mut buf = vec![0u8; data.len()];
+        use std::io::Read;
+        let mut r = reader;
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, data);
     }
 }
