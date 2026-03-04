@@ -4,9 +4,12 @@ import (
 	"context"
 	"io"
 	"net"
+	gonet "net"
+	"strconv"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/proxy"
@@ -188,4 +191,76 @@ func (r *LengthPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		mb = append(mb, b)
 	}
 	return mb, nil
+}
+
+const loopbackDetachGuardPort = 2036
+
+// ShouldBypassVisionDNS returns true when the flow is DoT/DoQ (TCP or UDP
+// 53/853) on the loopback REALITY ingress (2036). In that case Vision should
+// be skipped to avoid detach/padding overhead.
+func ShouldBypassVisionDNS(ctx context.Context, dest xnet.Destination) bool {
+	if dest.Port != xnet.Port(53) && dest.Port != xnet.Port(853) {
+		return false
+	}
+	switch dest.Network {
+	case xnet.Network_TCP, xnet.Network_UDP:
+	default:
+		return false
+	}
+	inb := session.InboundFromContext(ctx)
+	if inb == nil || inb.Conn == nil {
+		return false
+	}
+	la := inb.Conn.LocalAddr()
+	ra := inb.Conn.RemoteAddr()
+	if la == nil || ra == nil {
+		return false
+	}
+	lip := extractStdIP(la)
+	rip := extractStdIP(ra)
+	if lip == nil || rip == nil || !(lip.IsLoopback() || rip.IsLoopback()) {
+		return false
+	}
+	_, lport, _ := gonet.SplitHostPort(la.String())
+	_, rport, _ := gonet.SplitHostPort(ra.String())
+	return lport == strconv.Itoa(loopbackDetachGuardPort) || rport == strconv.Itoa(loopbackDetachGuardPort)
+}
+
+// ShouldBypassVisionLoopbackUDP returns true for any UDP flow on the loopback
+// REALITY ingress (2036). This helps DoQ (UDP/853) and other UDP control
+// traffic avoid Vision overhead.
+func ShouldBypassVisionLoopbackUDP(ctx context.Context, dest xnet.Destination) bool {
+	if dest.Network != xnet.Network_UDP {
+		return false
+	}
+	inb := session.InboundFromContext(ctx)
+	if inb == nil || inb.Conn == nil {
+		return false
+	}
+	la := inb.Conn.LocalAddr()
+	ra := inb.Conn.RemoteAddr()
+	if la == nil || ra == nil {
+		return false
+	}
+	lip := extractStdIP(la)
+	rip := extractStdIP(ra)
+	if lip == nil || rip == nil || !(lip.IsLoopback() || rip.IsLoopback()) {
+		return false
+	}
+	_, lport, _ := gonet.SplitHostPort(la.String())
+	_, rport, _ := gonet.SplitHostPort(ra.String())
+	return lport == strconv.Itoa(loopbackDetachGuardPort) || rport == strconv.Itoa(loopbackDetachGuardPort)
+}
+
+func extractStdIP(addr gonet.Addr) net.IP {
+	switch a := addr.(type) {
+	case *gonet.TCPAddr:
+		return a.IP
+	case *gonet.UDPAddr:
+		return a.IP
+	case *gonet.IPAddr:
+		return a.IP
+	default:
+		return nil
+	}
 }

@@ -404,13 +404,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	postRequest := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
+		bypassVision := requestAddons.Flow == vless.XRV &&
+			(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
+				encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
+
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
 		if err := encoding.EncodeRequestHeader(bufferWriter, request, requestAddons); err != nil {
 			return errors.New("failed to encode request header").Base(err).AtWarning()
 		}
 
 		// default: serverWriter := bufferWriter
-		serverWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, true, ctx, conn, ob)
+		var serverWriter buf.Writer
+		if bypassVision {
+			serverWriter = bufferWriter
+		} else {
+			serverWriter = encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, true, ctx, conn, ob)
+		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
 			serverWriter = xudp.NewPacketWriter(serverWriter, target, xudp.GetGlobalID(ctx))
 		}
@@ -464,6 +473,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	getResponse := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
+		bypassVision := requestAddons.Flow == vless.XRV &&
+			(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
+				encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
+
 		responseAddons, err := encoding.DecodeResponseHeader(conn, request)
 		if err != nil {
 			return errors.New("failed to decode response header").Base(err).AtInfo()
@@ -471,7 +484,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		// default: serverReader := buf.NewReader(conn)
 		serverReader := encoding.DecodeBodyAddons(conn, request, responseAddons)
-		if requestAddons.Flow == vless.XRV {
+		if requestAddons.Flow == vless.XRV && !bypassVision {
 			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, input, rawInput, ob)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
@@ -482,7 +495,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if requestAddons.Flow == vless.XRV {
+		if requestAddons.Flow == vless.XRV && !bypassVision {
 			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
 		} else {
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer

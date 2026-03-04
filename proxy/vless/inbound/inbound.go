@@ -676,8 +676,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer readerArena.Close()
 		defer writerArena.Close()
 	}
+	bypassVision := requestAddons.Flow == vless.XRV &&
+		(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
+			encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
+
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
-	if requestAddons.Flow == vless.XRV {
+	if requestAddons.Flow == vless.XRV && !bypassVision {
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, connection, input, rawInput, nil)
 	}
 
@@ -685,7 +689,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if err := encoding.EncodeResponseHeader(bufferWriter, request, responseAddons); err != nil {
 		return errors.New("failed to encode response header").Base(err).AtWarning()
 	}
-	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, visionWriterCtx, connection, nil)
+	var clientWriter buf.Writer
+	if bypassVision {
+		clientWriter = bufferWriter
+	} else {
+		clientWriter = encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, visionWriterCtx, connection, nil)
+	}
 	bufferWriter.SetFlushNext()
 
 	if request.Command == protocol.RequestCommandRvs {
