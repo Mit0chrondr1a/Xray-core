@@ -6,10 +6,7 @@ import (
 	goerrors "errors"
 	"io"
 	gonet "net"
-	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -37,38 +34,6 @@ import (
 
 var useSplice bool
 
-const (
-	egressPenaltyArmThresholdDefault = 2
-	egressPenaltyResetAfter          = 30 * time.Second
-	egressPenaltyPruneAfter          = 2 * time.Minute
-	egressMarkerLogInterval          = 30 * time.Second
-	egressFastFailShadowEnvFlag      = "xray.freedom.egress.fastfail.shadow"
-)
-
-var (
-	egressDialPenalty sync.Map // key: net.Destination.String(), value: *egressDialPenaltyState
-
-	egressMarkerDialFailTotal         atomic.Uint64
-	egressMarkerDialFailTimeout       atomic.Uint64
-	egressMarkerDialFailNoRoute       atomic.Uint64
-	egressMarkerDialFailRefused       atomic.Uint64
-	egressMarkerPenaltyArm            atomic.Uint64
-	egressMarkerFastFailCandidate     atomic.Uint64
-	egressMarkerFastFailHit           atomic.Uint64
-	egressMarkerPenaltyClear          atomic.Uint64
-	egressMarkerLastSummaryUnix       atomic.Int64
-	egressMarkerFastFailShadowEnabled atomic.Bool
-)
-
-type egressDialPenaltyState struct {
-	mu                  sync.Mutex
-	consecutiveFailures uint32
-	blockedUntilUnix    int64
-	blockedClass        string
-	lastFailureUnix     int64
-	lastFailureClass    string
-}
-
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		h := new(Handler)
@@ -84,23 +49,6 @@ func init() {
 	switch value {
 	case defaultFlagValue, "auto", "enable":
 		useSplice = true
-	}
-	// Default to active fast-fail so repeatedly dead destinations don't keep
-	// consuming retry slots and dial latency. Set shadow mode via:
-	// xray.freedom.egress.fastfail.shadow=true
-	egressMarkerFastFailShadowEnabled.Store(parseEgressFastFailShadowMode())
-}
-
-func parseEgressFastFailShadowMode() bool {
-	raw := strings.TrimSpace(strings.ToLower(platform.NewEnvFlag(egressFastFailShadowEnvFlag).GetValue(func() string { return "" })))
-	switch raw {
-	case "", "0", "false", "f", "no", "n", "off", "disable", "disabled", "enforce", "active":
-		return false
-	case "1", "true", "t", "yes", "y", "on", "enable", "enabled", "shadow":
-		return true
-	default:
-		v, err := strconv.ParseBool(raw)
-		return err == nil && v
 	}
 }
 
@@ -164,169 +112,22 @@ func classifyEgressDialFailure(err error) (string, bool) {
 	return "", false
 }
 
-func egressPenaltyArmThreshold(class string) uint32 {
-	if class == "refused" {
-		return 1
-	}
-	return egressPenaltyArmThresholdDefault
-}
-
-func egressPenaltyDelayForFailure(class string, consecutive uint32) time.Duration {
-	threshold := egressPenaltyArmThreshold(class)
-	if consecutive < threshold {
-		return 0
-	}
-
-	switch class {
-	case "refused":
-		switch consecutive - threshold {
-		case 0:
-			return 1 * time.Second
-		case 1:
-			return 2 * time.Second
-		case 2:
-			return 4 * time.Second
-		default:
-			return 6 * time.Second
-		}
-	case "no_route":
-		switch consecutive - threshold {
-		case 0:
-			return 3 * time.Second
-		case 1:
-			return 6 * time.Second
-		case 2:
-			return 12 * time.Second
-		default:
-			return 20 * time.Second
-		}
-	default:
-		switch consecutive - threshold {
-		case 0:
-			return 2 * time.Second
-		case 1:
-			return 4 * time.Second
-		case 2:
-			return 8 * time.Second
-		default:
-			return 12 * time.Second
-		}
-	}
-}
-
-func (s *egressDialPenaltyState) shouldFastFail(nowUnix int64) (time.Duration, bool, string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.blockedUntilUnix <= nowUnix {
-		return 0, false, ""
-	}
-	return time.Duration(s.blockedUntilUnix - nowUnix), true, s.blockedClass
-}
-
-func (s *egressDialPenaltyState) noteFailure(nowUnix int64, class string) (time.Duration, bool, uint32) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.lastFailureUnix == 0 || nowUnix-s.lastFailureUnix > int64(egressPenaltyResetAfter) {
-		s.consecutiveFailures = 0
-	}
-	if s.lastFailureClass != "" && s.lastFailureClass != class {
-		s.consecutiveFailures = 0
-	}
-
-	s.lastFailureUnix = nowUnix
-	s.lastFailureClass = class
-	s.consecutiveFailures++
-	delay := egressPenaltyDelayForFailure(class, s.consecutiveFailures)
-	if delay <= 0 {
-		return 0, false, s.consecutiveFailures
-	}
-
-	armed := s.blockedUntilUnix <= nowUnix
-	s.blockedUntilUnix = nowUnix + int64(delay)
-	s.blockedClass = class
-	return delay, armed, s.consecutiveFailures
-}
-
-func (s *egressDialPenaltyState) shouldPrune(nowUnix int64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.blockedUntilUnix > nowUnix {
+func isDNSDest(dest net.Destination) bool {
+	if dest.Port != net.Port(53) && dest.Port != net.Port(853) {
 		return false
 	}
-	if s.lastFailureUnix == 0 {
+	switch dest.Network {
+	case net.Network_TCP, net.Network_UDP:
 		return true
+	default:
+		return false
 	}
-	return nowUnix-s.lastFailureUnix > int64(egressPenaltyPruneAfter)
 }
 
-func getEgressDialPenaltyState(dest net.Destination) *egressDialPenaltyState {
-	key := dest.String()
-	if s, ok := egressDialPenalty.Load(key); ok {
-		return s.(*egressDialPenaltyState)
-	}
-	state := &egressDialPenaltyState{}
-	actual, _ := egressDialPenalty.LoadOrStore(key, state)
-	return actual.(*egressDialPenaltyState)
-}
-
-func shouldFastFailEgressDial(dest net.Destination) (time.Duration, bool, string) {
-	state, ok := egressDialPenalty.Load(dest.String())
-	if !ok {
-		return 0, false, ""
-	}
-	return state.(*egressDialPenaltyState).shouldFastFail(time.Now().UnixNano())
-}
-
-func noteEgressDialFailure(dest net.Destination, class string) (time.Duration, bool, uint32) {
-	return getEgressDialPenaltyState(dest).noteFailure(time.Now().UnixNano(), class)
-}
-
-func clearEgressDialPenalty(dest net.Destination) bool {
-	_, existed := egressDialPenalty.LoadAndDelete(dest.String())
-	return existed
-}
-
-func pruneAndCountEgressDialPenalty(nowUnix int64) int {
-	tracked := 0
-	egressDialPenalty.Range(func(key, value any) bool {
-		state, ok := value.(*egressDialPenaltyState)
-		if !ok {
-			egressDialPenalty.Delete(key)
-			return true
-		}
-		if state.shouldPrune(nowUnix) {
-			egressDialPenalty.Delete(key)
-			return true
-		}
-		tracked++
-		return true
-	})
-	return tracked
-}
-
-func maybeLogEgressDialSummary(ctx context.Context) {
-	nowUnix := time.Now().Unix()
-	last := egressMarkerLastSummaryUnix.Load()
-	if nowUnix-last < int64(egressMarkerLogInterval/time.Second) {
-		return
-	}
-	if !egressMarkerLastSummaryUnix.CompareAndSwap(last, nowUnix) {
-		return
-	}
-
-	tracked := pruneAndCountEgressDialPenalty(time.Now().UnixNano())
-	errors.LogInfo(ctx, "proxy markers[kind=egress]: ",
-		"dial_fail_total=", egressMarkerDialFailTotal.Load(),
-		" dial_fail_timeout=", egressMarkerDialFailTimeout.Load(),
-		" dial_fail_no_route=", egressMarkerDialFailNoRoute.Load(),
-		" dial_fail_refused=", egressMarkerDialFailRefused.Load(),
-		" penalty_arm=", egressMarkerPenaltyArm.Load(),
-		" fast_fail_candidate=", egressMarkerFastFailCandidate.Load(),
-		" fast_fail_hit=", egressMarkerFastFailHit.Load(),
-		" penalty_clear=", egressMarkerPenaltyClear.Load(),
-		" shadow_mode=", egressMarkerFastFailShadowEnabled.Load(),
-		" tracked=", tracked)
+// shouldBypassEgressFastFail is retained for interface compatibility; currently
+// all destinations use the normal dial path without fast-fail penalties.
+func shouldBypassEgressFastFail(net.Destination) bool {
+	return false
 }
 
 // Process implements proxy.Outbound.
@@ -362,14 +163,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			UDPOverride.Port = destination.Port
 		}
 	}
+
 	proxy.RecordPipelineFlowMix(ctx, destination.Network, session.AllowedNetworkFromContext(ctx))
 
 	input := link.Reader
 	output := link.Writer
 
 	var conn stat.Connection
-	var fastFailErr error
-	err := retry.ExponentialBackoff(5, 100).On(func() error {
+
+	bypassFastFail := shouldBypassEgressFastFail(destination)
+
+	// Fast path for DNS/loopback control traffic: single-shot dial without
+	// penalty/backoff to avoid long startup corks.
+	if bypassFastFail {
 		dialDest := destination
 		if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
 			strategy := h.config.DomainStrategy
@@ -392,45 +198,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if delay, blocked, class := shouldFastFailEgressDial(dialDest); blocked {
-			// Shadow mode: mark would-have-fast-failed destinations but continue
-			// normal retry/dial behavior to avoid reducing resilience.
-			egressMarkerFastFailCandidate.Add(1)
-			if !egressMarkerFastFailShadowEnabled.Load() {
-				egressMarkerFastFailHit.Add(1)
-				fastFailErr = errors.New("[kind=egress.fast_fail] destination ", dialDest, ", class=", class, ", cooldown=", delay)
-				maybeLogEgressDialSummary(ctx)
-				return nil
-			}
-		}
-
 		rawConn, err := dialer.Dial(ctx, dialDest)
 		if err != nil {
-			if class, ok := classifyEgressDialFailure(err); ok {
-				egressMarkerDialFailTotal.Add(1)
-				switch class {
-				case "timeout":
-					egressMarkerDialFailTimeout.Add(1)
-				case "no_route":
-					egressMarkerDialFailNoRoute.Add(1)
-				case "refused":
-					egressMarkerDialFailRefused.Add(1)
-				}
-				delay, armed, consecutive := noteEgressDialFailure(dialDest, class)
-				if armed {
-					egressMarkerPenaltyArm.Add(1)
-					errors.LogWarning(ctx, "[kind=egress.penalty_arm] destination ", dialDest, ", class=", class, ", consecutive=", consecutive, ", cooldown=", delay)
-				}
-				maybeLogEgressDialSummary(ctx)
-			} else if clearEgressDialPenalty(dialDest) {
-				egressMarkerPenaltyClear.Add(1)
-			}
-			return err
+			return errors.New("failed to open connection to ", dialDest).Base(err)
 		}
-		if clearEgressDialPenalty(dialDest) {
-			egressMarkerPenaltyClear.Add(1)
-		}
-
 		if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
 			version := byte(h.config.ProxyProtocol)
 			srcAddr := inbound.Source.RawNetAddr()
@@ -443,13 +214,52 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		conn = rawConn
-		return nil
-	})
-	if fastFailErr != nil {
-		return errors.New("failed to open connection to ", destination).Base(fastFailErr)
-	}
-	if err != nil {
-		return errors.New("failed to open connection to ", destination).Base(err)
+	} else {
+		err := retry.ExponentialBackoff(5, 100).On(func() error {
+			dialDest := destination
+			if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
+				strategy := h.config.DomainStrategy
+				if destination.Network == net.Network_UDP && origTargetAddr != nil && outGateway == nil {
+					strategy = strategy.GetDynamicStrategy(origTargetAddr.Family())
+				}
+				ips, err := internet.LookupForIP(dialDest.Address.Domain(), strategy, outGateway)
+				if err != nil {
+					errors.LogDebugInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
+					if h.config.DomainStrategy.ForceIP() {
+						return err
+					}
+				} else {
+					dialDest = net.Destination{
+						Network: dialDest.Network,
+						Address: net.IPAddress(ips[dice.Roll(len(ips))]),
+						Port:    dialDest.Port,
+					}
+					errors.LogDebug(ctx, "dialing to ", dialDest)
+				}
+			}
+
+			rawConn, err := dialer.Dial(ctx, dialDest)
+			if err != nil {
+				return err
+			}
+
+			if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
+				version := byte(h.config.ProxyProtocol)
+				srcAddr := inbound.Source.RawNetAddr()
+				dstAddr := rawConn.RemoteAddr()
+				header := proxyproto.HeaderProxyFromAddrs(version, srcAddr, dstAddr)
+				if _, err = header.WriteTo(rawConn); err != nil {
+					rawConn.Close()
+					return err
+				}
+			}
+
+			conn = rawConn
+			return nil
+		})
+		if err != nil {
+			return errors.New("failed to open connection to ", destination).Base(err)
+		}
 	}
 	defer conn.Close()
 	errors.LogDebug(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
@@ -493,6 +303,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					noises:      h.config.Noises,
 					firstWrite:  true,
 					UDPOverride: UDPOverride,
+					DestPort:    destination.Port,
 					remoteAddr:  net.DestinationFromAddr(conn.RemoteAddr()).Address,
 				}
 			}
@@ -758,7 +569,12 @@ type NoisePacketWriter struct {
 	noises      []*Noise
 	firstWrite  bool
 	UDPOverride net.Destination
+	DestPort    net.Port
 	remoteAddr  net.Address
+}
+
+func isDNSControlPort(port net.Port) bool {
+	return port == 53 || port == 853
 }
 
 // MultiBuffer writer with Noise before first packet
@@ -766,7 +582,7 @@ func (w *NoisePacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if w.firstWrite {
 		w.firstWrite = false
 		//Do not send Noise for dns requests(just to be safe)
-		if w.UDPOverride.Port == 53 {
+		if isDNSControlPort(w.UDPOverride.Port) || isDNSControlPort(w.DestPort) {
 			return w.Writer.WriteMultiBuffer(mb)
 		}
 		var noise []byte

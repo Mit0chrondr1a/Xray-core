@@ -6,10 +6,8 @@ import (
 	"io"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/net"
 )
 
 type errReader struct {
@@ -126,60 +124,5 @@ func TestClassifyEgressDialFailureRefused(t *testing.T) {
 func TestClassifyEgressDialFailureContextCancelled(t *testing.T) {
 	if class, ok := classifyEgressDialFailure(context.Canceled); ok {
 		t.Fatalf("expected context cancel to be ignored, got %q", class)
-	}
-}
-
-func TestEgressPenaltyStateBackoffAndReset(t *testing.T) {
-	var state egressDialPenaltyState
-	now := time.Now().UnixNano()
-
-	if delay, armed, consecutive := state.noteFailure(now, "timeout"); delay != 0 || armed || consecutive != 1 {
-		t.Fatalf("first failure should not arm cooldown: delay=%v armed=%v consecutive=%d", delay, armed, consecutive)
-	}
-
-	delay, armed, consecutive := state.noteFailure(now+int64(time.Millisecond), "timeout")
-	if !armed {
-		t.Fatal("second consecutive failure should arm cooldown")
-	}
-	if delay != 2*time.Second {
-		t.Fatalf("expected 2s cooldown on second failure, got %v", delay)
-	}
-	if consecutive != 2 {
-		t.Fatalf("expected consecutive=2, got %d", consecutive)
-	}
-
-	if remaining, blocked, class := state.shouldFastFail(now + int64(time.Second)); !blocked || remaining <= 0 {
-		t.Fatalf("expected active cooldown; blocked=%v remaining=%v class=%q", blocked, remaining, class)
-	} else if class != "timeout" {
-		t.Fatalf("expected timeout block class, got %q", class)
-	}
-
-	delay, armed, consecutive = state.noteFailure(now+int64(3*time.Second), "refused")
-	if !armed {
-		t.Fatal("first refused failure should arm cooldown")
-	}
-	if delay != 1*time.Second {
-		t.Fatalf("expected 1s cooldown on first refused failure, got %v", delay)
-	}
-	if consecutive != 1 {
-		t.Fatalf("expected class switch to reset consecutive failures, got %d", consecutive)
-	}
-
-	resetAt := now + int64(egressPenaltyResetAfter) + int64(time.Second)
-	if delay, armed, consecutive := state.noteFailure(resetAt, "timeout"); delay != 0 || armed || consecutive != 1 {
-		t.Fatalf("failure after reset window should restart counters: delay=%v armed=%v consecutive=%d", delay, armed, consecutive)
-	}
-}
-
-func TestClearEgressDialPenalty(t *testing.T) {
-	dest := net.TCPDestination(net.ParseAddress("108.160.166.62"), 443)
-	state := getEgressDialPenaltyState(dest)
-	state.noteFailure(time.Now().UnixNano(), "timeout")
-
-	if !clearEgressDialPenalty(dest) {
-		t.Fatal("expected destination penalty state to be cleared")
-	}
-	if clearEgressDialPenalty(dest) {
-		t.Fatal("expected second clear to report no state")
 	}
 }
