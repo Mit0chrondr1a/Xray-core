@@ -110,7 +110,7 @@ var (
 	// Xray clients) see the Rust ServerHello.
 	// See docs/ktls-vision-incompatibility.md.
 	useNativeRealityServerFn = func(v *Listener) bool {
-		return nativeRealityServerEligible(v, native.Available(), tls.NativeFullKTLSSupported(), tls.DeferredKTLSPromotionDisabled())
+		return nativeRealityServerEligible(v, native.Available(), tls.NativeFullKTLSSupported(), tls.DeferredKTLSPromotionDisabledFor("vision"))
 	}
 
 	rustPeekBypassByRemote sync.Map // key: remote scope key (IP for non-loopback, endpoint for loopback), value: int64(unix nano until)
@@ -199,6 +199,31 @@ func nativeRealityServerEligible(v *Listener, nativeAvailable, fullKTLS, deferre
 		return false
 	}
 	return true
+}
+
+// loopbackDetachGuardPort is the REALITY ingress port behind the local SNI
+// shunter. Loopback traffic on this port (e.g., nginx -> xray) should avoid
+// the Rust deferred path to keep DNS/short control flows from incurring
+// rustls/peek latency; Go REALITY is deterministic here and already known to
+// work in the baseline branch.
+const loopbackDetachGuardPort = "2036"
+
+func isLoopbackDetachGuardConn(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	la, ra := conn.LocalAddr(), conn.RemoteAddr()
+	if la == nil || ra == nil {
+		return false
+	}
+	lip := extractIP(la)
+	rip := extractIP(ra)
+	if lip == nil || rip == nil || !(lip.IsLoopback() || rip.IsLoopback()) {
+		return false
+	}
+	_, lport, _ := net.SplitHostPort(la.String())
+	_, rport, _ := net.SplitHostPort(ra.String())
+	return lport == loopbackDetachGuardPort || rport == loopbackDetachGuardPort
 }
 
 func tcpMarkerSnapshot(total *atomic.Uint64, last *atomic.Uint64) (current uint64, delta uint64) {
@@ -460,6 +485,12 @@ func (v *Listener) keepAccepting() {
 				defer maybeLogTCPRealityHandoverMarkers(context.Background())
 				nowUnix := time.Now().UnixNano()
 				nativePathEligible := useNativeRealityServerFn(v)
+				if nativePathEligible && isLoopbackDetachGuardConn(conn) {
+					nativePathEligible = false
+					tcpRealityMarkerRustPathIneligible.Add(1)
+					tcpRealityMarkerRustPeekBypassLoopback.Add(1)
+					errors.LogDebug(context.Background(), "[kind=tcp-handover.loopback_guard] skip Rust REALITY for loopback ingress ", conn.LocalAddr(), " <- ", conn.RemoteAddr())
+				}
 				if nativePathEligible && shouldBypassRustDeferredForRemote(conn.RemoteAddr(), nowUnix) {
 					tcpRealityMarkerRustPeekBypassActive.Add(1)
 					if isLoopbackAddr(conn.RemoteAddr()) {
@@ -472,7 +503,11 @@ func (v *Listener) keepAccepting() {
 					tcpRealityMarkerRustPathIneligible.Add(1)
 					acceptProxyProtocol := v.config != nil && v.config.AcceptProxyProtocol
 					hasMldsa65Seed := v.realityXrayConfig != nil && len(v.realityXrayConfig.Mldsa65Seed) > 0
-					deferredPromotionDisabled := tls.DeferredKTLSPromotionDisabled()
+					scope := "vision"
+					if la := conn.LocalAddr(); la != nil {
+						scope = scope + ":" + la.String()
+					}
+					deferredPromotionDisabled := tls.DeferredKTLSPromotionDisabledFor(scope)
 					errors.LogDebug(context.Background(),
 						"[kind=tcp-handover.rust_path_ineligible] Rust REALITY server path disabled: nativeAvailable=", native.Available(),
 						" fullKTLS=", tls.NativeFullKTLSSupported(),
@@ -508,6 +543,9 @@ func (v *Listener) keepAccepting() {
 								}
 								_ = conn.Close()
 								return
+							}
+							if la := conn.LocalAddr(); la != nil {
+								deferredConn.SetKTLSPromotionScope("vision:" + la.String())
 							}
 							tcpRealityMarkerRustSuccess.Add(1)
 							conn = deferredConn

@@ -79,14 +79,13 @@ func TestXHTTPKREALITYListenerEligible(t *testing.T) {
 	baseReality := &reality.Config{}
 
 	tests := []struct {
-		name                      string
-		port                      net.Port
-		socketSettings            *internet.SocketConfig
-		realityConfig             *reality.Config
-		nativeAvailable           bool
-		fullKTLSSupported         bool
-		deferredPromotionDisabled bool
-		want                      bool
+		name              string
+		port              net.Port
+		socketSettings    *internet.SocketConfig
+		realityConfig     *reality.Config
+		nativeAvailable   bool
+		fullKTLSSupported bool
+		want              bool
 	}{
 		{
 			name:              "unix socket port",
@@ -119,15 +118,6 @@ func TestXHTTPKREALITYListenerEligible(t *testing.T) {
 			nativeAvailable:   true,
 			fullKTLSSupported: false,
 			want:              false,
-		},
-		{
-			name:                      "deferred promotion cooldown active",
-			port:                      basePort,
-			realityConfig:             baseReality,
-			nativeAvailable:           true,
-			fullKTLSSupported:         true,
-			deferredPromotionDisabled: true,
-			want:                      false,
 		},
 		{
 			name:              "proxy protocol enabled",
@@ -166,7 +156,6 @@ func TestXHTTPKREALITYListenerEligible(t *testing.T) {
 				tc.realityConfig,
 				tc.nativeAvailable,
 				tc.fullKTLSSupported,
-				tc.deferredPromotionDisabled,
 				pipeline.CapabilitySummary{KTLSSupported: true, SockmapSupported: true, SpliceSupported: true},
 			)
 			if got != tc.want {
@@ -307,6 +296,122 @@ func TestXHTTPListenerApplyBackoff(t *testing.T) {
 			}
 			if tc.wantHit && got[0] != tc.wantDur {
 				t.Fatalf("xhttpListenerApplyBackoff() duration = %v, want %v", got[0], tc.wantDur)
+			}
+		})
+	}
+}
+
+func TestXHTTPComposeCapabilitiesSummaryReflectsSpliceProbe(t *testing.T) {
+	base := pipeline.CapabilitySummary{
+		KTLSSupported:    false,
+		SockmapSupported: false,
+		SpliceSupported:  false,
+	}
+	got := xhttpComposeCapabilitiesSummary(base, true, true)
+
+	if !got.KTLSSupported {
+		t.Fatal("expected KTLSSupported to be true when probe reports support")
+	}
+	if !got.SockmapSupported {
+		t.Fatal("expected SockmapSupported to be true when probe reports support")
+	}
+	if got.SpliceSupported {
+		t.Fatal("expected SpliceSupported to reflect probe result, not be forced true")
+	}
+}
+
+func TestXHTTPRecordTerminalDecisionPartition(t *testing.T) {
+	reset := func() {
+		xhttpDecisionRustKTLS.Store(0)
+		xhttpDecisionGoFallback.Store(0)
+		xhttpDecisionDrop.Store(0)
+	}
+
+	resetCooldown := func() func() {
+		orig := deferredKTLSPromotionDisabledFn
+		deferredKTLSPromotionDisabledFn = func(string) bool { return true }
+		return func() { deferredKTLSPromotionDisabledFn = orig }
+	}
+
+	tests := []struct {
+		name         string
+		snap         pipeline.DecisionSnapshot
+		err          error
+		wantRust     uint64
+		wantFallback uint64
+		wantDrop     uint64
+	}{
+		{
+			name: "ktls success",
+			snap: pipeline.DecisionSnapshot{
+				Path:   pipeline.PathKTLS,
+				Reason: pipeline.ReasonKTLSSuccess,
+			},
+			wantRust:     1,
+			wantFallback: 0,
+			wantDrop:     0,
+		},
+		{
+			name: "fallback success",
+			snap: pipeline.DecisionSnapshot{
+				Path:   pipeline.PathUserspace,
+				Reason: pipeline.ReasonFallbackSuccess,
+			},
+			wantRust:     0,
+			wantFallback: 1,
+			wantDrop:     0,
+		},
+		{
+			name: "failed fallback counts as drop only",
+			snap: pipeline.DecisionSnapshot{
+				Path:   pipeline.PathUserspace,
+				Reason: pipeline.ReasonFallbackFailed,
+			},
+			err:          errors.New("fallback failed"),
+			wantRust:     0,
+			wantFallback: 0,
+			wantDrop:     1,
+		},
+		{
+			name: "non-fallback error is drop",
+			snap: pipeline.DecisionSnapshot{
+				Path:   pipeline.PathUserspace,
+				Reason: pipeline.ReasonRustHandshakeFailed,
+			},
+			err:          errors.New("handshake failed"),
+			wantRust:     0,
+			wantFallback: 0,
+			wantDrop:     1,
+		},
+		{
+			name: "cooldown",
+			snap: pipeline.DecisionSnapshot{
+				Path:   pipeline.PathUserspace,
+				Reason: pipeline.ReasonKTLSPromotionCooldown,
+			},
+			wantRust:     0,
+			wantFallback: 1,
+			wantDrop:     0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reset()
+			if tt.name == "cooldown" {
+				undo := resetCooldown()
+				defer undo()
+			}
+			xhttpRecordTerminalDecision(tt.snap, tt.err)
+
+			if got := xhttpDecisionRustKTLS.Load(); got != tt.wantRust {
+				t.Fatalf("xhttpDecisionRustKTLS = %d, want %d", got, tt.wantRust)
+			}
+			if got := xhttpDecisionGoFallback.Load(); got != tt.wantFallback {
+				t.Fatalf("xhttpDecisionGoFallback = %d, want %d", got, tt.wantFallback)
+			}
+			if got := xhttpDecisionDrop.Load(); got != tt.wantDrop {
+				t.Fatalf("xhttpDecisionDrop = %d, want %d", got, tt.wantDrop)
 			}
 		})
 	}
