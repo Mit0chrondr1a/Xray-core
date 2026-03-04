@@ -86,6 +86,15 @@ fn reality_auth_key(shared_secret: &[u8], random_prefix: &[u8]) -> Result<Vec<u8
     Ok(key)
 }
 
+fn copy_secret_to_result_slot(dst: &mut [u8], secret: &mut Vec<u8>) -> usize {
+    let len = secret.len().min(dst.len());
+    if len > 0 {
+        dst[..len].copy_from_slice(&secret[..len]);
+    }
+    secret.zeroize();
+    len
+}
+
 // AES-256-GCM with 32-byte key from HKDF-SHA256. This matches the Go REALITY
 // implementation: Go derives a 32-byte AuthKey via HKDF and passes it to
 // aes.NewCipher(), which auto-selects AES-256 for 32-byte keys. The previous
@@ -294,7 +303,7 @@ pub fn reality_client_connect(
     let shared_secret = privkey.diffie_hellman(&pubkey);
 
     // Derive auth key
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])?;
+    let auth_key = Zeroizing::new(reality_auth_key(shared_secret.as_bytes(), &random[..20])?);
 
     // Build session_id plaintext: version(3) + reserved(1) + timestamp(4) + short_id(8)
     let mut session_id_plain = [0u8; 16];
@@ -312,13 +321,14 @@ pub fn reality_client_connect(
     let sid_len = short_id.len().min(8);
     session_id_plain[8..8 + sid_len].copy_from_slice(&short_id[..sid_len]);
 
-    // AES-GCM-128 seal: nonce=random[20:32], plaintext=session_id[0..16],
+    // AES-GCM seal: nonce=random[20:32], plaintext=session_id[0..16],
     // aad=ClientHello raw with session_id zeroed (matches Go's REALITY client).
     let nonce = &random[20..32];
     // Zero session_id in the raw buffer to build AAD (Go zeros it before Seal).
     client_hello_raw[39..71].fill(0);
-    let encrypted = aes_gcm_seal(&auth_key, nonce, &session_id_plain, client_hello_raw)
+    let encrypted = aes_gcm_seal(auth_key.as_ref(), nonce, &session_id_plain, client_hello_raw)
         .map_err(|e| RealityError::Protocol(e))?;
+    session_id_plain.zeroize();
 
     // Overwrite session_id in ClientHello (offset 39, 32 bytes)
     if encrypted.len() != 32 {
@@ -345,7 +355,7 @@ pub fn reality_client_connect(
     // This matches Go's VerifyPeerCertificate at reality.go:108-119.
     if !tls_state.server_cert_chain.is_empty() {
         let cert_der = &tls_state.server_cert_chain[0];
-        if !verify_reality_cert_hmac(cert_der, &auth_key) {
+        if !verify_reality_cert_hmac(cert_der, auth_key.as_ref()) {
             return Err(RealityError::AuthFailed(
                 "server cert HMAC verification failed".into(),
             ));
@@ -358,7 +368,7 @@ pub fn reality_client_connect(
 
     Ok(RealityResult {
         tls_state,
-        auth_key: Zeroizing::new(auth_key),
+        auth_key,
     })
 }
 
@@ -469,7 +479,7 @@ pub fn reality_server_accept(
     if session_id_len != 32 {
         return Err(RealityError::AuthFailed("session_id not 32 bytes".into()));
     }
-    let encrypted_session_id = ch_raw[39..71].to_vec();
+    let encrypted_session_id = &ch_raw[39..71];
 
     // Extract SNI from extensions
     let sni = parse_sni_from_client_hello(&ch_raw).unwrap_or_default();
@@ -490,15 +500,17 @@ pub fn reality_server_accept(
     let shared_secret = privkey.diffie_hellman(&client_pubkey);
 
     // Derive auth key
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])?;
+    let auth_key = Zeroizing::new(reality_auth_key(shared_secret.as_bytes(), &random[..20])?);
 
     // Decrypt session_id: nonce=random[20:32], ciphertext=encrypted_session_id,
     // aad=ClientHello raw with session_id zeroed (matches Go's REALITY server).
     let nonce = &random[20..32];
     let mut aad = ch_raw.clone();
     aad[39..71].fill(0);
-    let plaintext = aes_gcm_open(&auth_key, nonce, &encrypted_session_id, &aad)
-        .map_err(|e| RealityError::AuthFailed(format!("session_id decrypt: {}", e)))?;
+    let plaintext = Zeroizing::new(
+        aes_gcm_open(auth_key.as_ref(), nonce, encrypted_session_id, &aad)
+            .map_err(|e| RealityError::AuthFailed(format!("session_id decrypt: {}", e)))?,
+    );
 
     if plaintext.len() != 16 {
         return Err(RealityError::AuthFailed(
@@ -554,7 +566,7 @@ pub fn reality_server_accept(
         authenticated: true,
         client_version: client_ver,
         short_id,
-        auth_key: Zeroizing::new(auth_key),
+        auth_key,
         sni,
         client_hello_raw: ch_raw,
     })
@@ -880,7 +892,7 @@ fn reality_server_handshake_full(
     ),
     (i32, String), // (error_code, message)
 > {
-    let private_key = cfg.private_key.ok_or((1, "private_key not set".into()))?;
+    let mut private_key = cfg.private_key.ok_or((1, "private_key not set".into()))?;
     let version_range = cfg.version_range.unwrap_or(((0, 0, 0), (255, 255, 255)));
 
     // Step 1: Peek at ClientHello using MSG_PEEK (non-consuming).
@@ -927,19 +939,24 @@ fn reality_server_handshake_full(
     let client_x25519 = parse_x25519_key_share(ch_raw).ok_or((1, "no X25519 key_share".into()))?;
 
     let privkey = StaticSecret::from(private_key);
+    private_key.zeroize();
     let client_pubkey = PublicKey::from(client_x25519);
     let shared_secret = privkey.diffie_hellman(&client_pubkey);
 
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])
-        .map_err(|e| (2, format!("auth key: {}", e)))?;
+    let auth_key = Zeroizing::new(
+        reality_auth_key(shared_secret.as_bytes(), &random[..20])
+            .map_err(|e| (2, format!("auth key: {}", e)))?,
+    );
 
     // Decrypt session_id with AAD = ClientHello raw with session_id zeroed
     // (matches Go's github.com/xtls/reality server behavior).
     let nonce = &random[20..32];
     let mut aad = ch_raw.to_vec();
     aad[39..71].fill(0);
-    let plaintext = aes_gcm_open(&auth_key, nonce, encrypted_session_id, &aad)
-        .map_err(|e| (1, format!("session_id decrypt: {}", e)))?;
+    let plaintext = Zeroizing::new(
+        aes_gcm_open(auth_key.as_ref(), nonce, encrypted_session_id, &aad)
+            .map_err(|e| (1, format!("session_id decrypt: {}", e)))?,
+    );
 
     if plaintext.len() != 16 {
         return Err((1, "decrypted session_id wrong size".into()));
@@ -947,7 +964,7 @@ fn reality_server_handshake_full(
 
     let client_ver = (plaintext[0], plaintext[1], plaintext[2]);
     let timestamp = u32::from_be_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
-    let short_id = plaintext[8..16].to_vec();
+    let short_id = &plaintext[8..16];
 
     let (min_ver, max_ver) = version_range;
     if client_ver < min_ver || client_ver > max_ver {
@@ -999,7 +1016,7 @@ fn reality_server_handshake_full(
     let ed25519_pub = ed25519_pair.public_key().as_ref();
 
     let cert_sni = if sni.is_empty() { "localhost" } else { &sni };
-    let cert_der = build_reality_cert(pkcs8_doc.as_ref(), ed25519_pub, &auth_key, cert_sni)
+    let cert_der = build_reality_cert(pkcs8_doc.as_ref(), ed25519_pub, auth_key.as_ref(), cert_sni)
         .map_err(|e| (2, format!("cert gen: {}", e)))?;
 
     // Step 4: Build rustls ServerConfig with the REALITY cert.
@@ -1099,16 +1116,8 @@ fn reality_server_handshake_full(
     let state_handle = Box::into_raw(state) as *mut c_void;
 
     // Server: TX = server secret, RX = client secret
-    let tx_secret = capture
-        .server_secret
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let rx_secret = capture
-        .client_secret
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let tx_secret = capture.take_server_secret();
+    let rx_secret = capture.take_client_secret();
 
     Ok((
         cipher_suite,
@@ -1592,7 +1601,7 @@ fn reality_server_handshake_deferred(
     cfg: &RealityConfig,
     handshake_timeout: std::time::Duration,
 ) -> Result<Box<DeferredSession>, (i32, String)> {
-    let private_key = cfg.private_key.ok_or((1, "private_key not set".into()))?;
+    let mut private_key = cfg.private_key.ok_or((1, "private_key not set".into()))?;
     let version_range = cfg.version_range.unwrap_or(((0, 0, 0), (255, 255, 255)));
 
     // Step 1: Peek at ClientHello using MSG_PEEK (non-consuming).
@@ -1638,17 +1647,22 @@ fn reality_server_handshake_deferred(
     let client_x25519 = parse_x25519_key_share(ch_raw).ok_or((1, "no X25519 key_share".into()))?;
 
     let privkey = StaticSecret::from(private_key);
+    private_key.zeroize();
     let client_pubkey = PublicKey::from(client_x25519);
     let shared_secret = privkey.diffie_hellman(&client_pubkey);
 
-    let auth_key = reality_auth_key(shared_secret.as_bytes(), &random[..20])
-        .map_err(|e| (2, format!("auth key: {}", e)))?;
+    let auth_key = Zeroizing::new(
+        reality_auth_key(shared_secret.as_bytes(), &random[..20])
+            .map_err(|e| (2, format!("auth key: {}", e)))?,
+    );
 
     let nonce = &random[20..32];
     let mut aad = ch_raw.to_vec();
     aad[39..71].fill(0);
-    let plaintext = aes_gcm_open(&auth_key, nonce, encrypted_session_id, &aad)
-        .map_err(|e| (1, format!("session_id decrypt: {}", e)))?;
+    let plaintext = Zeroizing::new(
+        aes_gcm_open(auth_key.as_ref(), nonce, encrypted_session_id, &aad)
+            .map_err(|e| (1, format!("session_id decrypt: {}", e)))?,
+    );
 
     if plaintext.len() != 16 {
         return Err((1, "decrypted session_id wrong size".into()));
@@ -1656,7 +1670,7 @@ fn reality_server_handshake_deferred(
 
     let client_ver = (plaintext[0], plaintext[1], plaintext[2]);
     let timestamp = u32::from_be_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
-    let short_id = plaintext[8..16].to_vec();
+    let short_id = &plaintext[8..16];
 
     let (min_ver, max_ver) = version_range;
     if client_ver < min_ver || client_ver > max_ver {
@@ -1703,7 +1717,7 @@ fn reality_server_handshake_deferred(
     let ed25519_pub = ed25519_pair.public_key().as_ref();
 
     let cert_sni = if sni.is_empty() { "localhost" } else { &sni };
-    let cert_der = build_reality_cert(pkcs8_doc.as_ref(), ed25519_pub, &auth_key, cert_sni)
+    let cert_der = build_reality_cert(pkcs8_doc.as_ref(), ed25519_pub, auth_key.as_ref(), cert_sni)
         .map_err(|e| (2, format!("cert gen: {}", e)))?;
 
     // Step 4: Build rustls ServerConfig
@@ -2192,8 +2206,8 @@ pub extern "C" fn xray_deferred_enable_ktls_into(
                 ktls_rx,
                 rx_seq_start,
                 state_handle,
-                tx_secret,
-                rx_secret,
+                mut tx_secret,
+                mut rx_secret,
                 drained,
             )) => {
                 out.version = 0x0304;
@@ -2203,15 +2217,9 @@ pub extern "C" fn xray_deferred_enable_ktls_into(
                 out.rx_seq_start = rx_seq_start;
                 out.state_handle = state_handle;
 
-                if !tx_secret.is_empty() {
-                    let len = tx_secret.len().min(48);
-                    out.tx_secret[..len].copy_from_slice(&tx_secret[..len]);
-                    out.secret_len = len as u8;
-                }
-                if !rx_secret.is_empty() {
-                    let len = rx_secret.len().min(48);
-                    out.rx_secret[..len].copy_from_slice(&rx_secret[..len]);
-                }
+                let tx_len = copy_secret_to_result_slot(&mut out.tx_secret, &mut tx_secret);
+                out.secret_len = tx_len as u8;
+                let _ = copy_secret_to_result_slot(&mut out.rx_secret, &mut rx_secret);
 
                 unsafe { tls::write_drained_to_result(out, drained, drained_buf, drained_cap) };
                 0
@@ -2814,7 +2822,11 @@ pub extern "C" fn xray_reality_client_connect(
             }
         };
 
-        match reality_client_connect(fd, ch, &privkey, &server_pubkey, &cfg.short_id, cfg.version) {
+        let connect_result =
+            reality_client_connect(fd, ch, &privkey, &server_pubkey, &cfg.short_id, cfg.version);
+        privkey.zeroize();
+
+        match connect_result {
             Ok(result) => {
                 out.version = 0x0304; // TLS 1.3
                 out.cipher_suite = result.tls_state.cipher_suite;
@@ -2882,7 +2894,7 @@ pub extern "C" fn xray_reality_server_accept(
         *out = XrayTlsResult::new();
 
         let cfg = unsafe { &*cfg };
-        let private_key = match cfg.private_key {
+        let mut private_key = match cfg.private_key {
             Some(k) => k,
             None => {
                 out.set_error(1, "private_key not set");
@@ -2892,14 +2904,17 @@ pub extern "C" fn xray_reality_server_accept(
 
         let version_range = cfg.version_range.unwrap_or(((0, 0, 0), (255, 255, 255)));
 
-        match reality_server_accept(
+        let accept_result = reality_server_accept(
             fd,
             &private_key,
             &cfg.short_ids,
             &cfg.server_names,
             cfg.max_time_diff,
             version_range,
-        ) {
+        );
+        private_key.zeroize();
+
+        match accept_result {
             Ok(_result) => {
                 out.version = 0x0304; // TLS 1.3
                 out.ktls_tx = false;
@@ -2958,22 +2973,24 @@ pub extern "C" fn xray_reality_server_handshake_into(
 
         let handshake_timeout = tls::handshake_timeout_from_ms(handshake_timeout_ms);
         match reality_server_handshake_full(fd, cfg, handshake_timeout) {
-            Ok((cipher_suite, ktls_tx, ktls_rx, state_handle, tx_secret, rx_secret, drained)) => {
+            Ok((
+                cipher_suite,
+                ktls_tx,
+                ktls_rx,
+                state_handle,
+                mut tx_secret,
+                mut rx_secret,
+                drained,
+            )) => {
                 out.version = 0x0304;
                 out.cipher_suite = cipher_suite;
                 out.ktls_tx = ktls_tx;
                 out.ktls_rx = ktls_rx;
                 out.state_handle = state_handle;
 
-                if !tx_secret.is_empty() {
-                    let len = tx_secret.len().min(48);
-                    out.tx_secret[..len].copy_from_slice(&tx_secret[..len]);
-                    out.secret_len = len as u8;
-                }
-                if !rx_secret.is_empty() {
-                    let len = rx_secret.len().min(48);
-                    out.rx_secret[..len].copy_from_slice(&rx_secret[..len]);
-                }
+                let tx_len = copy_secret_to_result_slot(&mut out.tx_secret, &mut tx_secret);
+                out.secret_len = tx_len as u8;
+                let _ = copy_secret_to_result_slot(&mut out.rx_secret, &mut rx_secret);
 
                 // Forward drained data to Go (Go buffer first, Rust allocation fallback)
                 unsafe { tls::write_drained_to_result(out, drained, drained_buf, drained_cap) };
@@ -3059,6 +3076,26 @@ mod tests {
 
         // Open with empty AAD should fail (the critical bug we fixed)
         assert!(aes_gcm_open(&key, &nonce, &ct, &[]).is_err());
+    }
+
+    #[test]
+    fn test_copy_secret_to_result_slot_zeroizes_source() {
+        let mut dst = [0u8; 8];
+        let mut secret = vec![1u8, 2, 3, 4, 5, 6];
+        let copied = copy_secret_to_result_slot(&mut dst, &mut secret);
+        assert_eq!(copied, 6);
+        assert_eq!(&dst[..6], &[1, 2, 3, 4, 5, 6]);
+        assert!(secret.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_copy_secret_to_result_slot_truncates_and_zeroizes() {
+        let mut dst = [0u8; 4];
+        let mut secret = vec![9u8, 8, 7, 6, 5, 4];
+        let copied = copy_secret_to_result_slot(&mut dst, &mut secret);
+        assert_eq!(copied, 4);
+        assert_eq!(&dst, &[9, 8, 7, 6]);
+        assert!(secret.iter().all(|&b| b == 0));
     }
 
     #[test]

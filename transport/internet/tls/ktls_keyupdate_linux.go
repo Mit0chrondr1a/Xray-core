@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -37,12 +38,14 @@ const minKeyUpdateInterval = 100 * time.Millisecond
 type KTLSKeyUpdateHandler struct {
 	mu            sync.Mutex
 	fd            int
+	ownsFD        bool
 	cipherSuiteID uint16
 	hashFunc      crypto.Hash
 	keyLen        int
 	rxSecret      []byte
 	txSecret      []byte
 	lastKeyUpdate time.Time // rate limiting for peer-initiated KeyUpdates
+	closed        atomic.Bool
 }
 
 func newKTLSKeyUpdateHandler(fd int, cipherSuiteID uint16, rxSecret, txSecret []byte) *KTLSKeyUpdateHandler {
@@ -61,8 +64,19 @@ func newKTLSKeyUpdateHandler(fd int, cipherSuiteID uint16, rxSecret, txSecret []
 	default:
 		return nil
 	}
+
+	dupFD := fd
+	owns := false
+	if fd >= 0 {
+		if dup, err := dupCloseOnExec(fd); err == nil {
+			dupFD = dup
+			owns = true
+		}
+	}
+
 	return &KTLSKeyUpdateHandler{
-		fd:            fd,
+		fd:            dupFD,
+		ownsFD:        owns,
 		cipherSuiteID: cipherSuiteID,
 		hashFunc:      hashFunc,
 		keyLen:        keyLen,
@@ -78,8 +92,17 @@ func (h *KTLSKeyUpdateHandler) CipherSuiteID() uint16 {
 
 // Handle processes a pending TLS 1.3 KeyUpdate after the kernel returns EKEYEXPIRED.
 func (h *KTLSKeyUpdateHandler) Handle() error {
+	if h == nil || h.closed.Load() {
+		return fmt.Errorf("ktls: handler closed")
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed.Load() {
+		return fmt.Errorf("ktls: handler closed")
+	}
+	if h.fd < 0 {
+		return fmt.Errorf("ktls: invalid fd")
+	}
 
 	// Rate-limit peer-initiated KeyUpdates to prevent CPU exhaustion.
 	now := time.Now()
@@ -183,8 +206,17 @@ func (h *KTLSKeyUpdateHandler) Handle() error {
 // called after keyUpdateThreshold TLS records to stay within the AES-GCM
 // confidentiality limit (~2^24.5 records per key, RFC 8446 Section 5.5).
 func (h *KTLSKeyUpdateHandler) InitiateUpdate() error {
+	if h == nil || h.closed.Load() {
+		return fmt.Errorf("ktls: handler closed")
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed.Load() {
+		return fmt.Errorf("ktls: handler closed")
+	}
+	if h.fd < 0 {
+		return fmt.Errorf("ktls: invalid fd")
+	}
 
 	// Send KeyUpdate (update_not_requested = 0)
 	kuMsg := []byte{typeKeyUpdate, 0, 0, 1, 0}
@@ -228,12 +260,31 @@ func (h *KTLSKeyUpdateHandler) InitiateUpdate() error {
 
 // Close zeroes all secret material held by this handler.
 func (h *KTLSKeyUpdateHandler) Close() {
+	if h == nil {
+		return
+	}
+	if !h.closed.CompareAndSwap(false, true) {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	zeroBytes(h.rxSecret)
 	zeroBytes(h.txSecret)
 	h.rxSecret = nil
 	h.txSecret = nil
+	if h.ownsFD && h.fd >= 0 {
+		_ = unix.Close(h.fd)
+	}
+	h.fd = -1
+	h.ownsFD = false
+}
+
+// IsClosed reports whether the handler has been closed.
+func (h *KTLSKeyUpdateHandler) IsClosed() bool {
+	if h == nil {
+		return true
+	}
+	return h.closed.Load()
 }
 
 // expandLabel implements HKDF-Expand-Label from RFC 8446 Section 7.1.
@@ -287,6 +338,18 @@ func sendControlRecord(fd int, recordType byte, data []byte) error {
 	oob[syscall.CmsgLen(0)] = recordType
 
 	return syscall.Sendmsg(fd, data, oob, nil, 0)
+}
+
+func dupCloseOnExec(fd int) (int, error) {
+	newFD, err := unix.Dup(fd)
+	if err != nil {
+		return -1, err
+	}
+	if _, err := unix.FcntlInt(uintptr(newFD), unix.F_SETFD, unix.FD_CLOEXEC); err != nil {
+		_ = unix.Close(newFD)
+		return -1, err
+	}
+	return newFD, nil
 }
 
 // IsKeyExpired checks if an error indicates the kernel's kTLS keys have expired

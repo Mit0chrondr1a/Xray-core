@@ -24,9 +24,10 @@ func logPipelineSummary(ctx context.Context, snap pipeline.DecisionSnapshot) {
 	if kind == "" {
 		kind = "proxy"
 	}
+	path := snap.Path
 	errors.LogInfo(ctx, "proxy markers[kind=pipeline-summary]: ",
 		"kind=", kind,
-		" path=", string(snap.Path),
+		" path=", string(path),
 		" reason=", snap.Reason,
 		" splice_bytes=", snap.SpliceBytes,
 		" splice_duration_ns=", snap.SpliceDurationNs,

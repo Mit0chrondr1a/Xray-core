@@ -109,6 +109,22 @@ func TestKtlsAfterWrite_MaxRotationFailuresClosesConn(t *testing.T) {
 	}
 }
 
+func TestKtlsAfterWrite_SkipsClosedHandler(t *testing.T) {
+	secret := make([]byte, 32)
+	handler := newKTLSKeyUpdateHandler(-1, 0x1301, secret, secret)
+	if handler == nil {
+		t.Fatal("expected non-nil handler")
+	}
+	handler.Close()
+
+	var wr atomic.Uint64
+	ktlsAfterWrite(maxRecordPayload, handler, &wr, &atomic.Uint32{}, func() error { t.Fatal("close should not be called"); return nil })
+
+	if wr.Load() != 0 {
+		t.Fatalf("expected writeRecords to stay 0 for closed handler, got %d", wr.Load())
+	}
+}
+
 func TestDeriveKeysFromCapture_UnsupportedCipher(t *testing.T) {
 	capture := &keyCapture{}
 	capture.clientSecret = make([]byte, 32)
@@ -325,12 +341,12 @@ func TestKtlsKeyLen(t *testing.T) {
 		wantLen int
 		wantOK  bool
 	}{
-		{0x1301, 16, true},  // TLS_AES_128_GCM_SHA256
-		{0x1302, 32, true},  // TLS_AES_256_GCM_SHA384
-		{0x1303, 32, true},  // TLS_CHACHA20_POLY1305_SHA256
-		{0xc02f, 16, true},  // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-		{0xc030, 32, true},  // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-		{0xFFFF, 0, false},  // unsupported
+		{0x1301, 16, true}, // TLS_AES_128_GCM_SHA256
+		{0x1302, 32, true}, // TLS_AES_256_GCM_SHA384
+		{0x1303, 32, true}, // TLS_CHACHA20_POLY1305_SHA256
+		{0xc02f, 16, true}, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+		{0xc030, 32, true}, // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+		{0xFFFF, 0, false}, // unsupported
 	}
 	for _, tc := range tests {
 		kl, ok := ktlsKeyLen(tc.suite)

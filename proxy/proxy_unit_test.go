@@ -13,7 +13,10 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/pipeline"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/proxy/vless/encryption"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -610,6 +613,76 @@ func TestDetermineSocketCryptoHintNil(t *testing.T) {
 	}
 }
 
+func TestBuildVisionDecisionInputRefreshesCryptoHint(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	wrappedReader := &encryption.CommonConn{Conn: &tls.DeferredRustConn{}}
+	wrappedWriter := &encryption.CommonConn{Conn: right}
+	caps := pipeline.CapabilitySummary{SpliceSupported: true}
+
+	first, _, _, _, _ := buildVisionDecisionInput(wrappedReader, wrappedWriter, caps, false)
+	if first.ReaderCrypto != "userspace-tls" {
+		t.Fatalf("first ReaderCrypto=%q, want userspace-tls", first.ReaderCrypto)
+	}
+
+	// Switch the wrapped connection to raw TCP and verify the next decision
+	// snapshot reflects the new state.
+	wrappedReader.Conn = left
+	second, _, _, _, _ := buildVisionDecisionInput(wrappedReader, wrappedWriter, caps, false)
+	if second.ReaderCrypto != "none" {
+		t.Fatalf("second ReaderCrypto=%q, want none", second.ReaderCrypto)
+	}
+}
+
+func TestCopyRawConnIfExistUserspaceActiveTrafficBeyondFiveSeconds(t *testing.T) {
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{CanSpliceCopy: 0}
+	outbound := &session.Outbound{CanSpliceCopy: 0}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, nil, buf.Discard, timer, nil)
+	}()
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(5500 * time.Millisecond)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if _, err := readerPeer.Write([]byte("ping")); err != nil {
+				t.Fatalf("writer side failed before timeout window: %v", err)
+			}
+		case <-deadline.C:
+			readerPeer.Close()
+			err := <-errCh
+			if err != nil {
+				t.Fatalf("CopyRawConnIfExist() error=%v, want nil after active userspace traffic", err)
+			}
+			return
+		case err := <-errCh:
+			if goerrors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("CopyRawConnIfExist() returned hard timeout during active traffic: %v", err)
+			}
+			t.Fatalf("CopyRawConnIfExist() exited early: %v", err)
+		}
+	}
+}
+
 func TestIsExpectedSpliceReadFromError(t *testing.T) {
 	cases := []struct {
 		err  error
@@ -766,6 +839,23 @@ func TestVisionRawUnwrapWarningTimestampHelpers(t *testing.T) {
 	}
 	if _, ok := consumeVisionDetachTimestamp(conn); ok {
 		t.Fatal("second detach consume should be empty")
+	}
+}
+
+func TestClearVisionTelemetryTimestamps(t *testing.T) {
+	clearSyncMap(&pipelineVisionRawUnwrapUnixByConn)
+	clearSyncMap(&pipelineVisionDetachUnixByConn)
+	conn := &tls.DeferredRustConn{}
+
+	storeVisionRawUnwrapWarningTimestamp(conn, 123)
+	storeVisionDetachTimestamp(conn, 456)
+	clearVisionTelemetryTimestamps(conn)
+
+	if _, ok := consumeVisionRawUnwrapWarningTimestamp(conn); ok {
+		t.Fatal("raw unwrap timestamp should be cleared")
+	}
+	if _, ok := consumeVisionDetachTimestamp(conn); ok {
+		t.Fatal("detach timestamp should be cleared")
 	}
 }
 
