@@ -1,12 +1,16 @@
 package pipeline
 
+import "strings"
+
 // DecisionInput captures the key factors for handover/acceleration selection.
 type DecisionInput struct {
 	DeferredTLSActive bool
 	LoopbackPair      bool
 	Caps              CapabilitySummary
-	ReaderCrypto      string
-	WriterCrypto      string
+	// ReaderCrypto / WriterCrypto accept canonical values from callers,
+	// e.g. "none", "ktls-both", "ktls-tx-only", "ktls-rx-only", "userspace-tls".
+	ReaderCrypto string
+	WriterCrypto string
 }
 
 // DecideVisionPath returns a DecisionSnapshot with chosen path/reason based on inputs.
@@ -14,27 +18,47 @@ type DecisionInput struct {
 func DecideVisionPath(in DecisionInput) DecisionSnapshot {
 	snap := DecisionSnapshot{
 		Path:   PathUserspace,
-		Reason: "default",
+		Reason: ReasonDefault,
 		Caps:   in.Caps,
 	}
 
 	// If splice/zero-copy is unavailable, stay in userspace early to avoid
 	// bouncing through later fallback branches (keeps logs/telemetry honest).
 	if !in.Caps.SpliceSupported {
-		snap.Reason = "splice_capability_disabled"
+		snap.Reason = ReasonSpliceCapabilityDisabled
 		return snap
 	}
 
 	// Safety: if deferred TLS is still active, stay in userspace.
 	if in.DeferredTLSActive {
-		snap.Reason = "deferred_tls_guard"
+		snap.Reason = ReasonDeferredTLSGuard
+		return snap
+	}
+
+	readerCrypto := normalizeDecisionCryptoHint(in.ReaderCrypto)
+	writerCrypto := normalizeDecisionCryptoHint(in.WriterCrypto)
+	if readerCrypto == "userspace-tls" || writerCrypto == "userspace-tls" {
+		if in.LoopbackPair {
+			snap.Reason = ReasonLoopbackUserspaceTLSGuard
+		} else {
+			snap.Reason = ReasonUserspaceTLSGuard
+		}
 		return snap
 	}
 
 	// Start optimistic with splice; sockmap decided later by caller.
 	snap.Path = PathSplice
-	snap.Reason = "splice_primary"
+	snap.Reason = ReasonSplicePrimary
 
 	// Loopback allowed after detach; no extra change needed here.
 	return snap
+}
+
+func normalizeDecisionCryptoHint(v string) string {
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "userspace", "userspace_tls", "userspace-tls", "user-space-tls":
+		return "userspace-tls"
+	default:
+		return strings.TrimSpace(strings.ToLower(v))
+	}
 }
