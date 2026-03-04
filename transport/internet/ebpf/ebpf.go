@@ -9,7 +9,67 @@ package ebpf
 import (
 	"strconv"
 	"sync"
+	"syscall"
 )
+
+type sockmapProbeStage uint8
+
+const (
+	sockmapProbeStageNone sockmapProbeStage = iota
+	sockmapProbeStageMapCreate
+	sockmapProbeStageSKSkbLoad
+)
+
+func (s sockmapProbeStage) String() string {
+	switch s {
+	case sockmapProbeStageMapCreate:
+		return "map_create"
+	case sockmapProbeStageSKSkbLoad:
+		return "sk_skb_load"
+	default:
+		return "none"
+	}
+}
+
+type sockmapProbeFailureKind uint8
+
+const (
+	sockmapProbeFailureNone sockmapProbeFailureKind = iota
+	sockmapProbeFailureKernelUnsupported
+	sockmapProbeFailurePermissionDenied
+	sockmapProbeFailureTransient
+	sockmapProbeFailureUnknown
+)
+
+func (k sockmapProbeFailureKind) String() string {
+	switch k {
+	case sockmapProbeFailureKernelUnsupported:
+		return "kernel-unsupported"
+	case sockmapProbeFailurePermissionDenied:
+		return "permission-or-seccomp"
+	case sockmapProbeFailureTransient:
+		return "transient"
+	case sockmapProbeFailureUnknown:
+		return "unknown"
+	default:
+		return "none"
+	}
+}
+
+func classifySockmapProbeErrno(errno syscall.Errno) sockmapProbeFailureKind {
+	switch errno {
+	case 0:
+		return sockmapProbeFailureNone
+	case syscall.EPERM, syscall.EACCES:
+		return sockmapProbeFailurePermissionDenied
+	case syscall.EINVAL, syscall.EOPNOTSUPP, syscall.ENOSYS, syscall.EPROTONOSUPPORT:
+		return sockmapProbeFailureKernelUnsupported
+	case syscall.EAGAIN, syscall.EINTR, syscall.EBUSY, syscall.ENOMEM:
+		return sockmapProbeFailureTransient
+	default:
+		return sockmapProbeFailureUnknown
+	}
+}
 
 // Capabilities represents the detected eBPF capabilities of the system.
 type Capabilities struct {
@@ -43,6 +103,10 @@ type Capabilities struct {
 
 	// KernelVersion is the detected kernel version.
 	KernelVersion KernelVersion
+
+	// Internal sockmap probe metadata for diagnostics and retry policy.
+	sockmapProbeStage sockmapProbeStage
+	sockmapProbeErrno syscall.Errno
 }
 
 // KernelVersion represents a Linux kernel version.
@@ -66,6 +130,24 @@ func (v KernelVersion) AtLeast(major, minor, patch int) bool {
 // String returns the version as "Major.Minor.Patch".
 func (v KernelVersion) String() string {
 	return strconv.Itoa(v.Major) + "." + strconv.Itoa(v.Minor) + "." + strconv.Itoa(v.Patch)
+}
+
+func (c Capabilities) sockmapFailureKind() sockmapProbeFailureKind {
+	if c.SockmapSupported {
+		return sockmapProbeFailureNone
+	}
+	// Sockmap requires kernel 4.17+ regardless of probe errno.
+	if !c.KernelVersion.AtLeast(4, 17, 0) {
+		return sockmapProbeFailureKernelUnsupported
+	}
+	return classifySockmapProbeErrno(c.sockmapProbeErrno)
+}
+
+func (c Capabilities) sockmapProbeSummary() string {
+	if c.sockmapProbeErrno == 0 {
+		return "none"
+	}
+	return c.sockmapProbeStage.String() + ":" + c.sockmapProbeErrno.Error()
 }
 
 var (

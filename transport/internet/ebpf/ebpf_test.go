@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"net"
+	"syscall"
 	"testing"
 )
 
@@ -47,6 +48,40 @@ func TestKernelVersionString(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("KernelVersion%v.String() = %q, want %q", tt.v, got, tt.want)
 		}
+	}
+}
+
+func TestClassifySockmapProbeErrno(t *testing.T) {
+	tests := []struct {
+		errno syscall.Errno
+		want  sockmapProbeFailureKind
+	}{
+		{0, sockmapProbeFailureNone},
+		{syscall.EPERM, sockmapProbeFailurePermissionDenied},
+		{syscall.EACCES, sockmapProbeFailurePermissionDenied},
+		{syscall.EINVAL, sockmapProbeFailureKernelUnsupported},
+		{syscall.ENOSYS, sockmapProbeFailureKernelUnsupported},
+		{syscall.EAGAIN, sockmapProbeFailureTransient},
+		{syscall.ENOMEM, sockmapProbeFailureTransient},
+		{syscall.EIO, sockmapProbeFailureUnknown},
+	}
+
+	for _, tt := range tests {
+		if got := classifySockmapProbeErrno(tt.errno); got != tt.want {
+			t.Fatalf("classifySockmapProbeErrno(%v) = %v, want %v", tt.errno, got, tt.want)
+		}
+	}
+}
+
+func TestSockmapFailureKindKernelGatePrecedence(t *testing.T) {
+	caps := Capabilities{
+		SockmapSupported:  false,
+		KernelVersion:     KernelVersion{Major: 4, Minor: 15, Patch: 0},
+		sockmapProbeErrno: syscall.EPERM,
+	}
+
+	if got := caps.sockmapFailureKind(); got != sockmapProbeFailureKernelUnsupported {
+		t.Fatalf("sockmapFailureKind() = %v, want %v", got, sockmapProbeFailureKernelUnsupported)
 	}
 }
 

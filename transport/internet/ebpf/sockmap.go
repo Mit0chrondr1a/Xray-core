@@ -203,6 +203,10 @@ func (m *SockmapManager) Enable() error {
 	m.sweepStaleRatio.Store(0)
 
 	m.enabled.Store(true)
+
+	// Re-probe kTLS+SOCKHASH after maps are ready to avoid latched-false from early probes.
+	_ = forceProbeKTLSSockhashCompat("post-enable")
+
 	return nil
 }
 
@@ -285,6 +289,10 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 			"sockmap: asymmetric crypto redirect (",
 			inboundCrypto.String(), " <-> ", outboundCrypto.String(), ")")
 	}
+	if policy&PolicyKTLSActive != 0 {
+		// Ensure probe is fresh for kTLS flows.
+		_ = refreshKTLSSockhashCompat(false, "register-ktls")
+	}
 
 	if m.useNativeLoader {
 		// Rust/Aya path: register_pair_impl handles policy map writes internally,
@@ -294,6 +302,9 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 			m.recordRegistrationAttempt(true)
 			if isSockmapFull(err) {
 				m.fullRejects.Add(1)
+			}
+			if policy&PolicyKTLSActive != 0 {
+				_ = forceProbeKTLSSockhashCompat("register-ktls-fail")
 			}
 			return err
 		}
@@ -315,6 +326,9 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 			_ = deletePolicyEntry(outboundCookie) // best-effort cleanup
 			if isSockmapFull(err) {
 				m.fullRejects.Add(1)
+			}
+			if policy&PolicyKTLSActive != 0 {
+				_ = forceProbeKTLSSockhashCompat("register-ktls-fail")
 			}
 			return err
 		}
@@ -555,9 +569,16 @@ func CanUseZeroCopy(inbound, outbound net.Conn) bool {
 }
 
 var (
-	ktlsSockhashProbeOnce sync.Once
-	ktlsSockhashOK        bool
-	ktlsSockhashCompatFn  = KTLSSockhashCompatible
+	ktlsSockhashCompatFn = KTLSSockhashCompatible
+)
+
+const ktlsSockhashProbeTTL = 5 * time.Minute
+
+var (
+	ktlsProbeMu     sync.Mutex
+	ktlsProbeResult atomic.Bool
+	ktlsProbeLastNs atomic.Int64
+	ktlsProbeForced atomic.Bool
 )
 
 // KTLSSockhashCompatible reports whether the running kernel supports inserting
@@ -568,15 +589,7 @@ var (
 // this path. When/if a future kernel restores the callback, this probe will
 // automatically detect it — no code changes or version gates needed.
 func KTLSSockhashCompatible() bool {
-	ktlsSockhashProbeOnce.Do(func() {
-		ktlsSockhashOK = probeKTLSSockhashCompat()
-		if ktlsSockhashOK {
-			xerrors.LogDebug(context.Background(), "sockmap: kTLS+SOCKHASH probe passed")
-		} else {
-			xerrors.LogInfo(context.Background(), "sockmap: kTLS+SOCKHASH probe failed (kernel ", unameRelease(), ") — kTLS sockets will use splice instead of sockmap")
-		}
-	})
-	return ktlsSockhashOK
+	return refreshKTLSSockhashCompat(false, "compat-check")
 }
 
 // IncrementKTLSSpliceFallback records that a kTLS-eligible connection pair was
@@ -610,6 +623,42 @@ func CanUseZeroCopyWithCrypto(inbound, outbound net.Conn, inCrypto, outCrypto Cr
 		return false
 	}
 	return true
+}
+
+// refreshKTLSSockhashCompat refreshes the probe result. When force is true, TTL is ignored.
+func refreshKTLSSockhashCompat(force bool, reason string) bool {
+	now := time.Now().UnixNano()
+	last := ktlsProbeLastNs.Load()
+	if !force && last != 0 && now-last < int64(ktlsSockhashProbeTTL) {
+		return ktlsProbeResult.Load()
+	}
+
+	ktlsProbeMu.Lock()
+	defer ktlsProbeMu.Unlock()
+
+	// Re-check after acquiring lock.
+	last = ktlsProbeLastNs.Load()
+	if !force && last != 0 && time.Duration(now-last) < ktlsSockhashProbeTTL {
+		return ktlsProbeResult.Load()
+	}
+
+	result := probeKTLSSockhashCompat()
+	ktlsProbeResult.Store(result)
+	ktlsProbeLastNs.Store(time.Now().UnixNano())
+
+	if result {
+		xerrors.LogDebug(context.Background(), "sockmap: kTLS+SOCKHASH probe passed (reason=", reason, ")")
+	} else {
+		xerrors.LogInfo(context.Background(), "sockmap: kTLS+SOCKHASH probe failed (kernel ", unameRelease(), ", reason=", reason, ") — kTLS sockets will use splice instead of sockmap")
+	}
+
+	return result
+}
+
+// forceProbeKTLSSockhashCompat ignores TTL and reprobes immediately.
+func forceProbeKTLSSockhashCompat(reason string) bool {
+	ktlsProbeForced.Store(true)
+	return refreshKTLSSockhashCompat(true, reason)
 }
 
 // computeRedirectPolicy determines the redirect policy flags for a pair of

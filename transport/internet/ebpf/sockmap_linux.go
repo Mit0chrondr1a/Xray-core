@@ -184,6 +184,11 @@ const skSkbMapFDPlaceholder = 0
 // skSkbPolicyFDPlaceholder is the policy map fd placeholder in the verdict bytecode.
 const skSkbPolicyFDPlaceholder = 1
 
+const (
+	pinVersion     = "2"
+	pinVersionFile = "version"
+)
+
 // readSysctl reads an integer value from a /proc/sys sysctl path.
 func readSysctl(path string) (int, error) {
 	data, err := os.ReadFile(path)
@@ -233,6 +238,9 @@ func setupSockmapImpl(config SockmapConfig) error {
 		pinDir = filepath.Clean(config.PinPath)
 		if !strings.HasPrefix(pinDir, "/sys/fs/bpf/") {
 			return fmt.Errorf("pin path must be under /sys/fs/bpf/: %s", pinDir)
+		}
+		if err := ensurePinVersion(pinDir); err != nil {
+			return err
 		}
 	}
 
@@ -397,6 +405,7 @@ func teardownSockmapImpl() error {
 		unpinBPFMap(sockhashPinPath(oldState.sockmapPinPath))
 		unpinBPFMap(policyPinPath(oldState.sockmapPinPath))
 		os.Remove(oldState.sockmapPinPath)
+		removePinVersion(oldState.sockmapPinPath)
 	}
 
 	// Publish closed state atomically so readers immediately see all FDs as -1.
@@ -810,10 +819,64 @@ func policyPinPath(pinDir string) string {
 	return filepath.Join(pinDir, "policy")
 }
 
+func versionPinPath(pinDir string) string {
+	return filepath.Join(pinDir, pinVersionFile)
+}
+
 func removeExistingPin(path string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove existing pin %s: %w", path, err)
 	}
+	return nil
+}
+
+func readPinVersion(pinDir string) (string, error) {
+	if pinDir == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(versionPinPath(pinDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func writePinVersion(pinDir string) error {
+	if pinDir == "" {
+		return nil
+	}
+	path := versionPinPath(pinDir)
+	if err := os.WriteFile(path, []byte(pinVersion+"\n"), 0600); err != nil {
+		return err
+	}
+	return os.Chown(path, 0, 0)
+}
+
+func removePinVersion(pinDir string) {
+	if pinDir == "" {
+		return
+	}
+	_ = os.Remove(versionPinPath(pinDir))
+}
+
+func ensurePinVersion(pinDir string) error {
+	if pinDir == "" {
+		return nil
+	}
+	existing, err := readPinVersion(pinDir)
+	if err != nil {
+		return err
+	}
+	if existing == "" || existing == pinVersion {
+		return nil
+	}
+	// Version mismatch: clean old pins to force rebuild.
+	_ = removeExistingPin(sockhashPinPath(pinDir))
+	_ = removeExistingPin(policyPinPath(pinDir))
+	removePinVersion(pinDir)
 	return nil
 }
 
@@ -856,6 +919,13 @@ func pinMaps(pinPath string, hashFD, policyFD int) error {
 	if err := os.Chmod(policyPath, 0600); err != nil {
 		unpinBPFMap(policyPath)
 		unpinBPFMap(sockhashPath)
+		return err
+	}
+
+	if err := writePinVersion(pinPath); err != nil {
+		unpinBPFMap(policyPath)
+		unpinBPFMap(sockhashPath)
+		removePinVersion(pinPath)
 		return err
 	}
 
@@ -1109,6 +1179,9 @@ func setupSockmapNative(config SockmapConfig) error {
 		if !strings.HasPrefix(pinDir, "/sys/fs/bpf/") {
 			return fmt.Errorf("pin path must be under /sys/fs/bpf/: %s", pinDir)
 		}
+		if err := ensurePinVersion(pinDir); err != nil {
+			return err
+		}
 		config.PinPath = pinDir
 	}
 
@@ -1147,7 +1220,7 @@ func setupSockmapNative(config SockmapConfig) error {
 // teardownSockmapNative tears down eBPF programs via the Rust/Aya loader.
 func teardownSockmapNative() error {
 	// Publish closed state before tearing down, same as Go-native path.
-	currentState.Store(&ebpfState{
+	oldState := currentState.Swap(&ebpfState{
 		sockhashFD:      -1,
 		policyMapFD:     -1,
 		skSkbParserFD:   -1,
@@ -1157,6 +1230,9 @@ func teardownSockmapNative() error {
 
 	if err := native.EbpfTeardown(); err != nil {
 		return fmt.Errorf("native ebpf teardown: %w", err)
+	}
+	if oldState != nil && oldState.sockmapPinPath != "" {
+		removePinVersion(oldState.sockmapPinPath)
 	}
 	return nil
 }
