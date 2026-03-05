@@ -101,6 +101,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			tlsConfig = config.GetTLSConfig(tls.WithDestination(dest))
 		}
 		nativeTLSConfig := nativeTLSConfigWithRuntimeOverrides(config, tlsConfig)
+		dnsFlowClass := session.ResolveDNSFlowClass(ctx)
 
 		isFromMitmVerify := false
 		if r, ok := tlsConfig.Rand.(*tls.RandCarrier); ok && len(r.VerifyPeerCertByName) > 0 {
@@ -139,14 +140,20 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			} else {
 				err = conn.(*tls.UConn).HandshakeContext(ctx)
 			}
-		} else if shouldUseNativeTLSClient(nativeTLSConfig) && !session.VisionFlowFromContext(ctx) {
+		} else if shouldUseNativeTLSClient(nativeTLSConfig) &&
+			!session.VisionFlowFromContext(ctx) &&
+			dnsFlowClass != session.DNSFlowClassTCPControl {
 			conn, err = rustClientWithContext(ctx, conn, nativeTLSConfig, dest)
 		} else {
 			if shouldUseNativeTLSClient(nativeTLSConfig) {
-				errors.LogDebug(ctx, "Rust native TLS client skipped: Vision flow active — kTLS incompatible")
+				if session.VisionFlowFromContext(ctx) {
+					errors.LogDebug(ctx, "Rust native TLS client skipped: Vision flow active — kTLS incompatible")
+				} else if dnsFlowClass == session.DNSFlowClassTCPControl {
+					errors.LogDebug(ctx, "Rust native TLS client skipped: DNS TCP control-plane flow")
+				}
 			}
 			conn = tls.Client(conn, tlsConfig)
-			if session.VisionFlowFromContext(ctx) || (dest.Network == net.Network_TCP && (dest.Port == net.Port(53) || dest.Port == net.Port(853))) {
+			if session.VisionFlowFromContext(ctx) || dnsFlowClass == session.DNSFlowClassTCPControl {
 				// Vision flows and DNS control paths are latency-sensitive and
 				// short-lived; skip kTLS promotion to avoid kernel handover
 				// stalls/cork-pop on small early packets.

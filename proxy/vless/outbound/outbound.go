@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -58,12 +59,14 @@ type Handler struct {
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
 
-	testpre   uint32
-	initpre   sync.Once
-	preConns  chan *ConnExpire
-	preCtx    context.Context
-	preCancel context.CancelFunc
-	preWG     sync.WaitGroup
+	testpre       uint32
+	initpre       sync.Once
+	preConns      chan *ConnExpire
+	preConnsVFlow chan *ConnExpire
+	preCtx        context.Context
+	preCancel     context.CancelFunc
+	preWG         sync.WaitGroup
+	preVisionFlow atomic.Bool
 }
 
 type ConnExpire struct {
@@ -71,13 +74,49 @@ type ConnExpire struct {
 	Expire time.Time
 }
 
-func contextWithOutboundVisionFlow(ctx context.Context, flow string) context.Context {
-	if strings.HasPrefix(flow, vless.XRV) {
-		// Vision must be marked before dialing so the transport layer can
-		// avoid kTLS-producing native TLS/REALITY paths for this connection.
-		return session.ContextWithVisionFlow(ctx, true)
+func (h *Handler) preConnPool(visionFlow bool) chan *ConnExpire {
+	if visionFlow {
+		return h.preConnsVFlow
 	}
-	return ctx
+	return h.preConns
+}
+
+func (h *Handler) closePreConnPool(pool chan *ConnExpire) {
+	if pool == nil {
+		return
+	}
+	close(pool)
+	for ce := range pool {
+		if ce != nil && ce.Conn != nil {
+			ce.Conn.Close()
+		}
+	}
+}
+
+// applyVisionFlow marks outbound context based on flow and destination.
+func applyVisionFlow(ctx context.Context, flow string, dest net.Destination) context.Context {
+	ctx = session.ContextWithDNSFlowClass(ctx, session.ClassifyDNSFlow(dest))
+	visionFlow := strings.HasPrefix(flow, vless.XRV)
+	return session.ContextWithVisionFlow(ctx, visionFlow)
+}
+
+func effectiveRequestFlow(ctx context.Context, accountFlow string, dest net.Destination) string {
+	if strings.HasPrefix(accountFlow, vless.XRV) && session.ShouldDowngradeVisionFlow(ctx, dest) {
+		return ""
+	}
+	return accountFlow
+}
+
+// Vision flow does not support raw UDP on inbound; keep outbound UDP on the
+// established Mux tunnel semantics.
+func shouldRewriteUDPToMux(cmd protocol.RequestCommand, flow string, cone bool, port net.Port) bool {
+	if cmd != protocol.RequestCommandUDP {
+		return false
+	}
+	if flow == vless.XRV {
+		return true
+	}
+	return cone && port != 53 && port != 443
 }
 
 func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, input *bytes.Reader, rawInput *bytes.Buffer, err error) {
@@ -92,11 +131,11 @@ func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, in
 	// sets ContextWithVisionFlow(ctx, true) before dialing, which skips Rust
 	// native paths in the transport layer.  If we reach here, a code path
 	// bypassed the gate (e.g., pre-connect without VisionFlow propagation).
-	errors.LogWarning(context.Background(), "Vision flow on RustConn — VisionFlow context gate may have been bypassed; kTLS+Vision is incompatible")
+	errors.LogWarning(context.Background(), "Vision flow on RustConn — gating bypassed; kTLS+Vision is unsupported and will be rejected")
 	if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
 		return true, nil, nil, errors.New("RustConn without full kTLS cannot use " + flow).AtWarning()
 	}
-	return true, &bytes.Reader{}, &bytes.Buffer{}, nil
+	return true, nil, nil, errors.New("Vision is incompatible with kTLS-native RustConn; aborting outbound Vision flow").AtWarning()
 }
 
 // New creates a new VLess outbound handler.
@@ -161,12 +200,8 @@ func (h *Handler) Close() error {
 		h.preCancel()
 		h.preWG.Wait()
 	}
-	if h.preConns != nil {
-		close(h.preConns)
-		for ce := range h.preConns {
-			ce.Conn.Close()
-		}
-	}
+	h.closePreConnPool(h.preConns)
+	h.closePreConnPool(h.preConnsVFlow)
 	if h.reverse != nil {
 		return h.reverse.Close()
 	}
@@ -185,14 +220,25 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	rec := h.server
 	var conn stat.Connection
 	accountFlow := rec.User.Account.(*vless.MemoryAccount).Flow
-	ctx = contextWithOutboundVisionFlow(ctx, accountFlow)
+	target := ob.Target
+	requestFlow := effectiveRequestFlow(ctx, accountFlow, target)
+	ctx = applyVisionFlow(ctx, requestFlow, target)
+	if requestFlow == "" && strings.HasPrefix(accountFlow, vless.XRV) {
+		ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneOther)
+		errors.LogDebug(ctx, "loopback TCP DNS flow: downgrading Vision request to plain VLESS")
+	}
+	visionFlowActive := session.VisionFlowFromContext(ctx)
+	h.preVisionFlow.Store(visionFlowActive)
 
 	if h.testpre > 0 && h.reverse == nil {
 		h.initpre.Do(func() {
-			h.preConns = make(chan *ConnExpire)
+			poolCap := int(h.testpre)
+			if poolCap < 1 {
+				poolCap = 1
+			}
+			h.preConns = make(chan *ConnExpire, poolCap)
+			h.preConnsVFlow = make(chan *ConnExpire, poolCap)
 			h.preCtx, h.preCancel = context.WithCancel(context.Background())
-			// Keep pre-connect transport selection consistent with normal dials.
-			h.preCtx = contextWithOutboundVisionFlow(h.preCtx, accountFlow)
 			for range h.testpre {
 				h.preWG.Add(1)
 				go func() {
@@ -202,7 +248,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 							errors.LogError(h.preCtx, "panic in VLESS pre-connect goroutine: ", r, "\n", string(debug.Stack()))
 						}
 					}()
-					ctx := xctx.ContextWithID(h.preCtx, session.NewID())
 					backoff := time.Millisecond * 200
 					for {
 						select {
@@ -210,6 +255,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 							return
 						default:
 						}
+						vf := h.preVisionFlow.Load()
+						ctx := session.ContextWithVisionFlow(xctx.ContextWithID(h.preCtx, session.NewID()), vf)
 						conn, err := dialer.Dial(ctx, rec.Destination)
 						if err != nil {
 							errors.LogWarningInner(ctx, err, "pre-connect failed")
@@ -222,11 +269,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 							continue
 						}
 						backoff = time.Millisecond * 200
+						pool := h.preConnPool(vf)
 						select {
-						case h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(2 * time.Minute)}:
 						case <-h.preCtx.Done():
 							conn.Close()
 							return
+						default:
+						}
+						select {
+						case pool <- &ConnExpire{Conn: conn, Expire: time.Now().Add(2 * time.Minute)}:
+						default:
+							// Keep workers adaptive when flow mode flips by dropping
+							// stale/overflow preconnects instead of blocking on send.
+							conn.Close()
 						}
 						select {
 						case <-h.preCtx.Done():
@@ -237,6 +292,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}()
 			}
 		})
+		prePool := h.preConnPool(visionFlowActive)
+	preconnectLoop:
 		for {
 			var connTime *ConnExpire
 			select {
@@ -244,7 +301,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				return ctx.Err()
 			case <-h.preCtx.Done():
 				return errors.New("closed handler").AtWarning()
-			case connTime = <-h.preConns:
+			case connTime = <-prePool:
+			case <-time.After(150 * time.Millisecond):
+				// Preconnect is best-effort. Fall back to direct dial when the
+				// matching pool is temporarily empty.
+				break preconnectLoop
 			}
 			if connTime == nil {
 				return errors.New("closed handler").AtWarning()
@@ -274,7 +335,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Conn = conn // for Vision's pre-connect
 
 	iConn := stat.TryUnwrapStatsConn(conn)
-	target := ob.Target
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
 
 	if h.encryption != nil {
@@ -311,7 +371,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	account := request.User.Account.(*vless.MemoryAccount)
 
 	requestAddons := &encoding.Addons{
-		Flow: account.Flow,
+		Flow: requestFlow,
 	}
 
 	var input *bytes.Reader
@@ -323,7 +383,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		requestAddons.Flow = requestAddons.Flow[:16]
 		fallthrough
 	case vless.XRV:
-		ob.SetCanSpliceCopy(2)
+		ob.SetCanSpliceCopy(session.CopyGatePendingDetach)
 		switch request.Command {
 		case protocol.RequestCommandUDP:
 			if !allowUDP443 && request.Port == 443 {
@@ -336,7 +396,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			var p uintptr
 			if commonConn, ok := conn.(*encryption.CommonConn); ok {
 				if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
-					ob.SetCanSpliceCopy(3) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
+					ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 				}
 				t = reflect.TypeOf(commonConn).Elem()
 				p = uintptr(unsafe.Pointer(commonConn))
@@ -374,7 +434,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			return errors.New("unknown VLESS request command: ", request.Command)
 		}
 	default:
-		ob.SetCanSpliceCopy(3)
+		ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 	}
 
 	var newCtx context.Context
@@ -395,18 +455,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	clientReader := link.Reader // .(*pipe.Reader)
 	clientWriter := link.Writer // .(*pipe.Writer)
 	trafficState := proxy.NewTrafficState(account.ID.Bytes())
-	if request.Command == protocol.RequestCommandUDP && (requestAddons.Flow == vless.XRV || (h.cone && request.Port != 53 && request.Port != 443)) {
+	if shouldRewriteUDPToMux(request.Command, requestAddons.Flow, h.cone, request.Port) {
 		request.Command = protocol.RequestCommandMux
 		request.Address = net.DomainAddress("v1.mux.cool")
 		request.Port = net.Port(666)
+		if session.ResolveDNSFlowClass(ctx) == session.DNSFlowClassUDPControl {
+			ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneMuxXUDP)
+		}
+	}
+	bypassVisionPayload := requestAddons.Flow == vless.XRV &&
+		(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
+			encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
+	if bypassVisionPayload {
+		ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionBypass)
+		ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneVisionGuard)
 	}
 
 	postRequest := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-
-		bypassVision := requestAddons.Flow == vless.XRV &&
-			(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
-				encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
 
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
 		if err := encoding.EncodeRequestHeader(bufferWriter, request, requestAddons); err != nil {
@@ -415,7 +481,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		// default: serverWriter := bufferWriter
 		var serverWriter buf.Writer
-		if bypassVision {
+		if bypassVisionPayload {
 			serverWriter = bufferWriter
 		} else {
 			serverWriter = encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, true, ctx, conn, ob)
@@ -473,10 +539,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	getResponse := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
-		bypassVision := requestAddons.Flow == vless.XRV &&
-			(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
-				encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
-
 		responseAddons, err := encoding.DecodeResponseHeader(conn, request)
 		if err != nil {
 			return errors.New("failed to decode response header").Base(err).AtInfo()
@@ -484,7 +546,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		// default: serverReader := buf.NewReader(conn)
 		serverReader := encoding.DecodeBodyAddons(conn, request, responseAddons)
-		if requestAddons.Flow == vless.XRV && !bypassVision {
+		if requestAddons.Flow == vless.XRV && !bypassVisionPayload {
 			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, input, rawInput, ob)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
@@ -495,7 +557,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if requestAddons.Flow == vless.XRV && !bypassVision {
+		if requestAddons.Flow == vless.XRV && !bypassVisionPayload {
 			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
 		} else {
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer

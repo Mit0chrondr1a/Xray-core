@@ -13,6 +13,67 @@ import (
 	"github.com/xtls/xray-core/common/signal"
 )
 
+// CopyGateState enumerates copy-path eligibility states.
+type CopyGateState int32
+
+const (
+	CopyGateUnset           CopyGateState = iota // legacy default / unspecified
+	CopyGateEligible                             // previously 1: can splice/copy fast path
+	CopyGatePendingDetach                        // previously 2: pending protocol detach before splice
+	CopyGateForcedUserspace                      // previously 3: forced userspace copy
+	CopyGateNotApplicable                        // new: transport makes copy path inapplicable
+)
+
+func (s CopyGateState) String() string {
+	switch s {
+	case CopyGateEligible:
+		return "copy_eligible"
+	case CopyGatePendingDetach:
+		return "copy_pending_detach"
+	case CopyGateForcedUserspace:
+		return "copy_forced_userspace"
+	case CopyGateNotApplicable:
+		return "copy_not_applicable"
+	default:
+		return "copy_unset"
+	}
+}
+
+// CopyGateReason enumerates why copy path is constrained.
+type CopyGateReason int32
+
+const (
+	CopyGateReasonUnspecified CopyGateReason = iota
+	CopyGateReasonFlowNonVisionPolicy
+	CopyGateReasonTransportNonRawSplitConn
+	CopyGateReasonTransportUserspace
+	CopyGateReasonVisionBypass
+	CopyGateReasonDetachTimeout
+	CopyGateReasonSecurityGuard
+	CopyGateReasonMetadataMissing
+)
+
+func (r CopyGateReason) String() string {
+	switch r {
+	case CopyGateReasonFlowNonVisionPolicy:
+		return "flow_nonvision_policy"
+	case CopyGateReasonTransportNonRawSplitConn:
+		return "transport_nonraw_splitconn"
+	case CopyGateReasonTransportUserspace:
+		return "transport_userspace"
+	case CopyGateReasonVisionBypass:
+		return "vision_bypass"
+	case CopyGateReasonDetachTimeout:
+		return "detach_timeout"
+	case CopyGateReasonSecurityGuard:
+		return "security_guard"
+	case CopyGateReasonMetadataMissing:
+		return "metadata_missing"
+	default:
+		return "unspecified"
+	}
+}
+
 // NewID generates a new ID. The generated ID is high likely to be unique, but not cryptographically secure.
 // The generated ID will never be 0.
 func NewID() c.ID {
@@ -53,9 +114,10 @@ type Inbound struct {
 	Conn net.Conn
 	// Used by splice copy. Timer of the inbound buf copier. May be nil.
 	Timer *signal.ActivityTimer
-	// CanSpliceCopy is a property for this connection
-	// 1 = can, 2 = after processing protocol info should be able to, 3 = cannot
-	CanSpliceCopy int32
+	// CanSpliceCopy is a property for this connection (legacy backing store).
+	// Values are stored using CopyGateState.
+	CanSpliceCopy  int32
+	copyGateReason int32
 }
 
 // Outbound is the metadata of an outbound connection.
@@ -72,37 +134,96 @@ type Outbound struct {
 	Name string
 	// Unused. Conn is actually internet.Connection. May be nil. It is currently nil for outbound with proxySettings
 	Conn net.Conn
-	// CanSpliceCopy is a property for this connection
-	// 1 = can, 2 = after processing protocol info should be able to, 3 = cannot
-	CanSpliceCopy int32
+	// CanSpliceCopy is a property for this connection (legacy backing store).
+	// Values are stored using CopyGateState.
+	CanSpliceCopy  int32
+	copyGateReason int32
 }
 
-func (i *Inbound) GetCanSpliceCopy() int {
+// CopyGateState returns the typed copy-path gate state.
+func (i *Inbound) CopyGateState() CopyGateState {
 	if i == nil {
-		return 3
+		return CopyGateForcedUserspace
 	}
-	return int(atomic.LoadInt32(&i.CanSpliceCopy))
+	return CopyGateState(atomic.LoadInt32(&i.CanSpliceCopy))
 }
 
-func (i *Inbound) SetCanSpliceCopy(v int) {
+// CopyGateReason returns the most recent typed reason attached to the gate state.
+func (i *Inbound) CopyGateReason() CopyGateReason {
+	if i == nil {
+		return CopyGateReasonUnspecified
+	}
+	return CopyGateReason(atomic.LoadInt32(&i.copyGateReason))
+}
+
+// SetCopyGate sets both gate state and reason in one atomic pair of stores.
+func (i *Inbound) SetCopyGate(state CopyGateState, reason CopyGateReason) {
 	if i == nil {
 		return
 	}
-	atomic.StoreInt32(&i.CanSpliceCopy, int32(v))
+	atomic.StoreInt32(&i.CanSpliceCopy, int32(state))
+	atomic.StoreInt32(&i.copyGateReason, int32(reason))
 }
 
-func (o *Outbound) GetCanSpliceCopy() int {
-	if o == nil {
-		return 3
+// SetCopyGateReason updates reason while keeping existing state.
+func (i *Inbound) SetCopyGateReason(reason CopyGateReason) {
+	if i == nil {
+		return
 	}
-	return int(atomic.LoadInt32(&o.CanSpliceCopy))
+	atomic.StoreInt32(&i.copyGateReason, int32(reason))
 }
 
-func (o *Outbound) SetCanSpliceCopy(v int) {
+// GetCanSpliceCopy is a compatibility alias returning the typed gate state.
+func (i *Inbound) GetCanSpliceCopy() CopyGateState {
+	return i.CopyGateState()
+}
+
+// SetCanSpliceCopy is a compatibility alias accepting the typed gate state.
+func (i *Inbound) SetCanSpliceCopy(state CopyGateState) {
+	i.SetCopyGate(state, CopyGateReasonUnspecified)
+}
+
+// CopyGateState returns the typed copy-path gate state.
+func (o *Outbound) CopyGateState() CopyGateState {
+	if o == nil {
+		return CopyGateForcedUserspace
+	}
+	return CopyGateState(atomic.LoadInt32(&o.CanSpliceCopy))
+}
+
+// CopyGateReason returns the most recent typed reason attached to the gate state.
+func (o *Outbound) CopyGateReason() CopyGateReason {
+	if o == nil {
+		return CopyGateReasonUnspecified
+	}
+	return CopyGateReason(atomic.LoadInt32(&o.copyGateReason))
+}
+
+// SetCopyGate sets both gate state and reason in one atomic pair of stores.
+func (o *Outbound) SetCopyGate(state CopyGateState, reason CopyGateReason) {
 	if o == nil {
 		return
 	}
-	atomic.StoreInt32(&o.CanSpliceCopy, int32(v))
+	atomic.StoreInt32(&o.CanSpliceCopy, int32(state))
+	atomic.StoreInt32(&o.copyGateReason, int32(reason))
+}
+
+// SetCopyGateReason updates reason while keeping existing state.
+func (o *Outbound) SetCopyGateReason(reason CopyGateReason) {
+	if o == nil {
+		return
+	}
+	atomic.StoreInt32(&o.copyGateReason, int32(reason))
+}
+
+// GetCanSpliceCopy is a compatibility alias returning the typed gate state.
+func (o *Outbound) GetCanSpliceCopy() CopyGateState {
+	return o.CopyGateState()
+}
+
+// SetCanSpliceCopy is a compatibility alias accepting the typed gate state.
+func (o *Outbound) SetCanSpliceCopy(state CopyGateState) {
+	o.SetCopyGate(state, CopyGateReasonUnspecified)
 }
 
 // SniffingRequest controls the behavior of content sniffing. They are from inbound config. Read-only

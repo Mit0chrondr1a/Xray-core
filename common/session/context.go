@@ -27,6 +27,8 @@ const (
 	mitmAlpn11Key             ctx.SessionKey = 11 // used by TLS dialer
 	mitmServerNameKey         ctx.SessionKey = 12 // used by TLS dialer
 	visionFlowKey             ctx.SessionKey = 13 // VLESS Vision flow active — skip kTLS-producing Rust paths
+	dnsFlowClassKey           ctx.SessionKey = 14 // DNS flow class resolved once near dispatch
+	dnsPlaneKey               ctx.SessionKey = 15 // DNS handling plane marker for telemetry
 )
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -206,4 +208,30 @@ func VisionFlowFromContext(ctx context.Context) bool {
 		return val
 	}
 	return false
+}
+
+// ContextWithDNSFlowClass stores the resolved DNS flow class in context.
+func ContextWithDNSFlowClass(ctx context.Context, class DNSFlowClass) context.Context {
+	return context.WithValue(ctx, dnsFlowClassKey, class)
+}
+
+// DNSFlowClassFromContext returns the DNS flow class if present.
+func DNSFlowClassFromContext(ctx context.Context) DNSFlowClass {
+	if val, ok := ctx.Value(dnsFlowClassKey).(DNSFlowClass); ok {
+		return val
+	}
+	return DNSFlowClassUnset
+}
+
+// ContextWithDNSPlane stores DNS handling plane marker for telemetry.
+func ContextWithDNSPlane(ctx context.Context, plane DNSPlane) context.Context {
+	return context.WithValue(ctx, dnsPlaneKey, plane)
+}
+
+// DNSPlaneFromContext returns DNS handling plane marker if present.
+func DNSPlaneFromContext(ctx context.Context) DNSPlane {
+	if val, ok := ctx.Value(dnsPlaneKey).(DNSPlane); ok {
+		return val
+	}
+	return DNSPlaneUnknown
 }

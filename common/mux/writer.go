@@ -18,9 +18,11 @@ type Writer struct {
 	transferType protocol.TransferType
 	globalID     [8]byte
 	inbound      *session.Inbound
+	dnsFlowClass session.DNSFlowClass
+	dnsPlane     session.DNSPlane
 }
 
-func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, globalID [8]byte, inbound *session.Inbound) *Writer {
+func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, globalID [8]byte, inbound *session.Inbound, dnsFlowClass session.DNSFlowClass, dnsPlane session.DNSPlane) *Writer {
 	return &Writer{
 		id:           id,
 		dest:         dest,
@@ -29,6 +31,8 @@ func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType 
 		transferType: transferType,
 		globalID:     globalID,
 		inbound:      inbound,
+		dnsFlowClass: dnsFlowClass,
+		dnsPlane:     dnsPlane,
 	}
 }
 
@@ -43,10 +47,12 @@ func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.Trans
 
 func (w *Writer) getNextFrameMeta() FrameMetadata {
 	meta := FrameMetadata{
-		SessionID: w.id,
-		Target:    w.dest,
-		GlobalID:  w.globalID,
-		Inbound:   w.inbound,
+		SessionID:    w.id,
+		Target:       w.dest,
+		GlobalID:     w.globalID,
+		Inbound:      w.inbound,
+		DNSFlowClass: w.dnsFlowClass,
+		DNSPlane:     w.dnsPlane,
 	}
 
 	if w.followup {

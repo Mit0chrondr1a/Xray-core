@@ -72,6 +72,10 @@ type Handler struct {
 	downlinkCounter stats.Counter
 }
 
+func shouldBypassMuxForLoopbackControl(ctx context.Context, dest net.Destination) bool {
+	return session.ShouldDowngradeVisionFlow(ctx, dest)
+}
+
 // NewHandler creates a new Handler based on the given configuration.
 func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbound.Handler, error) {
 	v := core.MustFromContext(ctx)
@@ -208,6 +212,10 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
 	}
 	if h.mux != nil {
+		if shouldBypassMuxForLoopbackControl(ctx, ob.Target) {
+			errors.LogDebug(ctx, "loopback TCP DNS flow: bypassing outbound mux to preserve deterministic non-Vision path")
+			goto out
+		}
 		test := func(err error) {
 			if err != nil {
 				err := errors.New("failed to process mux outbound traffic").Base(err)

@@ -58,6 +58,27 @@ type Handler struct {
 	config        *Config
 }
 
+type dnsUplinkDiagnostic struct {
+	startedAt    time.Time
+	destination  net.Destination
+	flowClass    session.DNSFlowClass
+	dnsPlane     session.DNSPlane
+	firstWriteNs int64
+	totalBytes   int64
+}
+
+type dnsUplinkDiagnosticWriter struct {
+	Writer buf.Writer
+	diag   *dnsUplinkDiagnostic
+}
+
+func (w *dnsUplinkDiagnosticWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if w.diag != nil {
+		w.diag.observeWrite(int(mb.Len()))
+	}
+	return w.Writer.WriteMultiBuffer(mb)
+}
+
 // Init initializes the Handler with necessary parameters.
 func (h *Handler) Init(config *Config, pm policy.Manager) error {
 	h.config = config
@@ -124,6 +145,86 @@ func isDNSDest(dest net.Destination) bool {
 	}
 }
 
+func newDNSUplinkDiagnostic(ctx context.Context, destination net.Destination) *dnsUplinkDiagnostic {
+	if !isDNSDest(destination) {
+		return nil
+	}
+	if !session.ShouldBypassVisionDetach(ctx) {
+		return nil
+	}
+	return &dnsUplinkDiagnostic{
+		startedAt:   time.Now(),
+		destination: destination,
+		flowClass:   session.ResolveDNSFlowClass(ctx),
+		dnsPlane:    session.DNSPlaneFromContext(ctx),
+	}
+}
+
+func (d *dnsUplinkDiagnostic) observeWrite(n int) {
+	if d == nil || n <= 0 {
+		return
+	}
+	if d.firstWriteNs == 0 {
+		d.firstWriteNs = time.Since(d.startedAt).Nanoseconds()
+	}
+	d.totalBytes += int64(n)
+}
+
+func (d *dnsUplinkDiagnostic) log(ctx context.Context, result string, opErr error, inbound *session.Inbound, outbound *session.Outbound) {
+	if d == nil {
+		return
+	}
+	inboundGate := session.CopyGateUnset
+	if inbound != nil {
+		inboundGate = inbound.GetCanSpliceCopy()
+	}
+	outboundGate := session.CopyGateUnset
+	if outbound != nil {
+		outboundGate = outbound.GetCanSpliceCopy()
+	}
+	errors.LogDebug(ctx, "proxy markers[kind=dns-uplink-diagnostic]: ",
+		"result=", result,
+		" dns_flow_class=", d.flowClass.String(),
+		" dns_plane=", string(d.dnsPlane),
+		" dns_destination=", d.destination.String(),
+		" uplink_first_write_ns=", d.firstWriteNs,
+		" uplink_bytes=", d.totalBytes,
+		" uplink_duration_ns=", time.Since(d.startedAt).Nanoseconds(),
+		" inbound_copy_gate=", inboundGate.String(),
+		" outbound_copy_gate=", outboundGate.String(),
+		" err_class=", classifyDNSUplinkErr(opErr),
+	)
+}
+
+func classifyDNSUplinkErr(err error) string {
+	if err == nil {
+		return "none"
+	}
+	cause := errors.Cause(err)
+	if cause == nil {
+		cause = err
+	}
+	switch {
+	case goerrors.Is(cause, context.Canceled):
+		return "context_canceled"
+	case goerrors.Is(cause, context.DeadlineExceeded):
+		return "context_deadline_exceeded"
+	case goerrors.Is(cause, io.EOF):
+		return "eof"
+	case goerrors.Is(cause, gonet.ErrClosed),
+		goerrors.Is(cause, io.ErrClosedPipe),
+		goerrors.Is(cause, syscall.EPIPE),
+		goerrors.Is(cause, syscall.ECONNRESET),
+		goerrors.Is(cause, syscall.ENOTCONN),
+		goerrors.Is(cause, syscall.ESHUTDOWN):
+		return "conn_closed"
+	}
+	if ne, ok := cause.(interface{ Timeout() bool }); ok && ne.Timeout() {
+		return "timeout"
+	}
+	return "other"
+}
+
 // shouldBypassEgressFastFail is retained for interface compatibility; currently
 // all destinations use the normal dial path without fast-fail penalties.
 func shouldBypassEgressFastFail(net.Destination) bool {
@@ -141,7 +242,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("target not specified.")
 	}
 	ob.Name = "freedom"
-	ob.SetCanSpliceCopy(1)
+	ob.SetCanSpliceCopy(session.CopyGateEligible)
 	inbound := session.InboundFromContext(ctx)
 
 	destination := ob.Target
@@ -279,8 +380,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}, plcy.Timeouts.ConnectionIdle)
 
-	requestDone := func() error {
+	requestDone := func() (retErr error) {
 		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
+		uplinkDiag := newDNSUplinkDiagnostic(ctx, destination)
+		uplinkResult := "copy_complete"
+		if uplinkDiag != nil {
+			defer func() {
+				uplinkDiag.log(ctx, uplinkResult, retErr, inbound, ob)
+			}()
+		}
 
 		var writer buf.Writer
 		if destination.Network == net.Network_TCP {
@@ -308,15 +416,25 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 			}
 		}
+		if uplinkDiag != nil {
+			writer = &dnsUplinkDiagnosticWriter{
+				Writer: writer,
+				diag:   uplinkDiag,
+			}
+		}
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
 			if isExpectedRequestReadError(err) {
+				uplinkResult = "request_stream_closed"
 				errors.LogDebugInner(ctx, err, "freedom: request stream closed by peer")
 				return nil
 			}
-			return errors.New("failed to process request").Base(err)
+			uplinkResult = "copy_error"
+			retErr = errors.New("failed to process request").Base(err)
+			return retErr
 		}
 
+		uplinkResult = "copy_complete"
 		return nil
 	}
 

@@ -472,7 +472,7 @@ func TestVisionWriterCanSpliceCopyTransitions(t *testing.T) {
 	ts.Inbound.IsPadding = false
 	ts.Inbound.DownlinkWriterDirectCopy = true
 
-	inbound := &session.Inbound{CanSpliceCopy: 2}
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
 	ctx := session.ContextWithInbound(context.Background(), inbound)
 
 	w := NewVisionWriter(
@@ -489,8 +489,8 @@ func TestVisionWriterCanSpliceCopyTransitions(t *testing.T) {
 		t.Fatalf("WriteMultiBuffer() error = %v", err)
 	}
 
-	if inbound.GetCanSpliceCopy() != 2 {
-		t.Fatalf("CanSpliceCopy = %d, want 2", inbound.GetCanSpliceCopy())
+	if inbound.GetCanSpliceCopy() != session.CopyGatePendingDetach {
+		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGatePendingDetach)
 	}
 }
 
@@ -504,7 +504,7 @@ func TestVisionWriterCanSpliceCopyTransitionsNoDeferredConn(t *testing.T) {
 	ts.Inbound.IsPadding = false
 	ts.Inbound.DownlinkWriterDirectCopy = true
 
-	inbound := &session.Inbound{CanSpliceCopy: 2}
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
 	ctx := session.ContextWithInbound(context.Background(), inbound)
 
 	w := NewVisionWriter(
@@ -521,8 +521,8 @@ func TestVisionWriterCanSpliceCopyTransitionsNoDeferredConn(t *testing.T) {
 		t.Fatalf("WriteMultiBuffer() error = %v", err)
 	}
 
-	if inbound.GetCanSpliceCopy() != 1 {
-		t.Fatalf("CanSpliceCopy = %d, want 1", inbound.GetCanSpliceCopy())
+	if inbound.GetCanSpliceCopy() != session.CopyGateEligible {
+		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateEligible)
 	}
 }
 
@@ -535,7 +535,7 @@ func TestVisionReaderDirectCopyPromotesInboundSpliceState(t *testing.T) {
 	ts.Outbound.WithinPaddingBuffers = true
 	ts.Outbound.CurrentCommand = 2
 
-	inbound := &session.Inbound{CanSpliceCopy: 2, Conn: left}
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach), Conn: left}
 	ctx := session.ContextWithInbound(context.Background(), inbound)
 
 	b := buf.New()
@@ -553,8 +553,8 @@ func TestVisionReaderDirectCopyPromotesInboundSpliceState(t *testing.T) {
 	if !ts.Outbound.DownlinkReaderDirectCopy {
 		t.Fatal("DownlinkReaderDirectCopy should be true after command=2")
 	}
-	if inbound.GetCanSpliceCopy() != 1 {
-		t.Fatalf("CanSpliceCopy = %d, want 1", inbound.GetCanSpliceCopy())
+	if inbound.GetCanSpliceCopy() != session.CopyGateEligible {
+		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateEligible)
 	}
 }
 
@@ -646,8 +646,11 @@ func TestCopyRawConnIfExistUserspaceActiveTrafficBeyondFiveSeconds(t *testing.T)
 	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
 	defer timer.SetTimeout(0)
 
-	inbound := &session.Inbound{CanSpliceCopy: 0}
-	outbound := &session.Outbound{CanSpliceCopy: 0}
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Local:         xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	outbound := &session.Outbound{CanSpliceCopy: int32(session.CopyGateUnset)}
 	ctx := session.ContextWithInbound(context.Background(), inbound)
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
 
@@ -680,6 +683,144 @@ func TestCopyRawConnIfExistUserspaceActiveTrafficBeyondFiveSeconds(t *testing.T)
 			}
 			t.Fatalf("CopyRawConnIfExist() exited early: %v", err)
 		}
+	}
+}
+
+func TestCopyRawConnIfExistDNSGuardRecordsFirstResponseLatency(t *testing.T) {
+	resetDNSGuardMetrics()
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Local:         xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, nil, buf.Discard, timer, nil)
+	}()
+
+	if _, err := readerPeer.Write([]byte("dns-ok")); err != nil {
+		t.Fatalf("writer side failed: %v", err)
+	}
+	_ = readerPeer.Close()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for DNS guard flow completion")
+	}
+
+	if got := pipelineMarkerDNSGuardFirstResponseCount.Load(); got != 1 {
+		t.Fatalf("dns_guard_first_response_count=%d, want 1", got)
+	}
+	if got := pipelineMarkerDNSGuardFirstResponseNanos.Load(); got == 0 {
+		t.Fatal("dns_guard_first_response_nanos should be > 0")
+	}
+	histTotal := pipelineMarkerDNSGuardFirstRespLt20ms.Load() +
+		pipelineMarkerDNSGuardFirstResp20To100ms.Load() +
+		pipelineMarkerDNSGuardFirstResp100msTo1s.Load() +
+		pipelineMarkerDNSGuardFirstRespGe1s.Load()
+	if histTotal != 1 {
+		t.Fatalf("dns_guard_first_response_hist_total=%d, want 1", histTotal)
+	}
+	if got := pipelineMarkerDNSGuardZeroByteTimeout.Load(); got != 0 {
+		t.Fatalf("dns_guard_zero_byte_timeout=%d, want 0", got)
+	}
+}
+
+func TestCopyRawConnIfExistDNSGuardZeroByteTimeoutMetric(t *testing.T) {
+	resetDNSGuardMetrics()
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Local:         xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	err := CopyRawConnIfExist(ctx, testTimeoutConn{}, nil, buf.Discard, nil, nil)
+	if !goerrors.Is(err, io.EOF) {
+		t.Fatalf("CopyRawConnIfExist() error=%v, want io.EOF timeout close", err)
+	}
+
+	if got := pipelineMarkerDNSGuardZeroByteTimeout.Load(); got != 1 {
+		t.Fatalf("dns_guard_zero_byte_timeout=%d, want 1", got)
+	}
+	if got := pipelineMarkerDNSGuardFirstResponseCount.Load(); got != 0 {
+		t.Fatalf("dns_guard_first_response_count=%d, want 0", got)
+	}
+}
+
+func TestCopyRawConnIfExistVisionBypassDNSUsesImmediateUserspacePath(t *testing.T) {
+	resetDNSGuardMetrics()
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionBypass)
+	outbound := &session.Outbound{
+		Target: xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),
+	}
+	outbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionBypass)
+
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, nil, buf.Discard, timer, nil)
+	}()
+
+	if _, err := readerPeer.Write([]byte("dns-ok")); err != nil {
+		t.Fatalf("writer side failed: %v", err)
+	}
+	_ = readerPeer.Close()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for vision bypass DNS flow completion")
+	}
+
+	if got := pipelineMarkerDNSGuardFirstResponseCount.Load(); got != 0 {
+		t.Fatalf("dns_guard_first_response_count=%d, want 0 on early bypass path", got)
+	}
+	if got := pipelineMarkerDNSGuardZeroByteTimeout.Load(); got != 0 {
+		t.Fatalf("dns_guard_zero_byte_timeout=%d, want 0 on early bypass path", got)
 	}
 }
 
@@ -859,6 +1000,64 @@ func TestClearVisionTelemetryTimestamps(t *testing.T) {
 	}
 }
 
+func TestVisionDetachFutureTimeoutState(t *testing.T) {
+	clearSyncMap(&pipelineVisionDetachFutureByConn)
+	conn := &tls.DeferredRustConn{}
+	futAny, _ := pipelineVisionDetachFutureByConn.LoadOrStore(conn, &visionDetachFuture{
+		done: make(chan struct{}),
+	})
+	fut := futAny.(*visionDetachFuture)
+	fut.state.Store(visionDetachPending)
+	fut.state.Store(visionDetachTimedOut)
+	if got := fut.state.Load(); got != visionDetachTimedOut {
+		t.Fatalf("state=%d, want %d", got, visionDetachTimedOut)
+	}
+	// Simulate late completion
+	close(fut.done)
+	_ = fut.state.CompareAndSwap(visionDetachPending, visionDetachDone)
+	if got := fut.state.Load(); got != visionDetachTimedOut {
+		t.Fatalf("late completion must not clear timeout state; got=%d want=%d", got, visionDetachTimedOut)
+	}
+}
+
+func TestVisionNoDetachGuardEnabled(t *testing.T) {
+	cases := []struct {
+		name    string
+		inbVal  session.CopyGateState
+		outVals []session.CopyGateState
+		want    bool
+	}{
+		{"nil inbound", session.CopyGateUnset, nil, false},
+		{"inbound disallows splice", session.CopyGateForcedUserspace, nil, false},
+		{"outbound disallows splice", session.CopyGatePendingDetach, []session.CopyGateState{session.CopyGateForcedUserspace}, false},
+		{"all allow splice", session.CopyGatePendingDetach, []session.CopyGateState{}, true},
+		{"nonsplice outbound (0) keeps guard", session.CopyGatePendingDetach, []session.CopyGateState{session.CopyGateUnset}, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inb := &session.Inbound{}
+			if tc.name != "nil inbound" {
+				inb.SetCanSpliceCopy(tc.inbVal)
+			}
+			var outbounds []*session.Outbound
+			for _, v := range tc.outVals {
+				ob := &session.Outbound{}
+				ob.SetCanSpliceCopy(v)
+				outbounds = append(outbounds, ob)
+			}
+			var inboundPtr *session.Inbound
+			if tc.name != "nil inbound" {
+				inboundPtr = inb
+			}
+			got := visionNoDetachGuardEnabled(inboundPtr, outbounds)
+			if got != tc.want {
+				t.Fatalf("visionNoDetachGuardEnabled()=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRecordPipelineFlowMix(t *testing.T) {
 	pipelineMarkerFlowMuxUDP.Store(0)
 	pipelineMarkerFlowPureTCP.Store(0)
@@ -898,6 +1097,23 @@ func (r *singleReadReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	return r.mb, r.err
 }
 
+type testTimeoutError struct{}
+
+func (testTimeoutError) Error() string   { return "i/o timeout" }
+func (testTimeoutError) Timeout() bool   { return true }
+func (testTimeoutError) Temporary() bool { return true }
+
+type testTimeoutConn struct{}
+
+func (testTimeoutConn) Read([]byte) (int, error)         { return 0, testTimeoutError{} }
+func (testTimeoutConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (testTimeoutConn) Close() error                     { return nil }
+func (testTimeoutConn) LocalAddr() gonet.Addr            { return testDummyAddr("timeout-local") }
+func (testTimeoutConn) RemoteAddr() gonet.Addr           { return testDummyAddr("timeout-remote") }
+func (testTimeoutConn) SetDeadline(time.Time) error      { return nil }
+func (testTimeoutConn) SetReadDeadline(time.Time) error  { return nil }
+func (testTimeoutConn) SetWriteDeadline(time.Time) error { return nil }
+
 func resetSpliceHistogramCounters() {
 	pipelineMarkerSpliceBytesLt4K.Store(0)
 	pipelineMarkerSpliceBytes4KTo64K.Store(0)
@@ -915,6 +1131,16 @@ func resetRawUnwrapHistogramCounters() {
 	pipelineMarkerRawUnwrapToDetach5To20ms.Store(0)
 	pipelineMarkerRawUnwrapToDetach20To100ms.Store(0)
 	pipelineMarkerRawUnwrapToDetachGe100ms.Store(0)
+}
+
+func resetDNSGuardMetrics() {
+	pipelineMarkerDNSGuardFirstResponseNanos.Store(0)
+	pipelineMarkerDNSGuardFirstResponseCount.Store(0)
+	pipelineMarkerDNSGuardFirstRespLt20ms.Store(0)
+	pipelineMarkerDNSGuardFirstResp20To100ms.Store(0)
+	pipelineMarkerDNSGuardFirstResp100msTo1s.Store(0)
+	pipelineMarkerDNSGuardFirstRespGe1s.Store(0)
+	pipelineMarkerDNSGuardZeroByteTimeout.Store(0)
 }
 
 func clearSyncMap(m *sync.Map) {
