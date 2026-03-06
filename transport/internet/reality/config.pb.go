@@ -21,6 +21,58 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type NativePathMode int32
+
+const (
+	NativePathMode_AUTO           NativePathMode = 0
+	NativePathMode_PREFER_NATIVE  NativePathMode = 1
+	NativePathMode_FORCE_NATIVE   NativePathMode = 2
+	NativePathMode_DISABLE_NATIVE NativePathMode = 3
+)
+
+// Enum value maps for NativePathMode.
+var (
+	NativePathMode_name = map[int32]string{
+		0: "AUTO",
+		1: "PREFER_NATIVE",
+		2: "FORCE_NATIVE",
+		3: "DISABLE_NATIVE",
+	}
+	NativePathMode_value = map[string]int32{
+		"AUTO":           0,
+		"PREFER_NATIVE":  1,
+		"FORCE_NATIVE":   2,
+		"DISABLE_NATIVE": 3,
+	}
+)
+
+func (x NativePathMode) Enum() *NativePathMode {
+	p := new(NativePathMode)
+	*p = x
+	return p
+}
+
+func (x NativePathMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (NativePathMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_transport_internet_reality_config_proto_enumTypes[0].Descriptor()
+}
+
+func (NativePathMode) Type() protoreflect.EnumType {
+	return &file_transport_internet_reality_config_proto_enumTypes[0]
+}
+
+func (x NativePathMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use NativePathMode.Descriptor instead.
+func (NativePathMode) EnumDescriptor() ([]byte, []int) {
+	return file_transport_internet_reality_config_proto_rawDescGZIP(), []int{0}
+}
+
 type Config struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
 	Show                  bool                   `protobuf:"varint,1,opt,name=show,proto3" json:"show,omitempty"`
@@ -45,6 +97,7 @@ type Config struct {
 	SpiderY               []int64                `protobuf:"varint,27,rep,packed,name=spider_y,json=spiderY,proto3" json:"spider_y,omitempty"`
 	MasterKeyLog          string                 `protobuf:"bytes,31,opt,name=master_key_log,json=masterKeyLog,proto3" json:"master_key_log,omitempty"`
 	KeyRotationHours      uint32                 `protobuf:"varint,32,opt,name=key_rotation_hours,json=keyRotationHours,proto3" json:"key_rotation_hours,omitempty"`
+	NativePathPolicy      *NativePathPolicy      `protobuf:"bytes,33,opt,name=native_path_policy,json=nativePathPolicy,proto3" json:"native_path_policy,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -233,6 +286,13 @@ func (x *Config) GetKeyRotationHours() uint32 {
 	return 0
 }
 
+func (x *Config) GetNativePathPolicy() *NativePathPolicy {
+	if x != nil {
+		return x.NativePathPolicy
+	}
+	return nil
+}
+
 type LimitFallback struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	AfterBytes       uint64                 `protobuf:"varint,1,opt,name=after_bytes,json=afterBytes,proto3" json:"after_bytes,omitempty"`
@@ -293,11 +353,163 @@ func (x *LimitFallback) GetBurstBytesPerSec() uint64 {
 	return 0
 }
 
+type NativePathBreaker struct {
+	state                        protoimpl.MessageState `protogen:"open.v1"`
+	Enabled                      bool                   `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	PeekTimeoutThreshold         uint32                 `protobuf:"varint,2,opt,name=peek_timeout_threshold,json=peekTimeoutThreshold,proto3" json:"peek_timeout_threshold,omitempty"`
+	InternalErrorThreshold       uint32                 `protobuf:"varint,3,opt,name=internal_error_threshold,json=internalErrorThreshold,proto3" json:"internal_error_threshold,omitempty"`
+	WindowSeconds                uint32                 `protobuf:"varint,4,opt,name=window_seconds,json=windowSeconds,proto3" json:"window_seconds,omitempty"`
+	CooldownSeconds              uint32                 `protobuf:"varint,5,opt,name=cooldown_seconds,json=cooldownSeconds,proto3" json:"cooldown_seconds,omitempty"`
+	HalfOpenProbeIntervalSeconds uint32                 `protobuf:"varint,6,opt,name=half_open_probe_interval_seconds,json=halfOpenProbeIntervalSeconds,proto3" json:"half_open_probe_interval_seconds,omitempty"`
+	unknownFields                protoimpl.UnknownFields
+	sizeCache                    protoimpl.SizeCache
+}
+
+func (x *NativePathBreaker) Reset() {
+	*x = NativePathBreaker{}
+	mi := &file_transport_internet_reality_config_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NativePathBreaker) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NativePathBreaker) ProtoMessage() {}
+
+func (x *NativePathBreaker) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_internet_reality_config_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NativePathBreaker.ProtoReflect.Descriptor instead.
+func (*NativePathBreaker) Descriptor() ([]byte, []int) {
+	return file_transport_internet_reality_config_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *NativePathBreaker) GetEnabled() bool {
+	if x != nil {
+		return x.Enabled
+	}
+	return false
+}
+
+func (x *NativePathBreaker) GetPeekTimeoutThreshold() uint32 {
+	if x != nil {
+		return x.PeekTimeoutThreshold
+	}
+	return 0
+}
+
+func (x *NativePathBreaker) GetInternalErrorThreshold() uint32 {
+	if x != nil {
+		return x.InternalErrorThreshold
+	}
+	return 0
+}
+
+func (x *NativePathBreaker) GetWindowSeconds() uint32 {
+	if x != nil {
+		return x.WindowSeconds
+	}
+	return 0
+}
+
+func (x *NativePathBreaker) GetCooldownSeconds() uint32 {
+	if x != nil {
+		return x.CooldownSeconds
+	}
+	return 0
+}
+
+func (x *NativePathBreaker) GetHalfOpenProbeIntervalSeconds() uint32 {
+	if x != nil {
+		return x.HalfOpenProbeIntervalSeconds
+	}
+	return 0
+}
+
+type NativePathPolicy struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Mode             NativePathMode         `protobuf:"varint,1,opt,name=mode,proto3,enum=xray.transport.internet.reality.NativePathMode" json:"mode,omitempty"`
+	AllowFallback    bool                   `protobuf:"varint,2,opt,name=allow_fallback,json=allowFallback,proto3" json:"allow_fallback,omitempty"`
+	TelemetryEnforce bool                   `protobuf:"varint,3,opt,name=telemetry_enforce,json=telemetryEnforce,proto3" json:"telemetry_enforce,omitempty"`
+	Breaker          *NativePathBreaker     `protobuf:"bytes,4,opt,name=breaker,proto3" json:"breaker,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *NativePathPolicy) Reset() {
+	*x = NativePathPolicy{}
+	mi := &file_transport_internet_reality_config_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NativePathPolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NativePathPolicy) ProtoMessage() {}
+
+func (x *NativePathPolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_internet_reality_config_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NativePathPolicy.ProtoReflect.Descriptor instead.
+func (*NativePathPolicy) Descriptor() ([]byte, []int) {
+	return file_transport_internet_reality_config_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *NativePathPolicy) GetMode() NativePathMode {
+	if x != nil {
+		return x.Mode
+	}
+	return NativePathMode_AUTO
+}
+
+func (x *NativePathPolicy) GetAllowFallback() bool {
+	if x != nil {
+		return x.AllowFallback
+	}
+	return false
+}
+
+func (x *NativePathPolicy) GetTelemetryEnforce() bool {
+	if x != nil {
+		return x.TelemetryEnforce
+	}
+	return false
+}
+
+func (x *NativePathPolicy) GetBreaker() *NativePathBreaker {
+	if x != nil {
+		return x.Breaker
+	}
+	return nil
+}
+
 var File_transport_internet_reality_config_proto protoreflect.FileDescriptor
 
 const file_transport_internet_reality_config_proto_rawDesc = "" +
 	"\n" +
-	"'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\xc6\x06\n" +
+	"'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\xa7\a\n" +
 	"\x06Config\x12\x12\n" +
 	"\x04show\x18\x01 \x01(\bR\x04show\x12\x12\n" +
 	"\x04dest\x18\x02 \x01(\tR\x04dest\x12\x12\n" +
@@ -324,12 +536,30 @@ const file_transport_internet_reality_config_proto_rawDesc = "" +
 	"\bspider_x\x18\x1a \x01(\tR\aspiderX\x12\x19\n" +
 	"\bspider_y\x18\x1b \x03(\x03R\aspiderY\x12$\n" +
 	"\x0emaster_key_log\x18\x1f \x01(\tR\fmasterKeyLog\x12,\n" +
-	"\x12key_rotation_hours\x18  \x01(\rR\x10keyRotationHours\"\x83\x01\n" +
+	"\x12key_rotation_hours\x18  \x01(\rR\x10keyRotationHours\x12_\n" +
+	"\x12native_path_policy\x18! \x01(\v21.xray.transport.internet.reality.NativePathPolicyR\x10nativePathPolicy\"\x83\x01\n" +
 	"\rLimitFallback\x12\x1f\n" +
 	"\vafter_bytes\x18\x01 \x01(\x04R\n" +
 	"afterBytes\x12\"\n" +
 	"\rbytes_per_sec\x18\x02 \x01(\x04R\vbytesPerSec\x12-\n" +
-	"\x13burst_bytes_per_sec\x18\x03 \x01(\x04R\x10burstBytesPerSecB\x7f\n" +
+	"\x13burst_bytes_per_sec\x18\x03 \x01(\x04R\x10burstBytesPerSec\"\xb7\x02\n" +
+	"\x11NativePathBreaker\x12\x18\n" +
+	"\aenabled\x18\x01 \x01(\bR\aenabled\x124\n" +
+	"\x16peek_timeout_threshold\x18\x02 \x01(\rR\x14peekTimeoutThreshold\x128\n" +
+	"\x18internal_error_threshold\x18\x03 \x01(\rR\x16internalErrorThreshold\x12%\n" +
+	"\x0ewindow_seconds\x18\x04 \x01(\rR\rwindowSeconds\x12)\n" +
+	"\x10cooldown_seconds\x18\x05 \x01(\rR\x0fcooldownSeconds\x12F\n" +
+	" half_open_probe_interval_seconds\x18\x06 \x01(\rR\x1chalfOpenProbeIntervalSeconds\"\xf9\x01\n" +
+	"\x10NativePathPolicy\x12C\n" +
+	"\x04mode\x18\x01 \x01(\x0e2/.xray.transport.internet.reality.NativePathModeR\x04mode\x12%\n" +
+	"\x0eallow_fallback\x18\x02 \x01(\bR\rallowFallback\x12+\n" +
+	"\x11telemetry_enforce\x18\x03 \x01(\bR\x10telemetryEnforce\x12L\n" +
+	"\abreaker\x18\x04 \x01(\v22.xray.transport.internet.reality.NativePathBreakerR\abreaker*S\n" +
+	"\x0eNativePathMode\x12\b\n" +
+	"\x04AUTO\x10\x00\x12\x11\n" +
+	"\rPREFER_NATIVE\x10\x01\x12\x10\n" +
+	"\fFORCE_NATIVE\x10\x02\x12\x12\n" +
+	"\x0eDISABLE_NATIVE\x10\x03B\x7f\n" +
 	"#com.xray.transport.internet.realityP\x01Z4github.com/xtls/xray-core/transport/internet/reality\xaa\x02\x1fXray.Transport.Internet.Realityb\x06proto3"
 
 var (
@@ -344,19 +574,26 @@ func file_transport_internet_reality_config_proto_rawDescGZIP() []byte {
 	return file_transport_internet_reality_config_proto_rawDescData
 }
 
-var file_transport_internet_reality_config_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_transport_internet_reality_config_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_transport_internet_reality_config_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_transport_internet_reality_config_proto_goTypes = []any{
-	(*Config)(nil),        // 0: xray.transport.internet.reality.Config
-	(*LimitFallback)(nil), // 1: xray.transport.internet.reality.LimitFallback
+	(NativePathMode)(0),       // 0: xray.transport.internet.reality.NativePathMode
+	(*Config)(nil),            // 1: xray.transport.internet.reality.Config
+	(*LimitFallback)(nil),     // 2: xray.transport.internet.reality.LimitFallback
+	(*NativePathBreaker)(nil), // 3: xray.transport.internet.reality.NativePathBreaker
+	(*NativePathPolicy)(nil),  // 4: xray.transport.internet.reality.NativePathPolicy
 }
 var file_transport_internet_reality_config_proto_depIdxs = []int32{
-	1, // 0: xray.transport.internet.reality.Config.limit_fallback_upload:type_name -> xray.transport.internet.reality.LimitFallback
-	1, // 1: xray.transport.internet.reality.Config.limit_fallback_download:type_name -> xray.transport.internet.reality.LimitFallback
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	2, // 0: xray.transport.internet.reality.Config.limit_fallback_upload:type_name -> xray.transport.internet.reality.LimitFallback
+	2, // 1: xray.transport.internet.reality.Config.limit_fallback_download:type_name -> xray.transport.internet.reality.LimitFallback
+	4, // 2: xray.transport.internet.reality.Config.native_path_policy:type_name -> xray.transport.internet.reality.NativePathPolicy
+	0, // 3: xray.transport.internet.reality.NativePathPolicy.mode:type_name -> xray.transport.internet.reality.NativePathMode
+	3, // 4: xray.transport.internet.reality.NativePathPolicy.breaker:type_name -> xray.transport.internet.reality.NativePathBreaker
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_transport_internet_reality_config_proto_init() }
@@ -369,13 +606,14 @@ func file_transport_internet_reality_config_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transport_internet_reality_config_proto_rawDesc), len(file_transport_internet_reality_config_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   2,
+			NumEnums:      1,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_transport_internet_reality_config_proto_goTypes,
 		DependencyIndexes: file_transport_internet_reality_config_proto_depIdxs,
+		EnumInfos:         file_transport_internet_reality_config_proto_enumTypes,
 		MessageInfos:      file_transport_internet_reality_config_proto_msgTypes,
 	}.Build()
 	File_transport_internet_reality_config_proto = out.File

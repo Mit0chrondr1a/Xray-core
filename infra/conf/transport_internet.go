@@ -827,21 +827,38 @@ type LimitFallback struct {
 	BurstBytesPerSec uint64
 }
 
+type NativePathBreakerConfig struct {
+	Enabled                      *bool  `json:"enabled"`
+	PeekTimeoutThreshold         uint32 `json:"peekTimeoutThreshold"`
+	InternalErrorThreshold       uint32 `json:"internalErrorThreshold"`
+	WindowSeconds                uint32 `json:"windowSeconds"`
+	CooldownSeconds              uint32 `json:"cooldownSeconds"`
+	HalfOpenProbeIntervalSeconds uint32 `json:"halfOpenProbeIntervalSeconds"`
+}
+
+type NativePathPolicyConfig struct {
+	Mode             string                   `json:"mode"`
+	AllowFallback    *bool                    `json:"allowFallback"`
+	TelemetryEnforce *bool                    `json:"telemetryEnforce"`
+	Breaker          *NativePathBreakerConfig `json:"breaker"`
+}
+
 type REALITYConfig struct {
-	MasterKeyLog     string          `json:"masterKeyLog"`
-	Show             bool            `json:"show"`
-	Target           json.RawMessage `json:"target"`
-	Dest             json.RawMessage `json:"dest"`
-	Type             string          `json:"type"`
-	Xver             uint64          `json:"xver"`
-	ServerNames      []string        `json:"serverNames"`
-	PrivateKey       string          `json:"privateKey"`
-	MinClientVer     string          `json:"minClientVer"`
-	MaxClientVer     string          `json:"maxClientVer"`
-	MaxTimeDiff      uint64          `json:"maxTimeDiff"`
-	ShortIds         []string        `json:"shortIds"`
-	Mldsa65Seed      string          `json:"mldsa65Seed"`
-	KeyRotationHours uint32          `json:"keyRotationHours"`
+	MasterKeyLog     string                  `json:"masterKeyLog"`
+	Show             bool                    `json:"show"`
+	Target           json.RawMessage         `json:"target"`
+	Dest             json.RawMessage         `json:"dest"`
+	Type             string                  `json:"type"`
+	Xver             uint64                  `json:"xver"`
+	ServerNames      []string                `json:"serverNames"`
+	PrivateKey       string                  `json:"privateKey"`
+	MinClientVer     string                  `json:"minClientVer"`
+	MaxClientVer     string                  `json:"maxClientVer"`
+	MaxTimeDiff      uint64                  `json:"maxTimeDiff"`
+	ShortIds         []string                `json:"shortIds"`
+	Mldsa65Seed      string                  `json:"mldsa65Seed"`
+	KeyRotationHours uint32                  `json:"keyRotationHours"`
+	NativePathPolicy *NativePathPolicyConfig `json:"nativePathPolicy"`
 
 	LimitFallbackUpload   LimitFallback `json:"limitFallbackUpload"`
 	LimitFallbackDownload LimitFallback `json:"limitFallbackDownload"`
@@ -855,11 +872,78 @@ type REALITYConfig struct {
 	SpiderX       string `json:"spiderX"`
 }
 
+func buildNativePathPolicy(policy *NativePathPolicyConfig) (*reality.NativePathPolicy, error) {
+	b := &reality.NativePathBreaker{
+		Enabled:                      true,
+		PeekTimeoutThreshold:         3,
+		InternalErrorThreshold:       3,
+		WindowSeconds:                60,
+		CooldownSeconds:              30,
+		HalfOpenProbeIntervalSeconds: 2,
+	}
+	p := &reality.NativePathPolicy{
+		Mode:             reality.NativePathMode_AUTO,
+		AllowFallback:    true,
+		TelemetryEnforce: true,
+		Breaker:          b,
+	}
+	if policy == nil {
+		return p, nil
+	}
+	switch strings.ToUpper(strings.TrimSpace(policy.Mode)) {
+	case "", "AUTO":
+		p.Mode = reality.NativePathMode_AUTO
+	case "PREFER_NATIVE", "PREFER-NATIVE":
+		p.Mode = reality.NativePathMode_PREFER_NATIVE
+	case "FORCE_NATIVE", "FORCE-NATIVE":
+		p.Mode = reality.NativePathMode_FORCE_NATIVE
+	case "DISABLE_NATIVE", "DISABLE-NATIVE":
+		p.Mode = reality.NativePathMode_DISABLE_NATIVE
+	default:
+		return nil, errors.New(`invalid "nativePathPolicy.mode": `, policy.Mode)
+	}
+	if policy.AllowFallback != nil {
+		p.AllowFallback = *policy.AllowFallback
+	}
+	if p.Mode == reality.NativePathMode_DISABLE_NATIVE && !p.AllowFallback {
+		return nil, errors.New(`invalid nativePathPolicy: DISABLE_NATIVE with allowFallback=false is contradictory`)
+	}
+	if policy.TelemetryEnforce != nil {
+		p.TelemetryEnforce = *policy.TelemetryEnforce
+	}
+	if policy.Breaker != nil {
+		if policy.Breaker.Enabled != nil {
+			b.Enabled = *policy.Breaker.Enabled
+		}
+		if policy.Breaker.PeekTimeoutThreshold > 0 {
+			b.PeekTimeoutThreshold = policy.Breaker.PeekTimeoutThreshold
+		}
+		if policy.Breaker.InternalErrorThreshold > 0 {
+			b.InternalErrorThreshold = policy.Breaker.InternalErrorThreshold
+		}
+		if policy.Breaker.WindowSeconds > 0 {
+			b.WindowSeconds = policy.Breaker.WindowSeconds
+		}
+		if policy.Breaker.CooldownSeconds > 0 {
+			b.CooldownSeconds = policy.Breaker.CooldownSeconds
+		}
+		if policy.Breaker.HalfOpenProbeIntervalSeconds > 0 {
+			b.HalfOpenProbeIntervalSeconds = policy.Breaker.HalfOpenProbeIntervalSeconds
+		}
+	}
+	return p, nil
+}
+
 func (c *REALITYConfig) Build() (proto.Message, error) {
 	config := new(reality.Config)
 	config.MasterKeyLog = c.MasterKeyLog
 	config.Show = c.Show
 	var err error
+	nativePolicy, err := buildNativePathPolicy(c.NativePathPolicy)
+	if err != nil {
+		return nil, err
+	}
+	config.NativePathPolicy = nativePolicy
 	if c.Target != nil {
 		c.Dest = c.Target
 	}

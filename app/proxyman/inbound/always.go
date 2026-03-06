@@ -97,6 +97,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	if err != nil {
 		return nil, errors.New("failed to parse stream config").Base(err).AtWarning()
 	}
+	mss.InboundTag = tag
 
 	if receiverConfig.ReceiveOriginalDestination {
 		if mss.SocketSettings == nil {
