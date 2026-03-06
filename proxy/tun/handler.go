@@ -114,12 +114,13 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	inbound := session.Inbound{
 		Name:          "tun",
 		Tag:           t.tag,
-		CanSpliceCopy: 3,
+		CanSpliceCopy: int32(session.CopyGateForcedUserspace),
 		Source:        source,
 		User: &protocol.MemoryUser{
 			Level: t.config.UserLevel,
 		},
 	}
+	inbound.SetCopyGateReason(session.CopyGateReasonSecurityGuard)
 
 	ctx = session.ContextWithInbound(ctx, &inbound)
 	ctx = session.ContextWithContent(ctx, &session.Content{

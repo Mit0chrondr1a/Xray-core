@@ -52,7 +52,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		return errors.New("target not specified")
 	}
 	ob.Name = "shadowsocks"
-	ob.SetCanSpliceCopy(3)
+	ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 	destination := ob.Target
 	network := destination.Network
 

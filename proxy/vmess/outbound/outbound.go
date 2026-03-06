@@ -63,7 +63,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("target not specified").AtError()
 	}
 	ob.Name = "vmess"
-	ob.SetCanSpliceCopy(3)
+	ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 
 	rec := h.server
 	var conn stat.Connection

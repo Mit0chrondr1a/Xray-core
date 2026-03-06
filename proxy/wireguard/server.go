@@ -134,7 +134,7 @@ func (s *Server) forwardConnection(dest net.Destination, conn net.Conn) {
 		inbound = *s.info.inboundTag
 	}
 	inbound.Name = "wireguard"
-	inbound.SetCanSpliceCopy(3)
+	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 
 	// overwrite the source to use the tun address for each sub context.
 	// Since gvisor.ForwarderRequest doesn't provide any info to associate the sub-context with the Parent context
