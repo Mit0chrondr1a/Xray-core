@@ -13,13 +13,25 @@ type DecisionInput struct {
 	WriterCrypto string
 }
 
+// CopyGateInput centralizes early copy-path gate evaluation.
+type CopyGateInput struct {
+	InboundGate    CopyGateState
+	InboundReason  CopyGateReason
+	OutboundGates  []CopyGateState
+	OutboundReason []CopyGateReason
+}
+
 // DecideVisionPath returns a DecisionSnapshot with chosen path/reason based on inputs.
 // It centralizes the prechecks so callers (proxy, XHTTP) can avoid divergent heuristics.
 func DecideVisionPath(in DecisionInput) DecisionSnapshot {
 	snap := DecisionSnapshot{
-		Path:   PathUserspace,
-		Reason: ReasonDefault,
-		Caps:   in.Caps,
+		Path:           PathUserspace,
+		Reason:         ReasonDefault,
+		Caps:           in.Caps,
+		CopyPath:       CopyPathUserspace,
+		TLSOffloadPath: TLSOffloadUserspace,
+		CopyGateState:  CopyGateUnset,
+		CopyGateReason: CopyGateReasonUnspecified,
 	}
 
 	// If splice/zero-copy is unavailable, stay in userspace early to avoid
@@ -49,6 +61,7 @@ func DecideVisionPath(in DecisionInput) DecisionSnapshot {
 	// Start optimistic with splice; sockmap decided later by caller.
 	snap.Path = PathSplice
 	snap.Reason = ReasonSplicePrimary
+	snap.CopyPath = CopyPathSplice
 
 	// Loopback allowed after detach; no extra change needed here.
 	return snap
@@ -61,4 +74,45 @@ func normalizeDecisionCryptoHint(v string) string {
 	default:
 		return strings.TrimSpace(strings.ToLower(v))
 	}
+}
+
+// EvaluateCopyGate returns an early stop decision when copy path must stay in userspace
+// or is not applicable. It keeps policy consistent across proxy and XHTTP callers.
+// The returned reason is empty when no early decision is required.
+func EvaluateCopyGate(in CopyGateInput) (reason string, gate CopyGateState, gateReason CopyGateReason, copyPath CopyPath, stop bool) {
+	chooseReason := func(r CopyGateReason) CopyGateReason {
+		if r == CopyGateReasonUnspecified {
+			return CopyGateReasonUnspecified
+		}
+		return r
+	}
+	gate = in.InboundGate
+	gateReason = chooseReason(in.InboundReason)
+	if in.InboundGate == CopyGateForcedUserspace {
+		return ReasonInboundForcedUserspace, in.InboundGate, gateReason, CopyPathUserspace, true
+	}
+	if in.InboundGate == CopyGateNotApplicable {
+		if gateReason == CopyGateReasonUnspecified {
+			gateReason = CopyGateReasonTransportNonRawSplitConn
+		}
+		return ReasonCopyNotApplicable, in.InboundGate, gateReason, CopyPathNotApplicable, true
+	}
+
+	for i, g := range in.OutboundGates {
+		var r CopyGateReason
+		if i < len(in.OutboundReason) {
+			r = chooseReason(in.OutboundReason[i])
+		}
+		switch g {
+		case CopyGateForcedUserspace:
+			return ReasonOutboundForcedUserspace, g, r, CopyPathUserspace, true
+		case CopyGateNotApplicable:
+			if r == CopyGateReasonUnspecified {
+				r = CopyGateReasonTransportNonRawSplitConn
+			}
+			return ReasonCopyNotApplicable, g, r, CopyPathNotApplicable, true
+		}
+	}
+
+	return "", CopyGateUnset, CopyGateReasonUnspecified, CopyPathUnknown, false
 }

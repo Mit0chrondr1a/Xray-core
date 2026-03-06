@@ -63,17 +63,26 @@ type TlsStateHandle struct{}
 func (*TlsConfigHandle) release() {}
 func (*TlsStateHandle) release()  {}
 
+type DeferredHandleOwnership uint8
+
+const (
+	DeferredHandleOwnershipUnknown DeferredHandleOwnership = iota
+	DeferredHandleOwnershipConsumed
+	DeferredHandleOwnershipRetained
+)
+
 type TlsResult struct {
-	KtlsTx      bool
-	KtlsRx      bool
-	Version     uint16
-	CipherSuite uint16
-	ALPN        string
-	RxSeqStart  uint64
-	StateHandle *TlsStateHandle
-	TxSecret    []byte
-	RxSecret    []byte
-	DrainedData []byte
+	KtlsTx                  bool
+	KtlsRx                  bool
+	Version                 uint16
+	CipherSuite             uint16
+	ALPN                    string
+	RxSeqStart              uint64
+	StateHandle             *TlsStateHandle
+	DeferredHandleOwnership DeferredHandleOwnership
+	TxSecret                []byte
+	RxSecret                []byte
+	DrainedData             []byte
 }
 
 // ZeroSecrets zeroes the traffic secret fields after they have been copied.
@@ -189,6 +198,7 @@ func DeferredDrainAndDetach(*DeferredSessionHandle) ([]byte, []byte, error) {
 func DeferredEnableKTLS(*DeferredSessionHandle) (*TlsResult, error) {
 	return nil, errNotAvailable
 }
+func DeferredHandleAlive(*DeferredSessionHandle) bool      { return false }
 func DeferredRestoreNonBlock(*DeferredSessionHandle) error { return nil }
 func DeferredFree(*DeferredSessionHandle)                  {}
 
@@ -342,6 +352,7 @@ const (
 
 // EbpfSkMsgCapability returns SkMsgNone when native eBPF is not available.
 func EbpfSkMsgCapability() SkMsgCapability { return SkMsgNone }
+func EbpfMaxEntries() uint32               { return 0 }
 
 func EbpfSetup(string, uint32, uint32) error                  { return errNotAvailable }
 func EbpfTeardown() error                                     { return errNotAvailable }

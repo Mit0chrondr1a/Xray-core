@@ -72,12 +72,12 @@ func (s *Server) Network() []net.Network {
 func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "socks"
-	inbound.SetCanSpliceCopy(2)
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 	inbound.User = &protocol.MemoryUser{
 		Level: s.config.UserLevel,
 	}
 	if !proxy.IsRAWTransportWithoutSecurity(conn) {
-		inbound.SetCanSpliceCopy(3)
+		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonTransportUserspace)
 	}
 
 	switch network {
@@ -158,8 +158,8 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 				Reason: "",
 			})
 		}
-		if inbound.GetCanSpliceCopy() == 2 {
-			inbound.SetCanSpliceCopy(1)
+		if inbound.GetCanSpliceCopy() == session.CopyGatePendingDetach {
+			inbound.SetCanSpliceCopy(session.CopyGateEligible)
 		}
 		if err := dispatcher.DispatchLink(ctx, dest, &transport.Link{
 			Reader: reader,

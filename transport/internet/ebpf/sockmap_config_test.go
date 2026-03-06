@@ -108,6 +108,20 @@ func TestSockmapManager_GetStatsEmpty(t *testing.T) {
 	}
 }
 
+func TestSockmapManager_GetStatsUsesEffectiveMaxEntries(t *testing.T) {
+	mgr := NewSockmapManager(SockmapConfig{MaxEntries: 4096})
+	mgr.useNativeLoader = true
+	mgr.setEffectiveMaxEntries(65536)
+
+	stats := mgr.GetSockmapStats()
+	if stats.MaxEntries != 65536 {
+		t.Fatalf("MaxEntries=%d, want 65536 (effective native capacity)", stats.MaxEntries)
+	}
+	if !stats.NativeLoader {
+		t.Fatal("NativeLoader should reflect the active runtime path")
+	}
+}
+
 // TestComputeRedirectPolicy_BothPlain verifies plain TCP pairs are allowed.
 func TestComputeRedirectPolicy_BothPlain(t *testing.T) {
 	policy := computeRedirectPolicy(CryptoNone, CryptoNone)

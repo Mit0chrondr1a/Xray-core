@@ -50,3 +50,25 @@ func TestShouldFallbackToSpliceOnStaleSweepRatio(t *testing.T) {
 		t.Fatalf("splice fallback counter mismatch: got %d, want 1", got)
 	}
 }
+
+func TestIncrementKTLSSpliceFallbackDoesNotAffectGenericFallbackWindow(t *testing.T) {
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	mgr.enabled.Store(true)
+	mgr.regWindowStartNs.Store(time.Now().UnixNano())
+	for i := 0; i < 32; i++ {
+		mgr.IncrementKTLSSpliceFallback()
+	}
+
+	if got := mgr.ktlsSpliceFallbacks.Load(); got != 32 {
+		t.Fatalf("ktls splice fallback counter mismatch: got %d, want 32", got)
+	}
+	if got := mgr.regWindowTotal.Load(); got != 0 {
+		t.Fatalf("generic registration total should stay untouched, got %d", got)
+	}
+	if got := mgr.regWindowFailures.Load(); got != 0 {
+		t.Fatalf("generic registration failures should stay untouched, got %d", got)
+	}
+	if mgr.ShouldFallbackToSplice() {
+		t.Fatal("kTLS incompatibility should not trigger global generic sockmap fallback")
+	}
+}

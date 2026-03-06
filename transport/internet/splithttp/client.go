@@ -10,6 +10,7 @@ import (
 	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -287,9 +288,11 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 type WaitReadCloser struct {
 	Wait chan struct{}
 	io.ReadCloser
-	mu     sync.Mutex
-	closed bool
-	once   sync.Once
+	mu             sync.Mutex
+	closed         bool
+	readDeadline   time.Time
+	deadlineSignal chan struct{}
+	once           sync.Once
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
@@ -303,24 +306,52 @@ func (w *WaitReadCloser) Set(rc io.ReadCloser) {
 		return
 	}
 	w.ReadCloser = rc
+	if deadline := w.readDeadline; !deadline.IsZero() {
+		_ = setSplitReadDeadline(rc, deadline)
+	}
 	w.mu.Unlock()
 	w.once.Do(func() { close(w.Wait) })
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	w.mu.Lock()
-	rc := w.ReadCloser
-	w.mu.Unlock()
-	if rc == nil {
-		<-w.Wait
+	for {
 		w.mu.Lock()
-		rc = w.ReadCloser
+		rc := w.ReadCloser
+		closed := w.closed
+		deadline := w.readDeadline
+		signal := w.ensureDeadlineSignalLocked()
 		w.mu.Unlock()
-		if rc == nil {
+		if rc != nil {
+			return rc.Read(b)
+		}
+		if closed {
 			return 0, io.ErrClosedPipe
 		}
+		if deadline.IsZero() {
+			select {
+			case <-w.Wait:
+			case <-signal:
+			}
+			continue
+		}
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			return 0, errSplitDeadlineExceeded
+		}
+		timer := time.NewTimer(timeout)
+		select {
+		case <-w.Wait:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-signal:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			return 0, errSplitDeadlineExceeded
+		}
 	}
-	return rc.Read(b)
 }
 
 func (w *WaitReadCloser) Close() error {
@@ -334,4 +365,29 @@ func (w *WaitReadCloser) Close() error {
 		return rc.Close()
 	}
 	return nil
+}
+
+func (w *WaitReadCloser) SetDeadline(t time.Time) error {
+	return w.SetReadDeadline(t)
+}
+
+func (w *WaitReadCloser) SetReadDeadline(t time.Time) error {
+	w.mu.Lock()
+	w.readDeadline = t
+	signal := w.ensureDeadlineSignalLocked()
+	w.deadlineSignal = make(chan struct{})
+	rc := w.ReadCloser
+	w.mu.Unlock()
+	close(signal)
+	if rc != nil {
+		return setSplitReadDeadline(rc, t)
+	}
+	return nil
+}
+
+func (w *WaitReadCloser) ensureDeadlineSignalLocked() chan struct{} {
+	if w.deadlineSignal == nil {
+		w.deadlineSignal = make(chan struct{})
+	}
+	return w.deadlineSignal
 }

@@ -6,6 +6,7 @@ import (
 	gotls "crypto/tls"
 	"encoding/base64"
 	"io"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -39,8 +40,14 @@ import (
 	"github.com/xtls/xray-core/proxy/vless/encryption"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/reality"
+	"github.com/xtls/xray-core/transport/internet/splithttp"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
+)
+
+var (
+	reverseOutboundWaitTimeout  = 5 * time.Second
+	reverseOutboundPollInterval = 200 * time.Millisecond
 )
 
 func init() {
@@ -201,15 +208,19 @@ func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
 		r = &Reverse{tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
 		// Wait for at least one outbound handler to be registered before adding
 		// the reverse handler, preventing it from becoming the default outbound.
-		// Bounded to 30s to avoid hanging forever on shutdown or misconfiguration.
-		waitDeadline := time.After(30 * time.Second)
+		// Keep the wait short and responsive: this is cold-path startup protection,
+		// not a session hot path, and long stalls hurt operability more than they help.
+		waitTimer := time.NewTimer(reverseOutboundWaitTimeout)
+		defer waitTimer.Stop()
+		pollTicker := time.NewTicker(reverseOutboundPollInterval)
+		defer pollTicker.Stop()
 		for len(h.outboundHandlerManager.ListHandlers(h.ctx)) == 0 {
 			select {
 			case <-h.ctx.Done():
 				return nil, errors.New("reverse: context cancelled while waiting for outbound handlers")
-			case <-waitDeadline:
+			case <-waitTimer.C:
 				return nil, errors.New("reverse: timed out waiting for outbound handlers to register")
-			case <-time.After(time.Second):
+			case <-pollTicker.C:
 			}
 		}
 		if err := h.outboundHandlerManager.AddHandler(h.ctx, r); err != nil {
@@ -342,10 +353,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				alpn = cs.NegotiatedProtocol
 				errors.LogInfo(ctx, "realName = "+name)
 				errors.LogInfo(ctx, "realAlpn = "+alpn)
-				if ktlsErr := dc.EnableKTLS(); ktlsErr != nil {
-					// Deferred handle is consumed by FFI even on failure, so
-					// this connection cannot safely continue rustls I/O.
+				if outcome, ktlsErr := dc.EnableKTLSOutcome(); ktlsErr != nil {
 					return errors.New("deferred kTLS enable failed in fallback").Base(ktlsErr).AtWarning()
+				} else if outcome.Status != tls.KTLSPromotionEnabled {
+					errors.LogWarning(ctx, "deferred kTLS not enabled in fallback path: ", outcome.Status)
+					// Continue on rustls; handle is still valid.
 				}
 			}
 			name = strings.ToLower(name)
@@ -569,19 +581,19 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	switch requestAddons.Flow {
 	case vless.XRV:
 		if account.Flow == requestAddons.Flow {
-			inbound.SetCanSpliceCopy(2)
+			inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 			switch request.Command {
 			case protocol.RequestCommandUDP:
 				return errors.New(requestAddons.Flow + " doesn't support UDP").AtWarning()
 			case protocol.RequestCommandMux, protocol.RequestCommandRvs:
-				inbound.SetCanSpliceCopy(3)
+				inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 				fallthrough // we will break Mux connections that contain TCP requests
 			case protocol.RequestCommandTCP:
 				var t reflect.Type
 				var p uintptr
 				if commonConn, ok := connection.(*encryption.CommonConn); ok {
 					if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
-						inbound.SetCanSpliceCopy(3) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
+						inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 					}
 					t = reflect.TypeOf(commonConn).Elem()
 					p = uintptr(unsafe.Pointer(commonConn))
@@ -598,14 +610,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
 						return errors.New("RustConn without full kTLS cannot use " + requestAddons.Flow).AtWarning()
 					}
-					// kTLS + Vision is a configuration error: kTLS should have been
-					// gated upstream (hub.go). Vision is the priority optimization.
-					// Proceed anyway — will likely EBADMSG if peer lacks kTLS.
-					// See docs/ktls-vision-incompatibility.md.
-					errors.LogWarning(ctx, requestAddons.Flow, " on RustConn with kTLS: ",
-						"outer TLS cannot be stripped after command=2 — kTLS should be gated upstream")
-					input = &bytes.Reader{}
-					rawInput = &bytes.Buffer{}
+					// kTLS + Vision is unsupported; refuse early to avoid corrupting streams.
+					return errors.New("Vision is incompatible with kTLS-native RustConn; use non-Vision or disable kTLS for this flow").AtWarning()
 				} else if _, ok := iConn.(*tls.DeferredRustConn); ok {
 					// Deferred kTLS: rustls handles TLS. Vision will strip at command=2.
 					// VisionReader will call DeferredRustConn.DrainAndDetach().
@@ -629,20 +635,39 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
 		}
 	case "":
-		inbound.SetCanSpliceCopy(3)
-		if account.Flow == vless.XRV && (request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) {
+		gateState, gateReason := flowEmptyGate(iConn)
+		allowRawAccel := os.Getenv("XRAY_FEATURE_FLOW_EMPTY_RAW_ACCEL") == "1"
+		ktlsReady := false
+		allowFlowDowngrade := allowVisionFlowDowngrade(inbound, account.Flow, request.Destination())
+		if strings.HasPrefix(account.Flow, vless.XRV) &&
+			(request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) &&
+			!allowFlowDowngrade {
 			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
 		}
 		if dc, ok := iConn.(*tls.DeferredRustConn); ok {
-			if err := dc.EnableKTLS(); err != nil {
+			if outcome, err := dc.EnableKTLSOutcome(); err != nil {
 				return errors.New("deferred kTLS enable failed for non-Vision VLESS").Base(err).AtWarning()
-			} else {
+			} else if outcome.Status == tls.KTLSPromotionEnabled {
 				errors.LogDebug(ctx, "non-Vision VLESS: kTLS enabled on DeferredRustConn")
+				ktlsReady = true
+			} else {
+				errors.LogWarning(ctx, "non-Vision VLESS: kTLS not enabled (", outcome.Status, "); continuing with rustls path")
 			}
 		} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 			if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
 				return errors.New("kTLS enable failed for non-Vision VLESS TLS connection").Base(err).AtWarning()
 			}
+			ktlsReady = true
+		}
+		// Optional ROI path: allow raw TCP + kTLS-ready empty-flow to be copy-eligible.
+		if allowRawAccel && ktlsReady && gateState != session.CopyGateNotApplicable && proxy.IsRAWTransportWithoutSecurity(iConn) {
+			inbound.SetCopyGate(session.CopyGateEligible, session.CopyGateReasonUnspecified)
+		} else {
+			inbound.SetCopyGate(gateState, gateReason)
+		}
+		if allowFlowDowngrade {
+			ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneOther)
+			errors.LogDebug(ctx, "loopback TCP DNS flow: accepting plain VLESS downgrade on Vision account")
 		}
 	default:
 		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
@@ -679,7 +704,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	bypassVision := requestAddons.Flow == vless.XRV &&
 		(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
 			encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
-
+	if bypassVision {
+		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionBypass)
+		ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneVisionGuard)
+		visionReaderCtx = ctx
+		visionWriterCtx = ctx
+	}
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
 	if requestAddons.Flow == vless.XRV && !bypassVision {
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, connection, input, rawInput, nil)
@@ -712,6 +742,27 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return errors.New("failed to dispatch request").Base(err)
 	}
 	return nil
+}
+
+// flowEmptyGate computes copy gate state/reason for flow=="" without TLS side effects.
+func flowEmptyGate(iConn net.Conn) (session.CopyGateState, session.CopyGateReason) {
+	state := session.CopyGateForcedUserspace
+	reason := session.CopyGateReasonFlowNonVisionPolicy
+	if splithttp.IsSplitConn(iConn) {
+		state = session.CopyGateNotApplicable
+		reason = session.CopyGateReasonTransportNonRawSplitConn
+	}
+	return state, reason
+}
+
+func allowVisionFlowDowngrade(inbound *session.Inbound, accountFlow string, dest net.Destination) bool {
+	if !strings.HasPrefix(accountFlow, vless.XRV) {
+		return false
+	}
+	if !session.IsControlPlaneLoopbackIngress(inbound) {
+		return false
+	}
+	return session.ClassifyDNSFlow(dest) == session.DNSFlowClassTCPControl
 }
 
 type Reverse struct {

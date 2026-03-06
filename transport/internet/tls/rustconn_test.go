@@ -268,11 +268,30 @@ func TestDeferredRustConn_ReadWriteAfterDetached(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	dc := &DeferredRustConn{rawConn: client}
+	dc := &DeferredRustConn{
+		rawConn:     client,
+		drainedData: []byte("hi"),
+	}
 	dc.detached.Store(true)
 
-	if _, err := dc.Read(make([]byte, 1)); err == nil {
-		t.Fatal("expected read error after detach")
+	buf := make([]byte, 2)
+	if n, err := dc.Read(buf); err != nil {
+		t.Fatalf("expected detached read to serve staged bytes, got error: %v", err)
+	} else if got := string(buf[:n]); got != "hi" {
+		t.Fatalf("detached staged read = %q, want %q", got, "hi")
+	}
+	writeToClient := make(chan error, 1)
+	go func() {
+		_, err := server.Write([]byte("ok"))
+		writeToClient <- err
+	}()
+	if n, err := dc.Read(buf); err != nil {
+		t.Fatalf("expected detached read to continue on raw socket, got error: %v", err)
+	} else if got := string(buf[:n]); got != "ok" {
+		t.Fatalf("detached raw read = %q, want %q", got, "ok")
+	}
+	if err := <-writeToClient; err != nil {
+		t.Fatalf("server write failed: %v", err)
 	}
 	readDone := make(chan error, 1)
 	go func() {

@@ -11,6 +11,7 @@ import (
 	"container/heap"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 )
@@ -22,14 +23,15 @@ type Packet struct {
 }
 
 type uploadQueue struct {
-	mu         sync.Mutex
-	cond       *sync.Cond
-	reader     io.ReadCloser
-	nomore     bool
-	heap       uploadHeap
-	nextSeq    uint64
-	closed     bool
-	maxPackets int
+	mu           sync.Mutex
+	cond         *sync.Cond
+	reader       io.ReadCloser
+	nomore       bool
+	heap         uploadHeap
+	nextSeq      uint64
+	closed       bool
+	maxPackets   int
+	readDeadline time.Time
 }
 
 func NewUploadQueue(maxPackets int) *uploadQueue {
@@ -136,9 +138,40 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 			return 0, io.EOF
 		}
 
+		if !h.readDeadline.IsZero() && !time.Now().Before(h.readDeadline) {
+			return 0, errSplitDeadlineExceeded
+		}
+
 		// Block waiting for new packets or close
+		var timer *time.Timer
+		if !h.readDeadline.IsZero() {
+			timer = time.AfterFunc(time.Until(h.readDeadline), func() {
+				h.mu.Lock()
+				h.cond.Broadcast()
+				h.mu.Unlock()
+			})
+		}
 		h.cond.Wait()
+		if timer != nil {
+			timer.Stop()
+		}
 	}
+}
+
+func (h *uploadQueue) SetDeadline(t time.Time) error {
+	return h.SetReadDeadline(t)
+}
+
+func (h *uploadQueue) SetReadDeadline(t time.Time) error {
+	h.mu.Lock()
+	reader := h.reader
+	h.readDeadline = t
+	h.cond.Broadcast()
+	h.mu.Unlock()
+	if reader != nil {
+		return setSplitReadDeadline(reader, t)
+	}
+	return nil
 }
 
 // heap code directly taken from https://pkg.go.dev/container/heap

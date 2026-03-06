@@ -59,7 +59,8 @@ var deferredKTLSPromotionDisabledUntilUnixNano atomic.Int64
 
 const ktlsScopeDefault = "global"
 
-var deferredKTLSPromotionScopes sync.Map // key string -> int64 unixNano until
+var deferredKTLSPromotionScopes sync.Map       // key string -> int64 unixNano until
+var deferredKTLSPromotionScopeMetrics sync.Map // key string -> int64 unixNano until (last set)
 
 func deferredKTLSPromotionDisabledAt(now time.Time) bool {
 	return deferredKTLSPromotionDisabledForScope(now, ktlsScopeDefault)
@@ -98,6 +99,7 @@ func deferKTLSPromotionForCooldownScope(scope string) {
 	}
 	until := time.Now().Add(deferredKTLSPromotionCooldown).UnixNano()
 	deferredKTLSPromotionScopes.Store(scope, until)
+	deferredKTLSPromotionScopeMetrics.Store(scope, until)
 	// Maintain legacy global cooldown for callers that still consult the global atomic.
 	for {
 		current := deferredKTLSPromotionDisabledUntilUnixNano.Load()
@@ -793,7 +795,7 @@ type DeferredRustConn struct {
 	ktlsState        KTLSState             // populated after EnableKTLS()
 	ktlsHandler      *KTLSKeyUpdateHandler // populated after EnableKTLS()
 	state            *native.TlsStateHandle
-	drainedData      []byte // from enable_ktls drain
+	drainedData      []byte // from enable_ktls drain or detach read-ahead
 	drainedOff       int
 	writeRecords     atomic.Uint64
 	rotationFailures atomic.Uint32
@@ -879,6 +881,7 @@ func (c *DeferredRustConn) Read(b []byte) (int, error) {
 			c.deferredMu.Unlock()
 
 			n, err := c.rawConn.Read(b)
+			c.logDeferredKTLSError(err)
 			if err != nil && isKeyExpired(err) && handler != nil {
 				if herr := handler.Handle(); herr != nil {
 					return 0, herr
@@ -889,7 +892,22 @@ func (c *DeferredRustConn) Read(b []byte) (int, error) {
 		}
 
 		if detached {
-			return 0, gonet.ErrClosed
+			c.deferredMu.Lock()
+			if c.drainedOff < len(c.drainedData) {
+				n := copy(b, c.drainedData[c.drainedOff:])
+				c.drainedOff += n
+				if c.drainedOff >= len(c.drainedData) {
+					for i := range c.drainedData {
+						c.drainedData[i] = 0
+					}
+					c.drainedData = nil
+					c.drainedOff = 0
+				}
+				c.deferredMu.Unlock()
+				return n, nil
+			}
+			c.deferredMu.Unlock()
+			return c.rawConn.Read(b)
 		}
 
 		// Hold read lock across DeferredRead so EnableKTLS/Drain/Free cannot
@@ -966,6 +984,7 @@ func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, 
 	}
 	buf := c.deferredReadBuf[:deferredReadBatchCap]
 	n, err := native.DeferredRead(h, buf)
+	c.logDeferredKTLSError(err)
 	if n <= 0 {
 		return n, err
 	}
@@ -1133,7 +1152,9 @@ func (c *DeferredRustConn) logDeferredKTLSEIO() {
 }
 
 // DrainAndDetach drains rustls buffered plaintext and read-ahead bytes, then
-// detaches the deferred session. After success, callers must use NetConn().
+// detaches the deferred session. Detached bytes are also staged internally so
+// callers that stay on DeferredRustConn after a late detach still observe a
+// lossless stream.
 func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, err error) {
 	c.deferredMu.Lock()
 	defer c.deferredMu.Unlock()
@@ -1154,6 +1175,20 @@ func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, 
 	if err != nil {
 		// Keep handle for fallback-to-rustls behavior.
 		return nil, nil, err
+	}
+	for i := range c.drainedData {
+		c.drainedData[i] = 0
+	}
+	total := len(plaintext) + len(rawAhead)
+	if total > 0 {
+		staged := make([]byte, 0, total)
+		staged = append(staged, plaintext...)
+		staged = append(staged, rawAhead...)
+		c.drainedData = staged
+		c.drainedOff = 0
+	} else {
+		c.drainedData = nil
+		c.drainedOff = 0
 	}
 	native.DeferredFree(h) // free Rust DeferredSession — restores fd state, closes dup'd fds
 	c.handle = nil
@@ -1191,12 +1226,35 @@ type KTLSPromotionOutcome struct {
 	State  KTLSState
 }
 
+// allow tests to override native DeferredEnableKTLS
+var deferredEnableKTLSFn = native.DeferredEnableKTLS
+var deferredHandleAliveFn = native.DeferredHandleAlive
+var nativeFullKTLSSupportedFn = NativeFullKTLSSupported
+
+func failCloseRawConn(rawConn gonet.Conn) {
+	if rawConn == nil {
+		return
+	}
+	if fd, err := ExtractFd(rawConn); err == nil {
+		_ = syscall.Shutdown(fd, syscall.SHUT_RDWR)
+	}
+	_ = rawConn.Close()
+}
+
 // EnableKTLS installs kTLS on the socket in-place and returns a typed outcome.
 // Existing callers can continue using the legacy error-return contract via EnableKTLS().
 func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 	out := KTLSPromotionOutcome{Status: KTLSPromotionFailed}
+	closeAfterUnlock := false
+	closeRawConn := false
+	var rawConnToClose gonet.Conn
 	c.deferredMu.Lock()
-	defer c.deferredMu.Unlock()
+	defer func() {
+		c.deferredMu.Unlock()
+		if closeAfterUnlock && closeRawConn {
+			failCloseRawConn(rawConnToClose)
+		}
+	}()
 	if c.detached.Load() {
 		return out, errors.New("tls: DeferredRustConn: already detached")
 	}
@@ -1211,9 +1269,15 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 		out.Status = KTLSPromotionCooldown
 		return out, nil
 	}
-	result, err := native.DeferredEnableKTLS(c.handle)
-	// FFI consumes the deferred session handle; clear local reference to avoid reuse.
-	c.handle = nil
+	if !nativeFullKTLSSupportedFn() {
+		out.Status = KTLSPromotionUnsupported
+		return out, nil
+	}
+	result, err := deferredEnableKTLSFn(c.handle)
+	handleRetained := c.handle != nil && deferredHandleAliveFn(c.handle)
+	if !handleRetained {
+		c.handle = nil
+	}
 
 	var (
 		handler *KTLSKeyUpdateHandler
@@ -1247,12 +1311,14 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 		c.drainedData = nil
 		c.drainedOff = 0
 		c.deferredReadMu.Lock()
-		for i := range c.deferredReadBuf {
-			c.deferredReadBuf[i] = 0
+		if !handleRetained {
+			for i := range c.deferredReadBuf {
+				c.deferredReadBuf[i] = 0
+			}
+			c.deferredReadBuf = nil
+			c.deferredReadOff = 0
+			c.deferredReadLen = 0
 		}
-		c.deferredReadBuf = nil
-		c.deferredReadOff = 0
-		c.deferredReadLen = 0
 		c.deferredReadMu.Unlock()
 		c.ktlsState = KTLSState{}
 		c.ktlsActive = false
@@ -1260,13 +1326,29 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 	failPromotion := func(err error) error {
 		rollbackPromotionFailure()
 		deferKTLSPromotionForCooldownScope(scope)
+		if !handleRetained {
+			closeAfterUnlock = true
+			if c.closed.CompareAndSwap(false, true) {
+				closeRawConn = true
+				rawConnToClose = c.rawConn
+			}
+		}
 		return err
 	}
 
 	if err != nil {
+		if !handleRetained {
+			return out, failPromotion(errors.New("tls: deferred kTLS promotion consumed deferred session").Base(err))
+		}
 		return out, failPromotion(err)
 	}
 	defer result.ZeroSecrets()
+	if result.DeferredHandleOwnership == native.DeferredHandleOwnershipRetained {
+		// Success with retained ownership is an invalid contract; fail safe.
+		return out, failPromotion(errors.New("tls: deferred kTLS promotion returned retained ownership on success"))
+	}
+	// Successful native promotion consumed the deferred handle.
+	c.handle = nil
 
 	state = result.StateHandle
 	result.StateHandle = nil
@@ -1277,8 +1359,11 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 	// already consumed and this connection can no longer safely carry TLS I/O.
 	if !result.KtlsTx || !result.KtlsRx {
 		rollbackPromotionFailure()
-		out.Status = KTLSPromotionUnsupported
-		return out, nil
+		if handleRetained {
+			out.Status = KTLSPromotionUnsupported
+			return out, nil
+		}
+		return out, failPromotion(errors.New("tls: deferred kTLS promotion incomplete and consumed deferred session"))
 	}
 
 	// Extract secrets and create KeyUpdateHandler first, then zero secrets
@@ -1321,30 +1406,21 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 	c.ktlsActive = true
 	c.cipher = result.CipherSuite
 
-	// Native handle is now fully consumed; zero and clear local reference.
-	if c.handle != nil {
-		native.DeferredFree(c.handle)
-		c.handle = nil
-	}
-
 	out.Status = KTLSPromotionEnabled
 	out.State = c.ktlsState
 	return out, nil
 }
 
-// EnableKTLS preserves the legacy signature; on cooldown/unsupported it returns nil.
+// EnableKTLS preserves the legacy signature; on cooldown/unsupported it now returns an error.
 func (c *DeferredRustConn) EnableKTLS() error {
 	out, err := c.EnableKTLSOutcome()
 	if err != nil {
 		return err
 	}
-	if out.Status == KTLSPromotionEnabled {
-		return nil
+	if out.Status != KTLSPromotionEnabled {
+		return errors.New("tls: deferred kTLS promotion " + out.Status.String())
 	}
-	if out.Status == KTLSPromotionCooldown || out.Status == KTLSPromotionUnsupported {
-		return nil
-	}
-	return errors.New("tls: deferred kTLS promotion did not complete (" + out.Status.String() + ")")
+	return nil
 }
 
 func (c *DeferredRustConn) Close() error {
@@ -1406,6 +1482,14 @@ func (c *DeferredRustConn) KTLSEnabled() KTLSState {
 	return c.ktlsState
 }
 
+// HasDeferredHandle reports whether the native deferred session handle is still
+// available for rustls I/O (i.e., not consumed for kTLS or freed/detached).
+func (c *DeferredRustConn) HasDeferredHandle() bool {
+	c.deferredMu.RLock()
+	defer c.deferredMu.RUnlock()
+	return c.handle != nil && deferredHandleAliveFn(c.handle) && !c.ktlsActive && !c.detached.Load()
+}
+
 // KTLSKeyUpdateHandler returns the key update handler (nil before EnableKTLS).
 func (c *DeferredRustConn) KTLSKeyUpdateHandler() *KTLSKeyUpdateHandler {
 	c.deferredMu.RLock()
@@ -1413,8 +1497,9 @@ func (c *DeferredRustConn) KTLSKeyUpdateHandler() *KTLSKeyUpdateHandler {
 	return c.ktlsHandler
 }
 
-// IsDetached reports whether the deferred rustls session has been detached and
-// the caller should use NetConn() directly.
+// IsDetached reports whether the deferred rustls session has been detached.
+// Callers should prefer NetConn() directly, though DeferredRustConn will keep
+// serving any staged detached plaintext for correctness.
 func (c *DeferredRustConn) IsDetached() bool {
 	return c.detached.Load()
 }
@@ -1501,16 +1586,23 @@ var _ Interface = (*DeferredRustConn)(nil)
 // KTLSPlaintextConn — hides ConnectionState() from http.Server
 // ---------------------------------------------------------------------------
 
-// KTLSPlaintextConn wraps a kTLS-enabled connection, hiding ConnectionState()
-// so http.Server treats it as plaintext and uses h2c detection. On the wire,
-// kTLS still handles encryption transparently in the kernel.
+// KTLSPlaintextConn wraps a kTLS-enabled connection, withholding the
+// ConnectionState() method so http.Server treats it as plaintext and uses h2c
+// detection. On the wire, kTLS still handles encryption transparently in the
+// kernel.
 type KTLSPlaintextConn struct {
-	inner gonet.Conn
+	inner    gonet.Conn
+	tlsState tls.ConnectionState
 }
 
 // NewKTLSPlaintextConn wraps a kTLS-enabled connection for server-side h2c use.
+// It preserves the TLS ConnectionState for HTTP stacks that need it.
 func NewKTLSPlaintextConn(conn gonet.Conn) *KTLSPlaintextConn {
-	return &KTLSPlaintextConn{inner: conn}
+	kc := &KTLSPlaintextConn{inner: conn}
+	if st, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		kc.tlsState = st.ConnectionState()
+	}
+	return kc
 }
 
 func (c *KTLSPlaintextConn) Read(b []byte) (int, error)  { return c.inner.Read(b) }
@@ -1528,7 +1620,13 @@ func (c *KTLSPlaintextConn) SetWriteDeadline(t time.Time) error {
 	return c.inner.SetWriteDeadline(t)
 }
 
-// Verify KTLSPlaintextConn implements net.Conn but NOT connectionStater.
+// TLSState exposes the captured TLS state without satisfying net/http's TLS
+// detection interface.
+func (c *KTLSPlaintextConn) TLSState() tls.ConnectionState {
+	return c.tlsState
+}
+
+// Verify KTLSPlaintextConn implements net.Conn.
 var _ gonet.Conn = (*KTLSPlaintextConn)(nil)
 
 // configToNative translates an Xray TLS Config to a native Rust TLS config handle.

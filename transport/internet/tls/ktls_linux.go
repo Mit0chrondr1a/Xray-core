@@ -36,6 +36,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -415,65 +416,96 @@ func TryEnableKTLS(conn *Conn) KTLSState {
 }
 
 var (
-	ktlsSupportOnce sync.Once
-	ktlsSupportOK   bool
-	fullKTLSOnce    sync.Once
-	fullKTLSOK      bool
-	ktlsProbeCache  sync.Map
+	ktlsSupportOnce         sync.Once
+	ktlsSupportOK           atomic.Bool
+	fullKTLSOnce            sync.Once
+	fullKTLSOK              atomic.Bool
+	ktlsProbeCache          sync.Map
+	ktlsProbeRefreshes      atomic.Uint64
+	ktlsProbeRefreshSuccess atomic.Uint64
+	ktlsProbeMu             sync.Mutex
 )
 
 func kernelKTLSSupportedCached() bool {
+	ktlsProbeMu.Lock()
+	defer ktlsProbeMu.Unlock()
+	return kernelKTLSSupportedCachedLocked()
+}
+
+// kernelKTLSSupportedCachedLocked requires ktlsProbeMu.
+func kernelKTLSSupportedCachedLocked() bool {
+	if ktlsSupportOK.Load() {
+		return true
+	}
 	ktlsSupportOnce.Do(func() {
-		ktlsSupportOK = KTLSSupported()
+		ktlsSupportOK.Store(KTLSSupported())
 	})
-	return ktlsSupportOK
+	return ktlsSupportOK.Load()
 }
 
 // NativeFullKTLSSupported reports whether this host supports full bidirectional
 // kTLS for the TLS 1.3 cipher suites used by native REALITY/TLS paths.
 // Suite probes run concurrently to reduce startup latency on throttled VPSes.
 func NativeFullKTLSSupported() bool {
+	ktlsProbeMu.Lock()
+	defer ktlsProbeMu.Unlock()
+	if fullKTLSOK.Load() {
+		return true
+	}
 	fullKTLSOnce.Do(func() {
-		if !kernelKTLSSupportedCached() {
-			xerrors.LogDebug(context.Background(), "kTLS full probe: kernel kTLS unavailable")
-			return
-		}
-		suites := []uint16{
-			tls.TLS_AES_128_GCM_SHA256,
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-		}
-		type probeResult struct {
-			suite uint16
-			ok    bool
-		}
-		ch := make(chan probeResult, len(suites))
-		for _, suite := range suites {
-			go func(s uint16) {
-				ch <- probeResult{suite: s, ok: probeFullKTLSForSuiteCached(TLS_1_3_VERSION, s)}
-			}(suite)
-		}
-		allOK := true
-		for range suites {
-			r := <-ch
-			if !r.ok {
-				xerrors.LogDebug(context.Background(), "kTLS full probe failed for TLS1.3 suite ", tls.CipherSuiteName(r.suite), " (", r.suite, ")")
-				allOK = false
-			}
-		}
-		if allOK {
-			fullKTLSOK = true
-			xerrors.LogDebug(context.Background(), "kTLS full probe passed for required TLS1.3 suites")
-		}
+		fullKTLSOK.Store(probeFullKTLSAllSuitesLocked())
 	})
-	return fullKTLSOK
+	return fullKTLSOK.Load()
+}
+
+// probeFullKTLSAllSuites runs the suite probes and returns true only if all required suites pass.
+func probeFullKTLSAllSuites() bool {
+	ktlsProbeMu.Lock()
+	defer ktlsProbeMu.Unlock()
+	return probeFullKTLSAllSuitesLocked()
+}
+
+// probeFullKTLSAllSuitesLocked requires ktlsProbeMu.
+func probeFullKTLSAllSuitesLocked() bool {
+	if !kernelKTLSSupportedCachedLocked() {
+		xerrors.LogDebug(context.Background(), "kTLS full probe: kernel kTLS unavailable")
+		return false
+	}
+	suites := []uint16{
+		tls.TLS_AES_128_GCM_SHA256,
+		tls.TLS_AES_256_GCM_SHA384,
+		tls.TLS_CHACHA20_POLY1305_SHA256,
+	}
+	type probeResult struct {
+		suite uint16
+		ok    bool
+	}
+	ch := make(chan probeResult, len(suites))
+	for _, suite := range suites {
+		go func(s uint16) {
+			ch <- probeResult{suite: s, ok: probeFullKTLSForSuiteCached(TLS_1_3_VERSION, s)}
+		}(suite)
+	}
+	allOK := true
+	for range suites {
+		r := <-ch
+		if !r.ok {
+			xerrors.LogDebug(context.Background(), "kTLS full probe failed for TLS1.3 suite ", tls.CipherSuiteName(r.suite), " (", r.suite, ")")
+			allOK = false
+		}
+	}
+	if allOK {
+		xerrors.LogDebug(context.Background(), "kTLS full probe passed for required TLS1.3 suites")
+	}
+	return allOK
 }
 
 // NativeFullKTLSSupportedForTLSConfig reports whether native Rust TLS can be
 // safely used for this server TLS config without risking handshake-time hard
 // failures due to missing full bidirectional kTLS support.
 func NativeFullKTLSSupportedForTLSConfig(config *Config) bool {
-	if !kernelKTLSSupportedCached() {
+	// Re-probe if previous full probe failed to allow module autoloads to recover.
+	if !kernelKTLSSupportedCached() && !forceRefreshKTLSSupport() {
 		return false
 	}
 	tls12Enabled, tls13Enabled := nativeTLSConfigVersions(config)
@@ -500,12 +532,45 @@ func NativeFullKTLSSupportedForTLSConfig(config *Config) bool {
 			tls.TLS_AES_256_GCM_SHA384,
 			tls.TLS_CHACHA20_POLY1305_SHA256,
 		} {
-			if !probeFullKTLSForSuiteCached(TLS_1_3_VERSION, suite) {
+			if !probeFullKTLSForSuiteCached(TLS_1_3_VERSION, suite) && !forceRefreshFullKTLSProbe() {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+// forceRefreshKTLSSupport clears cached kTLS kernel support and reprobes once.
+func forceRefreshKTLSSupport() bool {
+	ktlsProbeMu.Lock()
+	defer ktlsProbeMu.Unlock()
+	ktlsSupportOnce = sync.Once{}
+	ktlsSupportOK.Store(false)
+	ktlsProbeRefreshes.Add(1)
+	ok := KTLSSupported()
+	ktlsSupportOK.Store(ok)
+	if ok {
+		ktlsProbeRefreshSuccess.Add(1)
+	}
+	return ok
+}
+
+// forceRefreshFullKTLSProbe clears cached full-suite probe and reruns it.
+func forceRefreshFullKTLSProbe() bool {
+	ktlsProbeMu.Lock()
+	defer ktlsProbeMu.Unlock()
+	fullKTLSOnce = sync.Once{}
+	fullKTLSOK.Store(probeFullKTLSAllSuitesLocked())
+	ktlsProbeRefreshes.Add(1)
+	if fullKTLSOK.Load() {
+		ktlsProbeRefreshSuccess.Add(1)
+	}
+	return fullKTLSOK.Load()
+}
+
+// KTLSProbeRefreshEpoch reports the number of forced kTLS capability refreshes.
+func KTLSProbeRefreshEpoch() uint64 {
+	return ktlsProbeRefreshes.Load()
 }
 
 type ktlsProbeResult struct {

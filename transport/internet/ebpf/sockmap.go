@@ -27,18 +27,19 @@ type SockmapManager struct {
 	pairs           sync.Map // SockPairKey → *SockPair
 
 	// Capacity monitoring
-	activePairs   atomic.Int64
-	totalPairs    atomic.Int64 // lifetime total
-	fullRejects   atomic.Int64 // registration failures due to capacity
-	peakPairs     atomic.Int64 // high-water mark
-	staleCleanups atomic.Int64 // entries removed by sweeper
-	lastWarningNs atomic.Int64 // rate-limit warnings to 1/min
+	activePairs         atomic.Int64
+	totalPairs          atomic.Int64  // lifetime total
+	fullRejects         atomic.Int64  // registration failures due to capacity
+	peakPairs           atomic.Int64  // high-water mark
+	staleCleanups       atomic.Int64  // entries removed by sweeper
+	lastWarningNs       atomic.Int64  // rate-limit warnings to 1/min
+	effectiveMaxEntries atomic.Uint32 // actual runtime capacity (may differ under native loader)
 
 	// Contention detection
-	regFailures       atomic.Int64 // RegisterPair failures (lifetime, any cause)
+	regFailures       atomic.Int64 // generic sockmap registration failures that indicate contention
 	regWindowStartNs  atomic.Int64 // start time of registration failure window
-	regWindowTotal    atomic.Int64 // registrations attempted in current window
-	regWindowFailures atomic.Int64 // failed registrations in current window
+	regWindowTotal    atomic.Int64 // generic sockmap registrations attempted in current window
+	regWindowFailures atomic.Int64 // generic sockmap registration failures in current window
 	sweepStaleRatio   atomic.Int64 // last sweep: stale-found * 1000 / total-checked (permille)
 	spliceFallbacks   atomic.Int64 // times sockmap was skipped due to contention
 
@@ -66,9 +67,9 @@ type SockmapStats struct {
 	SpliceFallbacks     int64
 	KTLSSpliceFallbacks int64
 	Enabled             bool
-	MaxEntries          uint32
-	NativeLoader        bool // true when Rust/Aya eBPF loader is active
-	SkMsgCapability     int  // 0=full, 1=cork-only, 2=none
+	MaxEntries          uint32 // effective runtime capacity
+	NativeLoader        bool   // true when Rust/Aya eBPF loader is active
+	SkMsgCapability     int    // 0=full, 1=cork-only, 2=none
 }
 
 // SockPairKey identifies a socket pair for proxying.
@@ -149,17 +150,19 @@ const (
 func NewSockmapManager(config SockmapConfig) *SockmapManager {
 	// Clamp MaxEntries to sane bounds.
 	if config.MaxEntries == 0 {
-		config.MaxEntries = 65536
+		config.MaxEntries = DefaultSockmapConfig().MaxEntries
 	}
 	const maxSockmapEntries = 1 << 20 // 1M entries
 	if config.MaxEntries > maxSockmapEntries {
 		config.MaxEntries = maxSockmapEntries
 	}
-	return &SockmapManager{
+	m := &SockmapManager{
 		config:   config,
 		lruList:  list.New(),
 		lruIndex: make(map[SockPairKey]*list.Element),
 	}
+	m.effectiveMaxEntries.Store(config.MaxEntries)
+	return m
 }
 
 // Enable activates sockmap-based proxying.
@@ -201,6 +204,12 @@ func (m *SockmapManager) Enable() error {
 	m.regWindowTotal.Store(0)
 	m.regWindowFailures.Store(0)
 	m.sweepStaleRatio.Store(0)
+	m.setEffectiveMaxEntries(m.config.MaxEntries)
+	if m.useNativeLoader {
+		if maxEntries := native.EbpfMaxEntries(); maxEntries != 0 {
+			m.setEffectiveMaxEntries(maxEntries)
+		}
+	}
 
 	m.enabled.Store(true)
 
@@ -239,6 +248,7 @@ func (m *SockmapManager) Disable() error {
 
 	m.useNativeLoader = false
 	m.enabled.Store(false)
+	m.setEffectiveMaxEntries(m.config.MaxEntries)
 	return nil
 }
 
@@ -291,15 +301,17 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 	}
 	if policy&PolicyKTLSActive != 0 {
 		// Ensure probe is fresh for kTLS flows.
-		_ = refreshKTLSSockhashCompat(false, "register-ktls")
+		if !refreshKTLSSockhashCompat(false, "register-ktls") {
+			m.IncrementKTLSSpliceFallback()
+			return xerrors.New("sockmap: kTLS+sockhash not compatible on this kernel")
+		}
 	}
 
 	if m.useNativeLoader {
 		// Rust/Aya path: register_pair_impl handles policy map writes internally,
 		// so skip Go-side setPolicyEntry() calls.
 		if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie, policy); err != nil {
-			m.regFailures.Add(1)
-			m.recordRegistrationAttempt(true)
+			m.recordSockmapRegistrationFailure()
 			if isSockmapFull(err) {
 				m.fullRejects.Add(1)
 			}
@@ -320,8 +332,7 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 		}
 
 		if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie, 0); err != nil {
-			m.regFailures.Add(1)
-			m.recordRegistrationAttempt(true)
+			m.recordSockmapRegistrationFailure()
 			_ = deletePolicyEntry(inboundCookie)  // best-effort cleanup
 			_ = deletePolicyEntry(outboundCookie) // best-effort cleanup
 			if isSockmapFull(err) {
@@ -509,7 +520,7 @@ func (m *SockmapManager) GetSockmapStats() SockmapStats {
 		SpliceFallbacks:     m.spliceFallbacks.Load(),
 		KTLSSpliceFallbacks: m.ktlsSpliceFallbacks.Load(),
 		Enabled:             m.enabled.Load(),
-		MaxEntries:          m.config.MaxEntries,
+		MaxEntries:          m.runtimeMaxEntries(),
 		NativeLoader:        m.useNativeLoader,
 		SkMsgCapability:     int(native.EbpfSkMsgCapability()),
 	}
@@ -701,6 +712,20 @@ func (m *SockmapManager) updatePeakPairs(current int64) {
 	}
 }
 
+func (m *SockmapManager) setEffectiveMaxEntries(maxEntries uint32) {
+	if maxEntries == 0 {
+		maxEntries = m.config.MaxEntries
+	}
+	m.effectiveMaxEntries.Store(maxEntries)
+}
+
+func (m *SockmapManager) runtimeMaxEntries() uint32 {
+	if maxEntries := m.effectiveMaxEntries.Load(); maxEntries != 0 {
+		return maxEntries
+	}
+	return m.config.MaxEntries
+}
+
 // rotateRegFailureWindow resets registration counters when the current
 // observation window expires.
 func (m *SockmapManager) rotateRegFailureWindow(nowNs int64) {
@@ -732,9 +757,14 @@ func (m *SockmapManager) recordRegistrationAttempt(failed bool) {
 	}
 }
 
+func (m *SockmapManager) recordSockmapRegistrationFailure() {
+	m.regFailures.Add(1)
+	m.recordRegistrationAttempt(true)
+}
+
 // checkUtilization logs warnings when approaching sockmap capacity.
 func (m *SockmapManager) checkUtilization(active int64) {
-	maxEntries := int64(m.config.MaxEntries)
+	maxEntries := int64(m.runtimeMaxEntries())
 	if maxEntries == 0 {
 		return
 	}
@@ -887,7 +917,7 @@ func (m *SockmapManager) doSweep() (int, int) {
 	}
 
 	// Proactive LRU eviction at high utilization.
-	maxEntries := int64(m.config.MaxEntries)
+	maxEntries := int64(m.runtimeMaxEntries())
 	if maxEntries > 0 {
 		active := m.activePairs.Load()
 		utilization := float64(active*2) / float64(maxEntries)

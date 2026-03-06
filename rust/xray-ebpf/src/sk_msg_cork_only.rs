@@ -8,9 +8,7 @@
 //! Receive-path redirect via SK_SKB is unaffected — data flows normally.
 
 use aya_ebpf::{
-    bindings::sk_action::SK_PASS,
-    helpers::bpf_msg_cork_bytes,
-    macros::sk_msg,
+    bindings::sk_action::SK_PASS, helpers::bpf_msg_cork_bytes, macros::sk_msg,
     programs::SkMsgContext,
 };
 

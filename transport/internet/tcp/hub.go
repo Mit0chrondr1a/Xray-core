@@ -37,14 +37,13 @@ type Listener struct {
 	realityXrayConfig *reality.Config
 	authConfig        internet.ConnectionAuthenticator
 	config            *Config
+	inboundTag        string
 	addConn           internet.ConnHandler
 	connSemaphore     chan struct{}
 }
 
 const tlsHandshakeTimeout = 8 * time.Second
 const tcpRealityMarkerLogInterval = 30 * time.Second
-const rustPeekBypassWindow = 3 * time.Minute
-const rustPeekBypassLoopbackWindow = 5 * time.Second
 
 var (
 	realityBlacklist     *ebpf.BlacklistManager
@@ -52,21 +51,18 @@ var (
 
 	tcpRealityMarkerLastLogUnix atomic.Int64
 
-	tcpRealityMarkerRustAttempt                        atomic.Uint64
-	tcpRealityMarkerRustSuccess                        atomic.Uint64
-	tcpRealityMarkerRustPathIneligible                 atomic.Uint64
-	tcpRealityMarkerRustFDExtractFailed                atomic.Uint64
-	tcpRealityMarkerRustAuthFallback                   atomic.Uint64
-	tcpRealityMarkerRustPeekTimeoutFallback            atomic.Uint64
-	tcpRealityMarkerRustPeekBypassActive               atomic.Uint64
-	tcpRealityMarkerRustPeekBypassSet                  atomic.Uint64
-	tcpRealityMarkerRustPeekBypassLoopback             atomic.Uint64
-	tcpRealityMarkerRustPeekBypassLoopbackScopedSet    atomic.Uint64
-	tcpRealityMarkerRustPeekBypassLoopbackScopedActive atomic.Uint64
-	tcpRealityMarkerRustWrapFailed                     atomic.Uint64
-	tcpRealityMarkerRustHandshakeFailed                atomic.Uint64
-	tcpRealityMarkerRustDurationNanosTotal             atomic.Uint64
-	tcpRealityMarkerRustDurationSamples                atomic.Uint64
+	tcpRealityMarkerRustAttempt             atomic.Uint64
+	tcpRealityMarkerRustSuccess             atomic.Uint64
+	tcpRealityMarkerRustPathIneligible      atomic.Uint64
+	tcpRealityMarkerNativeSkipPolicy        atomic.Uint64
+	tcpRealityMarkerNativeSkipBreaker       atomic.Uint64
+	tcpRealityMarkerRustFDExtractFailed     atomic.Uint64
+	tcpRealityMarkerRustAuthFallback        atomic.Uint64
+	tcpRealityMarkerRustPeekTimeoutFallback atomic.Uint64
+	tcpRealityMarkerRustWrapFailed          atomic.Uint64
+	tcpRealityMarkerRustHandshakeFailed     atomic.Uint64
+	tcpRealityMarkerRustDurationNanosTotal  atomic.Uint64
+	tcpRealityMarkerRustDurationSamples     atomic.Uint64
 
 	tcpRealityMarkerGoFallbackAttempt    atomic.Uint64
 	tcpRealityMarkerGoFallbackSuccess    atomic.Uint64
@@ -74,26 +70,23 @@ var (
 	tcpRealityMarkerGoFallbackNanosTotal atomic.Uint64
 	tcpRealityMarkerGoFallbackSamples    atomic.Uint64
 
-	tcpRealityMarkerLastRustAttempt                        atomic.Uint64
-	tcpRealityMarkerLastRustSuccess                        atomic.Uint64
-	tcpRealityMarkerLastRustPathIneligible                 atomic.Uint64
-	tcpRealityMarkerLastRustFDExtractFailed                atomic.Uint64
-	tcpRealityMarkerLastRustAuthFallback                   atomic.Uint64
-	tcpRealityMarkerLastRustPeekTimeoutFallback            atomic.Uint64
-	tcpRealityMarkerLastRustPeekBypassActive               atomic.Uint64
-	tcpRealityMarkerLastRustPeekBypassSet                  atomic.Uint64
-	tcpRealityMarkerLastRustPeekBypassLoopback             atomic.Uint64
-	tcpRealityMarkerLastRustPeekBypassLoopbackScopedSet    atomic.Uint64
-	tcpRealityMarkerLastRustPeekBypassLoopbackScopedActive atomic.Uint64
-	tcpRealityMarkerLastRustWrapFailed                     atomic.Uint64
-	tcpRealityMarkerLastRustHandshakeFailed                atomic.Uint64
-	tcpRealityMarkerLastRustDurationNanosTotal             atomic.Uint64
-	tcpRealityMarkerLastRustDurationSamples                atomic.Uint64
-	tcpRealityMarkerLastGoFallbackAttempt                  atomic.Uint64
-	tcpRealityMarkerLastGoFallbackSuccess                  atomic.Uint64
-	tcpRealityMarkerLastGoFallbackFailed                   atomic.Uint64
-	tcpRealityMarkerLastGoFallbackNanosTotal               atomic.Uint64
-	tcpRealityMarkerLastGoFallbackSamples                  atomic.Uint64
+	tcpRealityMarkerLastRustAttempt             atomic.Uint64
+	tcpRealityMarkerLastRustSuccess             atomic.Uint64
+	tcpRealityMarkerLastRustPathIneligible      atomic.Uint64
+	tcpRealityMarkerLastNativeSkipPolicy        atomic.Uint64
+	tcpRealityMarkerLastNativeSkipBreaker       atomic.Uint64
+	tcpRealityMarkerLastRustFDExtractFailed     atomic.Uint64
+	tcpRealityMarkerLastRustAuthFallback        atomic.Uint64
+	tcpRealityMarkerLastRustPeekTimeoutFallback atomic.Uint64
+	tcpRealityMarkerLastRustWrapFailed          atomic.Uint64
+	tcpRealityMarkerLastRustHandshakeFailed     atomic.Uint64
+	tcpRealityMarkerLastRustDurationNanosTotal  atomic.Uint64
+	tcpRealityMarkerLastRustDurationSamples     atomic.Uint64
+	tcpRealityMarkerLastGoFallbackAttempt       atomic.Uint64
+	tcpRealityMarkerLastGoFallbackSuccess       atomic.Uint64
+	tcpRealityMarkerLastGoFallbackFailed        atomic.Uint64
+	tcpRealityMarkerLastGoFallbackNanosTotal    atomic.Uint64
+	tcpRealityMarkerLastGoFallbackSamples       atomic.Uint64
 
 	getRealityBlacklistFn   = getRealityBlacklist
 	realityServerFn         = reality.Server
@@ -109,121 +102,27 @@ var (
 	// real Dest's ServerHello. Only authenticated clients (our own
 	// Xray clients) see the Rust ServerHello.
 	// See docs/ktls-vision-incompatibility.md.
-	useNativeRealityServerFn = func(v *Listener) bool {
-		return nativeRealityServerEligible(v, native.Available(), tls.NativeFullKTLSSupported(), tls.DeferredKTLSPromotionDisabledFor("vision"))
-	}
-
-	rustPeekBypassByRemote sync.Map // key: remote scope key (IP for non-loopback, endpoint for loopback), value: int64(unix nano until)
+	useNativeRealityServerFn = nativeRealityServerEligible
 )
 
-func isLoopbackAddr(addr net.Addr) bool {
-	ip := extractIP(addr)
-	return ip != nil && ip.IsLoopback()
+func nativeRealityServerEligible(v *Listener) bool {
+	ok, _ := nativePathEligibility(v)
+	return ok
 }
 
-func rustPeekBypassKey(addr net.Addr) string {
-	ip := extractIP(addr)
-	if ip == nil {
-		return ""
-	}
-	if ip.IsLoopback() {
-		// Keep loopback bypass flow-scoped so one localhost timeout does not
-		// suppress Rust deferred handshakes for unrelated localhost flows.
-		return addr.String()
-	}
-	return ip.String()
+func nativeRealityServerEligibleInternal(v *Listener, nativeAvailable, fullKTLS bool) bool {
+	ok, _ := nativePathEligibilityWith(v, nativeAvailable, fullKTLS)
+	return ok
 }
 
-func shouldBypassRustDeferredForRemote(addr net.Addr, nowUnix int64) bool {
-	key := rustPeekBypassKey(addr)
-	if key == "" {
-		return false
+func finalizeTerminalDecision(decision nativeAttemptDecision, terminalDecision string) string {
+	if terminalDecision != "" {
+		return terminalDecision
 	}
-	untilAny, ok := rustPeekBypassByRemote.Load(key)
-	if !ok {
-		return false
+	if decision.TelemetryEnforce {
+		return "native_failstop"
 	}
-	untilUnix, ok := untilAny.(int64)
-	if !ok {
-		rustPeekBypassByRemote.Delete(key)
-		return false
-	}
-	if untilUnix <= nowUnix {
-		rustPeekBypassByRemote.Delete(key)
-		return false
-	}
-	return true
-}
-
-func bypassWindowForRemote(addr net.Addr) time.Duration {
-	if isLoopbackAddr(addr) {
-		return rustPeekBypassLoopbackWindow
-	}
-	return rustPeekBypassWindow
-}
-
-func setRustPeekBypassForRemote(addr net.Addr, nowUnix int64) (time.Duration, bool) {
-	key := rustPeekBypassKey(addr)
-	if key == "" {
-		return 0, false
-	}
-	window := bypassWindowForRemote(addr)
-	rustPeekBypassByRemote.Store(key, nowUnix+int64(window))
-	return window, true
-}
-
-func pruneAndCountRustPeekBypass(nowUnix int64) int {
-	tracked := 0
-	rustPeekBypassByRemote.Range(func(key, value any) bool {
-		untilUnix, ok := value.(int64)
-		if !ok || untilUnix <= nowUnix {
-			rustPeekBypassByRemote.Delete(key)
-			return true
-		}
-		tracked++
-		return true
-	})
-	return tracked
-}
-
-func nativeRealityServerEligible(v *Listener, nativeAvailable, fullKTLS, deferredPromotionDisabled bool) bool {
-	if !nativeAvailable || !fullKTLS || deferredPromotionDisabled || v == nil || v.realityXrayConfig == nil {
-		return false
-	}
-	if v.config != nil && v.config.AcceptProxyProtocol {
-		return false
-	}
-	// Go REALITY derives ML-DSA signing key from mldsa65_seed. Keep Go path
-	// until native deferred server config wires equivalent signing material.
-	if len(v.realityXrayConfig.Mldsa65Seed) > 0 {
-		return false
-	}
-	return true
-}
-
-// loopbackDetachGuardPort is the REALITY ingress port behind the local SNI
-// shunter. Loopback traffic on this port (e.g., nginx -> xray) should avoid
-// the Rust deferred path to keep DNS/short control flows from incurring
-// rustls/peek latency; Go REALITY is deterministic here and already known to
-// work in the baseline branch.
-const loopbackDetachGuardPort = "2036"
-
-func isLoopbackDetachGuardConn(conn net.Conn) bool {
-	if conn == nil {
-		return false
-	}
-	la, ra := conn.LocalAddr(), conn.RemoteAddr()
-	if la == nil || ra == nil {
-		return false
-	}
-	lip := extractIP(la)
-	rip := extractIP(ra)
-	if lip == nil || rip == nil || !(lip.IsLoopback() || rip.IsLoopback()) {
-		return false
-	}
-	_, lport, _ := net.SplitHostPort(la.String())
-	_, rport, _ := net.SplitHostPort(ra.String())
-	return lport == loopbackDetachGuardPort || rport == loopbackDetachGuardPort
+	return "native_failed_with_fallback"
 }
 
 func tcpMarkerSnapshot(total *atomic.Uint64, last *atomic.Uint64) (current uint64, delta uint64) {
@@ -242,19 +141,14 @@ func maybeLogTCPRealityHandoverMarkers(ctx context.Context) {
 		return
 	}
 
-	rustPeekBypassTracked := pruneAndCountRustPeekBypass(now)
-
 	rustAttempt, rustAttemptDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustAttempt, &tcpRealityMarkerLastRustAttempt)
 	rustSuccess, rustSuccessDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustSuccess, &tcpRealityMarkerLastRustSuccess)
 	rustPathIneligible, rustPathIneligibleDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustPathIneligible, &tcpRealityMarkerLastRustPathIneligible)
+	nativeSkipPolicy, nativeSkipPolicyDelta := tcpMarkerSnapshot(&tcpRealityMarkerNativeSkipPolicy, &tcpRealityMarkerLastNativeSkipPolicy)
+	nativeSkipBreaker, nativeSkipBreakerDelta := tcpMarkerSnapshot(&tcpRealityMarkerNativeSkipBreaker, &tcpRealityMarkerLastNativeSkipBreaker)
 	rustFDExtractFailed, rustFDExtractFailedDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustFDExtractFailed, &tcpRealityMarkerLastRustFDExtractFailed)
 	rustAuthFallback, rustAuthFallbackDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustAuthFallback, &tcpRealityMarkerLastRustAuthFallback)
 	rustPeekFallback, rustPeekFallbackDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustPeekTimeoutFallback, &tcpRealityMarkerLastRustPeekTimeoutFallback)
-	rustPeekBypassActive, rustPeekBypassActiveDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustPeekBypassActive, &tcpRealityMarkerLastRustPeekBypassActive)
-	rustPeekBypassSet, rustPeekBypassSetDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustPeekBypassSet, &tcpRealityMarkerLastRustPeekBypassSet)
-	rustPeekBypassLoopback, rustPeekBypassLoopbackDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustPeekBypassLoopback, &tcpRealityMarkerLastRustPeekBypassLoopback)
-	rustPeekBypassLoopbackScopedSet, rustPeekBypassLoopbackScopedSetDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustPeekBypassLoopbackScopedSet, &tcpRealityMarkerLastRustPeekBypassLoopbackScopedSet)
-	rustPeekBypassLoopbackScopedActive, rustPeekBypassLoopbackScopedActiveDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustPeekBypassLoopbackScopedActive, &tcpRealityMarkerLastRustPeekBypassLoopbackScopedActive)
 	rustWrapFailed, rustWrapFailedDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustWrapFailed, &tcpRealityMarkerLastRustWrapFailed)
 	rustHandshakeFailed, rustHandshakeFailedDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustHandshakeFailed, &tcpRealityMarkerLastRustHandshakeFailed)
 	rustNanos, rustNanosDelta := tcpMarkerSnapshot(&tcpRealityMarkerRustDurationNanosTotal, &tcpRealityMarkerLastRustDurationNanosTotal)
@@ -287,15 +181,11 @@ func maybeLogTCPRealityHandoverMarkers(ctx context.Context) {
 		"rust_attempt=", rustAttempt, "(+", rustAttemptDelta, ") ",
 		"rust_success=", rustSuccess, "(+", rustSuccessDelta, ") ",
 		"rust_path_ineligible=", rustPathIneligible, "(+", rustPathIneligibleDelta, ") ",
+		"native_skip_policy=", nativeSkipPolicy, "(+", nativeSkipPolicyDelta, ") ",
+		"native_skip_breaker=", nativeSkipBreaker, "(+", nativeSkipBreakerDelta, ") ",
 		"rust_fd_extract_failed=", rustFDExtractFailed, "(+", rustFDExtractFailedDelta, ") ",
 		"rust_auth_fallback=", rustAuthFallback, "(+", rustAuthFallbackDelta, ") ",
 		"rust_peek_timeout_fallback=", rustPeekFallback, "(+", rustPeekFallbackDelta, ") ",
-		"rust_peek_bypass_active=", rustPeekBypassActive, "(+", rustPeekBypassActiveDelta, ") ",
-		"rust_peek_bypass_set=", rustPeekBypassSet, "(+", rustPeekBypassSetDelta, ") ",
-		"rust_peek_bypass_loopback=", rustPeekBypassLoopback, "(+", rustPeekBypassLoopbackDelta, ") ",
-		"rust_peek_bypass_loopback_scoped_set=", rustPeekBypassLoopbackScopedSet, "(+", rustPeekBypassLoopbackScopedSetDelta, ") ",
-		"rust_peek_bypass_loopback_scoped_active=", rustPeekBypassLoopbackScopedActive, "(+", rustPeekBypassLoopbackScopedActiveDelta, ") ",
-		"rust_peek_bypass_tracked=", rustPeekBypassTracked, " ",
 		"rust_wrap_failed=", rustWrapFailed, "(+", rustWrapFailedDelta, ") ",
 		"rust_handshake_failed=", rustHandshakeFailed, "(+", rustHandshakeFailedDelta, ") ",
 		"rust_duration_ns=", rustNanos, "(+", rustNanosDelta, ") ",
@@ -389,6 +279,7 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 		l.realityXrayConfig = config
 		go goreality.DetectPostHandshakeRecordsLens(l.realityConfig)
 	}
+	l.inboundTag = streamSettings.InboundTag
 
 	if tcpSettings.HeaderSettings != nil {
 		headerConfig, err := tcpSettings.HeaderSettings.GetInstance()
@@ -483,47 +374,75 @@ func (v *Listener) keepAccepting() {
 			} else if v.realityConfig != nil {
 				rustDone := false
 				defer maybeLogTCPRealityHandoverMarkers(context.Background())
-				nowUnix := time.Now().UnixNano()
-				nativePathEligible := useNativeRealityServerFn(v)
-				if nativePathEligible && isLoopbackDetachGuardConn(conn) {
-					nativePathEligible = false
-					tcpRealityMarkerRustPathIneligible.Add(1)
-					tcpRealityMarkerRustPeekBypassLoopback.Add(1)
-					errors.LogDebug(context.Background(), "[kind=tcp-handover.loopback_guard] skip Rust REALITY for loopback ingress ", conn.LocalAddr(), " <- ", conn.RemoteAddr())
+				decision := shouldAttemptNativeRealityForAddr(v, conn.LocalAddr())
+				nativeAttempted := decision.Attempt
+				nativeSkipReason := decision.SkipReason
+				if nativeSkipReason == "" {
+					nativeSkipReason = "none"
 				}
-				if nativePathEligible && shouldBypassRustDeferredForRemote(conn.RemoteAddr(), nowUnix) {
-					tcpRealityMarkerRustPeekBypassActive.Add(1)
-					if isLoopbackAddr(conn.RemoteAddr()) {
-						tcpRealityMarkerRustPeekBypassLoopbackScopedActive.Add(1)
+				terminalDecision := ""
+				switch {
+				case decision.SkipByPolicy:
+					terminalDecision = "native_skipped_by_policy"
+				case decision.SkipByBreaker:
+					terminalDecision = "native_skipped_by_circuit_breaker"
+				}
+				defer func() {
+					terminalDecision = finalizeTerminalDecision(decision, terminalDecision)
+					logMsg := "[kind=tcp-handover.native_decision]"
+					if decision.TelemetryEnforce && terminalDecision == "native_failstop" {
+						errors.LogWarning(context.Background(), logMsg,
+							" native_policy_mode=", decision.PolicyMode,
+							" native_breaker_state=", decision.BreakerState,
+							" native_skip_reason=", nativeSkipReason,
+							" native_attempted=", nativeAttempted,
+							" native_terminal=", terminalDecision,
+							" local=", conn.LocalAddr(),
+							" remote=", conn.RemoteAddr(),
+						)
+					} else {
+						errors.LogInfo(context.Background(), logMsg,
+							" native_policy_mode=", decision.PolicyMode,
+							" native_breaker_state=", decision.BreakerState,
+							" native_skip_reason=", nativeSkipReason,
+							" native_attempted=", nativeAttempted,
+							" native_terminal=", terminalDecision,
+							" local=", conn.LocalAddr(),
+							" remote=", conn.RemoteAddr(),
+						)
 					}
-					nativePathEligible = false
-					errors.LogDebug(context.Background(), "[kind=tcp-handover.rust_peek_bypass] skip Rust deferred for ", conn.RemoteAddr())
-				}
-				if !nativePathEligible {
+				}()
+
+				if decision.SkipByPolicy {
 					tcpRealityMarkerRustPathIneligible.Add(1)
-					acceptProxyProtocol := v.config != nil && v.config.AcceptProxyProtocol
-					hasMldsa65Seed := v.realityXrayConfig != nil && len(v.realityXrayConfig.Mldsa65Seed) > 0
-					scope := "vision"
-					if la := conn.LocalAddr(); la != nil {
-						scope = scope + ":" + la.String()
+					tcpRealityMarkerNativeSkipPolicy.Add(1)
+					errors.LogDebug(context.Background(), "[kind=tcp-handover.native_skip_policy] skip Rust REALITY: reason=", decision.SkipReason)
+					if decision.ForceNative || decision.FailStop {
+						errors.LogWarning(context.Background(), "[kind=tcp-handover.native_failstop] native path ineligible; closing connection (force=", decision.ForceNative, " allowFallback=", decision.AllowFallback, ")")
+						_ = conn.Close()
+						terminalDecision = "native_failstop"
+						return
 					}
-					deferredPromotionDisabled := tls.DeferredKTLSPromotionDisabledFor(scope)
-					errors.LogDebug(context.Background(),
-						"[kind=tcp-handover.rust_path_ineligible] Rust REALITY server path disabled: nativeAvailable=", native.Available(),
-						" fullKTLS=", tls.NativeFullKTLSSupported(),
-						" hasRealityXrayConfig=", v.realityXrayConfig != nil,
-						" deferredPromotionDisabled=", deferredPromotionDisabled,
-						" acceptProxyProtocol=", acceptProxyProtocol,
-						" hasMldsa65Seed=", hasMldsa65Seed,
-					)
 				}
-				if nativePathEligible {
+				if decision.SkipByBreaker {
+					tcpRealityMarkerNativeSkipBreaker.Add(1)
+					errors.LogDebug(context.Background(), "[kind=tcp-handover.native_skip_breaker] skip Rust REALITY: state=", decision.BreakerState, " reason=", decision.SkipReason)
+					if decision.ForceNative || decision.FailStop {
+						errors.LogWarning(context.Background(), "[kind=tcp-handover.native_failstop] breaker open; closing connection (force=", decision.ForceNative, " allowFallback=", decision.AllowFallback, ")")
+						_ = conn.Close()
+						terminalDecision = "native_failstop"
+						return
+					}
+				}
+
+				if decision.Attempt {
 					tcpRealityMarkerRustAttempt.Add(1)
 					fd, fdErr := tls.ExtractFd(conn)
 					if fdErr == nil {
 						if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 							errors.LogWarningInner(context.Background(), err, "failed to set REALITY handshake deadline")
 							_ = conn.Close()
+							terminalDecision = "native_failstop"
 							return
 						}
 						rustStart := time.Now()
@@ -537,49 +456,93 @@ func (v *Listener) keepAccepting() {
 							deferredConn, wrapErr := tls.NewDeferredRustConn(conn, deferredResult)
 							if wrapErr != nil {
 								tcpRealityMarkerRustWrapFailed.Add(1)
+								if decision.Breaker != nil {
+									decision.Breaker.recordOutcome(time.Now(), nativeAttemptOutcomeInternalFail)
+								}
 								errors.LogWarningInner(context.Background(), wrapErr, "[kind=tcp-handover.rust_wrap_failed] Rust REALITY deferred handshake succeeded but wrap failed")
 								if deferredResult.Handle != nil {
 									native.DeferredFree(deferredResult.Handle)
 								}
 								_ = conn.Close()
+								terminalDecision = "native_failstop"
 								return
 							}
 							if la := conn.LocalAddr(); la != nil {
 								deferredConn.SetKTLSPromotionScope("vision:" + la.String())
 							}
 							tcpRealityMarkerRustSuccess.Add(1)
+							if decision.Breaker != nil {
+								decision.Breaker.recordOutcome(time.Now(), nativeAttemptOutcomeSuccess)
+							}
+							terminalDecision = "native_success"
 							conn = deferredConn
 							rustDone = true
 							errors.LogDebug(context.Background(), "Rust REALITY deferred path active: wrapped as *tls.DeferredRustConn (kTLS deferred)")
 						} else if stderrors.Is(deferredErr, native.ErrRealityAuthFailed) {
 							tcpRealityMarkerRustAuthFallback.Add(1)
+							if decision.Breaker != nil {
+								decision.Breaker.recordOutcome(time.Now(), nativeAttemptOutcomeAuthFailed)
+							}
 							recordRealityFailureOnce()
 							errors.LogInfo(context.Background(), "[kind=tcp-handover.rust_auth_fallback] Rust REALITY auth failed, falling back to camouflage")
 							errors.LogDebug(context.Background(), "REALITY auth detail: ", deferredErr)
+							if !decision.AllowFallback {
+								errors.LogWarning(context.Background(), "[kind=tcp-handover.native_failstop] auth fallback disabled by policy")
+								_ = conn.Close()
+								terminalDecision = "native_failstop"
+								return
+							}
+							terminalDecision = "native_failed_with_fallback"
 							// Fall through — MSG_PEEK left socket data unconsumed,
 							// Go reality.Server() will read it and handle spider crawl.
 						} else if isDeferredRealityPeekTimeout(deferredErr) {
 							tcpRealityMarkerRustPeekTimeoutFallback.Add(1)
-							tcpRealityMarkerRustPeekBypassSet.Add(1)
-							if bypassWindow, ok := setRustPeekBypassForRemote(conn.RemoteAddr(), time.Now().UnixNano()); ok && bypassWindow <= rustPeekBypassLoopbackWindow {
-								tcpRealityMarkerRustPeekBypassLoopback.Add(1)
-								tcpRealityMarkerRustPeekBypassLoopbackScopedSet.Add(1)
+							if decision.Breaker != nil {
+								decision.Breaker.recordOutcome(time.Now(), nativeAttemptOutcomePeekTimeout)
 							}
 							// Timeout happened before auth/handshake consumed bytes.
-							// Try Go REALITY path for better compatibility on slow paths.
-							errors.LogDebugInner(context.Background(), deferredErr, "[kind=tcp-handover.rust_peek_timeout] Rust REALITY deferred peek timed out, falling back to Go REALITY")
+							// Try Go REALITY path for better compatibility on slow paths
+							// unless policy explicitly disables fallback.
+							errors.LogDebugInner(context.Background(), deferredErr, "[kind=tcp-handover.rust_peek_timeout] Rust REALITY deferred peek timed out")
+							if !decision.AllowFallback {
+								errors.LogWarning(context.Background(), "[kind=tcp-handover.native_failstop] timeout fallback disabled by policy")
+								_ = conn.Close()
+								terminalDecision = "native_failstop"
+								return
+							}
+							terminalDecision = "native_failed_with_fallback"
 						} else {
 							tcpRealityMarkerRustHandshakeFailed.Add(1)
+							if decision.Breaker != nil {
+								decision.Breaker.recordOutcome(time.Now(), nativeAttemptOutcomeInternalFail)
+							}
 							errors.LogWarningInner(context.Background(), deferredErr, "[kind=tcp-handover.rust_deferred_failed] Rust REALITY deferred handshake failed")
 							_ = conn.Close()
+							terminalDecision = "native_failstop"
 							return
 						}
 					} else {
 						tcpRealityMarkerRustFDExtractFailed.Add(1)
+						if decision.Breaker != nil {
+							decision.Breaker.recordOutcome(time.Now(), nativeAttemptOutcomeInternalFail)
+						}
 						errors.LogDebugInner(context.Background(), fdErr, "[kind=tcp-handover.rust_fd_extract_failed] Rust REALITY server path skipped: failed to extract fd")
+						if !decision.AllowFallback {
+							errors.LogWarning(context.Background(), "[kind=tcp-handover.native_failstop] fd-extract fallback disabled by policy")
+							_ = conn.Close()
+							terminalDecision = "native_failstop"
+							return
+						}
+						terminalDecision = "native_failed_with_fallback"
 					}
 				}
 				if !rustDone {
+					if decision.ForceNative || decision.FailStop {
+						errors.LogWarning(context.Background(), "[kind=tcp-handover.native_failstop] fallback prohibited; closing connection (force=", decision.ForceNative, " allowFallback=", decision.AllowFallback, ")")
+						_ = conn.Close()
+						terminalDecision = "native_failstop"
+						return
+					}
 					tcpRealityMarkerGoFallbackAttempt.Add(1)
 					// Keep fallback behavior aligned with upstream Go REALITY
 					// listener: do not wrap reality.Server() with an external
@@ -593,9 +556,13 @@ func (v *Listener) keepAccepting() {
 						recordRealityFailureOnce()
 						errors.LogInfo(context.Background(), "[kind=tcp-handover.go_fallback_failed] ", serveErr.Error())
 						_ = conn.Close()
+						terminalDecision = "native_failstop"
 						return
 					}
 					tcpRealityMarkerGoFallbackSuccess.Add(1)
+					if nativeAttempted {
+						terminalDecision = "native_failed_with_fallback"
+					}
 					conn = realityConn
 				}
 			}

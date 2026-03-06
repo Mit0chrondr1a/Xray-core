@@ -233,8 +233,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	iConn := stat.TryUnwrapStatsConn(connection)
 	// VMess never uses Vision — always wants kTLS if available.
 	if dc, ok := iConn.(*tls.DeferredRustConn); ok {
-		if err := dc.EnableKTLS(); err != nil {
+		if outcome, err := dc.EnableKTLSOutcome(); err != nil {
 			return errors.New("deferred kTLS enable failed for VMess").Base(err).AtWarning()
+		} else if outcome.Status != tls.KTLSPromotionEnabled {
+			errors.LogWarning(ctx, "VMess: kTLS not enabled (", outcome.Status, "); continuing with rustls path")
 		}
 	}
 	_, isDrain := iConn.(*net.TCPConn)
@@ -281,7 +283,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "vmess"
-	inbound.SetCanSpliceCopy(3)
+	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 	inbound.User = request.User
 
 	sessionPolicy = h.policyManager.ForLevel(request.User.Level)

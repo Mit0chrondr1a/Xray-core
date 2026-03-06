@@ -55,6 +55,7 @@ errorgen
 
 # Logs
 *.log
+logs/
 
 # Coverage reports
 coverage.*

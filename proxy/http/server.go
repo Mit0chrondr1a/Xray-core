@@ -92,12 +92,12 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 func (s *Server) ProcessWithFirstbyte(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher, firstbyte ...byte) error {
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "http"
-	inbound.SetCanSpliceCopy(2)
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 	inbound.User = &protocol.MemoryUser{
 		Level: s.config.UserLevel,
 	}
 	if !proxy.IsRAWTransportWithoutSecurity(conn) {
-		inbound.SetCanSpliceCopy(3)
+		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonTransportUserspace)
 	}
 	var reader *bufio.Reader
 	if len(firstbyte) > 0 {
@@ -189,8 +189,8 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, buffer *buf
 		buffer = nil
 	}
 
-	if inbound.GetCanSpliceCopy() == 2 {
-		inbound.SetCanSpliceCopy(1)
+	if inbound.GetCanSpliceCopy() == session.CopyGatePendingDetach {
+		inbound.SetCanSpliceCopy(session.CopyGateEligible)
 	}
 	if err := dispatcher.DispatchLink(ctx, dest, &transport.Link{
 		Reader: reader,

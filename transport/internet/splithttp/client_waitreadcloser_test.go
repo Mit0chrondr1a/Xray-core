@@ -1,7 +1,9 @@
 package splithttp
 
 import (
+	stderrors "errors"
 	"io"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,5 +73,21 @@ func TestWaitReadCloserCloseClosesUnderlyingOnlyOnce(t *testing.T) {
 
 	if got := rc.closed.Load(); got != 1 {
 		t.Fatalf("underlying body closed %d times, want 1", got)
+	}
+}
+
+func TestWaitReadCloserReadHonorsDeadlineBeforeBodyArrives(t *testing.T) {
+	w := &WaitReadCloser{Wait: make(chan struct{})}
+	if err := w.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("unexpected SetReadDeadline error: %v", err)
+	}
+
+	start := time.Now()
+	_, err := w.Read(make([]byte, 1))
+	if !stderrors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("unexpected read error: %v", err)
+	}
+	if time.Since(start) < 15*time.Millisecond {
+		t.Fatal("Read returned before deadline elapsed")
 	}
 }

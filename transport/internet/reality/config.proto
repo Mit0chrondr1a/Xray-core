@@ -33,10 +33,34 @@ message Config {
   string master_key_log = 31;
 
   uint32 key_rotation_hours = 32;
+  NativePathPolicy native_path_policy = 33;
 }
 
 message LimitFallback {
   uint64 after_bytes = 1;
   uint64 bytes_per_sec = 2;
   uint64 burst_bytes_per_sec = 3;
+}
+
+enum NativePathMode {
+  AUTO = 0;
+  PREFER_NATIVE = 1;
+  FORCE_NATIVE = 2;
+  DISABLE_NATIVE = 3;
+}
+
+message NativePathBreaker {
+  bool enabled = 1;
+  uint32 peek_timeout_threshold = 2;
+  uint32 internal_error_threshold = 3;
+  uint32 window_seconds = 4;
+  uint32 cooldown_seconds = 5;
+  uint32 half_open_probe_interval_seconds = 6;
+}
+
+message NativePathPolicy {
+  NativePathMode mode = 1;
+  bool allow_fallback = 2;
+  bool telemetry_enforce = 3;
+  NativePathBreaker breaker = 4;
 }

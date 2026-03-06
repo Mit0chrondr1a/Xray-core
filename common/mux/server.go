@@ -101,7 +101,7 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 		timer:          time.NewTicker(60 * time.Second),
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
-		inbound.SetCanSpliceCopy(3)
+		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 	}
 	go worker.run(ctx)
 	go worker.monitor()
@@ -165,6 +165,20 @@ func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.Bu
 
 func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata, reader *buf.BufferedReader) error {
 	ctx = session.SubContextFromMuxInbound(ctx)
+	dnsFlowClass := meta.DNSFlowClass
+	if dnsFlowClass == session.DNSFlowClassUnset {
+		dnsFlowClass = session.ClassifyDNSFlow(meta.Target)
+	}
+	if dnsFlowClass != session.DNSFlowClassUnset {
+		ctx = session.ContextWithDNSFlowClass(ctx, dnsFlowClass)
+	}
+	dnsPlane := meta.DNSPlane
+	if dnsPlane == session.DNSPlaneUnknown && dnsFlowClass == session.DNSFlowClassUDPControl {
+		dnsPlane = session.DNSPlaneMuxXUDP
+	}
+	if dnsPlane != session.DNSPlaneUnknown && dnsPlane != "" {
+		ctx = session.ContextWithDNSPlane(ctx, dnsPlane)
+	}
 	if meta.Inbound != nil && meta.Inbound.Source.IsValid() && meta.Inbound.Local.IsValid() {
 		if inbound := session.InboundFromContext(ctx); inbound != nil {
 			newInbound := *inbound

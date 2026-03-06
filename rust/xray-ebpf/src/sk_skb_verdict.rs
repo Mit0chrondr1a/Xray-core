@@ -7,14 +7,13 @@
 //! 4. If allowed, redirects via SOCKHASH to the paired socket
 
 use aya_ebpf::{
-    bindings::sk_action::SK_PASS,
-    helpers::bpf_get_socket_cookie,
-    macros::stream_verdict,
-    programs::SkBuffContext,
-    EbpfContext,
+    bindings::sk_action::SK_PASS, helpers::bpf_get_socket_cookie, macros::stream_verdict,
+    programs::SkBuffContext, EbpfContext,
 };
 
-use crate::maps::{POLICY_MAP, SOCKHASH, POLICY_ALLOW_REDIRECT, POLICY_USE_INGRESS};
+use crate::maps::{
+    POLICY_ALLOW_REDIRECT, POLICY_KTLS_ACTIVE, POLICY_MAP, POLICY_USE_INGRESS, SOCKHASH,
+};
 
 /// Stream verdict: redirect incoming data to the paired socket.
 #[stream_verdict]
@@ -32,13 +31,19 @@ fn try_skb_verdict(ctx: &SkBuffContext) -> Result<u32, ()> {
     // Look up policy for this socket.
     let policy = match unsafe { POLICY_MAP.get(&cookie) } {
         Some(flags) => *flags,
-        None => 0, // deny-by-default; require explicit policy entry
+        None => POLICY_ALLOW_REDIRECT, // match Go loader default (allow redirect if missing)
     };
 
     // Check allow bit.
     if policy & POLICY_ALLOW_REDIRECT == 0 {
         return Ok(SK_PASS);
     }
+
+    // If policy indicates kTLS is active, there is no behavior difference for
+    // SK_SKB redirects today, but consulting the bit keeps the kernel data path
+    // aligned with the policy schema and allows future kTLS-specific handling
+    // (e.g., stats, conditional paths) without map schema changes.
+    let _ktls_active = policy & POLICY_KTLS_ACTIVE != 0;
 
     // Determine redirect flags (ingress vs egress).
     let flags: u64 = if policy & POLICY_USE_INGRESS != 0 {

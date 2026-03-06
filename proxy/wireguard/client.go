@@ -149,7 +149,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("target not specified")
 	}
 	ob.Name = "wireguard"
-	ob.SetCanSpliceCopy(3)
+	ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 
 	if err := h.processWireGuard(ctx, dialer); err != nil {
 		return err

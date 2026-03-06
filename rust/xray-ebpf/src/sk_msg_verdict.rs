@@ -21,7 +21,10 @@ use aya_ebpf::{
     programs::SkMsgContext,
 };
 
-use crate::maps::{CORK_THRESHOLD, POLICY_MAP, SOCKHASH, POLICY_ALLOW_REDIRECT, POLICY_USE_INGRESS};
+use crate::maps::{
+    CORK_THRESHOLD, POLICY_ALLOW_REDIRECT, POLICY_KTLS_ACTIVE, POLICY_MAP, POLICY_USE_INGRESS,
+    SOCKHASH,
+};
 
 /// SK_MSG verdict: cork small writes and redirect batched data.
 #[sk_msg]
@@ -36,25 +39,27 @@ pub fn xray_sk_msg(ctx: SkMsgContext) -> u32 {
 fn try_sk_msg(ctx: &SkMsgContext) -> Result<u32, ()> {
     let size = unsafe { (*ctx.msg).size } as u32;
 
-    // Cork small writes to batch into MTU-sized chunks.
-    if size < CORK_THRESHOLD {
-        let ret = unsafe { bpf_msg_cork_bytes(ctx.msg as *mut _, CORK_THRESHOLD) };
-        if ret == 0 {
-            return Ok(SK_PASS);
-        }
-        // If cork fails (e.g., not supported), fall through to redirect.
-    }
-
     // Batched data ready — look up redirect target.
     let cookie = unsafe { bpf_get_socket_cookie(ctx.msg as *mut _) };
 
     let policy = match unsafe { POLICY_MAP.get(&cookie) } {
         Some(flags) => *flags,
-        None => 0, // deny-by-default; require explicit policy entry
+        None => POLICY_ALLOW_REDIRECT, // match Go loader default (allow redirect if missing)
     };
 
     if policy & POLICY_ALLOW_REDIRECT == 0 {
         return Ok(SK_PASS);
+    }
+
+    // Cork small writes only when kTLS is active (ciphertext path) — this avoids
+    // lengthening Nagle/latency for plain TCP while preserving MTU-sized batching
+    // benefits on encrypted kTLS flows.
+    if policy & POLICY_KTLS_ACTIVE != 0 && size < CORK_THRESHOLD {
+        let ret = unsafe { bpf_msg_cork_bytes(ctx.msg as *mut _, CORK_THRESHOLD) };
+        if ret == 0 {
+            return Ok(SK_PASS);
+        }
+        // If cork fails (e.g., not supported), fall through to redirect.
     }
 
     let flags: u64 = if policy & POLICY_USE_INGRESS != 0 {

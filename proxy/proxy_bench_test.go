@@ -60,9 +60,9 @@ func makeConnPair(b *testing.B) (client, server net.Conn) {
 
 func makeSpliceCopyCtx() context.Context {
 	ctx := context.Background()
-	inbound := &session.Inbound{CanSpliceCopy: 1}
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGateEligible)}
 	ctx = session.ContextWithInbound(ctx, inbound)
-	outbound := &session.Outbound{CanSpliceCopy: 1}
+	outbound := &session.Outbound{CanSpliceCopy: int32(session.CopyGateEligible)}
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
 	return ctx
 }
@@ -105,11 +105,11 @@ func BenchmarkCopyRawConn_ReadVWriteV(b *testing.B) {
 		b.StopTimer()
 		reader, readerPeer := makeConnPair(b)
 		writer, writerPeer := makeConnPair(b)
-		// CanSpliceCopy=3 forces readV path
+		// CopyGateForcedUserspace forces readV path
 		ctx := context.Background()
-		inbound := &session.Inbound{CanSpliceCopy: 3}
+		inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGateForcedUserspace)}
 		ctx = session.ContextWithInbound(ctx, inbound)
-		outbound := &session.Outbound{CanSpliceCopy: 3}
+		outbound := &session.Outbound{CanSpliceCopy: int32(session.CopyGateForcedUserspace)}
 		ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
 		timer := signal.CancelAfterInactivity(ctx, func() {}, 30*time.Second)
 

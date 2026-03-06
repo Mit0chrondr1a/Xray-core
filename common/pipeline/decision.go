@@ -10,6 +10,52 @@ const (
 	PathKTLS      Path = "ktls"
 )
 
+// CopyPath enumerates copy-plane outcomes distinct from TLS offload.
+type CopyPath string
+
+const (
+	CopyPathUnknown       CopyPath = ""
+	CopyPathUserspace     CopyPath = "userspace_copy"
+	CopyPathSplice        CopyPath = "splice"
+	CopyPathSockmap       CopyPath = "sockmap"
+	CopyPathNotApplicable CopyPath = "not_applicable"
+)
+
+// TLSOffloadPath reports whether TLS was offloaded.
+type TLSOffloadPath string
+
+const (
+	TLSOffloadUnknown     TLSOffloadPath = ""
+	TLSOffloadKTLS        TLSOffloadPath = "ktls"
+	TLSOffloadUserspace   TLSOffloadPath = "userspace_tls"
+	TLSOffloadNotRequired TLSOffloadPath = "not_required"
+)
+
+// CopyGateState enumerates gate states for copy-path eligibility.
+type CopyGateState string
+
+const (
+	CopyGateUnset           CopyGateState = "copy_unset"
+	CopyGateEligible        CopyGateState = "copy_eligible"
+	CopyGatePendingDetach   CopyGateState = "copy_pending_detach"
+	CopyGateForcedUserspace CopyGateState = "copy_forced_userspace"
+	CopyGateNotApplicable   CopyGateState = "copy_not_applicable"
+)
+
+// CopyGateReason enumerates typed reasons for copy gating.
+type CopyGateReason string
+
+const (
+	CopyGateReasonUnspecified              CopyGateReason = "unspecified"
+	CopyGateReasonFlowNonVisionPolicy      CopyGateReason = "flow_nonvision_policy"
+	CopyGateReasonTransportNonRawSplitConn CopyGateReason = "transport_nonraw_splitconn"
+	CopyGateReasonTransportUserspace       CopyGateReason = "transport_userspace"
+	CopyGateReasonVisionBypass             CopyGateReason = "vision_bypass"
+	CopyGateReasonDetachTimeout            CopyGateReason = "detach_timeout"
+	CopyGateReasonSecurityGuard            CopyGateReason = "security_guard"
+	CopyGateReasonMetadataMissing          CopyGateReason = "metadata_missing"
+)
+
 // Canonical decision reasons. Keep centralized to avoid ad-hoc strings.
 const (
 	ReasonDefault                           = "default"
@@ -22,6 +68,7 @@ const (
 	ReasonInboundForcedUserspace            = "inbound_forced_userspace"
 	ReasonMissingOutboundMetadata           = "missing_outbound_metadata"
 	ReasonOutboundForcedUserspace           = "outbound_forced_userspace"
+	ReasonControlPlaneDNSGuard              = "control_plane_dns_guard"
 	ReasonLoopbackDNSGuard                  = "loopback_dns_guard"
 	ReasonLoopbackPairGuard                 = "loopback_pair_guard"
 	ReasonEnsureRawFailed                   = "ensure_raw_failed"
@@ -57,6 +104,7 @@ const (
 	ReasonFallbackFailed                    = "fallback_failed"
 	ReasonFallbackSuccess                   = "fallback_success"
 	ReasonUnexpectedDrop                    = "unexpected_drop"
+	ReasonCopyNotApplicable                 = "copy_not_applicable"
 )
 
 // DecisionSnapshot carries per-connection pipeline outcomes for logging/telemetry.
@@ -71,4 +119,15 @@ type DecisionSnapshot struct {
 	SockmapSuccess      bool
 	ErrorClass          string
 	Kind                string // optional: component-specific tag (e.g., proxy, xhttp)
+	// Telemetry planes
+	TLSOffloadPath TLSOffloadPath
+	CopyPath       CopyPath
+	CopyGateState  CopyGateState
+	CopyGateReason CopyGateReason
+	// DNS control-plane telemetry.
+	DNSFlowClass string
+	DNSPlane     string
+	// Guarded DNS telemetry.
+	DNSGuardFirstResponseNs int64
+	DNSGuardZeroByteTimeout bool
 }

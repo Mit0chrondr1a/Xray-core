@@ -17,9 +17,9 @@ pub mod ebpf;
 pub(crate) mod fdutil;
 pub mod geodata;
 mod geoip;
+mod ktls_probe;
 mod mph;
 pub mod pipeline;
-mod ktls_probe;
 pub mod reality;
 pub mod tls;
 /// SAFETY: This module is pub(crate) by design. The TLS 1.3 engine
