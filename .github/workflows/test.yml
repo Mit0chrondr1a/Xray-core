@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+  schedule:
+    - cron: "15 2 * * *"
 
 jobs:
   check-assets:
@@ -74,4 +77,47 @@ jobs:
           key: xray-geodat-
           enableCrossOsArchive: true
       - name: Test
-        run: go test -timeout 1h -v ./...
+        run: go test -short -timeout 1h -v ./...
+
+  scenarios-extended:
+    needs: check-assets
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Restore Geodat Cache
+        uses: actions/cache/restore@v5
+        with:
+          path: resources
+          key: xray-geodat-
+      - name: Extended Scenario Regression Gate
+        env:
+          XRAY_SCENARIO_EXTENDED: "1"
+        run: go test -timeout 40m -count=1 -v ./testing/scenarios -run '^(TestSimpleTLSConnection|TestAutoIssuingCertificate|TestVMessKCPLarge)$'
+
+  dns-quic-external:
+    needs: check-assets
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: QUIC DNS External Integration Gate
+        env:
+          XRAY_EXTERNAL_DNS_TESTS: "1"
+        run: go test -timeout 20m -count=1 -v ./app/dns -run '^TestQUICNameServer(|WithIPv4Override|WithIPv6Override)$'

@@ -100,6 +100,8 @@ var (
 	testBinaryPathGen sync.Once
 )
 
+const scenarioExtendedEnv = "XRAY_SCENARIO_EXTENDED"
+
 func genTestBinaryPath() {
 	testBinaryPathGen.Do(func() {
 		var tempDir string
@@ -266,4 +268,16 @@ func WaitConnAvailableWithTest(t *testing.T, testFunc func() error) bool {
 		}
 	}
 	return true
+}
+
+func requireExtendedScenario(t *testing.T, objective string) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skipf("skipping extended scenario in short mode (%s)", objective)
+	}
+
+	if os.Getenv(scenarioExtendedEnv) != "1" {
+		t.Skipf("skipping extended scenario; set %s=1 (%s)", scenarioExtendedEnv, objective)
+	}
 }

@@ -33,13 +33,13 @@ func TestReaderWriter(t *testing.T) {
 	pReader, pWriter := pipe.New(pipe.WithSizeLimit(1024))
 
 	dest := net.TCPDestination(net.DomainAddress("example.com"), 80)
-	writer := NewWriter(1, dest, pWriter, protocol.TransferTypeStream, [8]byte{}, &session.Inbound{})
+	writer := NewWriter(1, dest, pWriter, protocol.TransferTypeStream, [8]byte{}, &session.Inbound{}, session.DNSFlowClassUnset, session.DNSPlaneUnknown)
 
 	dest2 := net.TCPDestination(net.LocalHostIP, 443)
-	writer2 := NewWriter(2, dest2, pWriter, protocol.TransferTypeStream, [8]byte{}, &session.Inbound{})
+	writer2 := NewWriter(2, dest2, pWriter, protocol.TransferTypeStream, [8]byte{}, &session.Inbound{}, session.DNSFlowClassUnset, session.DNSPlaneUnknown)
 
 	dest3 := net.TCPDestination(net.LocalHostIPv6, 18374)
-	writer3 := NewWriter(3, dest3, pWriter, protocol.TransferTypeStream, [8]byte{}, &session.Inbound{})
+	writer3 := NewWriter(3, dest3, pWriter, protocol.TransferTypeStream, [8]byte{}, &session.Inbound{}, session.DNSFlowClassUnset, session.DNSPlaneUnknown)
 
 	writePayload := func(writer *Writer, payload ...byte) error {
 		b := buf.New()
@@ -69,6 +69,7 @@ func TestReaderWriter(t *testing.T) {
 			SessionStatus: SessionStatusNew,
 			Target:        dest,
 			Option:        OptionData,
+			DNSPlane:      session.DNSPlaneUnknown,
 		}); r != "" {
 			t.Error("metadata: ", r)
 		}
@@ -88,6 +89,7 @@ func TestReaderWriter(t *testing.T) {
 			SessionID:     2,
 			Option:        0,
 			Target:        dest2,
+			DNSPlane:      session.DNSPlaneUnknown,
 		}); r != "" {
 			t.Error("meta: ", r)
 		}
@@ -100,6 +102,7 @@ func TestReaderWriter(t *testing.T) {
 			SessionID:     1,
 			SessionStatus: SessionStatusKeep,
 			Option:        1,
+			DNSPlane:      session.DNSPlaneUnknown,
 		}); r != "" {
 			t.Error("meta: ", r)
 		}
@@ -119,6 +122,7 @@ func TestReaderWriter(t *testing.T) {
 			SessionStatus: SessionStatusNew,
 			Option:        1,
 			Target:        dest3,
+			DNSPlane:      session.DNSPlaneUnknown,
 		}); r != "" {
 			t.Error("meta: ", r)
 		}
@@ -137,6 +141,7 @@ func TestReaderWriter(t *testing.T) {
 			SessionID:     1,
 			SessionStatus: SessionStatusEnd,
 			Option:        0,
+			DNSPlane:      session.DNSPlaneUnknown,
 		}); r != "" {
 			t.Error("meta: ", r)
 		}
@@ -149,6 +154,7 @@ func TestReaderWriter(t *testing.T) {
 			SessionID:     3,
 			SessionStatus: SessionStatusEnd,
 			Option:        0,
+			DNSPlane:      session.DNSPlaneUnknown,
 		}); r != "" {
 			t.Error("meta: ", r)
 		}
@@ -161,6 +167,7 @@ func TestReaderWriter(t *testing.T) {
 			SessionID:     2,
 			SessionStatus: SessionStatusKeep,
 			Option:        1,
+			DNSPlane:      session.DNSPlaneUnknown,
 		}); r != "" {
 			t.Error("meta: ", r)
 		}
@@ -179,6 +186,7 @@ func TestReaderWriter(t *testing.T) {
 			SessionID:     2,
 			SessionStatus: SessionStatusEnd,
 			Option:        0,
+			DNSPlane:      session.DNSPlaneUnknown,
 		}); r != "" {
 			t.Error("meta: ", r)
 		}

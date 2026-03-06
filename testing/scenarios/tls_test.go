@@ -29,6 +29,8 @@ import (
 )
 
 func TestSimpleTLSConnection(t *testing.T) {
+	requireExtendedScenario(t, "vmess+tls pinned-certificate baseline")
+
 	tcpServer := tcp.Server{
 		MsgProcessor: xor,
 	}
@@ -125,6 +127,8 @@ func TestSimpleTLSConnection(t *testing.T) {
 }
 
 func TestAutoIssuingCertificate(t *testing.T) {
+	requireExtendedScenario(t, "tls authority-issued certificate path")
+
 	if runtime.GOOS == "windows" {
 		// Not supported on Windows yet.
 		return

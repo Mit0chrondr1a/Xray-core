@@ -3,6 +3,7 @@ package dns_test
 import (
 	"context"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 
@@ -13,7 +14,23 @@ import (
 	"github.com/xtls/xray-core/features/dns"
 )
 
+const externalQUICDNSTestsEnv = "XRAY_EXTERNAL_DNS_TESTS"
+
+func requireExternalQUICDNSTests(t *testing.T) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping external QUIC DNS tests in short mode")
+	}
+
+	if os.Getenv(externalQUICDNSTestsEnv) != "1" {
+		t.Skipf("skipping external QUIC DNS tests; set %s=1 to enable", externalQUICDNSTestsEnv)
+	}
+}
+
 func TestQUICNameServer(t *testing.T) {
+	requireExternalQUICDNSTests(t)
+
 	url, err := url.Parse("quic://dns.adguard-dns.com")
 	common.Must(err)
 	s, err := NewQUICNameServer(url, false, false, 0, net.IP(nil))
@@ -41,6 +58,8 @@ func TestQUICNameServer(t *testing.T) {
 }
 
 func TestQUICNameServerWithIPv4Override(t *testing.T) {
+	requireExternalQUICDNSTests(t)
+
 	url, err := url.Parse("quic://dns.adguard-dns.com")
 	common.Must(err)
 	s, err := NewQUICNameServer(url, false, false, 0, net.IP(nil))
@@ -64,6 +83,8 @@ func TestQUICNameServerWithIPv4Override(t *testing.T) {
 }
 
 func TestQUICNameServerWithIPv6Override(t *testing.T) {
+	requireExternalQUICDNSTests(t)
+
 	url, err := url.Parse("quic://dns.adguard-dns.com")
 	common.Must(err)
 	s, err := NewQUICNameServer(url, false, false, 0, net.IP(nil))
