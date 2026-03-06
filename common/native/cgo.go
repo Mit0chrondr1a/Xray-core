@@ -19,6 +19,7 @@ struct xray_tls_result {
     uint8_t  alpn[32];
     void*    state_handle;
     int32_t  error_code;
+    uint8_t  deferred_handle_ownership;
     char     error_msg[256];
     uint8_t  tx_secret[48];
     uint8_t  rx_secret[48];
@@ -218,6 +219,7 @@ extern void xray_geosite_result_free(struct xray_geosite_result* result);
 	extern int32_t xray_ebpf_available();
 	extern int32_t xray_ebpf_setup(const char* pin_path, uint32_t max_entries, uint32_t cork_threshold);
 	extern int32_t xray_ebpf_teardown();
+	extern uint32_t xray_ebpf_max_entries();
 	extern int32_t xray_ebpf_register_pair(int32_t inbound_fd, int32_t outbound_fd, uint64_t inbound_cookie, uint64_t outbound_cookie, uint32_t policy_flags);
 	extern int32_t xray_ebpf_unregister_pair(uint64_t inbound_cookie, uint64_t outbound_cookie);
 
@@ -363,18 +365,29 @@ type TlsStateHandle struct {
 	ptr unsafe.Pointer
 }
 
+// DeferredHandleOwnership reports whether xray_deferred_enable_ktls consumed
+// the deferred session handle or returned it still live for fallback.
+type DeferredHandleOwnership uint8
+
+const (
+	DeferredHandleOwnershipUnknown DeferredHandleOwnership = iota
+	DeferredHandleOwnershipConsumed
+	DeferredHandleOwnershipRetained
+)
+
 // TlsResult contains the result of a TLS handshake.
 type TlsResult struct {
-	KtlsTx      bool
-	KtlsRx      bool
-	Version     uint16
-	CipherSuite uint16
-	ALPN        string
-	RxSeqStart  uint64
-	StateHandle *TlsStateHandle
-	TxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
-	RxSecret    []byte // base traffic secret for KeyUpdate (TLS 1.3 only)
-	DrainedData []byte // plaintext drained from rustls after handshake
+	KtlsTx                  bool
+	KtlsRx                  bool
+	Version                 uint16
+	CipherSuite             uint16
+	ALPN                    string
+	RxSeqStart              uint64
+	StateHandle             *TlsStateHandle
+	DeferredHandleOwnership DeferredHandleOwnership // set by deferred enable_ktls path
+	TxSecret                []byte                  // base traffic secret for KeyUpdate (TLS 1.3 only)
+	RxSecret                []byte                  // base traffic secret for KeyUpdate (TLS 1.3 only)
+	DrainedData             []byte                  // plaintext drained from rustls after handshake
 }
 
 // ZeroSecrets zeroes the traffic secret fields after they have been copied.
@@ -1060,14 +1073,14 @@ func DeferredDrainAndDetach(handle *DeferredSessionHandle) ([]byte, []byte, erro
 	return plaintext, rawAhead, nil
 }
 
-// DeferredEnableKTLS consumes the deferred session and installs kTLS on the socket.
-// After this call, the handle is invalid and must not be used.
+// DeferredEnableKTLS attempts deferred kTLS installation.
+// Ownership of handle.ptr is reported by Rust via deferred_handle_ownership:
+// consumed => handle must no longer be used; retained => rustls fallback may continue.
 func DeferredEnableKTLS(handle *DeferredSessionHandle) (*TlsResult, error) {
 	if handle == nil || handle.ptr == nil {
 		return nil, errors.New("native: nil deferred session handle")
 	}
 	ptr := handle.ptr
-	handle.ptr = nil // consumed — prevent double-free
 	var drainedInline [tlsResultDrainedInlineCap]byte
 	var cResult C.struct_xray_tls_result
 	rc := C.xray_deferred_enable_ktls_into(
@@ -1077,12 +1090,24 @@ func DeferredEnableKTLS(handle *DeferredSessionHandle) (*TlsResult, error) {
 		C.size_t(tlsResultDrainedInlineCap),
 	)
 	runtime.KeepAlive(drainedInline)
+	ownership := DeferredHandleOwnership(cResult.deferred_handle_ownership)
 	if rc != 0 {
 		cleanupTLSResultOnError(&cResult)
 		errMsg := C.GoString(&cResult.error_msg[0])
+		if ownership != DeferredHandleOwnershipRetained {
+			handle.ptr = nil
+		}
 		return nil, errors.New("native: deferred enable_ktls: " + errMsg)
 	}
-	return extractTlsResultWithInline(&cResult, drainedInline[:]), nil
+	result := extractTlsResultWithInline(&cResult, drainedInline[:])
+	// Successful promotion always consumes deferred ownership in Go.
+	handle.ptr = nil
+	return result, nil
+}
+
+// DeferredHandleAlive reports whether the deferred session handle is still usable.
+func DeferredHandleAlive(handle *DeferredSessionHandle) bool {
+	return handle != nil && handle.ptr != nil
 }
 
 // DeferredRestoreNonBlock restores O_NONBLOCK on the deferred session's fd
@@ -1136,11 +1161,12 @@ func extractTlsResult(cResult *C.struct_xray_tls_result) *TlsResult {
 // bytes that were written directly into a Go-owned buffer by Rust.
 func extractTlsResultWithInline(cResult *C.struct_xray_tls_result, drainedInline []byte) *TlsResult {
 	result := &TlsResult{
-		KtlsTx:      bool(cResult.ktls_tx),
-		KtlsRx:      bool(cResult.ktls_rx),
-		Version:     uint16(cResult.version),
-		CipherSuite: uint16(cResult.cipher_suite),
-		RxSeqStart:  uint64(cResult.rx_seq_start),
+		KtlsTx:                  bool(cResult.ktls_tx),
+		KtlsRx:                  bool(cResult.ktls_rx),
+		Version:                 uint16(cResult.version),
+		CipherSuite:             uint16(cResult.cipher_suite),
+		RxSeqStart:              uint64(cResult.rx_seq_start),
+		DeferredHandleOwnership: DeferredHandleOwnership(cResult.deferred_handle_ownership),
 	}
 	// Extract ALPN (null-terminated string in 32-byte buffer)
 	alpnBytes := C.GoBytes(unsafe.Pointer(&cResult.alpn[0]), 32)
@@ -2051,6 +2077,9 @@ var ebpfSkMsgCapability SkMsgCapability = SkMsgNone
 
 // EbpfSkMsgCapability returns the SK_MSG capability level from the Rust loader.
 func EbpfSkMsgCapability() SkMsgCapability { return ebpfSkMsgCapability }
+
+// EbpfMaxEntries reports the effective SOCKHASH capacity compiled into the native loader.
+func EbpfMaxEntries() uint32 { return uint32(C.xray_ebpf_max_entries()) }
 
 // EbpfSetup initializes eBPF sockmap with pinned maps for zero-downtime recovery.
 func EbpfSetup(pinPath string, maxEntries, corkThreshold uint32) error {

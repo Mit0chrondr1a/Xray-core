@@ -34,9 +34,22 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
+func applyXHTTPCopyGate(decision *pipeline.DecisionSnapshot) {
+	_, gate, gateReason, copyPath, _ := pipeline.EvaluateCopyGate(pipeline.CopyGateInput{
+		InboundGate:   pipeline.CopyGateNotApplicable,
+		InboundReason: pipeline.CopyGateReasonTransportNonRawSplitConn,
+	})
+	decision.CopyGateState = gate
+	decision.CopyGateReason = gateReason
+	if copyPath != pipeline.CopyPathUnknown {
+		decision.CopyPath = copyPath
+	}
+}
+
 var (
-	xhttpCapsOnce sync.Once
-	xhttpCaps     pipeline.CapabilitySummary
+	xhttpCapsVal       atomic.Value // pipeline.CapabilitySummary
+	xhttpCapsEpoch     atomic.Uint64
+	xhttpCapsProbeSeen atomic.Uint64
 
 	deferredKTLSPromotionDisabledFn = tls.DeferredKTLSPromotionDisabledFor
 )
@@ -476,6 +489,18 @@ func (c *httpServerConn) Close() error {
 	return c.Instance.Close()
 }
 
+func (c *httpServerConn) SetDeadline(t time.Time) error {
+	return stderrors.Join(c.SetReadDeadline(t), c.SetWriteDeadline(t))
+}
+
+func (c *httpServerConn) SetReadDeadline(t time.Time) error {
+	return setSplitReadDeadline(c.Reader, t)
+}
+
+func (c *httpServerConn) SetWriteDeadline(t time.Time) error {
+	return http.NewResponseController(c.ResponseWriter).SetWriteDeadline(t)
+}
+
 // kTLSListener wraps a net.Listener to perform Rust-based TLS handshakes
 // with mandatory kTLS offload on Accept. The returned connections have TLS
 // handled transparently by the kernel; http.Server sees them as plaintext
@@ -580,6 +605,7 @@ var (
 	xhttpRealityMarkerGoFallbackNanosTotal atomic.Uint64
 	xhttpRealityMarkerGoFallbackSamples    atomic.Uint64
 	xhttpDecisionRustKTLS                  atomic.Uint64
+	xhttpDecisionRustUserspace             atomic.Uint64
 	xhttpDecisionGoFallback                atomic.Uint64
 	xhttpDecisionDrop                      atomic.Uint64
 
@@ -601,8 +627,12 @@ var (
 	xhttpRealityMarkerLastGoFallbackNanosTotal    atomic.Uint64
 	xhttpRealityMarkerLastGoFallbackSamples       atomic.Uint64
 	xhttpDecisionLastRustKTLS                     atomic.Uint64
+	xhttpDecisionLastRustUserspace                atomic.Uint64
 	xhttpDecisionLastGoFallback                   atomic.Uint64
 	xhttpDecisionLastDrop                         atomic.Uint64
+	xhttpFallbackHandleConsumed                   atomic.Uint64
+	xhttpFallbackHandleAlive                      atomic.Uint64
+	xhttpInvalidateHook                           atomic.Value // func()
 )
 
 func xhttpTelemetryV2Enabled() bool {
@@ -610,14 +640,36 @@ func xhttpTelemetryV2Enabled() bool {
 }
 
 func xhttpCapabilitiesSummary() pipeline.CapabilitySummary {
-	xhttpCapsOnce.Do(func() {
-		xhttpCaps = xhttpComposeCapabilitiesSummary(
-			native.CapabilitiesSummary(),
-			ebpf.GetCapabilities().SockmapSupported,
-			tls.NativeFullKTLSSupported(),
-		)
-	})
-	return xhttpCaps
+	probeEpoch := tls.KTLSProbeRefreshEpoch()
+	if v := xhttpCapsVal.Load(); v != nil {
+		s := v.(pipeline.CapabilitySummary)
+		if (s.KTLSSupported || s.SockmapSupported || s.SpliceSupported) &&
+			xhttpCapsProbeSeen.Load() == probeEpoch {
+			return s
+		}
+	}
+	caps := xhttpComposeCapabilitiesSummary(
+		native.CapabilitiesSummary(),
+		ebpf.GetCapabilities().SockmapSupported,
+		tls.NativeFullKTLSSupported(),
+	)
+	xhttpCapsVal.Store(caps)
+	xhttpCapsProbeSeen.Store(probeEpoch)
+	return caps
+}
+
+func xhttpInvalidateCapabilitiesSummary() {
+	xhttpCapsVal.Store(pipeline.CapabilitySummary{})
+	xhttpCapsProbeSeen.Store(tls.KTLSProbeRefreshEpoch())
+	xhttpCapsEpoch.Add(1)
+	if hook, ok := xhttpInvalidateHook.Load().(func()); ok && hook != nil {
+		hook()
+	}
+}
+
+// xhttpCapabilityEpoch returns the current epoch counter (for tests/metrics).
+func xhttpCapabilityEpoch() uint64 {
+	return xhttpCapsEpoch.Load()
 }
 
 func xhttpComposeCapabilitiesSummary(summary pipeline.CapabilitySummary, sockmapSupported, ktlsSupported bool) pipeline.CapabilitySummary {
@@ -641,6 +693,8 @@ func logXHTTPDecision(ctx context.Context, path, reason string, caps pipeline.Ca
 		" ktls_supported=", caps.KTLSSupported,
 		" sockmap_supported=", caps.SockmapSupported,
 		" splice_supported=", caps.SpliceSupported,
+		" fallback_handle_consumed=", xhttpFallbackHandleConsumed.Load(),
+		" fallback_handle_alive=", xhttpFallbackHandleAlive.Load(),
 	)
 }
 
@@ -653,6 +707,10 @@ func logXHTTPSummary(ctx context.Context, snap pipeline.DecisionSnapshot) {
 		"kind=", kind,
 		" path=", string(snap.Path),
 		" reason=", snap.Reason,
+		" tls_offload_path=", snap.TLSOffloadPath,
+		" copy_path=", snap.CopyPath,
+		" copy_gate_state=", snap.CopyGateState,
+		" copy_gate_reason=", snap.CopyGateReason,
 		" splice_bytes=", snap.SpliceBytes,
 		" splice_duration_ns=", snap.SpliceDurationNs,
 		" userspace_bytes=", snap.UserspaceBytes,
@@ -671,6 +729,10 @@ func xhttpRecordTerminalDecision(snap pipeline.DecisionSnapshot, err error) {
 	}
 	if snap.Path == pipeline.PathKTLS {
 		xhttpDecisionRustKTLS.Add(1)
+		return
+	}
+	if snap.Reason != pipeline.ReasonFallbackSuccess {
+		xhttpDecisionRustUserspace.Add(1)
 		return
 	}
 	xhttpDecisionGoFallback.Add(1)
@@ -740,6 +802,7 @@ func maybeLogXHTTPRealityHandoverMarkers(ctx context.Context) {
 	goFallbackNanos, goFallbackNanosDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerGoFallbackNanosTotal, &xhttpRealityMarkerLastGoFallbackNanosTotal)
 	goFallbackSamples, goFallbackSamplesDelta := xhttpMarkerSnapshot(&xhttpRealityMarkerGoFallbackSamples, &xhttpRealityMarkerLastGoFallbackSamples)
 	decisionRustKTLS, decisionRustKTLSDelta := xhttpMarkerSnapshot(&xhttpDecisionRustKTLS, &xhttpDecisionLastRustKTLS)
+	decisionRustUserspace, decisionRustUserspaceDelta := xhttpMarkerSnapshot(&xhttpDecisionRustUserspace, &xhttpDecisionLastRustUserspace)
 	decisionGoFallback, decisionGoFallbackDelta := xhttpMarkerSnapshot(&xhttpDecisionGoFallback, &xhttpDecisionLastGoFallback)
 	decisionDrop, decisionDropDelta := xhttpMarkerSnapshot(&xhttpDecisionDrop, &xhttpDecisionLastDrop)
 
@@ -781,6 +844,7 @@ func maybeLogXHTTPRealityHandoverMarkers(ctx context.Context) {
 		"go_fallback_samples=", goFallbackSamples, "(+", goFallbackSamplesDelta, ") ",
 		"go_fallback_avg_ns=", goFallbackAvgNs, "(+", goFallbackAvgNsDelta, ") ",
 		"decision_rust_ktls=", decisionRustKTLS, "(+", decisionRustKTLSDelta, ") ",
+		"decision_rust_userspace=", decisionRustUserspace, "(+", decisionRustUserspaceDelta, ") ",
 		"decision_go_fallback=", decisionGoFallback, "(+", decisionGoFallbackDelta, ") ",
 		"decision_drop=", decisionDrop, "(+", decisionDropDelta, ")",
 	)
@@ -894,11 +958,16 @@ func (l *kREALITYListener) handshakeAndEnqueue(rawConn net.Conn) {
 func (l *kREALITYListener) processConn(rawConn net.Conn) (conn net.Conn, err error) {
 	caps := xhttpCapabilitiesSummary()
 	decision := pipeline.DecisionSnapshot{
-		Path:   pipeline.PathUserspace,
-		Reason: pipeline.ReasonDefault,
-		Caps:   caps,
-		Kind:   "xhttp",
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonDefault,
+		Caps:           caps,
+		Kind:           "xhttp",
+		CopyPath:       pipeline.CopyPathUnknown,
+		TLSOffloadPath: pipeline.TLSOffloadUserspace,
+		CopyGateState:  pipeline.CopyGateUnset,
+		CopyGateReason: pipeline.CopyGateReasonUnspecified,
 	}
+	applyXHTTPCopyGate(&decision)
 	var rustDurationNs int64
 	var fallbackDurationNs int64
 	var ktlsAttempt bool
@@ -959,39 +1028,52 @@ func (l *kREALITYListener) processConn(rawConn net.Conn) (conn net.Conn, err err
 					Caps:              caps,
 				})
 				decision.Kind = "xhttp"
+				applyXHTTPCopyGate(&decision)
 				xhttpRealityMarkerKTLSPromoteAttempt.Add(1)
 				ktlsAttempt = true
 				deferredConn.SetKTLSPromotionScope(scope)
 				outcome, promoteErr := deferredConn.EnableKTLSOutcome()
+				failAndClose := func(reason string, marker *atomic.Uint64) (net.Conn, error) {
+					if marker != nil {
+						marker.Add(1)
+					}
+					xhttpFallbackHandleConsumed.Add(1)
+					decision.Path = pipeline.PathUserspace
+					decision.Reason = reason
+					decision.TLSOffloadPath = pipeline.TLSOffloadUserspace
+					decision.CopyPath = pipeline.CopyPathNotApplicable
+					_ = deferredConn.Close()
+					return nil, errors.New("XHTTP Rust REALITY: kTLS promotion not usable (" + reason + ")")
+				}
+				fallbackWithDeferred := func(reason string, marker *atomic.Uint64) (net.Conn, error) {
+					if marker != nil {
+						marker.Add(1)
+					}
+					decision.Path = pipeline.PathUserspace
+					decision.Reason = reason
+					decision.TLSOffloadPath = pipeline.TLSOffloadUserspace
+					decision.CopyPath = pipeline.CopyPathNotApplicable
+					// Promotion status was non-fatal; keep the deferred rustls
+					// session alive and continue in userspace TLS.
+					if deferredConn.HasDeferredHandle() {
+						xhttpFallbackHandleAlive.Add(1)
+						xhttpRealityMarkerRustSuccess.Add(1)
+						return deferredConn, nil
+					}
+					xhttpFallbackHandleConsumed.Add(1)
+					_ = deferredConn.Close()
+					return nil, errors.New("XHTTP Rust REALITY: deferred handle unavailable for userspace fallback (" + reason + ")")
+				}
 				switch {
 				case promoteErr != nil:
-					xhttpRealityMarkerKTLSPromoteFailed.Add(1)
 					errors.LogWarningInner(context.Background(), promoteErr, "[kind=xhttp-handover.ktls_promote_failed] XHTTP Rust REALITY deferred kTLS promotion failed")
-					decision.Path = pipeline.PathUserspace
-					decision.Reason = pipeline.ReasonKTLSPromoteFailedFallback
-					xhttpRealityMarkerGoFallbackAttempt.Add(1)
-					xhttpRealityMarkerGoFallbackSuccess.Add(1)
-					return deferredConn, nil
+					return failAndClose(pipeline.ReasonKTLSPromoteFailedFallback, &xhttpRealityMarkerKTLSPromoteFailed)
 				case outcome.Status == tls.KTLSPromotionCooldown:
-					decision.Path = pipeline.PathUserspace
-					decision.Reason = pipeline.ReasonKTLSPromotionCooldown
-					xhttpRealityMarkerGoFallbackAttempt.Add(1)
-					xhttpRealityMarkerGoFallbackSuccess.Add(1)
-					return deferredConn, nil
+					return fallbackWithDeferred(pipeline.ReasonKTLSPromotionCooldown, nil)
 				case outcome.Status == tls.KTLSPromotionUnsupported:
-					xhttpRealityMarkerKTLSPromoteFailed.Add(1)
-					decision.Path = pipeline.PathUserspace
-					decision.Reason = pipeline.ReasonKTLSUnsupported
-					xhttpRealityMarkerGoFallbackAttempt.Add(1)
-					xhttpRealityMarkerGoFallbackSuccess.Add(1)
-					return deferredConn, nil
+					return fallbackWithDeferred(pipeline.ReasonKTLSUnsupported, &xhttpRealityMarkerKTLSPromoteFailed)
 				case outcome.Status != tls.KTLSPromotionEnabled:
-					xhttpRealityMarkerKTLSPromoteFailed.Add(1)
-					decision.Path = pipeline.PathUserspace
-					decision.Reason = pipeline.ReasonKTLSNotEnabled
-					xhttpRealityMarkerGoFallbackAttempt.Add(1)
-					xhttpRealityMarkerGoFallbackSuccess.Add(1)
-					return deferredConn, nil
+					return fallbackWithDeferred(pipeline.ReasonKTLSNotEnabled, &xhttpRealityMarkerKTLSPromoteFailed)
 				default:
 					xhttpRealityMarkerKTLSPromoteSuccess.Add(1)
 					ktlsSuccess = true
@@ -999,6 +1081,8 @@ func (l *kREALITYListener) processConn(rawConn net.Conn) (conn net.Conn, err err
 					decision.Path = pipeline.PathKTLS
 					decision.Reason = pipeline.ReasonKTLSSuccess
 					decision.SpliceDurationNs = rustDurationNs
+					decision.TLSOffloadPath = pipeline.TLSOffloadKTLS
+					decision.CopyPath = pipeline.CopyPathNotApplicable
 					return tls.NewKTLSPlaintextConn(deferredConn), nil
 				}
 			}
@@ -1029,6 +1113,7 @@ func (l *kREALITYListener) processConn(rawConn net.Conn) (conn net.Conn, err err
 			Caps:              caps,
 		})
 		decision.Kind = "xhttp"
+		applyXHTTPCopyGate(&decision)
 		xhttpRealityMarkerGoFallbackAttempt.Add(1)
 		// Keep fallback behavior aligned with upstream REALITY listener: no extra
 		// deadline wrapper around reality.Server(), so camouflage timing/flow
@@ -1347,5 +1432,7 @@ func getTLSConfig(streamSettings *internet.MemoryStreamConfig) *gotls.Config {
 	return config.GetTLSConfig()
 }
 func init() {
+	// Initialize optional hook storage so Load is safe before any custom hook is set.
+	xhttpInvalidateHook.Store((func())(nil))
 	common.Must(internet.RegisterTransportListener(protocolName, ListenXH))
 }

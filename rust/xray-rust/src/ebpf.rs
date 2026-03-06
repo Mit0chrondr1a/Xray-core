@@ -12,14 +12,17 @@
 //!   4. Attach all programs to the SOCKHASH
 
 use aya::{
-    maps::{sock::SockMapFd, Map, SockHash},
+    maps::{sock::SockMapFd, HashMap, SockHash},
     programs::{SkMsg, SkSkb},
     Ebpf,
 };
+use libc::close;
 use std::ffi::{c_char, CStr};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::IntoRawFd;
 use std::path::Path;
 use std::sync::RwLock;
+
+const EBPF_MAX_ENTRIES: u32 = 65_536;
 
 /// Align macro for include_bytes (ensures eBPF bytecode is properly aligned).
 #[cfg(feature = "ebpf-bytecode")]
@@ -71,6 +74,8 @@ const EBPF_ERR_GENERIC: i32 = -1;
 const EBPF_ERR_PERMISSION: i32 = -2;
 const EBPF_ERR_MISSING_FEATURE: i32 = -3;
 const EBPF_ERR_LOAD_FAILURE: i32 = -4;
+const DEFAULT_MAX_ENTRIES: u32 = 65_536;
+const DEFAULT_CORK_THRESHOLD: u32 = 1_400;
 
 /// SK_MSG capability levels (positive return codes from xray_ebpf_setup).
 const SK_MSG_FULL: i32 = 0;
@@ -108,15 +113,10 @@ fn classify_ebpf_error(err: &str) -> i32 {
 /// # Returns
 /// 0 on success, negative error code on failure:
 /// `-1` generic, `-2` permission, `-3` missing feature, `-4` load failure.
-// NOTE: `max_entries` and `cork_threshold` are accepted for FFI compatibility
-// but not yet wired to the Aya loader. Aya uses map sizes baked into the eBPF
-// bytecode. cork_threshold should be passed to the SK_MSG program via a BPF
-// array map in a future revision. See Go-native path in sockmap_linux.go for
-// the runtime-configurable equivalent.
 fn setup_sockmap_impl(
     pin_path: &str,
-    _max_entries: u32,
-    _cork_threshold: u32,
+    max_entries: u32,
+    cork_threshold: u32,
 ) -> Result<i32, String> {
     let mut guard = EBPF_STATE.write().unwrap_or_else(|e| {
         eprintln!("xray-rust eBPF: recovering poisoned write lock");
@@ -154,13 +154,18 @@ fn setup_sockmap_impl(
         let _ = std::fs::remove_file(pin_dir.join("sockhash"));
         let _ = std::fs::remove_file(pin_dir.join("policy"));
 
+        let target_entries = if max_entries == 0 {
+            DEFAULT_MAX_ENTRIES
+        } else {
+            max_entries
+        };
+
         let (sockhash_fd, sockhash_map_fd) = {
             let sockhash: SockHash<_, u64> = bpf
                 .map_mut("SOCKHASH")
                 .ok_or("missing SOCKHASH")?
                 .try_into()
                 .map_err(|e| format!("sockhash map type: {e}"))?;
-            let fd = sockhash.fd().as_fd().as_raw_fd();
             let map_fd = sockhash
                 .fd()
                 .try_clone()
@@ -168,20 +173,45 @@ fn setup_sockmap_impl(
             sockhash
                 .pin(pin_dir.join("sockhash"))
                 .map_err(|e| format!("pin sockhash: {e}"))?;
+            let fd = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pin_dir.join("sockhash"))
+                .map_err(|e| format!("open pinned sockhash: {e}"))?
+                .into_raw_fd();
             (fd, map_fd)
         };
 
-        let policy = bpf.map("POLICY_MAP").ok_or("missing POLICY_MAP")?;
-        let policy_fd = match policy {
-            Map::HashMap(data) | Map::LruHashMap(data) => data.fd().as_fd().as_raw_fd(),
-            _ => return Err("POLICY_MAP is not a hash map".into()),
-        };
-        policy
+        let policy_map_any = bpf.map_mut("POLICY_MAP").ok_or("missing POLICY_MAP")?;
+        let policy_map: HashMap<_, u64, u32> = policy_map_any
+            .try_into()
+            .map_err(|e| format!("policy map type: {e}"))?;
+        policy_map
             .pin(pin_dir.join("policy"))
             .map_err(|e| format!("pin policy: {e}"))?;
+        let policy_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pin_dir.join("policy"))
+            .map_err(|e| format!("open pinned policy: {e}"))?
+            .into_raw_fd();
 
         // Set 0600 permissions on pinned files.
         set_pin_permissions(pin_dir);
+
+        // Runtime cork threshold is still compiled into the bytecode; reject
+        // mismatches to avoid silent drift.
+        if cork_threshold != 0 && cork_threshold != DEFAULT_CORK_THRESHOLD {
+            return Err(format!(
+                "runtime cork_threshold {} not supported; compiled threshold {}",
+                cork_threshold, DEFAULT_CORK_THRESHOLD
+            ));
+        }
+
+        eprintln!(
+            "xray-rust eBPF: sockhash/policy requested_max_entries={} compiled_max_entries={} cork_threshold={} (compiled)",
+            target_entries, EBPF_MAX_ENTRIES, DEFAULT_CORK_THRESHOLD
+        );
 
         // Step 3: Attach programs.
 
@@ -216,6 +246,11 @@ fn setup_sockmap_impl(
             policy_fd,
             pin_path: pin_path.to_string(),
         });
+
+        eprintln!(
+            "xray-rust eBPF: capability snapshot {{sk_msg_level={}, requested_max_entries={}, compiled_max_entries={}, cork_threshold={}}}",
+            sk_msg_level, target_entries, EBPF_MAX_ENTRIES, DEFAULT_CORK_THRESHOLD
+        );
 
         Ok(sk_msg_level)
     }
@@ -288,6 +323,10 @@ fn teardown_impl() -> Result<(), String> {
         e.into_inner()
     });
     if let Some(state) = guard.take() {
+        unsafe {
+            close(state.policy_fd);
+            close(state.sockhash_fd);
+        }
         // Unpin maps (best-effort).
         let pin_dir = Path::new(&state.pin_path);
         let _ = std::fs::remove_file(pin_dir.join("sockhash"));
@@ -452,6 +491,12 @@ fn neg_errno(err: &std::io::Error) -> i32 {
 #[no_mangle]
 pub extern "C" fn xray_ebpf_available() -> i32 {
     1
+}
+
+/// Reports the effective map capacity compiled into the native Aya loader.
+#[no_mangle]
+pub extern "C" fn xray_ebpf_max_entries() -> u32 {
+    EBPF_MAX_ENTRIES
 }
 
 /// Set up eBPF sockmap with pinned maps.

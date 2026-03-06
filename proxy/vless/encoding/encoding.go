@@ -176,7 +176,16 @@ func DecodeResponseHeader(reader io.Reader, request *protocol.RequestHeader) (*A
 func XtlsRead(reader buf.Reader, writer buf.Writer, timer *signal.ActivityTimer, conn net.Conn, trafficState *proxy.TrafficState, isUplink bool, ctx context.Context) error {
 	err := func() error {
 		for {
-			if isUplink && trafficState.Inbound.UplinkReaderDirectCopy || !isUplink && trafficState.Outbound.DownlinkReaderDirectCopy {
+			trafficStateMuLocked := func() bool {
+				trafficState.Lock()
+				defer trafficState.Unlock()
+				if isUplink {
+					return trafficState.Inbound.UplinkReaderDirectCopy
+				}
+				return trafficState.Outbound.DownlinkReaderDirectCopy
+			}()
+
+			if trafficStateMuLocked {
 				var writerConn net.Conn
 				var inTimer *signal.ActivityTimer
 				if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {

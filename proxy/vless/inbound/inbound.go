@@ -45,6 +45,11 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
+var (
+	reverseOutboundWaitTimeout  = 5 * time.Second
+	reverseOutboundPollInterval = 200 * time.Millisecond
+)
+
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		var dc dns.Client
@@ -203,15 +208,19 @@ func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
 		r = &Reverse{tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
 		// Wait for at least one outbound handler to be registered before adding
 		// the reverse handler, preventing it from becoming the default outbound.
-		// Bounded to 30s to avoid hanging forever on shutdown or misconfiguration.
-		waitDeadline := time.After(30 * time.Second)
+		// Keep the wait short and responsive: this is cold-path startup protection,
+		// not a session hot path, and long stalls hurt operability more than they help.
+		waitTimer := time.NewTimer(reverseOutboundWaitTimeout)
+		defer waitTimer.Stop()
+		pollTicker := time.NewTicker(reverseOutboundPollInterval)
+		defer pollTicker.Stop()
 		for len(h.outboundHandlerManager.ListHandlers(h.ctx)) == 0 {
 			select {
 			case <-h.ctx.Done():
 				return nil, errors.New("reverse: context cancelled while waiting for outbound handlers")
-			case <-waitDeadline:
+			case <-waitTimer.C:
 				return nil, errors.New("reverse: timed out waiting for outbound handlers to register")
-			case <-time.After(time.Second):
+			case <-pollTicker.C:
 			}
 		}
 		if err := h.outboundHandlerManager.AddHandler(h.ctx, r); err != nil {

@@ -567,50 +567,19 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				}
 			}
 			unlock()
+			detachCompleted := false
 			select {
 			case <-fut.done:
-				ts.Lock()
-				locked = true
-				detachDoneUnix := time.Now().UnixNano()
-				if fut.result.duration > 0 {
-					pipelineMarkerVisionDetachPhaseNanos.Add(uint64(fut.result.duration.Nanoseconds()))
-					pipelineMarkerVisionDetachPhaseCount.Add(1)
-				}
-				if fut.result.err != nil {
-					maybeLogPipelineRuntimeSummary(w.ctx)
-					// Cannot safely strip outer TLS. Keep rustls active for correctness.
-					errors.LogWarning(w.ctx, "[kind=vision.drain_detach_failed] DeferredRustConn drain failed, keeping rustls active: ", fut.result.err)
-					*switchToDirectCopy = false
-					pipelineVisionDetachFutureByConn.Delete(dc)
-					return buffer, err
-				}
-				// If this future had timed out earlier, treat completion as informational and
-				// keep rustls path (no late state flip).
-				if fut.state.Load() == visionDetachTimedOut {
-					pipelineVisionDetachFutureByConn.Delete(dc)
-					errors.LogWarning(w.ctx, "[kind=vision.drain_detach_late] DeferredRustConn detach completed after timeout; keeping rustls path")
-					return buffer, err
-				}
-				if ts != nil && ts.CreatedAtUnixNano > 0 && detachDoneUnix > ts.CreatedAtUnixNano {
-					pipelineMarkerVisionPaddingPhaseNanos.Add(uint64(detachDoneUnix - ts.CreatedAtUnixNano))
-					pipelineMarkerVisionPaddingPhaseCount.Add(1)
-				}
-				if rawUnwrapUnix, ok := consumeVisionRawUnwrapWarningTimestamp(w.conn); ok && detachDoneUnix > rawUnwrapUnix {
-					unwrapToDetachNs := uint64(detachDoneUnix - rawUnwrapUnix)
-					pipelineMarkerRawUnwrapToDetachNanosTotal.Add(unwrapToDetachNs)
-					pipelineMarkerRawUnwrapToDetachSamples.Add(1)
-					recordRawUnwrapToDetachHistogram(unwrapToDetachNs)
-				}
-				storeVisionDetachTimestamp(w.conn, detachDoneUnix)
-				errors.LogDebug(w.ctx, "Vision: DeferredRustConn drained and detached; switching reader to raw socket")
-				if len(fut.result.plaintext) > 0 {
-					buffer = append(buffer, buf.FromBytes(fut.result.plaintext))
-				}
-				if len(fut.result.rawAhead) > 0 {
-					buffer = append(buffer, buf.FromBytes(fut.result.rawAhead))
-				}
-				pipelineVisionDetachFutureByConn.Delete(dc)
+				detachCompleted = true
 			case <-time.After(wait):
+				select {
+				case <-fut.done:
+					detachCompleted = true
+				default:
+				}
+				if detachCompleted {
+					break
+				}
 				ts.Lock()
 				locked = true
 				pipelineMarkerVisionDetachTimeout.Add(1)
@@ -627,6 +596,47 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				// Keep future cached so a later completion can be observed (and ignored) or retried deterministically.
 				return buffer, err
 			}
+			ts.Lock()
+			locked = true
+			detachDoneUnix := time.Now().UnixNano()
+			if fut.result.duration > 0 {
+				pipelineMarkerVisionDetachPhaseNanos.Add(uint64(fut.result.duration.Nanoseconds()))
+				pipelineMarkerVisionDetachPhaseCount.Add(1)
+			}
+			if fut.result.err != nil {
+				maybeLogPipelineRuntimeSummary(w.ctx)
+				// Cannot safely strip outer TLS. Keep rustls active for correctness.
+				errors.LogWarning(w.ctx, "[kind=vision.drain_detach_failed] DeferredRustConn drain failed, keeping rustls active: ", fut.result.err)
+				*switchToDirectCopy = false
+				pipelineVisionDetachFutureByConn.Delete(dc)
+				return buffer, err
+			}
+			// If this future had timed out earlier, treat completion as informational and
+			// keep rustls path (no late state flip).
+			if fut.state.Load() == visionDetachTimedOut {
+				pipelineVisionDetachFutureByConn.Delete(dc)
+				errors.LogWarning(w.ctx, "[kind=vision.drain_detach_late] DeferredRustConn detach completed after timeout; keeping rustls path")
+				return buffer, err
+			}
+			if ts != nil && ts.CreatedAtUnixNano > 0 && detachDoneUnix > ts.CreatedAtUnixNano {
+				pipelineMarkerVisionPaddingPhaseNanos.Add(uint64(detachDoneUnix - ts.CreatedAtUnixNano))
+				pipelineMarkerVisionPaddingPhaseCount.Add(1)
+			}
+			if rawUnwrapUnix, ok := consumeVisionRawUnwrapWarningTimestamp(w.conn); ok && detachDoneUnix > rawUnwrapUnix {
+				unwrapToDetachNs := uint64(detachDoneUnix - rawUnwrapUnix)
+				pipelineMarkerRawUnwrapToDetachNanosTotal.Add(unwrapToDetachNs)
+				pipelineMarkerRawUnwrapToDetachSamples.Add(1)
+				recordRawUnwrapToDetachHistogram(unwrapToDetachNs)
+			}
+			storeVisionDetachTimestamp(w.conn, detachDoneUnix)
+			errors.LogDebug(w.ctx, "Vision: DeferredRustConn drained and detached; switching reader to raw socket")
+			if len(fut.result.plaintext) > 0 {
+				buffer = append(buffer, buf.FromBytes(fut.result.plaintext))
+			}
+			if len(fut.result.rawAhead) > 0 {
+				buffer = append(buffer, buf.FromBytes(fut.result.rawAhead))
+			}
+			pipelineVisionDetachFutureByConn.Delete(dc)
 		} else {
 			// XTLS Vision processes TLS-like conn's input and rawInput
 			if w.input != nil {

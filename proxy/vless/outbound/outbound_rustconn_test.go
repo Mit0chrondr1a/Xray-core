@@ -53,7 +53,7 @@ func TestGetVisionBuffersForRustConn(t *testing.T) {
 		}
 	})
 
-	t.Run("xrv rust conn with full ktls accepted", func(t *testing.T) {
+	t.Run("xrv rust conn with full ktls rejected", func(t *testing.T) {
 		client, server := gonet.Pipe()
 		defer server.Close()
 
@@ -68,14 +68,14 @@ func TestGetVisionBuffersForRustConn(t *testing.T) {
 		defer rc.Close()
 
 		handled, input, rawInput, err := getVisionBuffersForRustConn(rc, vless.XRV)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
 		if !handled {
 			t.Fatal("expected RustConn branch to be handled")
 		}
-		if input == nil || rawInput == nil {
-			t.Fatal("expected non-nil placeholder buffers for RustConn")
+		if err == nil {
+			t.Fatal("expected Vision to reject RustConn with active kTLS")
+		}
+		if input != nil || rawInput != nil {
+			t.Fatal("expected nil buffers when Vision rejects RustConn")
 		}
 	})
 }

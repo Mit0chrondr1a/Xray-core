@@ -29,7 +29,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::tls::{self, TlsState, XrayTlsResult};
+use crate::tls::{
+    self, TlsState, XrayTlsResult, DEFERRED_HANDLE_OWNERSHIP_CONSUMED,
+    DEFERRED_HANDLE_OWNERSHIP_RETAINED,
+};
 use crate::tls13::{self, CertVerifyPolicy, Tls13Error, Tls13State};
 
 // ---------------------------------------------------------------------------
@@ -326,8 +329,13 @@ pub fn reality_client_connect(
     let nonce = &random[20..32];
     // Zero session_id in the raw buffer to build AAD (Go zeros it before Seal).
     client_hello_raw[39..71].fill(0);
-    let encrypted = aes_gcm_seal(auth_key.as_ref(), nonce, &session_id_plain, client_hello_raw)
-        .map_err(|e| RealityError::Protocol(e))?;
+    let encrypted = aes_gcm_seal(
+        auth_key.as_ref(),
+        nonce,
+        &session_id_plain,
+        client_hello_raw,
+    )
+    .map_err(|e| RealityError::Protocol(e))?;
     session_id_plain.zeroize();
 
     // Overwrite session_id in ClientHello (offset 39, 32 bytes)
@@ -1462,7 +1470,7 @@ impl DeferredSession {
     /// Consume the session, install kTLS on the socket, and return the
     /// same tuple as `reality_server_handshake_full`.
     pub fn enable_ktls(
-        self,
+        &mut self,
     ) -> Result<
         (
             u16,         // cipher_suite
@@ -1474,53 +1482,53 @@ impl DeferredSession {
             Vec<u8>,     // rx base traffic secret
             Vec<u8>,     // drained plaintext data
         ),
-        (i32, String),
+        (i32, String, bool), // code, message, handle_retained
     > {
         let tls_version = self.tls_version;
         let original_fd = self.original_fd;
 
         if self.detached.load(Ordering::Acquire) {
-            return Err((2, "deferred session already detached".into()));
+            return Err((2, "deferred session already detached".into(), true));
         }
 
-        // Extract all state from the three locks (self is consumed, so into_inner is safe)
-        let mut conn = self
-            .tls
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .ok_or_else(|| (2, "deferred session closed".to_string()))?;
-        let reader = self
-            .reader
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .ok_or_else(|| (2, "deferred session reader closed".to_string()))?;
-        let writer = self
-            .writer
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .ok_or_else(|| (2, "deferred session writer closed".to_string()))?;
-        let capture = self
-            .capture
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .ok_or_else(|| (2, "deferred session capture closed".to_string()))?;
+        // Keep session components in-place so early failures can retain the
+        // deferred handle for userspace rustls fallback.
+        let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reader_guard = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut capture_guard = self.capture.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Drop reader + writer (closes dup'd fds) — but keep guards alive
-        // until after kTLS install (they restore O_NONBLOCK/timeouts on original fd)
-        drop(reader);
-        drop(writer);
+        let _conn = tls_guard
+            .as_ref()
+            .ok_or_else(|| (2, "deferred session closed".to_string(), true))?;
+        let _reader = reader_guard
+            .as_mut()
+            .ok_or_else(|| (2, "deferred session reader closed".to_string(), true))?;
+        let _writer = writer_guard
+            .as_mut()
+            .ok_or_else(|| (2, "deferred session writer closed".to_string(), true))?;
+        let capture = capture_guard
+            .as_mut()
+            .ok_or_else(|| (2, "deferred session capture closed".to_string(), true))?;
 
-        // Drain any buffered plaintext
+        // From this point onward the deferred session is consumed: extracting
+        // secrets takes ownership of ServerConnection and cannot be undone.
+        let mut conn = tls_guard
+            .take()
+            .ok_or_else(|| (2, "deferred session closed".to_string(), false))?;
         let drained = tls::drain_plaintext(&mut conn);
-
         let secrets = conn
             .dangerous_extract_secrets()
-            .map_err(|e| (2, format!("extract secrets: {}", e)))?;
+            .map_err(|e| (2, format!("extract secrets: {}", e), false))?;
 
         let (tx_seq, tx_secrets) = secrets.tx;
         let (rx_seq, rx_secrets) = secrets.rx;
 
         let cipher_suite = tls::cipher_suite_to_u16(&tx_secrets);
+
+        // ULP can fail independently; do it after secrets are extracted so a rustls
+        // failure does not leave the socket in TLS ULP state.
+        tls::setup_ulp(original_fd).map_err(|e| (2, format!("ULP: {}", e), false))?;
 
         // Install kTLS on the original fd
         #[cfg(debug_assertions)]
@@ -1529,7 +1537,6 @@ impl DeferredSession {
             original_fd, tls_version, cipher_suite, tx_seq, rx_seq,
         );
 
-        tls::setup_ulp(original_fd).map_err(|e| (2, format!("ULP: {}", e)))?;
         let tx_result =
             tls::install_ktls(original_fd, tls::TLS_TX, tls_version, &tx_secrets, tx_seq);
         let rx_result =
@@ -1566,6 +1573,7 @@ impl DeferredSession {
                         .as_deref()
                         .unwrap_or("none"),
                 ),
+                false,
             ));
         }
 
@@ -2175,9 +2183,10 @@ pub extern "C" fn xray_deferred_restore_nonblock(handle: *mut c_void) -> i32 {
     })
 }
 
-/// Consume the deferred session handle and install kTLS.
-/// After this call, the handle is invalid — caller must not use it.
-/// Results are written to the XrayTlsResult struct (same as full handshake).
+/// Attempt deferred kTLS installation and report handle ownership in
+/// XrayTlsResult.deferred_handle_ownership:
+/// - consumed: handle must not be used again
+/// - retained: caller may continue rustls I/O on fallback path
 #[no_mangle]
 pub extern "C" fn xray_deferred_enable_ktls(handle: *mut c_void, out: *mut XrayTlsResult) -> i32 {
     xray_deferred_enable_ktls_into(handle, out, std::ptr::null_mut(), 0)
@@ -2196,9 +2205,12 @@ pub extern "C" fn xray_deferred_enable_ktls_into(
         }
         let out = unsafe { &mut *out };
         *out = XrayTlsResult::new();
+        out.deferred_handle_ownership = DEFERRED_HANDLE_OWNERSHIP_CONSUMED;
 
-        // Consume the handle — take ownership back from the raw pointer
-        let session = unsafe { Box::from_raw(handle as *mut DeferredSession) };
+        // Take ownership of the handle, then explicitly report whether the
+        // handle was consumed or retained when returning to Go.
+        let mut session = unsafe { Box::from_raw(handle as *mut DeferredSession) };
+        let tls_version = session.tls_version;
         match session.enable_ktls() {
             Ok((
                 cipher_suite,
@@ -2210,7 +2222,7 @@ pub extern "C" fn xray_deferred_enable_ktls_into(
                 mut rx_secret,
                 drained,
             )) => {
-                out.version = 0x0304;
+                out.version = tls_version;
                 out.cipher_suite = cipher_suite;
                 out.ktls_tx = ktls_tx;
                 out.ktls_rx = ktls_rx;
@@ -2222,10 +2234,17 @@ pub extern "C" fn xray_deferred_enable_ktls_into(
                 let _ = copy_secret_to_result_slot(&mut out.rx_secret, &mut rx_secret);
 
                 unsafe { tls::write_drained_to_result(out, drained, drained_buf, drained_cap) };
+                out.deferred_handle_ownership = DEFERRED_HANDLE_OWNERSHIP_CONSUMED;
                 0
             }
-            Err((code, msg)) => {
+            Err((code, msg, retained)) => {
                 out.set_error(code, &msg);
+                if retained {
+                    out.deferred_handle_ownership = DEFERRED_HANDLE_OWNERSHIP_RETAINED;
+                    let _ = Box::into_raw(session);
+                } else {
+                    out.deferred_handle_ownership = DEFERRED_HANDLE_OWNERSHIP_CONSUMED;
+                }
                 code
             }
         }

@@ -271,6 +271,13 @@ func setupSockmapImpl(config SockmapConfig) error {
 		return fmt.Errorf("failed to create policy map: %w", err)
 	}
 
+	xerrors.LogInfo(context.Background(),
+		"sockmap: maps created",
+		" sockhash_entries=", config.MaxEntries,
+		" policy_entries=", config.MaxEntries,
+		" cork_threshold=", config.CorkThreshold,
+	)
+
 	// Build and load sk_skb stream parser
 	parserInsns := buildSKSkbParserProgram()
 	parserBytecode := encodeBPFInsns(parserInsns)

@@ -39,3 +39,8 @@ func NativeFullKTLSSupported() bool {
 func NativeFullKTLSSupportedForTLSConfig(*Config) bool {
 	return false
 }
+
+// KTLSProbeRefreshEpoch returns zero on non-Linux platforms.
+func KTLSProbeRefreshEpoch() uint64 {
+	return 0
+}

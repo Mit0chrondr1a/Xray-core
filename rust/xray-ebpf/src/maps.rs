@@ -4,7 +4,7 @@
 //! for zero-downtime recovery across process restarts.
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{HashMap, SockHash};
+use aya_ebpf::maps::{LruHashMap, SockHash};
 
 /// SOCKHASH map: socket cookie (u64) -> socket fd.
 ///
@@ -12,7 +12,7 @@ use aya_ebpf::maps::{HashMap, SockHash};
 /// paired sockets. Both programs share this map — SK_SKB handles the
 /// receive path, SK_MSG handles the send path.
 #[map]
-pub static SOCKHASH: SockHash<u64> = SockHash::with_max_entries(65536, 0);
+pub static SOCKHASH: SockHash<u64> = SockHash::with_max_entries(crate::maps::MAX_ENTRIES, 0);
 
 /// Policy map: socket cookie (u64) -> policy flags (u32).
 ///
@@ -20,13 +20,15 @@ pub static SOCKHASH: SockHash<u64> = SockHash::with_max_entries(65536, 0);
 /// Flag bits:
 ///   bit 0 (POLICY_ALLOW_REDIRECT): allow redirect to paired socket
 ///   bit 1 (POLICY_USE_INGRESS):    redirect into target's ingress queue
-///   bit 2 (POLICY_KTLS_ACTIVE):    kTLS is active on both sockets
+///   bit 2 (POLICY_KTLS_ACTIVE):    at least one socket in the pair is kTLS
 #[map]
-pub static POLICY_MAP: HashMap<u64, u32> = HashMap::with_max_entries(65536, 0);
+pub static POLICY_MAP: LruHashMap<u64, u32> =
+    LruHashMap::with_max_entries(crate::maps::MAX_ENTRIES, 0);
 
 // Policy flag constants (must match Go's PolicyAllowRedirect etc.)
 pub const POLICY_ALLOW_REDIRECT: u32 = 1 << 0;
 pub const POLICY_USE_INGRESS: u32 = 1 << 1;
+pub const POLICY_KTLS_ACTIVE: u32 = 1 << 2;
 
 /// Cork threshold: batch small writes into chunks of this size.
 /// 1400 bytes is just under typical MTU (1500) minus TCP/IP headers,
@@ -34,3 +36,4 @@ pub const POLICY_USE_INGRESS: u32 = 1 << 1;
 ///
 /// Shared by both xray_sk_msg (full) and xray_sk_msg_cork (fallback).
 pub const CORK_THRESHOLD: u32 = 1400;
+pub const MAX_ENTRIES: u32 = 65_536;

@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -142,6 +143,19 @@ func TestTryEnableKTLS(t *testing.T) {
 	t.Logf("Server kTLS state: Enabled=%v TxReady=%v RxReady=%v", serverState.Enabled, serverState.TxReady, serverState.RxReady)
 
 	clientConn.Close()
+}
+
+func TestForceRefreshKTLSSupportCounters(t *testing.T) {
+	ktlsSupportOnce = sync.Once{}
+	ktlsSupportOK.Store(false)
+	ktlsProbeRefreshes.Store(0)
+	ktlsProbeRefreshSuccess.Store(0)
+
+	_ = forceRefreshKTLSSupport()
+
+	if got := ktlsProbeRefreshes.Load(); got == 0 {
+		t.Fatal("expected refresh counter to increment")
+	}
 }
 
 func TestHandshakeAndEnableKTLS(t *testing.T) {

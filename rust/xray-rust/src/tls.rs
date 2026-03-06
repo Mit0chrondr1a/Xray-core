@@ -25,6 +25,10 @@ use rustls_pki_types::pem::PemObject;
 // FFI result struct returned to Go
 // ---------------------------------------------------------------------------
 
+pub const DEFERRED_HANDLE_OWNERSHIP_UNKNOWN: u8 = 0;
+pub const DEFERRED_HANDLE_OWNERSHIP_CONSUMED: u8 = 1;
+pub const DEFERRED_HANDLE_OWNERSHIP_RETAINED: u8 = 2;
+
 #[repr(C)]
 pub struct XrayTlsResult {
     pub ktls_tx: bool,
@@ -34,6 +38,9 @@ pub struct XrayTlsResult {
     pub alpn: [u8; 32],
     pub state_handle: *mut c_void,
     pub error_code: i32,
+    // Deferred handle ownership outcome for xray_deferred_enable_ktls_*:
+    // 0 = unknown / not-applicable, 1 = consumed, 2 = retained.
+    pub deferred_handle_ownership: u8,
     pub error_msg: [u8; 256],
     pub tx_secret: [u8; 48],
     pub rx_secret: [u8; 48],
@@ -56,6 +63,7 @@ impl XrayTlsResult {
             alpn: [0u8; 32],
             state_handle: std::ptr::null_mut(),
             error_code: 0,
+            deferred_handle_ownership: 0,
             error_msg: [0u8; 256],
             tx_secret: [0u8; 48],
             rx_secret: [0u8; 48],
@@ -1064,20 +1072,76 @@ fn consume_post_handshake_records(conn: &mut ClientConnection, reader: &mut Reco
 fn build_protocol_versions(
     min: Option<u16>,
     max: Option<u16>,
-) -> Vec<&'static rustls::SupportedProtocolVersion> {
+) -> Result<Vec<&'static rustls::SupportedProtocolVersion>, String> {
     let mut versions = Vec::new();
-    let lo = min.unwrap_or(0x0303);
-    let hi = max.unwrap_or(0x0304);
+
+    let validate = |v: u16, label: &str| match v {
+        0x0303 | 0x0304 => Ok(v),
+        _ => Err(format!(
+            "{label} {:#06x} unsupported (allowed: TLS1.2=0x0303, TLS1.3=0x0304)",
+            v
+        )),
+    };
+
+    let lo = match min {
+        Some(v) => validate(v, "min_version")?,
+        None => 0x0303, // default TLS 1.2
+    };
+    let hi = match max {
+        Some(v) => validate(v, "max_version")?,
+        None => 0x0304, // default TLS 1.3
+    };
+
+    if lo > hi {
+        return Err(format!(
+            "min_version ({:#06x}) is greater than max_version ({:#06x})",
+            lo, hi
+        ));
+    }
+
     if lo <= 0x0303 && hi >= 0x0303 {
         versions.push(&rustls::version::TLS12);
     }
     if lo <= 0x0304 && hi >= 0x0304 {
         versions.push(&rustls::version::TLS13);
     }
+
     if versions.is_empty() {
-        versions.push(&rustls::version::TLS13);
+        return Err("no supported TLS versions remain after filtering".into());
     }
-    versions
+
+    Ok(versions)
+}
+
+#[cfg(test)]
+mod protocol_version_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_allow_tls12_and_tls13() {
+        let versions = build_protocol_versions(None, None).expect("default versions");
+        assert_eq!(
+            versions,
+            vec![&rustls::version::TLS12, &rustls::version::TLS13]
+        );
+    }
+
+    #[test]
+    fn min_tls13_limits_to_tls13() {
+        let versions = build_protocol_versions(Some(0x0304), None).expect("tls13 only");
+        assert_eq!(versions, vec![&rustls::version::TLS13]);
+    }
+
+    #[test]
+    fn rejects_unknown_versions() {
+        assert!(build_protocol_versions(Some(0x0302), None).is_err());
+        assert!(build_protocol_versions(None, Some(0x0305)).is_err());
+    }
+
+    #[test]
+    fn rejects_inverted_range() {
+        assert!(build_protocol_versions(Some(0x0304), Some(0x0303)).is_err());
+    }
 }
 
 /// Output of a TLS handshake — replaces the previous 9-element tuple.
@@ -1110,7 +1174,7 @@ fn do_server_handshake_core(
     pipeline: &mut crate::fdutil::HandshakePipeline,
     cfg: &TlsConfig,
 ) -> Result<ServerHandshakeCore, String> {
-    let versions = build_protocol_versions(cfg.min_version, cfg.max_version);
+    let versions = build_protocol_versions(cfg.min_version, cfg.max_version)?;
     let provider = cached_provider();
 
     if cfg.certs.is_empty() {
@@ -1240,7 +1304,7 @@ fn do_handshake(
         })
     } else {
         // --- Client path ---
-        let versions = build_protocol_versions(cfg.min_version, cfg.max_version);
+        let versions = build_protocol_versions(cfg.min_version, cfg.max_version)?;
         let provider = cached_provider();
 
         let sni: ServerName<'static> = cfg
