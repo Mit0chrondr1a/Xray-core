@@ -2,9 +2,7 @@ package dispatcher
 
 import (
 	"context"
-	gonet "net"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,10 +26,6 @@ import (
 )
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
-
-// loopbackDetachGuardPort mirrors the Vision/TCP loopback guard used in proxy.
-// Keep in sync with proxy.loopbackDetachGuardPort.
-const loopbackDetachGuardPort = 2036
 
 // regexCache caches compiled regexes from sniffing ExcludeForDomain patterns.
 // Patterns from config are static (SniffingRequest is read-only), so compiling
@@ -491,45 +485,6 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 		return CompositeResult(metaresult, contentResult), nil
 	}
 	return contentResult, contentErr
-}
-
-func extractAddrIP(addr gonet.Addr) net.IP {
-	switch a := addr.(type) {
-	case *gonet.TCPAddr:
-		return a.IP
-	case *gonet.UDPAddr:
-		return a.IP
-	case *gonet.IPAddr:
-		return a.IP
-	default:
-		return nil
-	}
-}
-
-// isLoopbackDetachGuardedInbound checks whether the inbound connection is the
-// loopback REALITY ingress (guarded port). Used to avoid tcp->udp DNS
-// conversion for DoT-over-TCP on that ingress.
-func isLoopbackDetachGuardedInbound(ctx context.Context) bool {
-	inb := session.InboundFromContext(ctx)
-	if inb == nil || inb.Conn == nil {
-		return false
-	}
-	la := inb.Conn.LocalAddr()
-	ra := inb.Conn.RemoteAddr()
-	if la == nil || ra == nil {
-		return false
-	}
-	lip := extractAddrIP(la)
-	rip := extractAddrIP(ra)
-	if lip == nil || rip == nil {
-		return false
-	}
-	if !(lip.IsLoopback() || rip.IsLoopback()) {
-		return false
-	}
-	_, lport, _ := gonet.SplitHostPort(la.String())
-	_, rport, _ := gonet.SplitHostPort(ra.String())
-	return lport == strconv.Itoa(loopbackDetachGuardPort) || rport == strconv.Itoa(loopbackDetachGuardPort)
 }
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
