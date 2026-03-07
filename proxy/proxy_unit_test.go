@@ -556,7 +556,7 @@ func TestVisionReaderDirectCopyPromotesInboundSpliceState(t *testing.T) {
 	reader := &singleReadReader{
 		mb: buf.MultiBuffer{b},
 	}
-	vr := NewVisionReader(reader, ts, false, ctx, left, nil, nil, nil)
+	vr := NewVisionReader(reader, ts, false, ctx, NewVisionTransitionSource(left, nil, nil), nil)
 	mb, err := vr.ReadMultiBuffer()
 	if err != nil {
 		t.Fatalf("ReadMultiBuffer() error = %v", err)
@@ -587,7 +587,7 @@ func TestVisionReaderDirectCopyOverridesCommandContinueHandoff(t *testing.T) {
 	b := buf.New()
 	b.Write([]byte("abc"))
 	reader := &singleReadReader{mb: buf.MultiBuffer{b}}
-	vr := NewVisionReader(reader, ts, false, ctx, left, nil, nil, nil)
+	vr := NewVisionReader(reader, ts, false, ctx, NewVisionTransitionSource(left, nil, nil), nil)
 	mb, err := vr.ReadMultiBuffer()
 	if err != nil {
 		t.Fatalf("ReadMultiBuffer() error = %v", err)
@@ -599,6 +599,60 @@ func TestVisionReaderDirectCopyOverridesCommandContinueHandoff(t *testing.T) {
 	}
 	if inbound.GetCanSpliceCopy() != session.CopyGateEligible {
 		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateEligible)
+	}
+}
+
+func TestVisionTransitionSourceDrainBufferedState(t *testing.T) {
+	input := bytes.NewReader([]byte("plain"))
+	var raw bytes.Buffer
+	raw.WriteString("raw")
+
+	source := NewVisionTransitionSource(nil, input, &raw)
+	plain, rawAhead := source.DrainBufferedState()
+
+	if got := string(plain); got != "plain" {
+		t.Fatalf("plaintext = %q, want %q", got, "plain")
+	}
+	if got := string(rawAhead); got != "raw" {
+		t.Fatalf("rawAhead = %q, want %q", got, "raw")
+	}
+	plain, rawAhead = source.DrainBufferedState()
+	if len(plain) != 0 || len(rawAhead) != 0 {
+		t.Fatalf("second drain = (%q, %q), want empty", string(plain), string(rawAhead))
+	}
+}
+
+func TestVisionReaderDirectCopyDrainsTransitionSourceBufferedState(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	ts := NewTrafficState(nil)
+	ts.Outbound.WithinPaddingBuffers = true
+	ts.Outbound.CurrentCommand = 2
+
+	input := bytes.NewReader([]byte("plain"))
+	var raw bytes.Buffer
+	raw.WriteString("raw")
+
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach), Conn: left}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+
+	b := buf.New()
+	b.Write([]byte("abc"))
+	reader := &singleReadReader{mb: buf.MultiBuffer{b}}
+	source := NewVisionTransitionSource(left, input, &raw)
+	vr := NewVisionReader(reader, ts, false, ctx, source, nil)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	defer buf.ReleaseMulti(mb)
+
+	got := make([]byte, mb.Len())
+	mb.Copy(got)
+	if string(got) != "abcplainraw" {
+		t.Fatalf("payload = %q, want %q", string(got), "abcplainraw")
 	}
 }
 
@@ -615,7 +669,7 @@ func TestVisionReaderCommandPaddingEndForcesUserspaceGate(t *testing.T) {
 	padded := XtlsPadding(buf.FromBytes([]byte("ok")), CommandPaddingEnd, &userUUID, false, ctx, []uint32{0, 0, 0, 1})
 	reader := &singleReadReader{mb: buf.MultiBuffer{padded}}
 
-	vr := NewVisionReader(reader, ts, true, ctx, nil, nil, nil, outbound)
+	vr := NewVisionReader(reader, ts, true, ctx, NewVisionTransitionSource(nil, nil, nil), outbound)
 	mb, err := vr.ReadMultiBuffer()
 	if err != nil {
 		t.Fatalf("ReadMultiBuffer() error = %v", err)
@@ -654,7 +708,7 @@ func TestVisionReaderCommandPaddingEndOverridesCommandContinueHandoff(t *testing
 	padded := XtlsPadding(buf.FromBytes([]byte("ok")), CommandPaddingEnd, &userUUID, false, ctx, []uint32{0, 0, 0, 1})
 	reader := &singleReadReader{mb: buf.MultiBuffer{padded}}
 
-	vr := NewVisionReader(reader, ts, true, ctx, nil, nil, nil, outbound)
+	vr := NewVisionReader(reader, ts, true, ctx, NewVisionTransitionSource(nil, nil, nil), outbound)
 	mb, err := vr.ReadMultiBuffer()
 	if err != nil {
 		t.Fatalf("ReadMultiBuffer() error = %v", err)
@@ -698,7 +752,7 @@ func TestVisionReaderDetectsRawDNSPayloadBypass(t *testing.T) {
 	ctx := session.ContextWithInbound(context.Background(), inbound)
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
 
-	vr := NewVisionReader(reader, ts, true, ctx, nil, nil, nil, outbound)
+	vr := NewVisionReader(reader, ts, true, ctx, NewVisionTransitionSource(nil, nil, nil), outbound)
 	mb, err := vr.ReadMultiBuffer()
 	if err != nil {
 		t.Fatalf("ReadMultiBuffer() error = %v", err)

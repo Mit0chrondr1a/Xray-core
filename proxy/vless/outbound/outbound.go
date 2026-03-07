@@ -1,19 +1,14 @@
 package outbound
 
 import (
-	"bytes"
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
-	"reflect"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
-
-	gonet "net"
 
 	utls "github.com/refraction-networking/utls"
 	proxyman "github.com/xtls/xray-core/app/proxyman/outbound"
@@ -39,7 +34,6 @@ import (
 	"github.com/xtls/xray-core/proxy/vless/encryption"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"github.com/xtls/xray-core/transport/pipe"
@@ -117,25 +111,6 @@ func shouldRewriteUDPToMux(cmd protocol.RequestCommand, flow string, cone bool, 
 		return true
 	}
 	return cone && port != 53 && port != 443
-}
-
-func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, input *bytes.Reader, rawInput *bytes.Buffer, err error) {
-	if flow != vless.XRV {
-		return false, nil, nil, nil
-	}
-	rc, ok := conn.(*tls.RustConn)
-	if !ok {
-		return false, nil, nil, nil
-	}
-	// This path should be unreachable now: the Vision flow gate in outbound.go
-	// sets ContextWithVisionFlow(ctx, true) before dialing, which skips Rust
-	// native paths in the transport layer.  If we reach here, a code path
-	// bypassed the gate (e.g., pre-connect without VisionFlow propagation).
-	errors.LogWarning(context.Background(), "Vision flow on RustConn — gating bypassed; kTLS+Vision is unsupported and will be rejected")
-	if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
-		return true, nil, nil, errors.New("RustConn without full kTLS cannot use " + flow).AtWarning()
-	}
-	return true, nil, nil, errors.New("Vision is incompatible with kTLS-native RustConn; aborting outbound Vision flow").AtWarning()
 }
 
 // New creates a new VLess outbound handler.
@@ -374,8 +349,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		Flow: requestFlow,
 	}
 
-	var input *bytes.Reader
-	var rawInput *bytes.Buffer
+	transitionSource := proxy.NewVisionTransitionSource(conn, nil, nil)
 	allowUDP443 := false
 	switch requestAddons.Flow {
 	case vless.XRV + "-udp443":
@@ -392,43 +366,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		case protocol.RequestCommandMux:
 			fallthrough // let server break Mux connections that contain TCP requests
 		case protocol.RequestCommandTCP, protocol.RequestCommandRvs:
-			var t reflect.Type
-			var p uintptr
 			if commonConn, ok := conn.(*encryption.CommonConn); ok {
 				if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
 					ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 				}
-				t = reflect.TypeOf(commonConn).Elem()
-				p = uintptr(unsafe.Pointer(commonConn))
-			} else if tlsConn, ok := iConn.(*tls.Conn); ok {
-				t = reflect.TypeOf(tlsConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(tlsConn.Conn))
-			} else if utlsConn, ok := iConn.(*tls.UConn); ok {
-				t = reflect.TypeOf(utlsConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(utlsConn.Conn))
-			} else if realityConn, ok := iConn.(*reality.UConn); ok {
-				t = reflect.TypeOf(realityConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(realityConn.Conn))
-			} else {
-				handled, rustInput, rustRaw, err := getVisionBuffersForRustConn(iConn, requestAddons.Flow)
-				if err != nil {
-					return err
-				}
-				if handled {
-					input = rustInput
-					rawInput = rustRaw
-				} else {
-					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
-				}
 			}
-			if t != nil {
-				i, iOK := t.FieldByName("input")
-				r, rOK := t.FieldByName("rawInput")
-				if !iOK || !rOK {
-					return errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
-				}
-				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+			if _, ok := iConn.(*tls.RustConn); ok {
+				errors.LogWarning(ctx, "Vision flow on RustConn - gating bypassed; kTLS+Vision is unsupported and will be rejected")
+			}
+			var err error
+			transitionSource, err = proxy.BuildVisionTransitionSource(conn, iConn)
+			if err != nil {
+				return err
 			}
 		default:
 			return errors.New("unknown VLESS request command: ", request.Command)
@@ -550,7 +499,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			encoding.ShouldHonorResponseVisionPayloadBypass(responseAddons, request.Destination())
 
 		if requestAddons.Flow == vless.XRV && !responseBypassVisionPayload {
-			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, input, rawInput, ob)
+			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, transitionSource, ob)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
 			if requestAddons.Flow == vless.XRV {

@@ -530,24 +530,20 @@ type VisionReader struct {
 	trafficState *TrafficState
 	ctx          context.Context
 	isUplink     bool
-	conn         net.Conn
-	input        *bytes.Reader
-	rawInput     *bytes.Buffer
+	source       *VisionTransitionSource
 	ob           *session.Outbound
 
 	// internal
 	directReadCounter stats.Counter
 }
 
-func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
+func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, source *VisionTransitionSource, ob *session.Outbound) *VisionReader {
 	return &VisionReader{
 		Reader:       reader,
 		trafficState: trafficState,
 		ctx:          ctx,
 		isUplink:     isUplink,
-		conn:         conn,
-		input:        input,
-		rawInput:     rawInput,
+		source:       source,
 		ob:           ob,
 	}
 }
@@ -810,7 +806,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 	if *switchToDirectCopy {
 		if w.isUplink {
-			storeVisionUplinkTimestamp(w.conn, time.Now().UnixNano())
+			storeVisionUplinkTimestamp(w.source.Conn(), time.Now().UnixNano())
 		}
 		if w.directReadCounter != nil {
 			w.directReadCounter.Add(int64(buffer.Len()))
@@ -820,14 +816,14 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 	if shouldObserveVisionPayloadBypass(ts, w.isUplink, w.ctx, buffer) {
 		if w.isUplink {
-			storeVisionUplinkTimestamp(w.conn, time.Now().UnixNano())
+			storeVisionUplinkTimestamp(w.source.Conn(), time.Now().UnixNano())
 		}
 		markVisionPayloadBypassObserved(w.ctx, ts, w.ob)
 		return buffer, err
 	}
 	if ts.VisionPayloadBypassObserved {
 		if w.isUplink {
-			storeVisionUplinkTimestamp(w.conn, time.Now().UnixNano())
+			storeVisionUplinkTimestamp(w.source.Conn(), time.Now().UnixNano())
 		}
 		return buffer, err
 	}
@@ -848,7 +844,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			if *currentCommand == int(CommandPaddingContinue) && *remainingContent <= 0 && *remainingPadding <= 0 && continueCommandsSeen != nil {
 				*continueCommandsSeen = *continueCommandsSeen + 1
 				if w.isUplink && *continueCommandsSeen >= 2 {
-					markVisionCommandContinueEvidence(w.ctx, w.conn, w.ob)
+					markVisionCommandContinueEvidence(w.ctx, w.source.Conn(), w.ob)
 				}
 			}
 		} else if *currentCommand == 1 {
@@ -858,7 +854,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			}
 			markVisionNoDetachObserved(w.ctx, w.ob)
 			if w.isUplink {
-				wakeVisionResponseLoop(w.ctx, w.conn, "command=1")
+				wakeVisionResponseLoop(w.ctx, w.source.Conn(), "command=1")
 			}
 		} else if *currentCommand == 2 {
 			*withinPaddingBuffers = false
@@ -877,7 +873,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		XtlsFilterTls(buffer, ts, w.ctx)
 	}
 	if w.isUplink && !buffer.IsEmpty() {
-		storeVisionUplinkTimestamp(w.conn, time.Now().UnixNano())
+		storeVisionUplinkTimestamp(w.source.Conn(), time.Now().UnixNano())
 	}
 
 	if *switchToDirectCopy {
@@ -887,7 +883,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			*switchToDirectCopy = false
 			return buffer, err
 		}
-		if dc := unwrapVisionDeferredConn(w.conn); dc != nil {
+		if dc := unwrapVisionDeferredConn(w.source.Conn()); dc != nil {
 			fut := startVisionDetach(dc)
 			wait := visionDetachWaitBudget()
 			if !fut.startedAt.IsZero() {
@@ -953,13 +949,13 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				pipelineMarkerVisionPaddingPhaseNanos.Add(uint64(detachDoneUnix - ts.CreatedAtUnixNano))
 				pipelineMarkerVisionPaddingPhaseCount.Add(1)
 			}
-			if rawUnwrapUnix, ok := consumeVisionRawUnwrapWarningTimestamp(w.conn); ok && detachDoneUnix > rawUnwrapUnix {
+			if rawUnwrapUnix, ok := consumeVisionRawUnwrapWarningTimestamp(w.source.Conn()); ok && detachDoneUnix > rawUnwrapUnix {
 				unwrapToDetachNs := uint64(detachDoneUnix - rawUnwrapUnix)
 				pipelineMarkerRawUnwrapToDetachNanosTotal.Add(unwrapToDetachNs)
 				pipelineMarkerRawUnwrapToDetachSamples.Add(1)
 				recordRawUnwrapToDetachHistogram(unwrapToDetachNs)
 			}
-			storeVisionDetachTimestamp(w.conn, detachDoneUnix)
+			storeVisionDetachTimestamp(w.source.Conn(), detachDoneUnix)
 			errors.LogDebug(w.ctx, "Vision: DeferredRustConn drained and detached; switching reader to raw socket")
 			if len(fut.result.plaintext) > 0 {
 				buffer = append(buffer, buf.FromBytes(fut.result.plaintext))
@@ -969,20 +965,12 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			}
 			pipelineVisionDetachFutureByConn.Delete(dc)
 		} else {
-			// XTLS Vision processes TLS-like conn's input and rawInput
-			if w.input != nil {
-				if inputBuffer, err := buf.ReadFrom(w.input); err == nil && !inputBuffer.IsEmpty() {
-					buffer, _ = buf.MergeMulti(buffer, inputBuffer)
-				}
-				*w.input = bytes.Reader{} // release memory
-				w.input = nil
+			plaintext, rawAhead := w.source.DrainBufferedState()
+			if len(plaintext) > 0 {
+				buffer = append(buffer, buf.FromBytes(plaintext))
 			}
-			if w.rawInput != nil {
-				if rawInputBuffer, err := buf.ReadFrom(w.rawInput); err == nil && !rawInputBuffer.IsEmpty() {
-					buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
-				}
-				*w.rawInput = bytes.Buffer{} // release memory
-				w.rawInput = nil
+			if len(rawAhead) > 0 {
+				buffer = append(buffer, buf.FromBytes(rawAhead))
 			}
 		}
 
@@ -1018,9 +1006,9 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			}
 		}
 		if w.isUplink {
-			wakeVisionResponseLoop(w.ctx, w.conn, "command=2")
+			wakeVisionResponseLoop(w.ctx, w.source.Conn(), "command=2")
 		}
-		readerConn, readCounter, _, readerHandler := UnwrapRawConn(w.conn)
+		readerConn, readCounter, _, readerHandler := UnwrapRawConn(w.source.Conn())
 		w.directReadCounter = readCounter
 		if readerHandler != nil {
 			w.Reader = buf.NewReader(&ktlsReader{Conn: readerConn, handler: readerHandler})
