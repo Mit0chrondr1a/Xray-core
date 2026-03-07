@@ -197,6 +197,172 @@ func TestLogVisionTransitionSourceAndDrain(t *testing.T) {
 	}
 }
 
+func TestLogVisionTransitionEvent(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	source := NewVisionTransitionSource(&testEOFConn{}, nil, nil)
+	source.kind = VisionTransitionKindDeferredRust
+	source.origin = VisionIngressOriginNativeRealityDeferred
+
+	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 2, 1, 0, 0, false, true)
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "kind=vision-transition-event") {
+		t.Fatalf("missing transition event log: %s", logs)
+	}
+	if !strings.Contains(logs, "direction=uplink") ||
+		!strings.Contains(logs, "transition_kind=deferred_rust_conn") ||
+		!strings.Contains(logs, "ingress_origin=native_reality_deferred") ||
+		!strings.Contains(logs, "event=command_observed") ||
+		!strings.Contains(logs, "command=2") ||
+		!strings.Contains(logs, "switch_to_direct_copy=true") {
+		t.Fatalf("missing transition event fields in logs: %s", logs)
+	}
+}
+
+func TestVisionReaderEmitsTransitionCommandEvent(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	ts := NewTrafficState(nil)
+	ts.Outbound.WithinPaddingBuffers = true
+	ts.Outbound.CurrentCommand = 2
+
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach), Conn: left}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+
+	b := buf.New()
+	b.Write([]byte("abc"))
+	reader := &singleReadReader{mb: buf.MultiBuffer{b}}
+	source := NewVisionTransitionSource(left, nil, nil)
+	source.kind = VisionTransitionKindDeferredRust
+	source.origin = VisionIngressOriginNativeRealityDeferred
+
+	vr := NewVisionReader(reader, ts, false, ctx, source, nil)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	buf.ReleaseMulti(mb)
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "kind=vision-transition-event") ||
+		!strings.Contains(logs, "direction=downlink") ||
+		!strings.Contains(logs, "ingress_origin=native_reality_deferred") ||
+		!strings.Contains(logs, "event=command_observed") ||
+		!strings.Contains(logs, "command=2") ||
+		!strings.Contains(logs, "switch_to_direct_copy=true") {
+		t.Fatalf("missing vision reader command event fields in logs: %s", logs)
+	}
+}
+
+func TestVisionReaderEmitsNoDetachTransitionEvent(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	uuid := []byte("0123456789abcdef")
+	ts := NewTrafficState(uuid)
+
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
+	outbound := &session.Outbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	userUUID := append([]byte(nil), uuid...)
+	padded := XtlsPadding(buf.FromBytes([]byte("ok")), CommandPaddingEnd, &userUUID, false, ctx, []uint32{0, 0, 0, 1})
+	reader := &singleReadReader{mb: buf.MultiBuffer{padded}}
+
+	source := NewVisionTransitionSource(&testEOFConn{}, nil, nil)
+	source.kind = VisionTransitionKindRealityConn
+	source.origin = VisionIngressOriginGoRealityFallback
+
+	vr := NewVisionReader(reader, ts, true, ctx, source, outbound)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	buf.ReleaseMulti(mb)
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "kind=vision-transition-event") ||
+		!strings.Contains(logs, "direction=uplink") ||
+		!strings.Contains(logs, "ingress_origin=go_reality_fallback") ||
+		!strings.Contains(logs, "event=command_observed") ||
+		!strings.Contains(logs, "command=1") ||
+		!strings.Contains(logs, "switch_to_direct_copy=false") {
+		t.Fatalf("missing no-detach transition event fields in logs: %s", logs)
+	}
+}
+
+func TestVisionReaderEmitsPayloadBypassTransitionEvent(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	ts := NewTrafficState([]byte("0123456789abcdef"))
+	rawDNS := []byte{
+		0x00, 0x2c,
+		0x12, 0x34,
+		0x01, 0x00,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x03, 'w', 'w', 'w', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+		0x03, 'c', 'o', 'm', 0x00,
+		0x00, 0x01, 0x00, 0x01,
+	}
+	reader := &singleReadReader{mb: buf.MultiBuffer{buf.FromBytes(rawDNS)}}
+
+	inbound := &session.Inbound{
+		Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	outbound := &session.Outbound{
+		Target: xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	source := NewVisionTransitionSource(&testEOFConn{}, nil, nil)
+	source.kind = VisionTransitionKindRealityConn
+	source.origin = VisionIngressOriginGoReality
+
+	vr := NewVisionReader(reader, ts, true, ctx, source, outbound)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	buf.ReleaseMulti(mb)
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "kind=vision-transition-event") ||
+		!strings.Contains(logs, "event=payload_bypass") ||
+		!strings.Contains(logs, "ingress_origin=go_reality") {
+		t.Fatalf("missing payload bypass transition event fields in logs: %s", logs)
+	}
+}
+
 func TestCopyRawConnIfExistLogsStableUserspaceAfterNoDetachEOF(t *testing.T) {
 	t.Cleanup(func() {
 		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))

@@ -49,6 +49,13 @@ type VisionTransitionSnapshot struct {
 	BufferedRawAhead  int
 }
 
+type VisionTransitionEvent string
+
+const (
+	VisionTransitionEventCommandObserved VisionTransitionEvent = "command_observed"
+	VisionTransitionEventPayloadBypass   VisionTransitionEvent = "payload_bypass"
+)
+
 // VisionTransitionSource makes the pre-detach Vision transition contract explicit.
 //
 // Historically Vision reached into Go TLS/REALITY internals via reflection to
@@ -173,6 +180,25 @@ func LogVisionTransitionDrain(ctx context.Context, direction string, source *Vis
 		" uses_deferred_rust=", snap.UsesDeferredRust,
 		" plaintext_len=", plaintextLen,
 		" raw_ahead_len=", rawAheadLen,
+	)
+}
+
+func LogVisionTransitionEvent(ctx context.Context, direction string, source *VisionTransitionSource, event VisionTransitionEvent, command int, continueCount int32, remainingContent int32, remainingPadding int32, withinPadding bool, switchToDirectCopy bool) {
+	if !debugVisionTransitionTrace() || source == nil {
+		return
+	}
+	snap := source.Snapshot()
+	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-event]: ",
+		"direction=", direction,
+		" transition_kind=", snap.Kind,
+		" ingress_origin=", snap.IngressOrigin,
+		" event=", event,
+		" command=", command,
+		" continue_count=", continueCount,
+		" remaining_content=", remainingContent,
+		" remaining_padding=", remainingPadding,
+		" within_padding=", withinPadding,
+		" switch_to_direct_copy=", switchToDirectCopy,
 	)
 }
 

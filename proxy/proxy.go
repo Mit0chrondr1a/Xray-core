@@ -537,6 +537,13 @@ type VisionReader struct {
 	directReadCounter stats.Counter
 }
 
+func visionTransitionDirection(isUplink bool) string {
+	if isUplink {
+		return "uplink"
+	}
+	return "downlink"
+}
+
 func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, source *VisionTransitionSource, ob *session.Outbound) *VisionReader {
 	return &VisionReader{
 		Reader:       reader,
@@ -819,6 +826,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			storeVisionUplinkTimestamp(w.source.Conn(), time.Now().UnixNano())
 		}
 		markVisionPayloadBypassObserved(w.ctx, ts, w.ob)
+		LogVisionTransitionEvent(w.ctx, visionTransitionDirection(w.isUplink), w.source, VisionTransitionEventPayloadBypass, -1, 0, 0, 0, false, false)
 		return buffer, err
 	}
 	if ts.VisionPayloadBypassObserved {
@@ -868,6 +876,22 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			}
 			errors.LogDebug(w.ctx, "XtlsRead unknown command ", *currentCommand, buffer.Len())
 		}
+		continueCount := int32(0)
+		if continueCommandsSeen != nil {
+			continueCount = *continueCommandsSeen
+		}
+		LogVisionTransitionEvent(
+			w.ctx,
+			visionTransitionDirection(w.isUplink),
+			w.source,
+			VisionTransitionEventCommandObserved,
+			*currentCommand,
+			continueCount,
+			*remainingContent,
+			*remainingPadding,
+			*withinPaddingBuffers,
+			*switchToDirectCopy,
+		)
 	}
 	if ts.NumberOfPacketToFilter > 0 {
 		XtlsFilterTls(buffer, ts, w.ctx)
