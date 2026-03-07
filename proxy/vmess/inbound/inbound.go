@@ -21,6 +21,7 @@ import (
 	feature_inbound "github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vmess"
 	"github.com/xtls/xray-core/proxy/vmess/encoding"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -226,7 +227,7 @@ func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSess
 // Process implements proxy.Inbound.Process().
 func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatcher routing.Dispatcher) error {
 	sessionPolicy := h.policyManager.ForLevel(0)
-	if err := connection.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
+	if err := proxy.SetHandshakeReadDeadline(connection, time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
 		return errors.New("unable to set read deadline").Base(err).AtWarning()
 	}
 
@@ -277,7 +278,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	errors.LogInfo(ctx, "received request for ", request.Destination())
 
-	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+	if err := proxy.ClearHandshakeReadDeadline(connection); err != nil {
 		errors.LogInfoInner(ctx, err, "unable to set back read deadline")
 	}
 

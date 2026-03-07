@@ -9,4 +9,5 @@ option java_multiple_files = true;
 message Addons {
   string Flow = 1;
   bytes Seed = 2;
+  bool BypassVisionPayload = 3;
 }

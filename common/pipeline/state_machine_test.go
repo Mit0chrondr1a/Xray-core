@@ -141,6 +141,72 @@ func TestEvaluateCopyGateOutboundForced(t *testing.T) {
 	}
 }
 
+func TestEvaluateCopyGateVisionNoDetachForced(t *testing.T) {
+	reason, gate, gateReason, copyPath, stop := EvaluateCopyGate(CopyGateInput{
+		InboundGate:   CopyGateForcedUserspace,
+		InboundReason: CopyGateReasonVisionNoDetach,
+	})
+	if !stop {
+		t.Fatalf("stop=%v, want true", stop)
+	}
+	if reason != ReasonVisionNoDetachUserspace {
+		t.Fatalf("reason=%q, want %q", reason, ReasonVisionNoDetachUserspace)
+	}
+	if gate != CopyGateForcedUserspace {
+		t.Fatalf("gate=%v, want %v", gate, CopyGateForcedUserspace)
+	}
+	if gateReason != CopyGateReasonVisionNoDetach {
+		t.Fatalf("gateReason=%v, want %v", gateReason, CopyGateReasonVisionNoDetach)
+	}
+	if copyPath != CopyPathUserspace {
+		t.Fatalf("copyPath=%v, want %v", copyPath, CopyPathUserspace)
+	}
+}
+
+func TestEvaluateCopyGateVisionUplinkCompleteForced(t *testing.T) {
+	reason, gate, gateReason, copyPath, stop := EvaluateCopyGate(CopyGateInput{
+		InboundGate:   CopyGateForcedUserspace,
+		InboundReason: CopyGateReasonVisionUplinkComplete,
+	})
+	if !stop {
+		t.Fatalf("stop=%v, want true", stop)
+	}
+	if reason != ReasonVisionUplinkCompleteUserspace {
+		t.Fatalf("reason=%q, want %q", reason, ReasonVisionUplinkCompleteUserspace)
+	}
+	if gate != CopyGateForcedUserspace {
+		t.Fatalf("gate=%v, want %v", gate, CopyGateForcedUserspace)
+	}
+	if gateReason != CopyGateReasonVisionUplinkComplete {
+		t.Fatalf("gateReason=%v, want %v", gateReason, CopyGateReasonVisionUplinkComplete)
+	}
+	if copyPath != CopyPathUserspace {
+		t.Fatalf("copyPath=%v, want %v", copyPath, CopyPathUserspace)
+	}
+}
+
+func TestEvaluateCopyGateVisionCommandContinueForced(t *testing.T) {
+	reason, gate, gateReason, copyPath, stop := EvaluateCopyGate(CopyGateInput{
+		InboundGate:   CopyGateForcedUserspace,
+		InboundReason: CopyGateReasonVisionCommandContinue,
+	})
+	if !stop {
+		t.Fatalf("stop=%v, want true", stop)
+	}
+	if reason != ReasonVisionCommandContinueUserspace {
+		t.Fatalf("reason=%q, want %q", reason, ReasonVisionCommandContinueUserspace)
+	}
+	if gate != CopyGateForcedUserspace {
+		t.Fatalf("gate=%v, want %v", gate, CopyGateForcedUserspace)
+	}
+	if gateReason != CopyGateReasonVisionCommandContinue {
+		t.Fatalf("gateReason=%v, want %v", gateReason, CopyGateReasonVisionCommandContinue)
+	}
+	if copyPath != CopyPathUserspace {
+		t.Fatalf("copyPath=%v, want %v", copyPath, CopyPathUserspace)
+	}
+}
+
 func TestEvaluateCopyGateNoStop(t *testing.T) {
 	reason, gate, gateReason, copyPath, stop := EvaluateCopyGate(CopyGateInput{
 		InboundGate: CopyGateEligible,

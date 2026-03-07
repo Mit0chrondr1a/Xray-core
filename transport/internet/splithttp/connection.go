@@ -20,6 +20,14 @@ var (
 	errSplitDeadlineUnsupported       = stderrors.New("splithttp: deadline not supported by underlying stream")
 )
 
+func IsDeadlineUnsupported(err error) bool {
+	return stderrors.Is(err, errSplitDeadlineUnsupported)
+}
+
+func ErrDeadlineUnsupported() error {
+	return errSplitDeadlineUnsupported
+}
+
 type deadlineSetter interface {
 	SetDeadline(time.Time) error
 }

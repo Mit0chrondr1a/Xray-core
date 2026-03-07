@@ -1145,7 +1145,37 @@ fn reality_server_handshake_full(
 /// Write all bytes from `buf` to `fd`, handling EAGAIN via poll(2).
 /// Handles EINTR from both write() and poll() (SA_RESTART does not apply to poll on Linux).
 /// Used by DeferredSession::write() after RestoreNonBlock restores O_NONBLOCK.
-fn write_all_with_poll(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<()> {
+fn timeout_deadline(timeout_ms: i64) -> Option<Instant> {
+    if timeout_ms < 0 {
+        return None;
+    }
+    Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+}
+
+fn remaining_poll_timeout(deadline: Option<Instant>) -> io::Result<i32> {
+    let Some(deadline) = deadline else {
+        return Ok(-1);
+    };
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "deferred poll timeout exceeded",
+        ));
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    let millis = remaining.as_millis();
+    if millis == 0 {
+        return Ok(1);
+    }
+    Ok(millis.min(i32::MAX as u128) as i32)
+}
+
+fn write_all_with_poll_deadline(
+    fd: std::os::unix::io::RawFd,
+    buf: &[u8],
+    deadline: Option<Instant>,
+) -> io::Result<()> {
     let mut written = 0;
     while written < buf.len() {
         let ret = unsafe {
@@ -1165,7 +1195,7 @@ fn write_all_with_poll(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<(
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                poll_writable(fd)?;
+                poll_writable(fd, deadline)?;
                 continue;
             }
             if err.kind() == io::ErrorKind::Interrupted {
@@ -1177,21 +1207,32 @@ fn write_all_with_poll(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<(
     Ok(())
 }
 
+fn write_all_with_poll(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<()> {
+    write_all_with_poll_deadline(fd, buf, None)
+}
+
 /// Block until `fd` is writable, handling EINTR.
-fn poll_writable(fd: std::os::unix::io::RawFd) -> io::Result<()> {
+fn poll_writable(fd: std::os::unix::io::RawFd, deadline: Option<Instant>) -> io::Result<()> {
     loop {
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLOUT,
             revents: 0,
         };
-        let pret = unsafe { libc::poll(&mut pfd, 1, -1) };
+        let timeout_ms = remaining_poll_timeout(deadline)?;
+        let pret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if pret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue; // EINTR — retry poll
             }
             return Err(err);
+        }
+        if pret == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "deferred write poll timeout exceeded",
+            ));
         }
         if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(io::Error::new(
@@ -1269,12 +1310,17 @@ impl DeferredSession {
     /// 2. Lock reader (may block) → read_one_record() → get record bytes → unlock
     /// 3. Lock tls (brief) → feed record to rustls → read plaintext → unlock
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_with_timeout(buf, -1)
+    }
+
+    pub fn read_with_timeout(&self, buf: &mut [u8], timeout_ms: i64) -> io::Result<usize> {
         if self.detached.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "deferred session detached",
             ));
         }
+        let deadline = timeout_deadline(timeout_ms);
         loop {
             // Step 1: Check if rustls already has plaintext buffered
             {
@@ -1296,7 +1342,7 @@ impl DeferredSession {
                 let reader = reader_guard.as_mut().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "deferred session reader closed")
                 })?;
-                reader.read_one_record()?
+                reader.read_one_record_deadline(deadline)?
             }; // reader lock released
 
             // Check detached between socket I/O and tls lock
@@ -1351,12 +1397,17 @@ impl DeferredSession {
     /// 1. Lock tls (brief) → encrypt plaintext → get ciphertext bytes → unlock
     /// 2. Lock writer (brief) → write_all ciphertext → flush → unlock
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.write_with_timeout(buf, -1)
+    }
+
+    pub fn write_with_timeout(&self, buf: &[u8], timeout_ms: i64) -> io::Result<usize> {
         if self.detached.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "deferred session detached",
             ));
         }
+        let deadline = timeout_deadline(timeout_ms);
 
         // Step 1: Encrypt plaintext through rustls → ciphertext buffer
         let (n, ciphertext) = {
@@ -1379,7 +1430,7 @@ impl DeferredSession {
             let writer = writer_guard.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "deferred session writer closed")
             })?;
-            write_all_with_poll(writer.as_raw_fd(), &ciphertext)?;
+            write_all_with_poll_deadline(writer.as_raw_fd(), &ciphertext, deadline)?;
             writer.flush()?;
         } // writer lock released
 
@@ -1911,13 +1962,26 @@ pub extern "C" fn xray_deferred_read(
     len: usize,
     out_n: *mut usize,
 ) -> i32 {
+    xray_deferred_read_timeout(handle, buf, len, -1, out_n)
+}
+
+/// Read decrypted data through the deferred session's rustls connection with
+/// an optional per-call timeout in milliseconds (-1 means no deadline).
+#[no_mangle]
+pub extern "C" fn xray_deferred_read_timeout(
+    handle: *mut c_void,
+    buf: *mut u8,
+    len: usize,
+    timeout_ms: i64,
+    out_n: *mut usize,
+) -> i32 {
     ffi_catch_i32!({
         if handle.is_null() || buf.is_null() || out_n.is_null() {
             return -1;
         }
         let session = unsafe { &*(handle as *const DeferredSession) };
         let slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
-        match session.read(slice) {
+        match session.read_with_timeout(slice, timeout_ms) {
             Ok(n) => {
                 unsafe { *out_n = n };
                 0
@@ -1935,6 +1999,10 @@ pub extern "C" fn xray_deferred_read(
                         unsafe { *out_n = 0 };
                         2 // local closed / detached
                     }
+                    io::ErrorKind::TimedOut => {
+                        unsafe { *out_n = 0 };
+                        3 // deadline exceeded
+                    }
                     _ => -1,
                 }
             }
@@ -1950,13 +2018,26 @@ pub extern "C" fn xray_deferred_write(
     len: usize,
     out_n: *mut usize,
 ) -> i32 {
+    xray_deferred_write_timeout(handle, buf, len, -1, out_n)
+}
+
+/// Write plaintext data through the deferred session's rustls connection with
+/// an optional per-call timeout in milliseconds (-1 means no deadline).
+#[no_mangle]
+pub extern "C" fn xray_deferred_write_timeout(
+    handle: *mut c_void,
+    buf: *const u8,
+    len: usize,
+    timeout_ms: i64,
+    out_n: *mut usize,
+) -> i32 {
     ffi_catch_i32!({
         if handle.is_null() || buf.is_null() || out_n.is_null() {
             return -1;
         }
         let session = unsafe { &*(handle as *const DeferredSession) };
         let slice = unsafe { std::slice::from_raw_parts(buf, len) };
-        match session.write(slice) {
+        match session.write_with_timeout(slice, timeout_ms) {
             Ok(n) => {
                 unsafe { *out_n = n };
                 0
@@ -1972,6 +2053,7 @@ pub extern "C" fn xray_deferred_write(
                     io::ErrorKind::ConnectionAborted | io::ErrorKind::NotConnected => {
                         2 // local closed / detached
                     }
+                    io::ErrorKind::TimedOut => 3,
                     _ => -1,
                 };
                 if code < 0 {

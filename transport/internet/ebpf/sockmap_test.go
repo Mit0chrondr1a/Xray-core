@@ -1,6 +1,8 @@
 package ebpf
 
 import (
+	"fmt"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -70,5 +72,68 @@ func TestIncrementKTLSSpliceFallbackDoesNotAffectGenericFallbackWindow(t *testin
 	}
 	if mgr.ShouldFallbackToSplice() {
 		t.Fatal("kTLS incompatibility should not trigger global generic sockmap fallback")
+	}
+}
+
+func TestFullRejectDoesNotAffectGenericFallbackWindow(t *testing.T) {
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	mgr.enabled.Store(true)
+	mgr.regWindowStartNs.Store(time.Now().UnixNano())
+
+	for i := 0; i < 32; i++ {
+		mgr.recordSockmapRegistrationFailure(fmt.Errorf("wrap: %w", syscall.ENOSPC))
+	}
+
+	if got := mgr.fullRejects.Load(); got != 32 {
+		t.Fatalf("full rejects = %d, want 32", got)
+	}
+	if got := mgr.regWindowTotal.Load(); got != 0 {
+		t.Fatalf("generic registration total should stay untouched, got %d", got)
+	}
+	if got := mgr.regWindowFailures.Load(); got != 0 {
+		t.Fatalf("generic registration failures should stay untouched, got %d", got)
+	}
+	if mgr.ShouldFallbackToSplice() {
+		t.Fatal("sockmap full pressure should not trigger global generic sockmap fallback")
+	}
+
+	mgr = NewSockmapManager(DefaultSockmapConfig())
+	mgr.enabled.Store(true)
+	mgr.regWindowStartNs.Store(time.Now().UnixNano())
+	for i := 0; i < 32; i++ {
+		mgr.recordSockmapRegistrationFailure(syscall.ENOSPC)
+	}
+
+	if got := mgr.fullRejects.Load(); got != 32 {
+		t.Fatalf("full rejects = %d, want 32", got)
+	}
+	if got := mgr.regWindowTotal.Load(); got != 0 {
+		t.Fatalf("generic registration total should stay untouched, got %d", got)
+	}
+	if got := mgr.regWindowFailures.Load(); got != 0 {
+		t.Fatalf("generic registration failures should stay untouched, got %d", got)
+	}
+	if mgr.ShouldFallbackToSplice() {
+		t.Fatal("sockmap full pressure should not trigger global generic sockmap fallback")
+	}
+
+	mgr = NewSockmapManager(DefaultSockmapConfig())
+	mgr.enabled.Store(true)
+	mgr.regWindowStartNs.Store(time.Now().UnixNano())
+	for i := 0; i < 32; i++ {
+		mgr.recordSockmapRegistrationFailure(syscall.EINVAL)
+	}
+
+	if got := mgr.fullRejects.Load(); got != 0 {
+		t.Fatalf("full rejects should stay untouched for generic failures, got %d", got)
+	}
+	if got := mgr.regWindowTotal.Load(); got != 32 {
+		t.Fatalf("generic registration total = %d, want 32", got)
+	}
+	if got := mgr.regWindowFailures.Load(); got != 32 {
+		t.Fatalf("generic registration failures = %d, want 32", got)
+	}
+	if !mgr.ShouldFallbackToSplice() {
+		t.Fatal("generic failures should still trigger fallback")
 	}
 }

@@ -464,9 +464,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 	bypassVisionPayload := requestAddons.Flow == vless.XRV &&
-		(encoding.ShouldBypassVisionDNS(ctx, request.Destination()) ||
-			encoding.ShouldBypassVisionLoopbackUDP(ctx, request.Destination()))
+		encoding.ShouldRequestVisionPayloadBypass(ctx, request.Destination())
 	if bypassVisionPayload {
+		requestAddons.BypassVisionPayload = true
 		ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionBypass)
 		ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneVisionGuard)
 	}
@@ -546,7 +546,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		// default: serverReader := buf.NewReader(conn)
 		serverReader := encoding.DecodeBodyAddons(conn, request, responseAddons)
-		if requestAddons.Flow == vless.XRV && !bypassVisionPayload {
+		responseBypassVisionPayload := bypassVisionPayload ||
+			encoding.ShouldHonorResponseVisionPayloadBypass(responseAddons, request.Destination())
+
+		if requestAddons.Flow == vless.XRV && !responseBypassVisionPayload {
 			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, input, rawInput, ob)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
@@ -557,7 +560,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if requestAddons.Flow == vless.XRV && !bypassVisionPayload {
+		if requestAddons.Flow == vless.XRV && !responseBypassVisionPayload {
 			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
 		} else {
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer

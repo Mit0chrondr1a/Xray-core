@@ -4,6 +4,7 @@ package native
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"time"
 	"unsafe"
@@ -29,6 +30,13 @@ func EbpfAvailable() bool {
 
 var errNotAvailable = errors.New("native TLS not available (build without CGO or non-Linux)")
 
+type deferredDeadlineError struct{}
+
+func (deferredDeadlineError) Error() string   { return os.ErrDeadlineExceeded.Error() }
+func (deferredDeadlineError) Timeout() bool   { return true }
+func (deferredDeadlineError) Temporary() bool { return true }
+func (deferredDeadlineError) Unwrap() error   { return os.ErrDeadlineExceeded }
+
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
 var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 
@@ -36,11 +44,23 @@ var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 // pre-auth MSG_PEEK phase and callers may safely fall back to Go REALITY.
 var ErrRealityDeferredPeekTimeout = errors.New("REALITY deferred peek timeout: needs fallback")
 
+// ErrRealityDeferredHandshakePeerAbort indicates deferred REALITY advanced
+// into the handshake phase and then hit a peer-abort/short-read condition.
+// The connection is no longer safe for same-socket Go fallback, but this
+// should not be treated as a breaker-worthy internal transport failure.
+var ErrRealityDeferredHandshakePeerAbort = errors.New("REALITY deferred handshake peer abort: close connection")
+
 func isRealityDeferredPeekTimeoutMsg(msg string) bool {
 	m := strings.ToLower(msg)
 	return strings.Contains(m, "peek_exact: receive timeout") ||
 		strings.Contains(m, "peek_exact: handshake timeout exceeded") ||
 		strings.Contains(m, "peek_exact: short read after")
+}
+
+func isRealityDeferredHandshakePeerAbortMsg(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "handshake: failed to fill whole buffer") ||
+		strings.Contains(m, "handshake: peer closed")
 }
 
 // IsRealityDeferredPeekTimeout reports whether err represents a deferred
@@ -53,6 +73,19 @@ func IsRealityDeferredPeekTimeout(err error) bool {
 		return true
 	}
 	return isRealityDeferredPeekTimeoutMsg(err.Error())
+}
+
+// IsRealityDeferredHandshakePeerAbort reports whether err represents a
+// deferred REALITY handshake short-read / peer-close after the handshake
+// phase has begun consuming bytes.
+func IsRealityDeferredHandshakePeerAbort(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRealityDeferredHandshakePeerAbort) {
+		return true
+	}
+	return isRealityDeferredHandshakePeerAbortMsg(err.Error())
 }
 
 // --- TLS Types ---
@@ -192,6 +225,12 @@ func TlsServerDeferred(int, *TlsConfigHandle, time.Duration) (*DeferredResult, e
 }
 func DeferredRead(*DeferredSessionHandle, []byte) (int, error)  { return 0, errNotAvailable }
 func DeferredWrite(*DeferredSessionHandle, []byte) (int, error) { return 0, errNotAvailable }
+func DeferredReadWithDeadline(*DeferredSessionHandle, []byte, time.Time) (int, error) {
+	return 0, errNotAvailable
+}
+func DeferredWriteWithDeadline(*DeferredSessionHandle, []byte, time.Time) (int, error) {
+	return 0, errNotAvailable
+}
 func DeferredDrainAndDetach(*DeferredSessionHandle) ([]byte, []byte, error) {
 	return nil, nil, errNotAvailable
 }

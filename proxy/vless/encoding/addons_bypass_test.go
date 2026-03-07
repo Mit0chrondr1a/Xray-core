@@ -49,3 +49,35 @@ func TestShouldBypassVisionLoopbackUDP(t *testing.T) {
 		t.Fatal("mux outer TCP flow must not bypass")
 	}
 }
+
+func TestShouldHonorInboundVisionPayloadBypass(t *testing.T) {
+	dest := xnet.TCPDestination(xnet.IPAddress([]byte{1, 0, 0, 1}), xnet.Port(53))
+	addons := &Addons{BypassVisionPayload: true}
+
+	if !ShouldHonorInboundVisionPayloadBypass(addons, loopbackIngressContext(), dest) {
+		t.Fatal("expected explicit bypass signal to be honored on loopback DNS ingress")
+	}
+
+	nonLoopback := session.ContextWithInbound(context.Background(), &session.Inbound{
+		Local: xnet.TCPDestination(xnet.IPAddress([]byte{10, 0, 0, 1}), xnet.Port(2036)),
+	})
+	if ShouldHonorInboundVisionPayloadBypass(addons, nonLoopback, dest) {
+		t.Fatal("non-loopback ingress must not honor explicit bypass signal")
+	}
+
+	if ShouldHonorInboundVisionPayloadBypass(&Addons{}, loopbackIngressContext(), dest) {
+		t.Fatal("missing explicit bypass signal must not be honored")
+	}
+}
+
+func TestShouldHonorResponseVisionPayloadBypass(t *testing.T) {
+	dest := xnet.TCPDestination(xnet.IPAddress([]byte{1, 0, 0, 1}), xnet.Port(53))
+	if !ShouldHonorResponseVisionPayloadBypass(&Addons{BypassVisionPayload: true}, dest) {
+		t.Fatal("expected response bypass signal for DNS control-plane destination")
+	}
+
+	nonDNS := xnet.TCPDestination(xnet.IPAddress([]byte{8, 8, 8, 8}), xnet.Port(443))
+	if ShouldHonorResponseVisionPayloadBypass(&Addons{BypassVisionPayload: true}, nonDNS) {
+		t.Fatal("non-DNS destination must not honor response bypass signal")
+	}
+}

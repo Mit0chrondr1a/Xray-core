@@ -511,6 +511,15 @@ func (v *Listener) keepAccepting() {
 								return
 							}
 							terminalDecision = "native_failed_with_fallback"
+						} else if isDeferredRealityPeerAbort(deferredErr) {
+							tcpRealityMarkerRustHandshakeFailed.Add(1)
+							if decision.Breaker != nil {
+								decision.Breaker.recordOutcome(time.Now(), nativeAttemptOutcomePeerAbort)
+							}
+							errors.LogInfoInner(context.Background(), deferredErr, "[kind=tcp-handover.rust_peer_abort] Rust REALITY deferred handshake aborted after consuming handshake bytes; closing connection without breaker penalty")
+							_ = conn.Close()
+							terminalDecision = "native_failstop"
+							return
 						} else {
 							tcpRealityMarkerRustHandshakeFailed.Add(1)
 							if decision.Breaker != nil {
@@ -657,6 +666,10 @@ func realityVersionRange(minClientVer, maxClientVer []byte) (bool, [3]uint8, [3]
 
 func isDeferredRealityPeekTimeout(err error) bool {
 	return native.IsRealityDeferredPeekTimeout(err)
+}
+
+func isDeferredRealityPeerAbort(err error) bool {
+	return native.IsRealityDeferredHandshakePeerAbort(err)
 }
 
 // Addr implements internet.Listener.Addr.

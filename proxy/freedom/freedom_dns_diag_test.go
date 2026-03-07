@@ -8,6 +8,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal"
 )
 
 func TestNewDNSUplinkDiagnosticGuardedDNS(t *testing.T) {
@@ -45,7 +46,7 @@ func TestDNSUplinkDiagnosticWriterObserveWrite(t *testing.T) {
 	}
 	writer := &dnsUplinkDiagnosticWriter{
 		Writer: buf.Discard,
-		diag:   diag,
+		dns:    diag,
 	}
 	mb := buf.MultiBuffer{buf.FromBytes([]byte("abc"))}
 	if err := writer.WriteMultiBuffer(mb); err != nil {
@@ -65,5 +66,89 @@ func TestClassifyDNSUplinkErr(t *testing.T) {
 	}
 	if got := classifyDNSUplinkErr(context.Canceled); got != "context_canceled" {
 		t.Fatalf("classifyDNSUplinkErr(context.Canceled)=%q, want %q", got, "context_canceled")
+	}
+}
+
+func TestNewVisionUplinkDiagnosticPendingDetachTCP(t *testing.T) {
+	inbound := &session.Inbound{}
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	diag := newVisionUplinkDiagnostic(inbound, net.TCPDestination(net.IPAddress([]byte{1, 1, 1, 1}), net.Port(443)))
+	if diag == nil {
+		t.Fatal("newVisionUplinkDiagnostic() returned nil for pending-detach TCP flow")
+	}
+}
+
+func TestNewVisionUplinkDiagnosticIgnoresDNSAndNonPending(t *testing.T) {
+	inbound := &session.Inbound{}
+	inbound.SetCanSpliceCopy(session.CopyGateEligible)
+	if diag := newVisionUplinkDiagnostic(inbound, net.TCPDestination(net.IPAddress([]byte{1, 1, 1, 1}), net.Port(443))); diag != nil {
+		t.Fatal("newVisionUplinkDiagnostic() should be nil for non-pending flow")
+	}
+
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	if diag := newVisionUplinkDiagnostic(inbound, net.TCPDestination(net.IPAddress([]byte{1, 1, 1, 1}), net.Port(53))); diag != nil {
+		t.Fatal("newVisionUplinkDiagnostic() should be nil for DNS flow")
+	}
+}
+
+func TestVisionUplinkDiagnosticWriterObserveWrite(t *testing.T) {
+	diag := &visionUplinkDiagnostic{
+		startedAt: time.Now().Add(-2 * time.Millisecond),
+	}
+	writer := &dnsUplinkDiagnosticWriter{
+		Writer: buf.Discard,
+		vision: diag,
+	}
+	mb := buf.MultiBuffer{buf.FromBytes([]byte("abcd"))}
+	if err := writer.WriteMultiBuffer(mb); err != nil {
+		t.Fatalf("WriteMultiBuffer() error = %v", err)
+	}
+	if diag.totalBytes != 4 {
+		t.Fatalf("totalBytes=%d, want 4", diag.totalBytes)
+	}
+	if diag.firstWriteNs <= 0 {
+		t.Fatalf("firstWriteNs=%d, want >0", diag.firstWriteNs)
+	}
+}
+
+func TestObserveVisionPendingDetachOnUplinkCompletePromotesNoDetachButLeavesTimerOwnershipToProxy(t *testing.T) {
+	inbound := &session.Inbound{}
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	outbound := &session.Outbound{}
+	outbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timer := signal.CancelAfterInactivity(ctx, cancel, 10*time.Millisecond)
+	defer timer.SetTimeout(0)
+
+	downlinkTimeout := 10 * time.Millisecond
+	func() {
+		defer func() {
+			timer.SetTimeout(downlinkTimeout)
+		}()
+		observeVisionPendingDetachOnUplinkComplete(context.Background(), inbound, outbound, "copy_complete", nil)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("timer should remain owned by the caller; observation must not extend it")
+	}
+	if downlinkTimeout != 10*time.Millisecond {
+		t.Fatalf("downlinkTimeout=%v, want unchanged caller timeout", downlinkTimeout)
+	}
+	if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+		t.Fatalf("inbound state=%v, want forced_userspace", got)
+	}
+	if got := inbound.CopyGateReason(); got != session.CopyGateReasonVisionUplinkComplete {
+		t.Fatalf("inbound reason=%v, want vision_uplink_complete", got)
+	}
+	if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+		t.Fatalf("outbound state=%v, want forced_userspace", got)
+	}
+	if got := outbound.CopyGateReason(); got != session.CopyGateReasonVisionUplinkComplete {
+		t.Fatalf("outbound reason=%v, want vision_uplink_complete", got)
 	}
 }

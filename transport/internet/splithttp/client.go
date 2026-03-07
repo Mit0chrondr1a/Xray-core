@@ -44,6 +44,10 @@ func (c *DefaultDialerClient) IsClosed() bool {
 	return c.closed.Load()
 }
 
+func (c *DefaultDialerClient) waitForPacketPostDispatch() bool {
+	return c.httpVersion == "1.1"
+}
+
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
 	// this is done when the TCP/UDP connection to the server was established,
 	// and we can unblock the Dial function and print correct net addresses in

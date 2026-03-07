@@ -41,6 +41,7 @@ func logPipelineSummary(ctx context.Context, snap pipeline.DecisionSnapshot) {
 		" splice_duration_ns=", snap.SpliceDurationNs,
 		" userspace_bytes=", snap.UserspaceBytes,
 		" userspace_duration_ns=", snap.UserspaceDurationNs,
+		" userspace_exit=", snap.UserspaceExit,
 		" sockmap_success=", snap.SockmapSuccess,
 		" ktls_supported=", snap.Caps.KTLSSupported,
 		" sockmap_supported=", snap.Caps.SockmapSupported,
