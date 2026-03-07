@@ -48,6 +48,9 @@ const (
 	CopyGateReasonTransportNonRawSplitConn
 	CopyGateReasonTransportUserspace
 	CopyGateReasonVisionBypass
+	CopyGateReasonVisionNoDetach
+	CopyGateReasonVisionUplinkComplete
+	CopyGateReasonVisionCommandContinue
 	CopyGateReasonDetachTimeout
 	CopyGateReasonSecurityGuard
 	CopyGateReasonMetadataMissing
@@ -63,6 +66,12 @@ func (r CopyGateReason) String() string {
 		return "transport_userspace"
 	case CopyGateReasonVisionBypass:
 		return "vision_bypass"
+	case CopyGateReasonVisionNoDetach:
+		return "vision_no_detach"
+	case CopyGateReasonVisionUplinkComplete:
+		return "vision_uplink_complete"
+	case CopyGateReasonVisionCommandContinue:
+		return "vision_command_continue"
 	case CopyGateReasonDetachTimeout:
 		return "detach_timeout"
 	case CopyGateReasonSecurityGuard:

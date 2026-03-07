@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
@@ -200,7 +201,7 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 
 func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	sessionPolicy := s.policyManager.ForLevel(0)
-	if err := conn.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
+	if err := proxy.SetHandshakeReadDeadline(conn, time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
 		return errors.New("unable to set read deadline").Base(err).AtWarning()
 	}
 
@@ -215,7 +216,7 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 		})
 		return errors.New("failed to create request from: ", conn.RemoteAddr()).Base(err)
 	}
-	conn.SetReadDeadline(time.Time{})
+	_ = proxy.ClearHandshakeReadDeadline(conn)
 
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {

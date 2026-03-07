@@ -51,9 +51,28 @@ const (
 	CopyGateReasonTransportNonRawSplitConn CopyGateReason = "transport_nonraw_splitconn"
 	CopyGateReasonTransportUserspace       CopyGateReason = "transport_userspace"
 	CopyGateReasonVisionBypass             CopyGateReason = "vision_bypass"
+	CopyGateReasonVisionNoDetach           CopyGateReason = "vision_no_detach"
+	CopyGateReasonVisionUplinkComplete     CopyGateReason = "vision_uplink_complete"
+	CopyGateReasonVisionCommandContinue    CopyGateReason = "vision_command_continue"
 	CopyGateReasonDetachTimeout            CopyGateReason = "detach_timeout"
 	CopyGateReasonSecurityGuard            CopyGateReason = "security_guard"
 	CopyGateReasonMetadataMissing          CopyGateReason = "metadata_missing"
+)
+
+// UserspaceExit classifies how a userspace fallback path actually terminated.
+// This complements the higher-level decision reason so logs can distinguish
+// transport close causes from policy/gating causes.
+type UserspaceExit string
+
+const (
+	UserspaceExitNone                   UserspaceExit = "none"
+	UserspaceExitTimeout                UserspaceExit = "timeout"
+	UserspaceExitRemoteReset            UserspaceExit = "remote_reset"
+	UserspaceExitRemoteEOFNoResponse    UserspaceExit = "remote_eof_no_response"
+	UserspaceExitLocalCloseNoResponse   UserspaceExit = "local_close_no_response"
+	UserspaceExitStableUserspaceClose   UserspaceExit = "stable_userspace_close"
+	UserspaceExitComplete               UserspaceExit = "complete"
+	UserspaceExitPostDetachRetrySuccess UserspaceExit = "post_detach_retry_success"
 )
 
 // Canonical decision reasons. Keep centralized to avoid ad-hoc strings.
@@ -87,6 +106,11 @@ const (
 	ReasonSockmapWaitFallback               = "sockmap_wait_fallback"
 	ReasonSockmapWaitFallbackUserspaceGuard = "sockmap_wait_fallback_userspace_guard"
 	ReasonSockmapRegisterFail               = "sockmap_register_fail"
+	ReasonVisionNoDetachUserspace           = "vision_no_detach_userspace"
+	ReasonVisionControlUserspace            = "vision_control_userspace"
+	ReasonVisionUplinkCompleteUserspace     = "vision_uplink_complete_userspace"
+	ReasonVisionQuiescedUserspace           = "vision_quiesced_userspace"
+	ReasonVisionCommandContinueUserspace    = "vision_command_continue_userspace"
 	ReasonUserspaceIdleTimeout              = "userspace_idle_timeout"
 	ReasonUserspaceNoDetachIdleTimeout      = "userspace_no_detach_idle_timeout"
 	ReasonUserspaceComplete                 = "userspace_complete"
@@ -130,4 +154,5 @@ type DecisionSnapshot struct {
 	// Guarded DNS telemetry.
 	DNSGuardFirstResponseNs int64
 	DNSGuardZeroByteTimeout bool
+	UserspaceExit           UserspaceExit
 }

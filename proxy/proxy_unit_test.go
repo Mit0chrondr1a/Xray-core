@@ -1,15 +1,18 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	goerrors "errors"
 	"io"
 	gonet "net"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -17,8 +20,18 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/proxy/vless/encryption"
+	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
+
+type visionDeferredWrapConn struct {
+	gonet.Conn
+	inner gonet.Conn
+}
+
+func (c *visionDeferredWrapConn) NetConn() gonet.Conn {
+	return c.inner
+}
 
 // --- NewTrafficState ---
 
@@ -558,6 +571,176 @@ func TestVisionReaderDirectCopyPromotesInboundSpliceState(t *testing.T) {
 	}
 }
 
+func TestVisionReaderDirectCopyOverridesCommandContinueHandoff(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	ts := NewTrafficState(nil)
+	ts.Outbound.WithinPaddingBuffers = true
+	ts.Outbound.CurrentCommand = 2
+
+	inbound := &session.Inbound{Conn: left}
+	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionCommandContinue)
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+
+	b := buf.New()
+	b.Write([]byte("abc"))
+	reader := &singleReadReader{mb: buf.MultiBuffer{b}}
+	vr := NewVisionReader(reader, ts, false, ctx, left, nil, nil, nil)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	buf.ReleaseMulti(mb)
+
+	if !ts.Outbound.DownlinkReaderDirectCopy {
+		t.Fatal("DownlinkReaderDirectCopy should be true after command=2")
+	}
+	if inbound.GetCanSpliceCopy() != session.CopyGateEligible {
+		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateEligible)
+	}
+}
+
+func TestVisionReaderCommandPaddingEndForcesUserspaceGate(t *testing.T) {
+	uuid := []byte("0123456789abcdef")
+	ts := NewTrafficState(uuid)
+
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
+	outbound := &session.Outbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	userUUID := append([]byte(nil), uuid...)
+	padded := XtlsPadding(buf.FromBytes([]byte("ok")), CommandPaddingEnd, &userUUID, false, ctx, []uint32{0, 0, 0, 1})
+	reader := &singleReadReader{mb: buf.MultiBuffer{padded}}
+
+	vr := NewVisionReader(reader, ts, true, ctx, nil, nil, nil, outbound)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	defer buf.ReleaseMulti(mb)
+
+	if got := mb.Len(); got != 2 {
+		t.Fatalf("payload length=%d, want 2", got)
+	}
+	if inbound.GetCanSpliceCopy() != session.CopyGateForcedUserspace {
+		t.Fatalf("inbound copy gate=%v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateForcedUserspace)
+	}
+	if inbound.CopyGateReason() != session.CopyGateReasonVisionNoDetach {
+		t.Fatalf("inbound copy gate reason=%v, want %v", inbound.CopyGateReason(), session.CopyGateReasonVisionNoDetach)
+	}
+	if outbound.GetCanSpliceCopy() != session.CopyGateForcedUserspace {
+		t.Fatalf("outbound copy gate=%v, want %v", outbound.GetCanSpliceCopy(), session.CopyGateForcedUserspace)
+	}
+	if outbound.CopyGateReason() != session.CopyGateReasonVisionNoDetach {
+		t.Fatalf("outbound copy gate reason=%v, want %v", outbound.CopyGateReason(), session.CopyGateReasonVisionNoDetach)
+	}
+}
+
+func TestVisionReaderCommandPaddingEndOverridesCommandContinueHandoff(t *testing.T) {
+	uuid := []byte("0123456789abcdef")
+	ts := NewTrafficState(uuid)
+
+	inbound := &session.Inbound{}
+	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionCommandContinue)
+	outbound := &session.Outbound{}
+	outbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionCommandContinue)
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	userUUID := append([]byte(nil), uuid...)
+	padded := XtlsPadding(buf.FromBytes([]byte("ok")), CommandPaddingEnd, &userUUID, false, ctx, []uint32{0, 0, 0, 1})
+	reader := &singleReadReader{mb: buf.MultiBuffer{padded}}
+
+	vr := NewVisionReader(reader, ts, true, ctx, nil, nil, nil, outbound)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	defer buf.ReleaseMulti(mb)
+
+	if inbound.GetCanSpliceCopy() != session.CopyGateForcedUserspace {
+		t.Fatalf("inbound copy gate=%v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateForcedUserspace)
+	}
+	if inbound.CopyGateReason() != session.CopyGateReasonVisionNoDetach {
+		t.Fatalf("inbound copy gate reason=%v, want %v", inbound.CopyGateReason(), session.CopyGateReasonVisionNoDetach)
+	}
+	if outbound.GetCanSpliceCopy() != session.CopyGateForcedUserspace {
+		t.Fatalf("outbound copy gate=%v, want %v", outbound.GetCanSpliceCopy(), session.CopyGateForcedUserspace)
+	}
+	if outbound.CopyGateReason() != session.CopyGateReasonVisionNoDetach {
+		t.Fatalf("outbound copy gate reason=%v, want %v", outbound.CopyGateReason(), session.CopyGateReasonVisionNoDetach)
+	}
+}
+
+func TestVisionReaderDetectsRawDNSPayloadBypass(t *testing.T) {
+	ts := NewTrafficState([]byte("0123456789abcdef"))
+	rawDNS := []byte{
+		0x00, 0x2c, // tcp length
+		0x12, 0x34, // dns id
+		0x01, 0x00, // flags
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x03, 'w', 'w', 'w', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+		0x03, 'c', 'o', 'm', 0x00,
+		0x00, 0x01, 0x00, 0x01,
+	}
+	b := buf.FromBytes(rawDNS)
+	reader := &singleReadReader{mb: buf.MultiBuffer{b}}
+
+	inbound := &session.Inbound{
+		Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	outbound := &session.Outbound{
+		Target: xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	vr := NewVisionReader(reader, ts, true, ctx, nil, nil, nil, outbound)
+	mb, err := vr.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() error = %v", err)
+	}
+	defer buf.ReleaseMulti(mb)
+
+	if got := mb.Len(); got != int32(len(rawDNS)) {
+		t.Fatalf("raw payload length = %d, want %d", got, len(rawDNS))
+	}
+	if !ts.VisionPayloadBypassObserved {
+		t.Fatal("VisionPayloadBypassObserved should be latched for raw DNS payload")
+	}
+	if inbound.GetCanSpliceCopy() != session.CopyGateForcedUserspace {
+		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateForcedUserspace)
+	}
+}
+
+func TestVisionWriterBypassesPaddingAfterRawDNSObservation(t *testing.T) {
+	var out bytes.Buffer
+	ts := NewTrafficState([]byte("0123456789abcdef"))
+	ts.VisionPayloadBypassObserved = true
+
+	inbound := &session.Inbound{
+		Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	outbound := &session.Outbound{
+		Target: xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	w := NewVisionWriter(buf.NewWriter(&out), ts, false, ctx, nil, nil, nil)
+	payload := []byte{0x00, 0x10, 0xde, 0xad, 0x81, 0x80}
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)}); err != nil {
+		t.Fatalf("WriteMultiBuffer() error = %v", err)
+	}
+
+	if got := out.Bytes(); !bytes.Equal(got, payload) {
+		t.Fatalf("raw response payload = %x, want %x", got, payload)
+	}
+}
+
 // --- Constants ---
 
 func TestCommandPaddingConstants(t *testing.T) {
@@ -636,6 +819,59 @@ func TestBuildVisionDecisionInputRefreshesCryptoHint(t *testing.T) {
 	}
 }
 
+func TestBuildVisionDecisionInputForCopyGatePrefersRawEligibleVisionPath(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	wrappedReader := &tls.DeferredRustConn{}
+	caps := pipeline.CapabilitySummary{SpliceSupported: true}
+
+	got, _, _, _, _ := buildVisionDecisionInputForCopyGate(
+		wrappedReader,
+		right,
+		left,
+		right,
+		caps,
+		false,
+		session.CopyGateEligible,
+	)
+	if got.ReaderCrypto != "none" {
+		t.Fatalf("ReaderCrypto=%q, want none when Vision direct-copy gate is eligible", got.ReaderCrypto)
+	}
+	if got.WriterCrypto != "none" {
+		t.Fatalf("WriterCrypto=%q, want none when Vision direct-copy gate is eligible", got.WriterCrypto)
+	}
+	if snap := pipeline.DecideVisionPath(got); snap.Path != pipeline.PathSplice {
+		t.Fatalf("DecideVisionPath(...).Path=%q, want %q", snap.Path, pipeline.PathSplice)
+	}
+}
+
+func TestBuildVisionDecisionInputForCopyGateKeepsWrapperGuardBeforeEligibility(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	wrappedReader := &tls.DeferredRustConn{}
+	caps := pipeline.CapabilitySummary{SpliceSupported: true}
+
+	got, _, _, _, _ := buildVisionDecisionInputForCopyGate(
+		wrappedReader,
+		right,
+		left,
+		right,
+		caps,
+		false,
+		session.CopyGatePendingDetach,
+	)
+	if got.ReaderCrypto != "userspace-tls" {
+		t.Fatalf("ReaderCrypto=%q, want userspace-tls before Vision direct-copy eligibility", got.ReaderCrypto)
+	}
+	if snap := pipeline.DecideVisionPath(got); snap.Reason != pipeline.ReasonUserspaceTLSGuard {
+		t.Fatalf("DecideVisionPath(...).Reason=%q, want %q", snap.Reason, pipeline.ReasonUserspaceTLSGuard)
+	}
+}
+
 func TestCopyRawConnIfExistUserspaceActiveTrafficBeyondFiveSeconds(t *testing.T) {
 	readerPeer, readerConn := gonet.Pipe()
 	defer readerPeer.Close()
@@ -686,6 +922,204 @@ func TestCopyRawConnIfExistUserspaceActiveTrafficBeyondFiveSeconds(t *testing.T)
 	}
 }
 
+func TestShouldDeferVisionFirstByteTimeoutWithRecentUplink(t *testing.T) {
+	conn := &tls.DeferredRustConn{}
+	defer clearVisionTelemetryTimestamps(conn)
+
+	now := time.Unix(1700000000, 0)
+	userspaceStart := now.Add(-1500 * time.Millisecond)
+	storeVisionUplinkTimestamp(conn, now.Add(-500*time.Millisecond).UnixNano())
+
+	remaining, ok := shouldDeferVisionFirstByteTimeout(conn, 0, false, true, true, userspaceStart, now)
+	if !ok {
+		t.Fatal("shouldDeferVisionFirstByteTimeout() = false, want true")
+	}
+	if want := 250 * time.Millisecond; remaining != want {
+		t.Fatalf("remaining grace = %v, want %v", remaining, want)
+	}
+}
+
+func TestShouldDeferVisionFirstByteTimeoutStopsAfterMaxWindow(t *testing.T) {
+	conn := &tls.DeferredRustConn{}
+	defer clearVisionTelemetryTimestamps(conn)
+
+	now := time.Unix(1700000000, 0)
+	storeVisionUplinkTimestamp(conn, now.Add(-time.Second).UnixNano())
+
+	if remaining, ok := shouldDeferVisionFirstByteTimeout(conn, 0, false, true, true, now.Add(-11*time.Second), now); ok {
+		t.Fatalf("shouldDeferVisionFirstByteTimeout() = true with remaining %v, want false after max window", remaining)
+	}
+}
+
+func TestShouldDeferVisionFirstByteTimeoutRequiresRecentUplink(t *testing.T) {
+	conn := &tls.DeferredRustConn{}
+	defer clearVisionTelemetryTimestamps(conn)
+
+	now := time.Unix(1700000000, 0)
+	storeVisionUplinkTimestamp(conn, now.Add(-2*time.Second).UnixNano())
+
+	if remaining, ok := shouldDeferVisionFirstByteTimeout(conn, 0, false, true, true, now.Add(-time.Second), now); ok {
+		t.Fatalf("shouldDeferVisionFirstByteTimeout() = true with remaining %v, want false when uplink is stale", remaining)
+	}
+}
+
+func TestShouldRetryVisionPostDetachTransitionWhenDeferredClears(t *testing.T) {
+	oldFn := visionDeferredTLSRequiredFn
+	defer func() { visionDeferredTLSRequiredFn = oldFn }()
+
+	calls := 0
+	visionDeferredTLSRequiredFn = func(conn gonet.Conn) bool {
+		calls++
+		return false
+	}
+
+	if !shouldRetryVisionPostDetachTransition(nil, nil, 0, false, true, true) {
+		t.Fatal("shouldRetryVisionPostDetachTransition() = false, want true when deferred TLS cleared mid-wait")
+	}
+	if calls != 2 {
+		t.Fatalf("visionDeferredTLSRequiredFn calls = %d, want 2", calls)
+	}
+}
+
+func TestShouldRetryVisionPostDetachTransitionRejectsActiveOrIneligibleFlows(t *testing.T) {
+	oldFn := visionDeferredTLSRequiredFn
+	defer func() { visionDeferredTLSRequiredFn = oldFn }()
+
+	visionDeferredTLSRequiredFn = func(conn gonet.Conn) bool { return false }
+	if shouldRetryVisionPostDetachTransition(nil, nil, 1, false, true, true) {
+		t.Fatal("shouldRetryVisionPostDetachTransition() = true with existing userspace bytes, want false")
+	}
+	if shouldRetryVisionPostDetachTransition(nil, nil, 0, true, true, true) {
+		t.Fatal("shouldRetryVisionPostDetachTransition() = true for DNS control flow, want false")
+	}
+	if shouldRetryVisionPostDetachTransition(nil, nil, 0, false, false, true) {
+		t.Fatal("shouldRetryVisionPostDetachTransition() = true without deferred TLS, want false")
+	}
+	if shouldRetryVisionPostDetachTransition(nil, nil, 0, false, true, false) {
+		t.Fatal("shouldRetryVisionPostDetachTransition() = true outside deferred phase, want false")
+	}
+
+	visionDeferredTLSRequiredFn = func(conn gonet.Conn) bool { return conn == nil }
+	if shouldRetryVisionPostDetachTransition(nil, nil, 0, false, true, true) {
+		t.Fatal("shouldRetryVisionPostDetachTransition() = true while deferred TLS still required, want false")
+	}
+}
+
+func TestMarkVisionCommandContinueEvidenceSetsReasonWithoutForcingState(t *testing.T) {
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+
+	if !markVisionCommandContinueEvidence(ctx, nil, outbound) {
+		t.Fatal("markVisionCommandContinueEvidence() = false, want true")
+	}
+	if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+		t.Fatalf("inbound state=%v, want pending_detach", got)
+	}
+	if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+		t.Fatalf("outbound state=%v, want pending_detach", got)
+	}
+	if got := inbound.CopyGateReason(); got != session.CopyGateReasonVisionCommandContinue {
+		t.Fatalf("inbound reason=%v, want vision_command_continue", got)
+	}
+	if got := outbound.CopyGateReason(); got != session.CopyGateReasonVisionCommandContinue {
+		t.Fatalf("outbound reason=%v, want vision_command_continue", got)
+	}
+}
+
+func TestVisionStableUserspaceGateIgnoresCommandContinueReason(t *testing.T) {
+	inbound := &session.Inbound{}
+	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionCommandContinue)
+
+	if gate, reason, ok := visionStableUserspaceGateActive(inbound, nil); ok {
+		t.Fatalf("visionStableUserspaceGateActive() = (%v,%v,true), want false for telemetry-only command=0 reason", gate, reason)
+	}
+}
+
+func TestObserveVisionUplinkCompletePromotesPendingDetachToInferredNoDetach(t *testing.T) {
+	inbound := &session.Inbound{}
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	outbound := &session.Outbound{}
+	outbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+
+	if !ObserveVisionUplinkComplete(context.Background(), inbound, outbound) {
+		t.Fatal("ObserveVisionUplinkComplete() = false, want true")
+	}
+	if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+		t.Fatalf("inbound state=%v, want forced_userspace", got)
+	}
+	if got := inbound.CopyGateReason(); got != session.CopyGateReasonVisionUplinkComplete {
+		t.Fatalf("inbound reason=%v, want vision_uplink_complete", got)
+	}
+	if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+		t.Fatalf("outbound state=%v, want forced_userspace", got)
+	}
+	if got := outbound.CopyGateReason(); got != session.CopyGateReasonVisionUplinkComplete {
+		t.Fatalf("outbound reason=%v, want vision_uplink_complete", got)
+	}
+}
+
+func TestObserveVisionUplinkCompleteExplicitOnlyLeavesGatesUntouched(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_EXPLICIT_ONLY", "1")
+
+	inbound := &session.Inbound{}
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	outbound := &session.Outbound{}
+	outbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+
+	if !ObserveVisionUplinkComplete(context.Background(), inbound, outbound) {
+		t.Fatal("ObserveVisionUplinkComplete() = false, want true for pending flow")
+	}
+	if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+		t.Fatalf("inbound state=%v, want pending_detach under explicit-only probe", got)
+	}
+	if got := inbound.CopyGateReason(); got != session.CopyGateReasonUnspecified {
+		t.Fatalf("inbound reason=%v, want unspecified under explicit-only probe", got)
+	}
+	if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+		t.Fatalf("outbound state=%v, want pending_detach under explicit-only probe", got)
+	}
+	if got := outbound.CopyGateReason(); got != session.CopyGateReasonUnspecified {
+		t.Fatalf("outbound reason=%v, want unspecified under explicit-only probe", got)
+	}
+}
+
+func TestMarkVisionNoDetachObservedOverridesUplinkComplete(t *testing.T) {
+	inbound := &session.Inbound{}
+	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionUplinkComplete)
+	outbound := &session.Outbound{}
+	outbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionUplinkComplete)
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+
+	markVisionNoDetachObserved(ctx, outbound)
+
+	if got := inbound.CopyGateReason(); got != session.CopyGateReasonVisionNoDetach {
+		t.Fatalf("inbound reason=%v, want vision_no_detach", got)
+	}
+	if got := outbound.CopyGateReason(); got != session.CopyGateReasonVisionNoDetach {
+		t.Fatalf("outbound reason=%v, want vision_no_detach", got)
+	}
+}
+
+func TestUnwrapVisionDeferredConnRecursesThroughWrappers(t *testing.T) {
+	reader, writer := gonet.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+
+	dc := &tls.DeferredRustConn{}
+	wrapped := &visionDeferredWrapConn{Conn: reader, inner: dc}
+	commonConn := encryption.NewCommonConn(wrapped, false)
+	statsConn := &stat.CounterConnection{Connection: commonConn}
+
+	if got := unwrapVisionDeferredConn(statsConn); got != dc {
+		t.Fatalf("unwrapVisionDeferredConn() = %T, want original deferred conn", got)
+	}
+}
+
 func TestCopyRawConnIfExistDNSGuardRecordsFirstResponseLatency(t *testing.T) {
 	resetDNSGuardMetrics()
 
@@ -695,7 +1129,7 @@ func TestCopyRawConnIfExistDNSGuardRecordsFirstResponseLatency(t *testing.T) {
 
 	copyCtx, cancelCopy := context.WithCancel(context.Background())
 	defer cancelCopy()
-	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, time.Second)
 	defer timer.SetTimeout(0)
 
 	inbound := &session.Inbound{
@@ -740,6 +1174,56 @@ func TestCopyRawConnIfExistDNSGuardRecordsFirstResponseLatency(t *testing.T) {
 		pipelineMarkerDNSGuardFirstRespGe1s.Load()
 	if histTotal != 1 {
 		t.Fatalf("dns_guard_first_response_hist_total=%d, want 1", histTotal)
+	}
+	if got := pipelineMarkerDNSGuardZeroByteTimeout.Load(); got != 0 {
+		t.Fatalf("dns_guard_zero_byte_timeout=%d, want 0", got)
+	}
+}
+
+func TestCopyRawConnIfExistDNSGuardReturnsAfterSingleResponseFrame(t *testing.T) {
+	resetDNSGuardMetrics()
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Local:         xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, nil, buf.Discard, timer, nil)
+	}()
+
+	frame := []byte{0x00, 0x04, 'd', 'n', 's', '!'}
+	if _, err := readerPeer.Write(frame); err != nil {
+		t.Fatalf("writer side failed: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for guarded DNS flow to retire after one response frame")
+	}
+
+	if got := pipelineMarkerDNSGuardFirstResponseCount.Load(); got != 1 {
+		t.Fatalf("dns_guard_first_response_count=%d, want 1", got)
 	}
 	if got := pipelineMarkerDNSGuardZeroByteTimeout.Load(); got != 0 {
 		t.Fatalf("dns_guard_zero_byte_timeout=%d, want 0", got)
@@ -821,6 +1305,712 @@ func TestCopyRawConnIfExistVisionBypassDNSUsesImmediateUserspacePath(t *testing.
 	}
 	if got := pipelineMarkerDNSGuardZeroByteTimeout.Load(); got != 0 {
 		t.Fatalf("dns_guard_zero_byte_timeout=%d, want 0 on early bypass path", got)
+	}
+}
+
+func TestCopyRawConnIfExistDefersFirstResponseTimeoutForRecentVisionUplink(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Local:         xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGateUnset),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{157, 240, 13, 52}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(1200*time.Millisecond, func() {
+		storeVisionUplinkTimestamp(writerConn, time.Now().UnixNano())
+	})
+	time.AfterFunc(2600*time.Millisecond, func() {
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("CopyRawConnIfExist() returned too early: %v", err)
+	case <-time.After(1700 * time.Millisecond):
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil or io.EOF after deferred first-response handoff", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed < 1700*time.Millisecond || elapsed > 3*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want bounded recent-uplink grace around 2s", elapsed)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("timeout waiting for deferred first-response handoff")
+	}
+}
+
+func TestCopyRawConnIfExistKeepsQuietUplinkTelemetryOnly(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{91, 108, 56, 133}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(500*time.Millisecond, func() {
+		storeVisionUplinkTimestamp(writerConn, time.Now().UnixNano())
+	})
+	time.AfterFunc(2500*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-response"))
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after late response/close on quiet-uplink path", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed < 2*time.Second || elapsed > 4*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want late close after quiet-uplink polling without forced timeout", elapsed)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Fatalf("inbound state=%v, want pending detach because quiet-uplink remains telemetry only", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Fatalf("outbound state=%v, want pending detach because quiet-uplink remains telemetry only", got)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("timeout waiting for quiet-uplink telemetry-only timeout")
+	}
+}
+
+func TestCopyRawConnIfExistQuietUplinkTimeoutStaysBounded(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 3*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{91, 108, 56, 133}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	storeVisionUplinkTimestamp(writerConn, time.Now().Add(-visionFirstResponseMax).UnixNano())
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	select {
+	case err := <-errCh:
+		if !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want io.EOF after shared inactivity timeout", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed < 3*time.Second || elapsed > 5*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want bounded quiet-uplink timeout from shared inactivity timer", elapsed)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("timeout waiting for shared inactivity timeout on quiet-uplink path")
+	}
+}
+
+func TestCopyRawConnIfExistHandsOffVisionNoDetachToStableUserspace(t *testing.T) {
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{57, 144, 14, 36}), xnet.Port(5222)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(500*time.Millisecond, func() {
+		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionNoDetach)
+		outbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionNoDetach)
+	})
+	time.AfterFunc(2500*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-response"))
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after no-detach handoff", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed < 2*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want > 2s to prove no-detach handoff survived initial guard timeout", elapsed)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("timeout waiting for no-detach userspace handoff")
+	}
+}
+
+func TestCopyRawConnIfExistPromotesControlCompatibilityPortToLocalUserspace(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+	clearSyncMap(&pipelineVisionResponseWakeByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{57, 144, 186, 36}), xnet.Port(5222)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(3500*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-control-response"))
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after control compatibility handoff", err)
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed < 3*time.Second || elapsed > 6*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want control compatibility window to survive beyond initial 3s timeout", elapsed)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Fatalf("inbound state=%v, want pending detach because control compatibility stays local-only", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Fatalf("outbound state=%v, want pending detach because control compatibility stays local-only", got)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("timeout waiting for control compatibility handoff")
+	}
+}
+
+func TestCopyRawConnIfExistWakeOnLaterVisionNoDetachSignal(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+	clearSyncMap(&pipelineVisionResponseWakeByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{57, 144, 15, 63}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(500*time.Millisecond, func() {
+		storeVisionUplinkTimestamp(writerConn, time.Now().UnixNano())
+	})
+	time.AfterFunc(1200*time.Millisecond, func() {
+		markVisionNoDetachObserved(ctx, outbound)
+		wakeVisionResponseLoop(ctx, writerConn, "test-command-1")
+	})
+	time.AfterFunc(2500*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-stable-response"))
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after explicit no-detach wake", err)
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed < 2*time.Second || elapsed > 5*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want later stable-userspace response after explicit wake", elapsed)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("inbound state=%v, want forced userspace after later command=1 signal", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("outbound state=%v, want forced userspace after later command=1 signal", got)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("timeout waiting for later explicit no-detach wake flow")
+	}
+}
+
+func TestCopyRawConnIfExistWakeOnUplinkCompletePromotesNoDetach(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+	clearSyncMap(&pipelineVisionResponseWakeByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{57, 144, 15, 63}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(500*time.Millisecond, func() {
+		storeVisionUplinkTimestamp(writerConn, time.Now().UnixNano())
+	})
+	time.AfterFunc(1200*time.Millisecond, func() {
+		if !ObserveVisionUplinkComplete(ctx, inbound, outbound) {
+			t.Error("ObserveVisionUplinkComplete() = false, want true")
+		}
+	})
+	time.AfterFunc(2500*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-response-after-uplink-complete"))
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after uplink-complete no-detach wake", err)
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed < 2*time.Second || elapsed > 5*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want later stable-userspace response after uplink-complete wake", elapsed)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("inbound state=%v, want forced userspace after uplink-complete promotion", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("outbound state=%v, want forced userspace after uplink-complete promotion", got)
+		}
+		if got := inbound.CopyGateReason(); got != session.CopyGateReasonVisionUplinkComplete {
+			t.Fatalf("inbound reason=%v, want vision_uplink_complete after uplink-complete promotion", got)
+		}
+		if got := outbound.CopyGateReason(); got != session.CopyGateReasonVisionUplinkComplete {
+			t.Fatalf("outbound reason=%v, want vision_uplink_complete after uplink-complete promotion", got)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("timeout waiting for uplink-complete wake flow")
+	}
+}
+
+func TestCopyRawConnIfExistUplinkCompleteTimeoutUsesLocalBudget(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+	clearSyncMap(&pipelineVisionResponseWakeByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{142, 251, 32, 182}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(200*time.Millisecond, func() {
+		if !ObserveVisionUplinkComplete(ctx, inbound, outbound) {
+			t.Error("ObserveVisionUplinkComplete() = false, want true")
+		}
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after bounded inferred no-detach timeout", err)
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed < 2500*time.Millisecond || elapsed > 4500*time.Millisecond {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want local inferred no-detach budget around 3s rather than doubled timer", elapsed)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("timeout waiting for inferred no-detach timeout flow")
+	}
+}
+
+func TestPrepareVisionStableUserspaceReadClearsWakeDeadline(t *testing.T) {
+	clearSyncMap(&pipelineVisionResponseWakeByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	registerVisionResponseWakeTarget(writerConn, readerConn)
+	if !ObserveVisionUplinkComplete(ctx, inbound, outbound) {
+		t.Fatal("ObserveVisionUplinkComplete() = false, want true")
+	}
+	prepareVisionStableUserspaceRead(readerConn, writerConn)
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := buf.NewReader(readerConn).ReadMultiBuffer()
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		t.Fatalf("ReadMultiBuffer() error=%v, want blocked read after clearing wake deadline", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	_, _ = readerPeer.Write([]byte("late-response"))
+	_ = readerPeer.Close()
+
+	select {
+	case err := <-readDone:
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("ReadMultiBuffer() error=%v, want nil/EOF after payload", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for reader after clearing wake deadline")
+	}
+}
+
+func TestCopyRawConnIfExistKeepsPersistentCommandContinueTelemetryOnly(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{149, 154, 167, 50}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(500*time.Millisecond, func() {
+		storeVisionUplinkTimestamp(writerConn, time.Now().UnixNano())
+	})
+	time.AfterFunc(1*time.Second, func() {
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Errorf("inbound state=%v, want pending detach while command=0 remains telemetry-only", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Errorf("outbound state=%v, want pending detach while command=0 remains telemetry-only", got)
+		}
+	})
+
+	select {
+	case err := <-errCh:
+		if !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want EOF timeout while command=0 stays telemetry-only", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed < 2500*time.Millisecond || elapsed > 4*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want bounded compatibility-first timeout around 3s", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for command=0 telemetry-only flow")
+	}
+}
+
+func TestCopyRawConnIfExistKeepsEarlyCommandContinueEvidenceTelemetryOnly(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+
+	readerPeer, readerConn := mustTCPPair(t)
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{151, 101, 1, 140}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(100*time.Millisecond, func() {
+		storeVisionUplinkTimestamp(writerConn, time.Now().UnixNano())
+		_ = markVisionCommandContinueEvidence(ctx, writerConn, outbound)
+	})
+	time.AfterFunc(500*time.Millisecond, func() {
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Errorf("inbound state=%v, want pending detach while command=0 evidence stays telemetry-only", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Errorf("outbound state=%v, want pending detach while command=0 evidence stays telemetry-only", got)
+		}
+	})
+	time.AfterFunc(1200*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-response"))
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after telemetry-only command=0 evidence", err)
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed < time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want > 1s to wait for late response", elapsed)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("timeout waiting for command=0 telemetry-only flow")
+	}
+}
+
+func TestCopyRawConnIfExistRetriesEOFOnceDetachClears(t *testing.T) {
+	readerConn := newStagedEOFThenDataConn([]byte("post-detach-response"))
+	writerConn := &tls.DeferredRustConn{}
+
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{216, 239, 34, 223}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	var written bytes.Buffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.NewWriter(&written), timer, nil)
+	}()
+
+	time.AfterFunc(100*time.Millisecond, func() {
+		markDeferredRustConnDetachedForTest(writerConn)
+		close(readerConn.eofReady)
+	})
+	time.AfterFunc(200*time.Millisecond, func() {
+		close(readerConn.dataReady)
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after EOF post-detach retry", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for EOF post-detach retry flow")
+	}
+
+	if got := written.String(); got != "post-detach-response" {
+		t.Fatalf("written payload=%q, want %q", got, "post-detach-response")
+	}
+}
+
+func TestClassifyUserspaceExit(t *testing.T) {
+	cases := []struct {
+		name            string
+		err             error
+		userspaceBytes  int64
+		stableUserspace bool
+		want            pipeline.UserspaceExit
+	}{
+		{
+			name:           "remote eof no response",
+			err:            io.EOF,
+			userspaceBytes: 0,
+			want:           pipeline.UserspaceExitRemoteEOFNoResponse,
+		},
+		{
+			name:            "stable userspace eof",
+			err:             io.EOF,
+			userspaceBytes:  0,
+			stableUserspace: true,
+			want:            pipeline.UserspaceExitStableUserspaceClose,
+		},
+		{
+			name:           "remote reset",
+			err:            syscall.ECONNRESET,
+			userspaceBytes: 0,
+			want:           pipeline.UserspaceExitRemoteReset,
+		},
+		{
+			name:           "local close no response",
+			err:            gonet.ErrClosed,
+			userspaceBytes: 0,
+			want:           pipeline.UserspaceExitLocalCloseNoResponse,
+		},
+		{
+			name:           "complete after bytes",
+			err:            io.EOF,
+			userspaceBytes: 64,
+			want:           pipeline.UserspaceExitComplete,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: pipeline.UserspaceExitNone,
+		},
+	}
+
+	for _, tc := range cases {
+		if got := classifyUserspaceExit(tc.err, tc.userspaceBytes, tc.stableUserspace); got != tc.want {
+			t.Fatalf("%s: classifyUserspaceExit() = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -963,6 +2153,7 @@ func TestRecordRawUnwrapToDetachHistogramBuckets(t *testing.T) {
 func TestVisionRawUnwrapWarningTimestampHelpers(t *testing.T) {
 	clearSyncMap(&pipelineVisionRawUnwrapUnixByConn)
 	clearSyncMap(&pipelineVisionDetachUnixByConn)
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
 	conn := &tls.DeferredRustConn{}
 
 	storeVisionRawUnwrapWarningTimestamp(conn, 123)
@@ -983,13 +2174,31 @@ func TestVisionRawUnwrapWarningTimestampHelpers(t *testing.T) {
 	}
 }
 
+func TestVisionUplinkTimestampHelpers(t *testing.T) {
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
+	conn := &tls.DeferredRustConn{}
+
+	now := time.Now().UnixNano()
+	storeVisionUplinkTimestamp(conn, now)
+
+	got, ok := loadVisionUplinkTimestamp(conn)
+	if !ok || got != now {
+		t.Fatalf("load uplink timestamp got (%d,%v), want (%d,true)", got, ok, now)
+	}
+	if remaining := remainingVisionUplinkGraceAt(conn, time.Second, time.Unix(0, now).Add(200*time.Millisecond)); remaining <= 0 || remaining > time.Second {
+		t.Fatalf("remainingVisionUplinkGraceAt()=%v, want within (0,%v]", remaining, time.Second)
+	}
+}
+
 func TestClearVisionTelemetryTimestamps(t *testing.T) {
 	clearSyncMap(&pipelineVisionRawUnwrapUnixByConn)
 	clearSyncMap(&pipelineVisionDetachUnixByConn)
+	clearSyncMap(&pipelineVisionUplinkUnixByConn)
 	conn := &tls.DeferredRustConn{}
 
 	storeVisionRawUnwrapWarningTimestamp(conn, 123)
 	storeVisionDetachTimestamp(conn, 456)
+	storeVisionUplinkTimestamp(conn, 789)
 	clearVisionTelemetryTimestamps(conn)
 
 	if _, ok := consumeVisionRawUnwrapWarningTimestamp(conn); ok {
@@ -997,6 +2206,9 @@ func TestClearVisionTelemetryTimestamps(t *testing.T) {
 	}
 	if _, ok := consumeVisionDetachTimestamp(conn); ok {
 		t.Fatal("detach timestamp should be cleared")
+	}
+	if _, ok := loadVisionUplinkTimestamp(conn); ok {
+		t.Fatal("uplink timestamp should be cleared")
 	}
 }
 
@@ -1113,6 +2325,65 @@ func (testTimeoutConn) RemoteAddr() gonet.Addr           { return testDummyAddr(
 func (testTimeoutConn) SetDeadline(time.Time) error      { return nil }
 func (testTimeoutConn) SetReadDeadline(time.Time) error  { return nil }
 func (testTimeoutConn) SetWriteDeadline(time.Time) error { return nil }
+
+type stagedEOFThenDataConn struct {
+	mu           sync.Mutex
+	eofReady     chan struct{}
+	dataReady    chan struct{}
+	data         []byte
+	returnedEOF  bool
+	returnedData bool
+}
+
+func newStagedEOFThenDataConn(data []byte) *stagedEOFThenDataConn {
+	return &stagedEOFThenDataConn{
+		eofReady:  make(chan struct{}),
+		dataReady: make(chan struct{}),
+		data:      append([]byte(nil), data...),
+	}
+}
+
+func (c *stagedEOFThenDataConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	if !c.returnedEOF {
+		ch := c.eofReady
+		c.mu.Unlock()
+		<-ch
+		c.mu.Lock()
+		c.returnedEOF = true
+		c.mu.Unlock()
+		return 0, io.EOF
+	}
+	if !c.returnedData {
+		ch := c.dataReady
+		c.mu.Unlock()
+		<-ch
+		c.mu.Lock()
+		c.returnedData = true
+		n := copy(b, c.data)
+		c.mu.Unlock()
+		return n, nil
+	}
+	c.mu.Unlock()
+	return 0, io.EOF
+}
+
+func (c *stagedEOFThenDataConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (c *stagedEOFThenDataConn) Close() error                     { return nil }
+func (c *stagedEOFThenDataConn) LocalAddr() gonet.Addr            { return testDummyAddr("staged-local") }
+func (c *stagedEOFThenDataConn) RemoteAddr() gonet.Addr           { return testDummyAddr("staged-remote") }
+func (c *stagedEOFThenDataConn) SetDeadline(time.Time) error      { return nil }
+func (c *stagedEOFThenDataConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *stagedEOFThenDataConn) SetWriteDeadline(time.Time) error { return nil }
+
+func markDeferredRustConnDetachedForTest(dc *tls.DeferredRustConn) {
+	field := reflect.ValueOf(dc).Elem().FieldByName("detached")
+	if !field.IsValid() {
+		panic("DeferredRustConn.detached field not found")
+	}
+	detached := (*atomic.Bool)(unsafe.Pointer(field.UnsafeAddr()))
+	detached.Store(true)
+}
 
 func resetSpliceHistogramCounters() {
 	pipelineMarkerSpliceBytesLt4K.Store(0)

@@ -67,14 +67,25 @@ type dnsUplinkDiagnostic struct {
 	totalBytes   int64
 }
 
+type visionUplinkDiagnostic struct {
+	startedAt    time.Time
+	destination  net.Destination
+	firstWriteNs int64
+	totalBytes   int64
+}
+
 type dnsUplinkDiagnosticWriter struct {
 	Writer buf.Writer
-	diag   *dnsUplinkDiagnostic
+	dns    *dnsUplinkDiagnostic
+	vision *visionUplinkDiagnostic
 }
 
 func (w *dnsUplinkDiagnosticWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	if w.diag != nil {
-		w.diag.observeWrite(int(mb.Len()))
+	if w.dns != nil {
+		w.dns.observeWrite(int(mb.Len()))
+	}
+	if w.vision != nil {
+		w.vision.observeWrite(int(mb.Len()))
 	}
 	return w.Writer.WriteMultiBuffer(mb)
 }
@@ -160,7 +171,30 @@ func newDNSUplinkDiagnostic(ctx context.Context, destination net.Destination) *d
 	}
 }
 
+func newVisionUplinkDiagnostic(inbound *session.Inbound, destination net.Destination) *visionUplinkDiagnostic {
+	if inbound == nil || destination.Network != net.Network_TCP || isDNSDest(destination) {
+		return nil
+	}
+	if inbound.GetCanSpliceCopy() != session.CopyGatePendingDetach {
+		return nil
+	}
+	return &visionUplinkDiagnostic{
+		startedAt:   time.Now(),
+		destination: destination,
+	}
+}
+
 func (d *dnsUplinkDiagnostic) observeWrite(n int) {
+	if d == nil || n <= 0 {
+		return
+	}
+	if d.firstWriteNs == 0 {
+		d.firstWriteNs = time.Since(d.startedAt).Nanoseconds()
+	}
+	d.totalBytes += int64(n)
+}
+
+func (d *visionUplinkDiagnostic) observeWrite(n int) {
 	if d == nil || n <= 0 {
 		return
 	}
@@ -196,7 +230,38 @@ func (d *dnsUplinkDiagnostic) log(ctx context.Context, result string, opErr erro
 	)
 }
 
-func classifyDNSUplinkErr(err error) string {
+func (d *visionUplinkDiagnostic) log(ctx context.Context, result string, opErr error, inbound *session.Inbound, outbound *session.Outbound) {
+	if d == nil {
+		return
+	}
+	inboundGate := session.CopyGateUnset
+	if inbound != nil {
+		inboundGate = inbound.GetCanSpliceCopy()
+	}
+	outboundGate := session.CopyGateUnset
+	if outbound != nil {
+		outboundGate = outbound.GetCanSpliceCopy()
+	}
+	errors.LogDebug(ctx, "proxy markers[kind=vision-uplink-diagnostic]: ",
+		"result=", result,
+		" destination=", d.destination.String(),
+		" uplink_first_write_ns=", d.firstWriteNs,
+		" uplink_bytes=", d.totalBytes,
+		" uplink_duration_ns=", time.Since(d.startedAt).Nanoseconds(),
+		" inbound_copy_gate=", inboundGate.String(),
+		" outbound_copy_gate=", outboundGate.String(),
+		" err_class=", classifyUplinkErr(opErr),
+	)
+}
+
+func observeVisionPendingDetachOnUplinkComplete(ctx context.Context, inbound *session.Inbound, outbound *session.Outbound, result string, retErr error) {
+	if result != "copy_complete" || retErr != nil {
+		return
+	}
+	proxy.ObserveVisionUplinkComplete(ctx, inbound, outbound)
+}
+
+func classifyUplinkErr(err error) string {
 	if err == nil {
 		return "none"
 	}
@@ -223,6 +288,10 @@ func classifyDNSUplinkErr(err error) string {
 		return "timeout"
 	}
 	return "other"
+}
+
+func classifyDNSUplinkErr(err error) string {
+	return classifyUplinkErr(err)
 }
 
 // shouldBypassEgressFastFail is retained for interface compatibility; currently
@@ -381,12 +450,30 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}, plcy.Timeouts.ConnectionIdle)
 
 	requestDone := func() (retErr error) {
-		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
+		downlinkTimeout := plcy.Timeouts.DownlinkOnly
+		// Raw Vision response handling has its own phase-aware timeout policy in
+		// CopyRawConnIfExist. Let that response loop own the shared inactivity
+		// timer instead of steering it here from request-side transport signals.
+		proxyOwnsResponseTimeout := false
+		if destination.Network == net.Network_TCP && useSplice && proxy.IsRAWTransportWithoutSecurity(conn) {
+			proxyOwnsResponseTimeout = true
+		}
+		defer func() {
+			if !proxyOwnsResponseTimeout {
+				timer.SetTimeout(downlinkTimeout)
+			}
+		}()
 		uplinkDiag := newDNSUplinkDiagnostic(ctx, destination)
+		visionDiag := newVisionUplinkDiagnostic(inbound, destination)
 		uplinkResult := "copy_complete"
-		if uplinkDiag != nil {
+		if uplinkDiag != nil || visionDiag != nil {
 			defer func() {
-				uplinkDiag.log(ctx, uplinkResult, retErr, inbound, ob)
+				if uplinkDiag != nil {
+					uplinkDiag.log(ctx, uplinkResult, retErr, inbound, ob)
+				}
+				if visionDiag != nil {
+					visionDiag.log(ctx, uplinkResult, retErr, inbound, ob)
+				}
 			}()
 		}
 
@@ -416,25 +503,35 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 			}
 		}
-		if uplinkDiag != nil {
+		if uplinkDiag != nil || visionDiag != nil {
 			writer = &dnsUplinkDiagnosticWriter{
 				Writer: writer,
-				diag:   uplinkDiag,
+				dns:    uplinkDiag,
+				vision: visionDiag,
 			}
 		}
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
 			if isExpectedRequestReadError(err) {
 				uplinkResult = "request_stream_closed"
+				if visionDiag != nil {
+					observeVisionPendingDetachOnUplinkComplete(ctx, inbound, ob, uplinkResult, retErr)
+				}
 				errors.LogDebugInner(ctx, err, "freedom: request stream closed by peer")
 				return nil
 			}
 			uplinkResult = "copy_error"
 			retErr = errors.New("failed to process request").Base(err)
+			if visionDiag != nil {
+				observeVisionPendingDetachOnUplinkComplete(ctx, inbound, ob, uplinkResult, retErr)
+			}
 			return retErr
 		}
 
 		uplinkResult = "copy_complete"
+		if visionDiag != nil {
+			observeVisionPendingDetachOnUplinkComplete(ctx, inbound, ob, uplinkResult, retErr)
+		}
 		return nil
 	}
 

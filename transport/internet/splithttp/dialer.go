@@ -79,6 +79,14 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	return xmuxClient.XmuxConn.(DialerClient), xmuxClient
 }
 
+func shouldWaitForPacketPostDispatch(client DialerClient) bool {
+	defaultClient, ok := client.(*DefaultDialerClient)
+	if !ok {
+		return false
+	}
+	return defaultClient.waitForPacketPostDispatch()
+}
+
 func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) string {
 	if realityConfig != nil {
 		return "2"
@@ -486,6 +494,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			}
 
 			client := httpClient
+			waitForDispatch := shouldWaitForPacketPostDispatch(client)
 			chunkURL := url.String()
 			chunkLen := int64(chunk.Len())
 			go func(client DialerClient, chunkCtx context.Context, chunk buf.MultiBuffer, chunkURL, sessionID, seqStr string, chunkLen int64) {
@@ -505,7 +514,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 				}
 			}(client, chunkCtx, chunk, chunkURL, sessionId, seqStr, chunkLen)
 
-			if _, ok := httpClient.(*DefaultDialerClient); ok {
+			if waitForDispatch {
 				<-wroteRequest.Wait()
 			}
 		}

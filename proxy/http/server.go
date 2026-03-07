@@ -109,7 +109,7 @@ func (s *Server) ProcessWithFirstbyte(ctx context.Context, network net.Network, 
 	}
 
 Start:
-	if err := conn.SetReadDeadline(time.Now().Add(s.policy().Timeouts.Handshake)); err != nil {
+	if err := proxy.SetHandshakeReadDeadline(conn, time.Now().Add(s.policy().Timeouts.Handshake)); err != nil {
 		errors.LogInfoInner(ctx, err, "failed to set read deadline")
 	}
 
@@ -133,7 +133,7 @@ Start:
 	}
 
 	errors.LogInfo(ctx, "request to Method [", request.Method, "] Host [", request.Host, "] with URL [", request.URL, "]")
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+	if err := proxy.ClearHandshakeReadDeadline(conn); err != nil {
 		errors.LogDebugInner(ctx, err, "failed to clear read deadline")
 	}
 

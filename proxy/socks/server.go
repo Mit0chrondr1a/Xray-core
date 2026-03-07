@@ -104,7 +104,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 
 func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher, firstbyte []byte) error {
 	plcy := s.policy()
-	if err := conn.SetReadDeadline(time.Now().Add(plcy.Timeouts.Handshake)); err != nil {
+	if err := proxy.SetHandshakeReadDeadline(conn, time.Now().Add(plcy.Timeouts.Handshake)); err != nil {
 		errors.LogInfoInner(ctx, err, "failed to set deadline")
 	}
 
@@ -143,7 +143,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 		inbound.User.Email = request.User.Email
 	}
 
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+	if err := proxy.ClearHandshakeReadDeadline(conn); err != nil {
 		errors.LogInfoInner(ctx, err, "failed to clear deadline")
 	}
 

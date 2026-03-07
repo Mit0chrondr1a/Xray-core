@@ -22,6 +22,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -151,7 +152,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	iConn := stat.TryUnwrapStatsConn(conn)
 
 	sessionPolicy := s.policyManager.ForLevel(0)
-	if err := conn.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
+	if err := proxy.SetHandshakeReadDeadline(conn, time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
 		return errors.New("unable to set read deadline").Base(err).AtWarning()
 	}
 
@@ -229,7 +230,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	}
 
 	destination := clientReader.Target
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+	if err := proxy.ClearHandshakeReadDeadline(conn); err != nil {
 		return errors.New("unable to set read deadline").Base(err).AtWarning()
 	}
 
@@ -378,7 +379,7 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 }
 
 func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.Session, connection stat.Connection, iConn stat.Connection, napfb map[string]map[string]map[string]*Fallback, first *buf.Buffer, firstLen int64, reader buf.Reader) error {
-	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+	if err := proxy.ClearHandshakeReadDeadline(connection); err != nil {
 		errors.LogWarningInner(ctx, err, "unable to set back read deadline")
 	}
 	errors.LogInfoInner(ctx, err, "fallback starts")
@@ -553,7 +554,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 				return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err).AtWarning()
 			}
 		}
-		if err := buf.Copy(reader, serverWriter, buf.UpdateActivity(timer)); err != nil {
+		if err := proxy.CopyFallbackRequest(ctx, connection, conn, reader, serverWriter, timer); err != nil {
 			return errors.New("failed to fallback request payload").Base(err).AtInfo()
 		}
 		return nil
@@ -563,7 +564,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 
 	getResponse := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
-		if err := buf.Copy(serverReader, writer, buf.UpdateActivity(timer)); err != nil {
+		if err := proxy.CopyFallbackResponse(ctx, conn, connection, writer, timer); err != nil {
 			return errors.New("failed to deliver response payload").Base(err).AtInfo()
 		}
 		return nil
