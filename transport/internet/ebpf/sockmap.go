@@ -311,10 +311,7 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 		// Rust/Aya path: register_pair_impl handles policy map writes internally,
 		// so skip Go-side setPolicyEntry() calls.
 		if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie, policy); err != nil {
-			m.recordSockmapRegistrationFailure()
-			if isSockmapFull(err) {
-				m.fullRejects.Add(1)
-			}
+			m.recordSockmapRegistrationFailure(err)
 			if policy&PolicyKTLSActive != 0 {
 				_ = forceProbeKTLSSockhashCompat("register-ktls-fail")
 			}
@@ -332,12 +329,9 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 		}
 
 		if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie, 0); err != nil {
-			m.recordSockmapRegistrationFailure()
+			m.recordSockmapRegistrationFailure(err)
 			_ = deletePolicyEntry(inboundCookie)  // best-effort cleanup
 			_ = deletePolicyEntry(outboundCookie) // best-effort cleanup
-			if isSockmapFull(err) {
-				m.fullRejects.Add(1)
-			}
 			if policy&PolicyKTLSActive != 0 {
 				_ = forceProbeKTLSSockhashCompat("register-ktls-fail")
 			}
@@ -757,7 +751,11 @@ func (m *SockmapManager) recordRegistrationAttempt(failed bool) {
 	}
 }
 
-func (m *SockmapManager) recordSockmapRegistrationFailure() {
+func (m *SockmapManager) recordSockmapRegistrationFailure(err error) {
+	if isSockmapFull(err) {
+		m.fullRejects.Add(1)
+		return
+	}
 	m.regFailures.Add(1)
 	m.recordRegistrationAttempt(true)
 }
