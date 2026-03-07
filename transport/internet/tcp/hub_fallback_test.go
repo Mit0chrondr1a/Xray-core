@@ -65,6 +65,43 @@ func TestIsDeferredRealityPeekTimeout(t *testing.T) {
 	}
 }
 
+func TestIsDeferredRealityPeerAbort(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "rustls short read",
+			err:  errors.New("native REALITY deferred: handshake: failed to fill whole buffer"),
+			want: true,
+		},
+		{
+			name: "wrapped sentinel",
+			err:  fmt.Errorf("%w: simulated", native.ErrRealityDeferredHandshakePeerAbort),
+			want: true,
+		},
+		{
+			name: "peek timeout does not match",
+			err:  fmt.Errorf("%w: simulated", native.ErrRealityDeferredPeekTimeout),
+			want: false,
+		},
+		{
+			name: "generic handshake error",
+			err:  errors.New("native REALITY deferred: handshake: bad certificate"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDeferredRealityPeerAbort(tt.err); got != tt.want {
+				t.Fatalf("isDeferredRealityPeerAbort() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNativeBreakerOpensOnThreshold(t *testing.T) {
 	policy := defaultNativePathPolicy()
 	policy.Breaker.PeekTimeoutThreshold = 2
@@ -102,6 +139,25 @@ func TestNativeBreakerAuthFailedDoesNotOpen(t *testing.T) {
 	skip, state, _ := cb.shouldSkip(now.Add(time.Second))
 	if skip {
 		t.Fatal("auth-failed should not open breaker")
+	}
+	if state != nativeBreakerStateClosed {
+		t.Fatalf("breaker state = %s, want %s", state, nativeBreakerStateClosed)
+	}
+}
+
+func TestNativeBreakerPeerAbortDoesNotOpen(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 1
+	scope := "test-breaker-peer-abort"
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomePeerAbort)
+	skip, state, _ := cb.shouldSkip(now.Add(time.Second))
+	if skip {
+		t.Fatal("peer-abort should not open breaker")
 	}
 	if state != nativeBreakerStateClosed {
 		t.Fatalf("breaker state = %s, want %s", state, nativeBreakerStateClosed)
@@ -155,6 +211,31 @@ func TestShouldAttemptNativeRealityDisabledByPolicy(t *testing.T) {
 	}
 	if decision.SkipReason != nativeSkipReasonPolicyModeDisabled {
 		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonPolicyModeDisabled)
+	}
+}
+
+func TestShouldAttemptNativeRealityDisabledByDebugEnv(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_DISABLE_NATIVE_REALITY", "1")
+
+	v := &Listener{
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_AUTO,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeReality(v)
+	if decision.Attempt {
+		t.Fatal("expected attempt=false when debug env disables native path")
+	}
+	if !decision.SkipByPolicy {
+		t.Fatal("expected SkipByPolicy=true when debug env disables native path")
+	}
+	if decision.SkipReason != nativeSkipReasonDebugDisabled {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonDebugDisabled)
 	}
 }
 
@@ -386,10 +467,10 @@ func TestLoopbackListenerAutoSkipsNative(t *testing.T) {
 		t.Fatal("loopback listener in AUTO should skip native path")
 	}
 	if !decision.SkipByPolicy {
-		t.Fatal("expected loopback listener skip to be classified as policy skip")
+		t.Fatal("expected loopback listener in AUTO to skip by policy")
 	}
-	if decision.SkipReason != nativeSkipReasonLoopbackListenerAuto {
-		t.Fatalf("skip reason=%s, want %s", decision.SkipReason, nativeSkipReasonLoopbackListenerAuto)
+	if decision.SkipReason != nativeSkipReasonLoopbackAutoGuard {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonLoopbackAutoGuard)
 	}
 }
 
@@ -452,17 +533,17 @@ func TestLoopbackConnLocalAddrAutoSkipsNative(t *testing.T) {
 	}
 	decision := shouldAttemptNativeRealityForAddr(v, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9100})
 	if decision.Attempt {
-		t.Fatal("loopback conn local addr in AUTO should skip native path even without relying on listener bind port")
+		t.Fatal("loopback conn local addr in AUTO should skip native path")
 	}
 	if !decision.SkipByPolicy {
-		t.Fatal("expected loopback local-addr skip to be classified as policy skip")
+		t.Fatal("expected loopback conn local addr in AUTO to skip by policy")
 	}
-	if decision.SkipReason != nativeSkipReasonLoopbackListenerAuto {
-		t.Fatalf("skip reason=%s, want %s", decision.SkipReason, nativeSkipReasonLoopbackListenerAuto)
+	if decision.SkipReason != nativeSkipReasonLoopbackAutoGuard {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonLoopbackAutoGuard)
 	}
 }
 
-func TestLoopbackIngressAutoGuardFallsBackWithoutRustAttempt(t *testing.T) {
+func TestLoopbackIngressPreferNativeAttemptsRustThenFallsBack(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -499,7 +580,7 @@ func TestLoopbackIngressAutoGuardFallsBackWithoutRustAttempt(t *testing.T) {
 		realityConfig: &goreality.Config{},
 		realityXrayConfig: &xrayreality.Config{
 			NativePathPolicy: &xrayreality.NativePathPolicy{
-				Mode:             xrayreality.NativePathMode_AUTO,
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
 				AllowFallback:    true,
 				TelemetryEnforce: true,
 				Breaker:          defaultNativePathPolicy().Breaker,
@@ -533,15 +614,15 @@ func TestLoopbackIngressAutoGuardFallsBackWithoutRustAttempt(t *testing.T) {
 		t.Fatal("timed out waiting for accepted fallback connection")
 	}
 
-	if delta := tcpRealityMarkerRustAttempt.Load() - beforeAttempt; delta != 0 {
-		t.Fatalf("rust_attempt delta=%d, want 0 under loopback auto guard", delta)
+	if delta := tcpRealityMarkerRustAttempt.Load() - beforeAttempt; delta < 1 {
+		t.Fatalf("rust_attempt delta=%d, want >=1 under loopback PREFER_NATIVE native attempt", delta)
 	}
 	if delta := tcpRealityMarkerGoFallbackAttempt.Load() - beforeFallback; delta < 1 {
 		t.Fatalf("go_fallback_attempt delta=%d, want >=1", delta)
 	}
 }
 
-func TestLoopbackIngressBurstFallsBackWithoutStall(t *testing.T) {
+func TestLoopbackIngressBurstPreferNativeAttemptsRustWithoutStall(t *testing.T) {
 	const connections = 24
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -580,7 +661,7 @@ func TestLoopbackIngressBurstFallsBackWithoutStall(t *testing.T) {
 		realityConfig: &goreality.Config{},
 		realityXrayConfig: &xrayreality.Config{
 			NativePathPolicy: &xrayreality.NativePathPolicy{
-				Mode:             xrayreality.NativePathMode_AUTO,
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
 				AllowFallback:    true,
 				TelemetryEnforce: true,
 				Breaker:          defaultNativePathPolicy().Breaker,
@@ -628,7 +709,98 @@ func TestLoopbackIngressBurstFallsBackWithoutStall(t *testing.T) {
 		}
 	}
 
-	if delta := tcpRealityMarkerRustAttempt.Load() - beforeAttempt; delta != 0 {
-		t.Fatalf("rust_attempt delta=%d, want 0 under loopback auto guard", delta)
+	if delta := tcpRealityMarkerRustAttempt.Load() - beforeAttempt; delta < uint64(connections) {
+		t.Fatalf("rust_attempt delta=%d, want >=%d under loopback PREFER_NATIVE native attempt", delta, connections)
+	}
+}
+
+func TestLoopbackIngressPeerAbortDoesNotOpenBreakerWhenPreferNative(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	oldUseNative := useNativeRealityServerFn
+	oldDoRust := doRustRealityDeferredFn
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	useNativeRealityServerFn = nativeRealityServerEligible
+	doRustRealityDeferredFn = func(*Listener, int) (*native.DeferredResult, error) {
+		return nil, fmt.Errorf("%w: simulated", native.ErrRealityDeferredHandshakePeerAbort)
+	}
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	defer func() {
+		useNativeRealityServerFn = oldUseNative
+		doRustRealityDeferredFn = oldDoRust
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+	}()
+
+	v := &Listener{
+		listener:      ln,
+		connSemaphore: make(chan struct{}, 8),
+		inboundTag:    "loopback-peer-abort",
+		realityConfig: &goreality.Config{},
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker: &xrayreality.NativePathBreaker{
+					Enabled:                      true,
+					PeekTimeoutThreshold:         3,
+					InternalErrorThreshold:       1,
+					WindowSeconds:                60,
+					CooldownSeconds:              30,
+					HalfOpenProbeIntervalSeconds: 2,
+				},
+			},
+		},
+	}
+	unexpectedAdd := make(chan struct{}, 1)
+	v.addConn = func(conn stat.Connection) {
+		_ = conn.Close()
+		select {
+		case unexpectedAdd <- struct{}{}:
+		default:
+		}
+	}
+	scope := nativePathBreakerScopeKey(v)
+	nativePathBreakerByScope.Delete(scope)
+	defer nativePathBreakerByScope.Delete(scope)
+
+	beforeHandshakeFailed := tcpRealityMarkerRustHandshakeFailed.Load()
+	go v.keepAccepting()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = client.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if tcpRealityMarkerRustHandshakeFailed.Load()-beforeHandshakeFailed >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if delta := tcpRealityMarkerRustHandshakeFailed.Load() - beforeHandshakeFailed; delta < 1 {
+		t.Fatalf("rust_handshake_failed delta=%d, want >=1", delta)
+	}
+	select {
+	case <-unexpectedAdd:
+		t.Fatal("peer-abort failstop should not reach addConn")
+	default:
+	}
+
+	decision := shouldAttemptNativeReality(v)
+	if !decision.Attempt {
+		t.Fatal("peer-abort should not suppress the next native attempt")
+	}
+	if decision.SkipByBreaker {
+		t.Fatalf("peer-abort should not open breaker, got skip reason %s", decision.SkipReason)
 	}
 }

@@ -2,6 +2,7 @@ use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use rustls::crypto::ring::default_provider;
@@ -730,7 +731,37 @@ impl rustls::KeyLog for SecretCapture {
 
 /// Read exactly `buf.len()` bytes from `fd`, handling EAGAIN via poll(2).
 /// Handles EINTR from both read() and poll() (SA_RESTART does not apply to poll on Linux).
-fn read_exact_with_poll(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> std::io::Result<()> {
+fn timeout_deadline(timeout_ms: i64) -> Option<Instant> {
+    if timeout_ms < 0 {
+        return None;
+    }
+    Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+}
+
+fn remaining_poll_timeout(deadline: Option<Instant>) -> std::io::Result<i32> {
+    let Some(deadline) = deadline else {
+        return Ok(-1);
+    };
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "deferred poll timeout exceeded",
+        ));
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    let millis = remaining.as_millis();
+    if millis == 0 {
+        return Ok(1);
+    }
+    Ok(millis.min(i32::MAX as u128) as i32)
+}
+
+fn read_exact_with_poll_deadline(
+    fd: std::os::unix::io::RawFd,
+    buf: &mut [u8],
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
         let ret = unsafe {
@@ -750,7 +781,7 @@ fn read_exact_with_poll(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> std::io
         } else {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
-                poll_readable(fd)?;
+                poll_readable(fd, deadline)?;
                 continue;
             }
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -762,21 +793,60 @@ fn read_exact_with_poll(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> std::io
     Ok(())
 }
 
+fn read_some_with_poll_deadline(
+    fd: std::os::unix::io::RawFd,
+    buf: &mut [u8],
+    deadline: Option<Instant>,
+) -> std::io::Result<usize> {
+    loop {
+        let ret = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if ret > 0 {
+            return Ok(ret as usize);
+        }
+        if ret == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read_some_with_poll: unexpected EOF",
+            ));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            poll_readable(fd, deadline)?;
+            continue;
+        }
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+fn read_exact_with_poll(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> std::io::Result<()> {
+    read_exact_with_poll_deadline(fd, buf, None)
+}
+
 /// Block until `fd` is readable, handling EINTR and edge cases.
-fn poll_readable(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+fn poll_readable(fd: std::os::unix::io::RawFd, deadline: Option<Instant>) -> std::io::Result<()> {
     loop {
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        let pret = unsafe { libc::poll(&mut pfd, 1, -1) };
+        let timeout_ms = remaining_poll_timeout(deadline)?;
+        let pret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if pret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue; // EINTR — retry poll
             }
             return Err(err);
+        }
+        if pret == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deferred read poll timeout exceeded",
+            ));
         }
         if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
             return Err(std::io::Error::new(
@@ -807,6 +877,7 @@ pub(crate) struct RecordReader {
     buf: Vec<u8>,
     pos: usize,
     len: usize,
+    record_target: usize,
     first_record_hash: Option<[u8; 32]>,
     record_count: usize,
 }
@@ -818,6 +889,7 @@ impl RecordReader {
             buf: Vec::new(),
             pos: 0,
             len: 0,
+            record_target: 0,
             first_record_hash: None,
             record_count: 0,
         }
@@ -858,6 +930,7 @@ impl RecordReader {
             .map_err(map_timeout)?;
         self.pos = 0;
         self.len = 5 + payload_len;
+        self.record_target = 0;
 
         // Capture SHA-256 hash of the first record consumed (for TOCTOU verification)
         if self.record_count == 0 {
@@ -885,29 +958,57 @@ impl RecordReader {
     /// Uses poll()-based reads to handle EAGAIN after RestoreNonBlock restores
     /// O_NONBLOCK on the fd while this reader is still active.
     pub(crate) fn read_one_record(&mut self) -> std::io::Result<Vec<u8>> {
+        self.read_one_record_deadline(None)
+    }
+
+    pub(crate) fn read_one_record_deadline(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> std::io::Result<Vec<u8>> {
         use std::os::unix::io::AsRawFd;
 
         // Drain leftover buffered bytes from handshake phase
-        if self.pos < self.len {
+        if self.record_target == 0 && self.pos < self.len {
             let leftover = self.buf[self.pos..self.len].to_vec();
             self.pos = self.len;
             return Ok(leftover);
         }
         let fd = self.tcp.as_raw_fd();
-        // Read fresh TLS record: 5-byte header + payload
-        let mut header = [0u8; 5];
-        read_exact_with_poll(fd, &mut header)?;
-        let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-        if payload_len > 16384 + 256 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("TLS record too large: {}", payload_len),
-            ));
+        if self.record_target == 0 {
+            self.buf.clear();
+            self.buf.resize(5, 0);
+            self.pos = 0;
+            self.len = 0;
+            self.record_target = 5;
         }
-        let mut record = Vec::with_capacity(5 + payload_len);
-        record.extend_from_slice(&header);
-        record.resize(5 + payload_len, 0);
-        read_exact_with_poll(fd, &mut record[5..])?;
+        while self.len < self.record_target {
+            let n = read_some_with_poll_deadline(
+                fd,
+                &mut self.buf[self.len..self.record_target],
+                deadline,
+            )?;
+            self.len += n;
+            if self.record_target == 5 && self.len == 5 {
+                let payload_len = u16::from_be_bytes([self.buf[3], self.buf[4]]) as usize;
+                if payload_len > 16384 + 256 {
+                    self.buf.clear();
+                    self.pos = 0;
+                    self.len = 0;
+                    self.record_target = 0;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("TLS record too large: {}", payload_len),
+                    ));
+                }
+                self.buf.resize(5 + payload_len, 0);
+                self.record_target = 5 + payload_len;
+            }
+        }
+        let record = self.buf[..self.record_target].to_vec();
+        self.buf.clear();
+        self.pos = 0;
+        self.len = 0;
+        self.record_target = 0;
         Ok(record)
     }
 
@@ -924,6 +1025,7 @@ impl RecordReader {
         self.buf.extend_from_slice(data);
         self.pos = 0;
         self.len = data.len();
+        self.record_target = 0;
     }
 
     /// Return bytes already read from the socket but not yet consumed by rustls.
@@ -933,12 +1035,14 @@ impl RecordReader {
             self.buf.clear();
             self.pos = 0;
             self.len = 0;
+            self.record_target = 0;
             return Vec::new();
         }
         let pending = self.buf[self.pos..self.len].to_vec();
         self.buf.clear();
         self.pos = 0;
         self.len = 0;
+        self.record_target = 0;
         pending
     }
 }
@@ -2906,5 +3010,61 @@ mod ktls_selftest {
         read_exact_with_poll(fd_r, &mut buf).unwrap();
         assert_eq!(&buf, &data[..]);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_read_exact_with_poll_deadline_times_out() {
+        use std::os::unix::io::AsRawFd;
+
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+
+        let fd = reader.as_raw_fd();
+        let mut buf = [0u8; 1];
+        let start = Instant::now();
+        let err = read_exact_with_poll_deadline(
+            fd,
+            &mut buf,
+            Some(Instant::now() + Duration::from_millis(20)),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() >= Duration::from_millis(15),
+            "timeout fired too early: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_record_reader_deadline_preserves_partial_record() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = std::thread::spawn(move || TcpStream::connect(addr).unwrap());
+        let (reader_stream, _) = listener.accept().unwrap();
+        let mut writer = client.join().unwrap();
+        reader_stream.set_nonblocking(true).unwrap();
+
+        let mut reader = RecordReader::new(reader_stream);
+        let record = [0x17u8, 0x03, 0x03, 0x00, 0x03, 0xAA, 0xBB, 0xCC];
+
+        writer.write_all(&record[..2]).unwrap();
+
+        let err = reader
+            .read_one_record_deadline(Some(Instant::now() + Duration::from_millis(20)))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        writer.write_all(&record[2..]).unwrap();
+
+        let got = reader
+            .read_one_record_deadline(Some(Instant::now() + Duration::from_millis(200)))
+            .unwrap();
+        assert_eq!(got, record);
     }
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"math/big"
 	gonet "net"
 	"sync"
@@ -48,6 +49,8 @@ const (
 	deferredKTLSPromotionCooldown = 3 * time.Minute
 	deferredReadBatchCap          = 16 * 1024 // 16 KiB read-ahead for deferred rustls reads
 	deferredReadBatchThreshold    = 2 * 1024  // batch only for small app reads to amortize cgo crossings
+	deferredWriteBatchCap         = 16 * 1024 // 16 KiB write coalescing budget for deferred rustls writes
+	deferredWriteBatchThreshold   = 2 * 1024  // coalesce only small app writes; large payloads flush immediately
 )
 
 // deferredKTLSPromotionDisabledUntilUnixNano stores a cooldown deadline.
@@ -784,6 +787,9 @@ func NewRustConnChecked(rawConn net.Conn, result *native.TlsResult, serverName s
 type DeferredRustConn struct {
 	rawConn          gonet.Conn
 	deferredMu       sync.RWMutex
+	deferredCond     *sync.Cond
+	deferredOps      int
+	deferredOpsBlock bool
 	handle           *native.DeferredSessionHandle
 	alpn             string
 	version          uint16
@@ -804,6 +810,13 @@ type DeferredRustConn struct {
 	deferredReadBuf  []byte
 	deferredReadOff  int
 	deferredReadLen  int
+	writeBatching    atomic.Bool
+	deferredWriteMu  sync.Mutex
+	deferredWriteBuf []byte
+	deferredWriteLen int
+	deadlineMu       sync.RWMutex
+	readDeadline     time.Time
+	writeDeadline    time.Time
 	readRecords      atomic.Uint64 // kTLS RX record counter for EBADMSG diagnostics
 	readBytes        atomic.Int64  // total kTLS RX bytes for EBADMSG diagnostics
 }
@@ -839,6 +852,154 @@ func (c *DeferredRustConn) SetKTLSPromotionScope(scope string) {
 		return
 	}
 	c.ktlsScope = scope
+}
+
+// SetDeferredWriteBatching enables or disables deferred small-write coalescing.
+// The default is disabled so protocol-control writes preserve progress unless a
+// caller explicitly opts into batching for a proven-safe data path.
+func (c *DeferredRustConn) SetDeferredWriteBatching(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.writeBatching.Store(enabled)
+}
+
+func (c *DeferredRustConn) ensureDeferredCondLocked() *sync.Cond {
+	if c.deferredCond == nil {
+		c.deferredCond = sync.NewCond(&c.deferredMu)
+	}
+	return c.deferredCond
+}
+
+// beginDeferredHandleUse pins the deferred handle for a blocking native read or
+// write without holding deferredMu across the FFI call. State transitions block
+// new entrants and wait for active users to drain before consuming the handle.
+func (c *DeferredRustConn) beginDeferredHandleUse() (*native.DeferredSessionHandle, bool, error) {
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+
+	for {
+		if c.closed.Load() {
+			return nil, false, gonet.ErrClosed
+		}
+		if c.ktlsActive || c.detached.Load() {
+			return nil, false, nil
+		}
+		if c.handle == nil {
+			return nil, false, gonet.ErrClosed
+		}
+		if !c.deferredOpsBlock {
+			c.deferredOps++
+			return c.handle, true, nil
+		}
+		c.ensureDeferredCondLocked().Wait()
+	}
+}
+
+func (c *DeferredRustConn) endDeferredHandleUse() {
+	c.deferredMu.Lock()
+	if c.deferredOps > 0 {
+		c.deferredOps--
+		if c.deferredOps == 0 {
+			c.ensureDeferredCondLocked().Broadcast()
+		}
+	}
+	c.deferredMu.Unlock()
+}
+
+func (c *DeferredRustConn) beginExclusiveDeferredTransitionLocked() {
+	c.ensureDeferredCondLocked()
+	c.deferredOpsBlock = true
+	for c.deferredOps > 0 {
+		c.deferredCond.Wait()
+	}
+}
+
+func (c *DeferredRustConn) endExclusiveDeferredTransitionLocked() {
+	if !c.deferredOpsBlock {
+		return
+	}
+	c.deferredOpsBlock = false
+	c.ensureDeferredCondLocked().Broadcast()
+}
+
+func (c *DeferredRustConn) appendDeferredWritePendingLocked(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	needed := c.deferredWriteLen + len(b)
+	if cap(c.deferredWriteBuf) < needed {
+		nextCap := cap(c.deferredWriteBuf)
+		if nextCap < deferredWriteBatchCap {
+			nextCap = deferredWriteBatchCap
+		}
+		for nextCap < needed {
+			nextCap *= 2
+		}
+		next := make([]byte, needed, nextCap)
+		copy(next, c.deferredWriteBuf[:c.deferredWriteLen])
+		for i := range c.deferredWriteBuf {
+			c.deferredWriteBuf[i] = 0
+		}
+		c.deferredWriteBuf = next
+	}
+	if len(c.deferredWriteBuf) < needed {
+		c.deferredWriteBuf = c.deferredWriteBuf[:needed]
+	}
+	copy(c.deferredWriteBuf[c.deferredWriteLen:needed], b)
+	c.deferredWriteLen = needed
+}
+
+func (c *DeferredRustConn) consumeDeferredWritePendingLocked(n int) {
+	if n <= 0 || c.deferredWriteLen == 0 {
+		return
+	}
+	if n >= c.deferredWriteLen {
+		for i := 0; i < c.deferredWriteLen; i++ {
+			c.deferredWriteBuf[i] = 0
+		}
+		c.deferredWriteLen = 0
+		if len(c.deferredWriteBuf) > 0 {
+			c.deferredWriteBuf = c.deferredWriteBuf[:0]
+		}
+		return
+	}
+	copy(c.deferredWriteBuf[:c.deferredWriteLen-n], c.deferredWriteBuf[n:c.deferredWriteLen])
+	for i := c.deferredWriteLen - n; i < c.deferredWriteLen; i++ {
+		c.deferredWriteBuf[i] = 0
+	}
+	c.deferredWriteLen -= n
+}
+
+func (c *DeferredRustConn) flushDeferredWritePendingLocked(h *native.DeferredSessionHandle, deadline time.Time) error {
+	c.deferredWriteMu.Lock()
+	defer c.deferredWriteMu.Unlock()
+	if c.deferredWriteLen == 0 {
+		return nil
+	}
+	n, err := deferredWriteWithDeadlineFn(h, c.deferredWriteBuf[:c.deferredWriteLen], deadline)
+	c.logDeferredKTLSError(err)
+	if err == nil && n > 0 {
+		c.writeRecords.Add(1)
+	}
+	if err == nil && n < c.deferredWriteLen {
+		err = io.ErrShortWrite
+	}
+	c.consumeDeferredWritePendingLocked(n)
+	return err
+}
+
+func earlierDeadline(a, b time.Time) time.Time {
+	switch {
+	case a.IsZero():
+		return b
+	case b.IsZero():
+		return a
+	case b.Before(a):
+		return b
+	default:
+		return a
+	}
 }
 
 func (c *DeferredRustConn) Read(b []byte) (int, error) {
@@ -910,39 +1071,29 @@ func (c *DeferredRustConn) Read(b []byte) (int, error) {
 			return c.rawConn.Read(b)
 		}
 
-		// Hold read lock across DeferredRead so EnableKTLS/Drain/Free cannot
-		// consume the handle concurrently.
-		c.deferredMu.RLock()
-		if c.closed.Load() {
-			c.deferredMu.RUnlock()
-			return 0, gonet.ErrClosed
+		h, acquired, err := c.beginDeferredHandleUse()
+		if err != nil {
+			return 0, err
 		}
-		if c.ktlsActive {
-			c.deferredMu.RUnlock()
+		if !acquired {
 			continue
 		}
-		if c.detached.Load() {
-			c.deferredMu.RUnlock()
-			return 0, gonet.ErrClosed
-		}
-		h := c.handle
-		if h == nil {
-			c.deferredMu.RUnlock()
-			return 0, gonet.ErrClosed
-		}
 		var n int
-		var err error
+		defer c.endDeferredHandleUse()
+		readDeadline := c.currentReadDeadline()
+		if err := c.flushDeferredWritePendingLocked(h, earlierDeadline(readDeadline, c.currentWriteDeadline())); err != nil {
+			return 0, err
+		}
 		if len(b) < deferredReadBatchThreshold {
-			n, err = c.deferredReadBatched(h, b)
+			n, err = c.deferredReadBatched(h, b, readDeadline)
 		} else {
-			n, err = native.DeferredRead(h, b)
+			n, err = deferredReadWithDeadlineFn(h, b, readDeadline)
 			c.logDeferredKTLSError(err)
 		}
 		if err == nil && n > 0 {
 			c.readRecords.Add(1)
 			c.readBytes.Add(int64(n))
 		}
-		c.deferredMu.RUnlock()
 		return n, err
 	}
 }
@@ -963,9 +1114,9 @@ func (c *DeferredRustConn) consumeDeferredReadCache(dst []byte) int {
 }
 
 // deferredReadBatched reads into an internal read-ahead buffer and serves `dst`
-// from that buffer. This amortizes cgo call overhead for small reads.
-// Caller must hold c.deferredMu.RLock while invoking this method.
-func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, dst []byte) (int, error) {
+// from that buffer. This amortizes cgo call overhead for small reads while the
+// deferred handle is pinned by beginDeferredHandleUse.
+func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, dst []byte, deadline time.Time) (int, error) {
 	c.deferredReadMu.Lock()
 	defer c.deferredReadMu.Unlock()
 
@@ -983,7 +1134,7 @@ func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, 
 		c.deferredReadBuf = make([]byte, deferredReadBatchCap)
 	}
 	buf := c.deferredReadBuf[:deferredReadBatchCap]
-	n, err := native.DeferredRead(h, buf)
+	n, err := deferredReadWithDeadlineFn(h, buf, deadline)
 	c.logDeferredKTLSError(err)
 	if n <= 0 {
 		return n, err
@@ -1003,6 +1154,9 @@ func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, 
 }
 
 func (c *DeferredRustConn) Write(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	for {
 		if c.closed.Load() {
 			return 0, gonet.ErrClosed
@@ -1027,35 +1181,62 @@ func (c *DeferredRustConn) Write(b []byte) (int, error) {
 			return c.rawConn.Write(b)
 		}
 
-		// Hold read lock across DeferredWrite so EnableKTLS/Drain/Free cannot
-		// consume the handle concurrently.
-		c.deferredMu.RLock()
-		if c.closed.Load() {
-			c.deferredMu.RUnlock()
-			return 0, gonet.ErrClosed
+		h, acquired, err := c.beginDeferredHandleUse()
+		if err != nil {
+			return 0, err
 		}
-		if c.ktlsActive {
-			c.deferredMu.RUnlock()
+		if !acquired {
 			continue
 		}
-		if c.detached.Load() {
-			c.deferredMu.RUnlock()
-			return c.rawConn.Write(b)
+
+		writeDeadline := c.currentWriteDeadline()
+		if c.writeBatching.Load() && len(b) < deferredWriteBatchThreshold && writeDeadline.IsZero() {
+			defer c.endDeferredHandleUse()
+			c.deferredWriteMu.Lock()
+			prevPending := c.deferredWriteLen
+			c.appendDeferredWritePendingLocked(b)
+			if c.deferredWriteLen < deferredWriteBatchThreshold {
+				c.deferredWriteMu.Unlock()
+				return len(b), nil
+			}
+			payloadLen := c.deferredWriteLen
+			n, err := deferredWriteWithDeadlineFn(h, c.deferredWriteBuf[:payloadLen], writeDeadline)
+			c.logDeferredKTLSError(err)
+			if err == nil && n > 0 {
+				c.writeRecords.Add(1)
+			}
+			if err == nil && n < payloadLen {
+				err = io.ErrShortWrite
+			}
+			c.consumeDeferredWritePendingLocked(n)
+			c.deferredWriteMu.Unlock()
+
+			sentFromCurrent := 0
+			if n > prevPending {
+				sentFromCurrent = n - prevPending
+				if sentFromCurrent > len(b) {
+					sentFromCurrent = len(b)
+				}
+			}
+			if err != nil && c.detached.Load() {
+				rawN, rawErr := c.rawConn.Write(b[sentFromCurrent:])
+				return sentFromCurrent + rawN, rawErr
+			}
+			return sentFromCurrent, err
 		}
-		h := c.handle
-		if h == nil {
-			c.deferredMu.RUnlock()
+
+		defer c.endDeferredHandleUse()
+		if err := c.flushDeferredWritePendingLocked(h, writeDeadline); err != nil {
 			if c.detached.Load() {
 				return c.rawConn.Write(b)
 			}
-			return 0, gonet.ErrClosed
+			return 0, err
 		}
-		n, err := native.DeferredWrite(h, b)
+		n, err := deferredWriteWithDeadlineFn(h, b, writeDeadline)
 		c.logDeferredKTLSError(err)
 		if err == nil && n > 0 {
 			c.writeRecords.Add(1)
 		}
-		c.deferredMu.RUnlock()
 		// Transition race: reader may detach while writer is still on rustls path.
 		// Retry on raw socket once detached.
 		if err != nil && c.detached.Load() {
@@ -1157,7 +1338,10 @@ func (c *DeferredRustConn) logDeferredKTLSEIO() {
 // lossless stream.
 func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, err error) {
 	c.deferredMu.Lock()
-	defer c.deferredMu.Unlock()
+	defer func() {
+		c.endExclusiveDeferredTransitionLocked()
+		c.deferredMu.Unlock()
+	}()
 	if c.closed.Load() {
 		return nil, nil, gonet.ErrClosed
 	}
@@ -1167,11 +1351,15 @@ func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, 
 	if c.detached.Load() {
 		return nil, nil, nil
 	}
+	c.beginExclusiveDeferredTransitionLocked()
 	h := c.handle
 	if h == nil {
 		return nil, nil, errors.New("tls: DeferredRustConn: already consumed or freed")
 	}
-	plaintext, rawAhead, err = native.DeferredDrainAndDetach(h)
+	if err := c.flushDeferredWritePendingLocked(h, c.currentWriteDeadline()); err != nil {
+		return nil, nil, errors.New("tls: DeferredRustConn: flush pending writes before detach").Base(err)
+	}
+	plaintext, rawAhead, err = deferredDrainAndDetachFn(h)
 	if err != nil {
 		// Keep handle for fallback-to-rustls behavior.
 		return nil, nil, err
@@ -1227,6 +1415,21 @@ type KTLSPromotionOutcome struct {
 }
 
 // allow tests to override native DeferredEnableKTLS
+var deferredReadFn = native.DeferredRead
+var deferredReadWithDeadlineFn = func(h *native.DeferredSessionHandle, b []byte, deadline time.Time) (int, error) {
+	if deadline.IsZero() {
+		return deferredReadFn(h, b)
+	}
+	return native.DeferredReadWithDeadline(h, b, deadline)
+}
+var deferredWriteFn = native.DeferredWrite
+var deferredWriteWithDeadlineFn = func(h *native.DeferredSessionHandle, b []byte, deadline time.Time) (int, error) {
+	if deadline.IsZero() {
+		return deferredWriteFn(h, b)
+	}
+	return native.DeferredWriteWithDeadline(h, b, deadline)
+}
+var deferredDrainAndDetachFn = native.DeferredDrainAndDetach
 var deferredEnableKTLSFn = native.DeferredEnableKTLS
 var deferredHandleAliveFn = native.DeferredHandleAlive
 var nativeFullKTLSSupportedFn = NativeFullKTLSSupported
@@ -1250,6 +1453,7 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 	var rawConnToClose gonet.Conn
 	c.deferredMu.Lock()
 	defer func() {
+		c.endExclusiveDeferredTransitionLocked()
 		c.deferredMu.Unlock()
 		if closeAfterUnlock && closeRawConn {
 			failCloseRawConn(rawConnToClose)
@@ -1272,6 +1476,10 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 	if !nativeFullKTLSSupportedFn() {
 		out.Status = KTLSPromotionUnsupported
 		return out, nil
+	}
+	c.beginExclusiveDeferredTransitionLocked()
+	if err := c.flushDeferredWritePendingLocked(c.handle, c.currentWriteDeadline()); err != nil {
+		return out, errors.New("tls: deferred kTLS promotion flush failed").Base(err)
 	}
 	result, err := deferredEnableKTLSFn(c.handle)
 	handleRetained := c.handle != nil && deferredHandleAliveFn(c.handle)
@@ -1434,6 +1642,7 @@ func (c *DeferredRustConn) Close() error {
 	}
 
 	c.deferredMu.Lock()
+	c.beginExclusiveDeferredTransitionLocked()
 	if c.handle != nil {
 		native.DeferredFree(c.handle)
 		c.handle = nil
@@ -1452,6 +1661,7 @@ func (c *DeferredRustConn) Close() error {
 	}
 	c.drainedData = nil
 	c.drainedOff = 0
+	c.endExclusiveDeferredTransitionLocked()
 	c.deferredMu.Unlock()
 
 	// Zero and release deferred read-ahead plaintext.
@@ -1463,6 +1673,14 @@ func (c *DeferredRustConn) Close() error {
 	c.deferredReadOff = 0
 	c.deferredReadLen = 0
 	c.deferredReadMu.Unlock()
+
+	c.deferredWriteMu.Lock()
+	for i := 0; i < c.deferredWriteLen; i++ {
+		c.deferredWriteBuf[i] = 0
+	}
+	c.deferredWriteBuf = nil
+	c.deferredWriteLen = 0
+	c.deferredWriteMu.Unlock()
 
 	return c.rawConn.Close()
 }
@@ -1565,16 +1783,49 @@ func (c *DeferredRustConn) RemoteAddr() gonet.Addr {
 
 // SetDeadline delegates to the underlying connection.
 func (c *DeferredRustConn) SetDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
+	if c.rawConn == nil {
+		return gonet.ErrClosed
+	}
 	return c.rawConn.SetDeadline(t)
 }
 
-// SetReadDeadline delegates to the underlying connection.
+func (c *DeferredRustConn) currentReadDeadline() time.Time {
+	c.deadlineMu.RLock()
+	defer c.deadlineMu.RUnlock()
+	return c.readDeadline
+}
+
+func (c *DeferredRustConn) currentWriteDeadline() time.Time {
+	c.deadlineMu.RLock()
+	defer c.deadlineMu.RUnlock()
+	return c.writeDeadline
+}
+
+// SetReadDeadline updates the deferred rustls read deadline and mirrors it to
+// the underlying raw connection for post-detach / kTLS paths.
 func (c *DeferredRustConn) SetReadDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.deadlineMu.Unlock()
+	if c.rawConn == nil {
+		return gonet.ErrClosed
+	}
 	return c.rawConn.SetReadDeadline(t)
 }
 
-// SetWriteDeadline delegates to the underlying connection.
+// SetWriteDeadline updates the deferred rustls write deadline and mirrors it to
+// the underlying raw connection for post-detach / kTLS paths.
 func (c *DeferredRustConn) SetWriteDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
+	if c.rawConn == nil {
+		return gonet.ErrClosed
+	}
 	return c.rawConn.SetWriteDeadline(t)
 }
 

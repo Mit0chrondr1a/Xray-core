@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	stdnet "net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,12 +29,13 @@ const (
 	nativeSkipReasonKTLSSupported           = "ktls_not_supported"
 	nativeSkipReasonMissingRealityConfig    = "missing_reality_config"
 	nativeSkipReasonProxyProtocolEnabled    = "accept_proxy_protocol_enabled"
-	nativeSkipReasonLoopbackListenerAuto    = "loopback_listener_auto_guard"
+	nativeSkipReasonLoopbackAutoGuard       = "loopback_listener_auto_guard"
 	nativeSkipReasonDeferredPromotionPaused = "deferred_ktls_promotion_cooldown"
 	nativeSkipReasonMldsaConfigured         = "mldsa65_seed_configured"
 	nativeSkipReasonUnknown                 = "unknown"
 	nativeSkipReasonBreakerCooldown         = "breaker_cooldown_active"
 	nativeSkipReasonBreakerHalfOpenProbe    = "breaker_half_open_probe_interval"
+	nativeSkipReasonDebugDisabled           = "debug_disable_native_reality"
 )
 
 type nativeAttemptOutcome string
@@ -42,6 +44,7 @@ const (
 	nativeAttemptOutcomeSuccess      nativeAttemptOutcome = "success"
 	nativeAttemptOutcomeAuthFailed   nativeAttemptOutcome = "auth_failed"
 	nativeAttemptOutcomePeekTimeout  nativeAttemptOutcome = "peek_timeout"
+	nativeAttemptOutcomePeerAbort    nativeAttemptOutcome = "peer_abort"
 	nativeAttemptOutcomeInternalFail nativeAttemptOutcome = "internal_error"
 )
 
@@ -218,14 +221,6 @@ func nativePathEligibilityWith(v *Listener, nativeAvailable, fullKTLS bool) (boo
 	return true, ""
 }
 
-func addrUsesLoopbackAddress(addr stdnet.Addr) bool {
-	if addr == nil {
-		return false
-	}
-	ip := extractIP(addr)
-	return ip != nil && ip.IsLoopback()
-}
-
 func nativeBreakerFromPolicy(policy *reality.NativePathPolicy) nativeBreakerConfig {
 	b := policy.GetBreaker()
 	cfg := nativeBreakerConfig{
@@ -336,7 +331,7 @@ func (cb *nativePathCircuitBreaker) recordOutcome(now time.Time, outcome nativeA
 		cb.nextProbeAt = time.Time{}
 		return
 	}
-	if outcome == nativeAttemptOutcomeAuthFailed {
+	if outcome == nativeAttemptOutcomeAuthFailed || outcome == nativeAttemptOutcomePeerAbort {
 		return
 	}
 	if cb.windowStart.IsZero() || now.Sub(cb.windowStart) >= cb.config.window {
@@ -372,6 +367,17 @@ func shouldAttemptNativeReality(v *Listener) nativeAttemptDecision {
 	return shouldAttemptNativeRealityForAddr(v, localAddr)
 }
 
+func isLoopbackAddr(addr stdnet.Addr) bool {
+	switch a := addr.(type) {
+	case *stdnet.TCPAddr:
+		return a != nil && a.IP != nil && a.IP.IsLoopback()
+	case *stdnet.UDPAddr:
+		return a != nil && a.IP != nil && a.IP.IsLoopback()
+	default:
+		return false
+	}
+}
+
 func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativeAttemptDecision {
 	policy := effectiveNativePathPolicy(v.realityXrayConfig)
 	decision := nativeAttemptDecision{
@@ -386,6 +392,11 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		decision.AllowFallback = false
 		decision.FailStop = true
 	}
+	if os.Getenv("XRAY_DEBUG_DISABLE_NATIVE_REALITY") == "1" {
+		decision.SkipByPolicy = true
+		decision.SkipReason = nativeSkipReasonDebugDisabled
+		return decision
+	}
 	if policy.GetMode() == reality.NativePathMode_DISABLE_NATIVE {
 		decision.SkipByPolicy = true
 		decision.SkipReason = nativeSkipReasonPolicyModeDisabled
@@ -394,17 +405,17 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		}
 		return decision
 	}
-	if policy.GetMode() == reality.NativePathMode_AUTO && addrUsesLoopbackAddress(localAddr) {
-		decision.SkipByPolicy = true
-		decision.SkipReason = nativeSkipReasonLoopbackListenerAuto
-		return decision
-	}
 	if ok, reason := nativePathEligibility(v); !ok {
 		decision.SkipByPolicy = true
 		decision.SkipReason = reason
 		if decision.ForceNative {
 			decision.FailStop = true
 		}
+		return decision
+	}
+	if policy.GetMode() == reality.NativePathMode_AUTO && isLoopbackAddr(localAddr) {
+		decision.SkipByPolicy = true
+		decision.SkipReason = nativeSkipReasonLoopbackAutoGuard
 		return decision
 	}
 	breaker := getNativePathBreaker(nativePathBreakerScopeKey(v), policy)

@@ -89,6 +89,8 @@ extern int32_t xray_reality_server_deferred(int fd, const void* reality_config, 
 extern int32_t xray_tls_server_deferred(int fd, const void* cfg, uint32_t handshake_timeout_ms, struct xray_deferred_result* out);
 extern int32_t xray_deferred_read(void* handle, uint8_t* buf, size_t len, size_t* out_n);
 extern int32_t xray_deferred_write(void* handle, const uint8_t* buf, size_t len, size_t* out_n);
+extern int32_t xray_deferred_read_timeout(void* handle, uint8_t* buf, size_t len, int64_t timeout_ms, size_t* out_n);
+extern int32_t xray_deferred_write_timeout(void* handle, const uint8_t* buf, size_t len, int64_t timeout_ms, size_t* out_n);
 extern int32_t xray_deferred_drain_and_detach(void* handle, uint8_t** out_plaintext_ptr, size_t* out_plaintext_len, uint8_t** out_raw_ptr, size_t* out_raw_len);
 extern int32_t xray_deferred_drain_and_detach_into(
     void* handle,
@@ -237,6 +239,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -286,6 +289,12 @@ var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 // pre-auth MSG_PEEK phase and callers may safely fall back to Go REALITY.
 var ErrRealityDeferredPeekTimeout = errors.New("REALITY deferred peek timeout: needs fallback")
 
+// ErrRealityDeferredHandshakePeerAbort indicates deferred REALITY advanced
+// into the handshake phase and then hit a peer-abort/short-read condition.
+// The connection is no longer safe for same-socket Go fallback, but this
+// should not be treated as a breaker-worthy internal transport failure.
+var ErrRealityDeferredHandshakePeerAbort = errors.New("REALITY deferred handshake peer abort: close connection")
+
 const defaultNativeHandshakeTimeout = 30 * time.Second
 
 func isRealityDeferredPeekTimeoutMsg(msg string) bool {
@@ -293,6 +302,12 @@ func isRealityDeferredPeekTimeoutMsg(msg string) bool {
 	return strings.Contains(m, "peek_exact: receive timeout") ||
 		strings.Contains(m, "peek_exact: handshake timeout exceeded") ||
 		strings.Contains(m, "peek_exact: short read after")
+}
+
+func isRealityDeferredHandshakePeerAbortMsg(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "handshake: failed to fill whole buffer") ||
+		strings.Contains(m, "handshake: peer closed")
 }
 
 // IsRealityDeferredPeekTimeout reports whether err represents a deferred
@@ -307,6 +322,19 @@ func IsRealityDeferredPeekTimeout(err error) bool {
 	return isRealityDeferredPeekTimeoutMsg(err.Error())
 }
 
+// IsRealityDeferredHandshakePeerAbort reports whether err represents a
+// deferred REALITY handshake short-read / peer-close after the handshake
+// phase has begun consuming bytes.
+func IsRealityDeferredHandshakePeerAbort(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRealityDeferredHandshakePeerAbort) {
+		return true
+	}
+	return isRealityDeferredHandshakePeerAbortMsg(err.Error())
+}
+
 func timeoutMillis(timeout time.Duration) C.uint32_t {
 	if timeout <= 0 {
 		timeout = defaultNativeHandshakeTimeout
@@ -319,6 +347,30 @@ func timeoutMillis(timeout time.Duration) C.uint32_t {
 		ms = uint64(^uint32(0))
 	}
 	return C.uint32_t(ms)
+}
+
+type deferredDeadlineError struct{}
+
+func (deferredDeadlineError) Error() string   { return os.ErrDeadlineExceeded.Error() }
+func (deferredDeadlineError) Timeout() bool   { return true }
+func (deferredDeadlineError) Temporary() bool { return true }
+func (deferredDeadlineError) Unwrap() error   { return os.ErrDeadlineExceeded }
+
+var errDeferredDeadlineExceeded error = deferredDeadlineError{}
+
+func deadlineMillis(deadline time.Time) C.int64_t {
+	if deadline.IsZero() {
+		return C.int64_t(-1)
+	}
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return 0
+	}
+	ms := timeout / time.Millisecond
+	if timeout%time.Millisecond != 0 {
+		ms++
+	}
+	return C.int64_t(ms)
 }
 
 func cleanupTLSResultOnError(cResult *C.struct_xray_tls_result) {
@@ -874,6 +926,9 @@ func RealityServerDeferred(fd int, cfg *RealityConfigHandle, timeout time.Durati
 		if isRealityDeferredPeekTimeoutMsg(errMsg) {
 			return nil, fmt.Errorf("%w: %s", ErrRealityDeferredPeekTimeout, errMsg)
 		}
+		if isRealityDeferredHandshakePeerAbortMsg(errMsg) {
+			return nil, fmt.Errorf("%w: %s", ErrRealityDeferredHandshakePeerAbort, errMsg)
+		}
 		return nil, errors.New("native REALITY deferred: " + errMsg)
 	}
 
@@ -981,6 +1036,40 @@ func DeferredRead(handle *DeferredSessionHandle, buf []byte) (int, error) {
 	return int(outN), nil
 }
 
+// DeferredReadWithDeadline reads decrypted data through the deferred session's
+// rustls connection with an optional per-call deadline.
+func DeferredReadWithDeadline(handle *DeferredSessionHandle, buf []byte, deadline time.Time) (int, error) {
+	if handle == nil || handle.ptr == nil {
+		return 0, errors.New("native: nil deferred session handle")
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	var outN C.size_t
+	rc := C.xray_deferred_read_timeout(
+		handle.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+		C.size_t(len(buf)),
+		deadlineMillis(deadline),
+		&outN,
+	)
+	runtime.KeepAlive(handle)
+	runtime.KeepAlive(buf)
+	if rc != 0 {
+		switch rc {
+		case 1:
+			return int(outN), io.EOF
+		case 2:
+			return int(outN), io.ErrClosedPipe
+		case 3:
+			return int(outN), errDeferredDeadlineExceeded
+		default:
+			return 0, errors.New("native: deferred read failed")
+		}
+	}
+	return int(outN), nil
+}
+
 // DeferredWrite writes plaintext data through the deferred session's rustls connection.
 func DeferredWrite(handle *DeferredSessionHandle, buf []byte) (int, error) {
 	if handle == nil || handle.ptr == nil {
@@ -1004,6 +1093,40 @@ func DeferredWrite(handle *DeferredSessionHandle, buf []byte) (int, error) {
 			return int(outN), io.EOF
 		case 2:
 			return int(outN), io.ErrClosedPipe
+		default:
+			return 0, io.ErrClosedPipe
+		}
+	}
+	return int(outN), nil
+}
+
+// DeferredWriteWithDeadline writes plaintext data through the deferred
+// session's rustls connection with an optional per-call deadline.
+func DeferredWriteWithDeadline(handle *DeferredSessionHandle, buf []byte, deadline time.Time) (int, error) {
+	if handle == nil || handle.ptr == nil {
+		return 0, errors.New("native: nil deferred session handle")
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	var outN C.size_t
+	rc := C.xray_deferred_write_timeout(
+		handle.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+		C.size_t(len(buf)),
+		deadlineMillis(deadline),
+		&outN,
+	)
+	runtime.KeepAlive(handle)
+	runtime.KeepAlive(buf)
+	if rc != 0 {
+		switch rc {
+		case 1:
+			return int(outN), io.EOF
+		case 2:
+			return int(outN), io.ErrClosedPipe
+		case 3:
+			return int(outN), errDeferredDeadlineExceeded
 		default:
 			return 0, io.ErrClosedPipe
 		}

@@ -1,6 +1,8 @@
 package native
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -216,6 +218,53 @@ func TestTlsResult_ZeroSecrets_NilSlices(t *testing.T) {
 	r.ZeroSecrets() // should not panic
 	if r.TxSecret != nil {
 		t.Error("TxSecret should be nil after ZeroSecrets")
+	}
+}
+
+func TestIsRealityDeferredHandshakePeerAbort(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "rustls short read",
+			err:  errors.New("native REALITY deferred: handshake: failed to fill whole buffer"),
+			want: true,
+		},
+		{
+			name: "peer closed after handshake start",
+			err:  errors.New("native REALITY deferred: handshake: peer closed"),
+			want: true,
+		},
+		{
+			name: "wrapped sentinel",
+			err:  fmt.Errorf("%w: simulated", ErrRealityDeferredHandshakePeerAbort),
+			want: true,
+		},
+		{
+			name: "peek timeout is not peer abort",
+			err:  errors.New("native REALITY deferred: peek record: peek_exact: short read after 5 retries (17/517 bytes)"),
+			want: false,
+		},
+		{
+			name: "generic handshake failure",
+			err:  errors.New("native REALITY deferred: handshake: bad certificate"),
+			want: false,
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsRealityDeferredHandshakePeerAbort(tt.err); got != tt.want {
+				t.Fatalf("IsRealityDeferredHandshakePeerAbort() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
