@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -165,6 +166,33 @@ func TestLogPipelineSummaryIncludesUserspaceExit(t *testing.T) {
 	logs := strings.Join(handler.msgs, "\n")
 	if !strings.Contains(logs, "userspace_exit=remote_eof_no_response") {
 		t.Fatalf("pipeline summary missing userspace_exit field: %s", logs)
+	}
+}
+
+func TestLogVisionTransitionSourceAndDrain(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	source := NewVisionTransitionSource(&testEOFConn{}, bytes.NewReader([]byte("plain")), bytes.NewBufferString("raw"))
+	source.kind = VisionTransitionKindOpaque
+
+	LogVisionTransitionSource(context.Background(), "inbound", source)
+	LogVisionTransitionDrain(context.Background(), "buffered-drain", source, len("plain"), len("raw"))
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "kind=vision-transition-source") {
+		t.Fatalf("missing transition source log: %s", logs)
+	}
+	if !strings.Contains(logs, "direction=inbound") || !strings.Contains(logs, "buffered_plaintext=5") || !strings.Contains(logs, "buffered_raw_ahead=3") {
+		t.Fatalf("missing transition source fields in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "kind=vision-transition-drain") || !strings.Contains(logs, "plaintext_len=5") || !strings.Contains(logs, "raw_ahead_len=3") {
+		t.Fatalf("missing transition drain fields in logs: %s", logs)
 	}
 }
 

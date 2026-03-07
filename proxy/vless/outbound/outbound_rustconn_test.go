@@ -29,6 +29,13 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		if source == nil {
 			t.Fatal("expected transition source for CommonConn")
 		}
+		snap := source.Snapshot()
+		if snap.Kind != proxy.VisionTransitionKindCommonConn {
+			t.Fatalf("transition kind = %q, want %q", snap.Kind, proxy.VisionTransitionKindCommonConn)
+		}
+		if !snap.HasBufferedState || snap.BufferedPlaintext != len("plain") || snap.BufferedRawAhead != len("raw") {
+			t.Fatalf("unexpected snapshot before drain: %+v", snap)
+		}
 
 		plain, rawAhead := source.DrainBufferedState()
 		if got := string(plain); got != "plain" {
@@ -53,8 +60,31 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		if source == nil {
 			t.Fatal("expected transition source for outer CommonConn")
 		}
+		if got := source.Snapshot().Kind; got != proxy.VisionTransitionKindCommonConn {
+			t.Fatalf("transition kind = %q, want %q", got, proxy.VisionTransitionKindCommonConn)
+		}
 		if source.Conn() != commonConn {
 			t.Fatal("expected transition source to keep outer CommonConn as public conn")
+		}
+	})
+
+	t.Run("deferred rust conn snapshot is explicit", func(t *testing.T) {
+		source, err := proxy.BuildVisionTransitionSource(nil, &tls.DeferredRustConn{})
+		if err != nil {
+			t.Fatalf("BuildVisionTransitionSource() error = %v", err)
+		}
+		if source == nil {
+			t.Fatal("expected transition source for DeferredRustConn")
+		}
+		snap := source.Snapshot()
+		if snap.Kind != proxy.VisionTransitionKindDeferredRust {
+			t.Fatalf("transition kind = %q, want %q", snap.Kind, proxy.VisionTransitionKindDeferredRust)
+		}
+		if !snap.UsesDeferredRust {
+			t.Fatalf("expected deferred-rust snapshot, got %+v", snap)
+		}
+		if snap.HasBufferedState {
+			t.Fatalf("deferred-rust snapshot should not report buffered state, got %+v", snap)
 		}
 	})
 

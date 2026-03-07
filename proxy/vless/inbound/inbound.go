@@ -693,6 +693,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
 	if requestAddons.Flow == vless.XRV && !bypassVision {
+		proxy.LogVisionTransitionSource(visionReaderCtx, "inbound", transitionSource)
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, transitionSource, nil)
 	}
 

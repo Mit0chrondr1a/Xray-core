@@ -499,6 +499,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			encoding.ShouldHonorResponseVisionPayloadBypass(responseAddons, request.Destination())
 
 		if requestAddons.Flow == vless.XRV && !responseBypassVisionPayload {
+			proxy.LogVisionTransitionSource(ctx, "outbound", transitionSource)
 			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, transitionSource, ob)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
