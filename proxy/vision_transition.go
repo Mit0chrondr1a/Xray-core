@@ -56,6 +56,15 @@ const (
 	VisionTransitionEventPayloadBypass   VisionTransitionEvent = "payload_bypass"
 )
 
+type VisionSemantic string
+
+const (
+	VisionSemanticUnknown          VisionSemantic = "unknown"
+	VisionSemanticPayloadBypass    VisionSemantic = "payload_bypass"
+	VisionSemanticExplicitNoDetach VisionSemantic = "explicit_no_detach"
+	VisionSemanticExplicitDirect   VisionSemantic = "explicit_direct_copy"
+)
+
 // VisionTransitionSource makes the pre-detach Vision transition contract explicit.
 //
 // Historically Vision reached into Go TLS/REALITY internals via reflection to
@@ -78,6 +87,7 @@ type visionTransitionDirectionTrace struct {
 	Command1Count int32
 	Command2Count int32
 	PayloadBypass bool
+	Semantic      VisionSemantic
 }
 
 type visionTransitionTraceSummary struct {
@@ -85,6 +95,17 @@ type visionTransitionTraceSummary struct {
 	IngressOrigin VisionIngressOrigin
 	Uplink        visionTransitionDirectionTrace
 	Downlink      visionTransitionDirectionTrace
+}
+
+func newVisionTransitionTraceSummary() *visionTransitionTraceSummary {
+	return &visionTransitionTraceSummary{
+		Uplink: visionTransitionDirectionTrace{
+			Semantic: VisionSemanticUnknown,
+		},
+		Downlink: visionTransitionDirectionTrace{
+			Semantic: VisionSemanticUnknown,
+		},
+	}
 }
 
 func NewVisionTransitionSource(conn gonet.Conn, input *bytes.Reader, rawInput *bytes.Buffer) *VisionTransitionSource {
@@ -234,10 +255,12 @@ func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, sec
 		" uplink_command1_count=", summary.Uplink.Command1Count,
 		" uplink_command2_count=", summary.Uplink.Command2Count,
 		" uplink_payload_bypass=", summary.Uplink.PayloadBypass,
+		" uplink_semantic=", summary.Uplink.Semantic,
 		" downlink_command0_count=", summary.Downlink.Command0Count,
 		" downlink_command1_count=", summary.Downlink.Command1Count,
 		" downlink_command2_count=", summary.Downlink.Command2Count,
 		" downlink_payload_bypass=", summary.Downlink.PayloadBypass,
+		" downlink_semantic=", summary.Downlink.Semantic,
 	)
 }
 
@@ -302,7 +325,7 @@ func recordVisionTransitionSource(source *VisionTransitionSource) {
 	if !ok {
 		return
 	}
-	value, _ := visionTransitionTraceByConn.LoadOrStore(key, &visionTransitionTraceSummary{})
+	value, _ := visionTransitionTraceByConn.LoadOrStore(key, newVisionTransitionTraceSummary())
 	summary, _ := value.(*visionTransitionTraceSummary)
 	if summary == nil {
 		return
@@ -323,7 +346,7 @@ func recordVisionTransitionEvent(source *VisionTransitionSource, direction strin
 	if !ok {
 		return
 	}
-	value, _ := visionTransitionTraceByConn.LoadOrStore(key, &visionTransitionTraceSummary{})
+	value, _ := visionTransitionTraceByConn.LoadOrStore(key, newVisionTransitionTraceSummary())
 	summary, _ := value.(*visionTransitionTraceSummary)
 	if summary == nil {
 		return
@@ -341,14 +364,17 @@ func recordVisionTransitionEvent(source *VisionTransitionSource, direction strin
 	switch event {
 	case VisionTransitionEventPayloadBypass:
 		trace.PayloadBypass = true
+		trace.Semantic = mergeVisionSemantic(trace.Semantic, VisionSemanticPayloadBypass)
 	case VisionTransitionEventCommandObserved:
 		switch command {
 		case 0:
 			trace.Command0Count++
 		case 1:
 			trace.Command1Count++
+			trace.Semantic = mergeVisionSemantic(trace.Semantic, VisionSemanticExplicitNoDetach)
 		case 2:
 			trace.Command2Count++
+			trace.Semantic = mergeVisionSemantic(trace.Semantic, VisionSemanticExplicitDirect)
 		}
 	}
 }
@@ -391,11 +417,36 @@ func mergeVisionTransitionSummaries(dst visionTransitionTraceSummary, src vision
 	dst.Uplink.Command1Count += src.Uplink.Command1Count
 	dst.Uplink.Command2Count += src.Uplink.Command2Count
 	dst.Uplink.PayloadBypass = dst.Uplink.PayloadBypass || src.Uplink.PayloadBypass
+	dst.Uplink.Semantic = mergeVisionSemantic(dst.Uplink.Semantic, src.Uplink.Semantic)
 	dst.Downlink.Command0Count += src.Downlink.Command0Count
 	dst.Downlink.Command1Count += src.Downlink.Command1Count
 	dst.Downlink.Command2Count += src.Downlink.Command2Count
 	dst.Downlink.PayloadBypass = dst.Downlink.PayloadBypass || src.Downlink.PayloadBypass
+	dst.Downlink.Semantic = mergeVisionSemantic(dst.Downlink.Semantic, src.Downlink.Semantic)
 	return dst
+}
+
+func mergeVisionSemantic(dst VisionSemantic, src VisionSemantic) VisionSemantic {
+	if visionSemanticRank(src) > visionSemanticRank(dst) {
+		return src
+	}
+	if dst == "" {
+		return VisionSemanticUnknown
+	}
+	return dst
+}
+
+func visionSemanticRank(semantic VisionSemantic) int {
+	switch semantic {
+	case VisionSemanticExplicitDirect:
+		return 3
+	case VisionSemanticExplicitNoDetach:
+		return 2
+	case VisionSemanticPayloadBypass:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func visionTransitionTraceKey(conn gonet.Conn, depth int) (gonet.Conn, bool) {

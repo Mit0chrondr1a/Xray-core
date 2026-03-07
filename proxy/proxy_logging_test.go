@@ -396,7 +396,9 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 		!strings.Contains(logs, "uplink_command0_count=1") ||
 		!strings.Contains(logs, "uplink_command1_count=1") ||
 		!strings.Contains(logs, "downlink_command2_count=1") ||
-		!strings.Contains(logs, "uplink_payload_bypass=true") {
+		!strings.Contains(logs, "uplink_payload_bypass=true") ||
+		!strings.Contains(logs, "uplink_semantic=explicit_no_detach") ||
+		!strings.Contains(logs, "downlink_semantic=explicit_direct_copy") {
 		t.Fatalf("missing transition summary fields in logs: %s", logs)
 	}
 }
