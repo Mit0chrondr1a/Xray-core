@@ -15,12 +15,14 @@ import (
 
 func TestBuildVisionTransitionSource(t *testing.T) {
 	t.Run("common conn supported path drains buffered state", func(t *testing.T) {
+		t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
 		client, server := gonet.Pipe()
 		defer client.Close()
 		defer server.Close()
 
 		commonConn := encryption.NewCommonConn(client, false)
 		setCommonConnBufferedState(t, commonConn, []byte("plain"), []byte("raw"))
+		proxy.ObserveVisionIngressOrigin(commonConn, proxy.VisionIngressOriginGoReality)
 
 		source, err := proxy.BuildVisionTransitionSource(commonConn, commonConn)
 		if err != nil {
@@ -32,6 +34,9 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		snap := source.Snapshot()
 		if snap.Kind != proxy.VisionTransitionKindCommonConn {
 			t.Fatalf("transition kind = %q, want %q", snap.Kind, proxy.VisionTransitionKindCommonConn)
+		}
+		if snap.IngressOrigin != proxy.VisionIngressOriginGoReality {
+			t.Fatalf("ingress origin = %q, want %q", snap.IngressOrigin, proxy.VisionIngressOriginGoReality)
 		}
 		if !snap.HasBufferedState || snap.BufferedPlaintext != len("plain") || snap.BufferedRawAhead != len("raw") {
 			t.Fatalf("unexpected snapshot before drain: %+v", snap)
@@ -47,11 +52,13 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 	})
 
 	t.Run("public common conn wins over stale inner conn", func(t *testing.T) {
+		t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
 		client, server := gonet.Pipe()
 		defer client.Close()
 		defer server.Close()
 
 		commonConn := encryption.NewCommonConn(client, false)
+		proxy.ObserveVisionIngressOrigin(client, proxy.VisionIngressOriginGoRealityFallback)
 
 		source, err := proxy.BuildVisionTransitionSource(commonConn, client)
 		if err != nil {
@@ -63,13 +70,19 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		if got := source.Snapshot().Kind; got != proxy.VisionTransitionKindCommonConn {
 			t.Fatalf("transition kind = %q, want %q", got, proxy.VisionTransitionKindCommonConn)
 		}
+		if got := source.Snapshot().IngressOrigin; got != proxy.VisionIngressOriginGoRealityFallback {
+			t.Fatalf("ingress origin = %q, want %q", got, proxy.VisionIngressOriginGoRealityFallback)
+		}
 		if source.Conn() != commonConn {
 			t.Fatal("expected transition source to keep outer CommonConn as public conn")
 		}
 	})
 
 	t.Run("deferred rust conn snapshot is explicit", func(t *testing.T) {
-		source, err := proxy.BuildVisionTransitionSource(nil, &tls.DeferredRustConn{})
+		t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+		deferred := &tls.DeferredRustConn{}
+		proxy.ObserveVisionIngressOrigin(deferred, proxy.VisionIngressOriginNativeRealityDeferred)
+		source, err := proxy.BuildVisionTransitionSource(nil, deferred)
 		if err != nil {
 			t.Fatalf("BuildVisionTransitionSource() error = %v", err)
 		}
@@ -79,6 +92,9 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		snap := source.Snapshot()
 		if snap.Kind != proxy.VisionTransitionKindDeferredRust {
 			t.Fatalf("transition kind = %q, want %q", snap.Kind, proxy.VisionTransitionKindDeferredRust)
+		}
+		if snap.IngressOrigin != proxy.VisionIngressOriginNativeRealityDeferred {
+			t.Fatalf("ingress origin = %q, want %q", snap.IngressOrigin, proxy.VisionIngressOriginNativeRealityDeferred)
 		}
 		if !snap.UsesDeferredRust {
 			t.Fatalf("expected deferred-rust snapshot, got %+v", snap)

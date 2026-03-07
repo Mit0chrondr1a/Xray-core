@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/ebpf"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -371,6 +372,7 @@ func (v *Listener) keepAccepting() {
 					_ = conn.Close()
 					return
 				}
+				proxy.ObserveVisionIngressOrigin(conn, proxy.VisionIngressOriginGoTLS)
 			} else if v.realityConfig != nil {
 				rustDone := false
 				defer maybeLogTCPRealityHandoverMarkers(context.Background())
@@ -477,6 +479,7 @@ func (v *Listener) keepAccepting() {
 							terminalDecision = "native_success"
 							conn = deferredConn
 							rustDone = true
+							proxy.ObserveVisionIngressOrigin(conn, proxy.VisionIngressOriginNativeRealityDeferred)
 							errors.LogDebug(context.Background(), "Rust REALITY deferred path active: wrapped as *tls.DeferredRustConn (kTLS deferred)")
 						} else if stderrors.Is(deferredErr, native.ErrRealityAuthFailed) {
 							tcpRealityMarkerRustAuthFallback.Add(1)
@@ -573,6 +576,11 @@ func (v *Listener) keepAccepting() {
 						terminalDecision = "native_failed_with_fallback"
 					}
 					conn = realityConn
+					if nativeAttempted {
+						proxy.ObserveVisionIngressOrigin(conn, proxy.VisionIngressOriginGoRealityFallback)
+					} else {
+						proxy.ObserveVisionIngressOrigin(conn, proxy.VisionIngressOriginGoReality)
+					}
 				}
 			}
 

@@ -6,12 +6,14 @@ import (
 	gonet "net"
 	"os"
 	"reflect"
+	"sync"
 	"unsafe"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/proxy/vless/encryption"
 	"github.com/xtls/xray-core/transport/internet/reality"
+	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -27,8 +29,19 @@ const (
 	VisionTransitionKindDeferredRust VisionTransitionKind = "deferred_rust_conn"
 )
 
+type VisionIngressOrigin string
+
+const (
+	VisionIngressOriginUnknown               VisionIngressOrigin = "unknown"
+	VisionIngressOriginGoTLS                 VisionIngressOrigin = "go_tls"
+	VisionIngressOriginGoReality             VisionIngressOrigin = "go_reality"
+	VisionIngressOriginGoRealityFallback     VisionIngressOrigin = "go_reality_fallback"
+	VisionIngressOriginNativeRealityDeferred VisionIngressOrigin = "native_reality_deferred"
+)
+
 type VisionTransitionSnapshot struct {
 	Kind              VisionTransitionKind
+	IngressOrigin     VisionIngressOrigin
 	PublicConnType    string
 	UsesDeferredRust  bool
 	HasBufferedState  bool
@@ -47,7 +60,10 @@ type VisionTransitionSource struct {
 	input    *bytes.Reader
 	rawInput *bytes.Buffer
 	kind     VisionTransitionKind
+	origin   VisionIngressOrigin
 }
+
+var visionIngressOriginByConn sync.Map
 
 func NewVisionTransitionSource(conn gonet.Conn, input *bytes.Reader, rawInput *bytes.Buffer) *VisionTransitionSource {
 	return &VisionTransitionSource{
@@ -81,11 +97,13 @@ func (s *VisionTransitionSource) Kind() VisionTransitionKind {
 
 func (s *VisionTransitionSource) Snapshot() VisionTransitionSnapshot {
 	snap := VisionTransitionSnapshot{
-		Kind: s.Kind(),
+		Kind:          s.Kind(),
+		IngressOrigin: VisionIngressOriginUnknown,
 	}
 	if s == nil {
 		return snap
 	}
+	snap.IngressOrigin = s.origin
 	if s.conn != nil {
 		snap.PublicConnType = reflect.TypeOf(s.conn).String()
 	}
@@ -134,6 +152,7 @@ func LogVisionTransitionSource(ctx context.Context, direction string, source *Vi
 	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-source]: ",
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
+		" ingress_origin=", snap.IngressOrigin,
 		" public_conn_type=", snap.PublicConnType,
 		" uses_deferred_rust=", snap.UsesDeferredRust,
 		" has_buffered_state=", snap.HasBufferedState,
@@ -150,10 +169,25 @@ func LogVisionTransitionDrain(ctx context.Context, direction string, source *Vis
 	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-drain]: ",
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
+		" ingress_origin=", snap.IngressOrigin,
 		" uses_deferred_rust=", snap.UsesDeferredRust,
 		" plaintext_len=", plaintextLen,
 		" raw_ahead_len=", rawAheadLen,
 	)
+}
+
+// ObserveVisionIngressOrigin records the ingress implementation that produced
+// the connection eventually handed to the Vision seam.
+//
+// This is an opt-in debug oracle keyed by the connection identity. It is
+// consumed once when BuildVisionTransitionSource resolves the seam so trace
+// logs can correlate Go/native ingress with the exact pre-detach contract
+// Vision observed.
+func ObserveVisionIngressOrigin(conn gonet.Conn, origin VisionIngressOrigin) {
+	if !debugVisionTransitionTrace() || conn == nil || origin == VisionIngressOriginUnknown {
+		return
+	}
+	visionIngressOriginByConn.Store(conn, origin)
 }
 
 // BuildVisionTransitionSource preserves the existing Vision buffer extraction
@@ -164,14 +198,64 @@ func BuildVisionTransitionSource(publicConn gonet.Conn, innerConn gonet.Conn) (*
 		publicConn = innerConn
 	}
 	if source, handled, err := buildVisionTransitionSourceForConn(publicConn, publicConn); handled {
+		if source != nil {
+			source.origin = consumeVisionIngressOrigin(publicConn, innerConn)
+		}
 		return source, err
 	}
 	if innerConn != nil && innerConn != publicConn {
 		if source, handled, err := buildVisionTransitionSourceForConn(publicConn, innerConn); handled {
+			if source != nil {
+				source.origin = consumeVisionIngressOrigin(publicConn, innerConn)
+			}
 			return source, err
 		}
 	}
 	return nil, errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
+}
+
+func consumeVisionIngressOrigin(publicConn gonet.Conn, innerConn gonet.Conn) VisionIngressOrigin {
+	if !debugVisionTransitionTrace() {
+		return VisionIngressOriginUnknown
+	}
+	if origin, ok := consumeVisionIngressOriginForConn(publicConn, 0); ok {
+		return origin
+	}
+	if innerConn != nil && innerConn != publicConn {
+		if origin, ok := consumeVisionIngressOriginForConn(innerConn, 0); ok {
+			return origin
+		}
+	}
+	return VisionIngressOriginUnknown
+}
+
+func consumeVisionIngressOriginForConn(conn gonet.Conn, depth int) (VisionIngressOrigin, bool) {
+	if conn == nil || depth > 8 {
+		return VisionIngressOriginUnknown, false
+	}
+	if value, ok := visionIngressOriginByConn.LoadAndDelete(conn); ok {
+		if origin, ok := value.(VisionIngressOrigin); ok && origin != VisionIngressOriginUnknown {
+			return origin, true
+		}
+	}
+	if sc := stat.TryUnwrapStatsConn(conn); sc != nil && sc != conn {
+		if origin, ok := consumeVisionIngressOriginForConn(sc, depth+1); ok {
+			return origin, true
+		}
+	}
+	if cc, ok := conn.(*encryption.CommonConn); ok && cc != nil {
+		if origin, ok := consumeVisionIngressOriginForConn(cc.Conn, depth+1); ok {
+			return origin, true
+		}
+	}
+	if unwrap, ok := conn.(visionNetConnUnwrapper); ok {
+		if inner := unwrap.NetConn(); inner != nil && inner != conn {
+			if origin, ok := consumeVisionIngressOriginForConn(inner, depth+1); ok {
+				return origin, true
+			}
+		}
+	}
+	return VisionIngressOriginUnknown, false
 }
 
 func buildVisionTransitionSourceForConn(publicConn gonet.Conn, candidate gonet.Conn) (*VisionTransitionSource, bool, error) {

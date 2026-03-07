@@ -180,6 +180,7 @@ func TestLogVisionTransitionSourceAndDrain(t *testing.T) {
 
 	source := NewVisionTransitionSource(&testEOFConn{}, bytes.NewReader([]byte("plain")), bytes.NewBufferString("raw"))
 	source.kind = VisionTransitionKindOpaque
+	source.origin = VisionIngressOriginGoReality
 
 	LogVisionTransitionSource(context.Background(), "inbound", source)
 	LogVisionTransitionDrain(context.Background(), "buffered-drain", source, len("plain"), len("raw"))
@@ -188,10 +189,10 @@ func TestLogVisionTransitionSourceAndDrain(t *testing.T) {
 	if !strings.Contains(logs, "kind=vision-transition-source") {
 		t.Fatalf("missing transition source log: %s", logs)
 	}
-	if !strings.Contains(logs, "direction=inbound") || !strings.Contains(logs, "buffered_plaintext=5") || !strings.Contains(logs, "buffered_raw_ahead=3") {
+	if !strings.Contains(logs, "direction=inbound") || !strings.Contains(logs, "ingress_origin=go_reality") || !strings.Contains(logs, "buffered_plaintext=5") || !strings.Contains(logs, "buffered_raw_ahead=3") {
 		t.Fatalf("missing transition source fields in logs: %s", logs)
 	}
-	if !strings.Contains(logs, "kind=vision-transition-drain") || !strings.Contains(logs, "plaintext_len=5") || !strings.Contains(logs, "raw_ahead_len=3") {
+	if !strings.Contains(logs, "kind=vision-transition-drain") || !strings.Contains(logs, "ingress_origin=go_reality") || !strings.Contains(logs, "plaintext_len=5") || !strings.Contains(logs, "raw_ahead_len=3") {
 		t.Fatalf("missing transition drain fields in logs: %s", logs)
 	}
 }
