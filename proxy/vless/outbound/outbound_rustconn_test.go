@@ -22,7 +22,7 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 
 		commonConn := encryption.NewCommonConn(client, false)
 		setCommonConnBufferedState(t, commonConn, []byte("plain"), []byte("raw"))
-		proxy.ObserveVisionIngressOrigin(commonConn, proxy.VisionIngressOriginGoReality)
+		proxy.ObserveVisionTransitionSource(commonConn, proxy.VisionTransitionKindCommonConn, proxy.VisionIngressOriginGoReality)
 
 		source, err := proxy.BuildVisionTransitionSource(commonConn, commonConn)
 		if err != nil {
@@ -58,7 +58,7 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		defer server.Close()
 
 		commonConn := encryption.NewCommonConn(client, false)
-		proxy.ObserveVisionIngressOrigin(client, proxy.VisionIngressOriginGoRealityFallback)
+		proxy.ObserveVisionTransitionSource(client, proxy.VisionTransitionKindCommonConn, proxy.VisionIngressOriginGoRealityFallback)
 
 		source, err := proxy.BuildVisionTransitionSource(commonConn, client)
 		if err != nil {
@@ -81,7 +81,7 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 	t.Run("deferred rust conn snapshot is explicit", func(t *testing.T) {
 		t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
 		deferred := &tls.DeferredRustConn{}
-		proxy.ObserveVisionIngressOrigin(deferred, proxy.VisionIngressOriginNativeRealityDeferred)
+		proxy.ObserveVisionTransitionSource(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred)
 		source, err := proxy.BuildVisionTransitionSource(nil, deferred)
 		if err != nil {
 			t.Fatalf("BuildVisionTransitionSource() error = %v", err)

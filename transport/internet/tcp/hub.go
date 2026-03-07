@@ -106,6 +106,13 @@ var (
 	useNativeRealityServerFn = nativeRealityServerEligible
 )
 
+func observeVisionIngressBridge(conn net.Conn, kind proxy.VisionTransitionKind, origin proxy.VisionIngressOrigin) {
+	if conn == nil || origin == proxy.VisionIngressOriginUnknown {
+		return
+	}
+	proxy.ObserveVisionTransitionSource(conn, kind, origin)
+}
+
 func nativeRealityServerEligible(v *Listener) bool {
 	ok, _ := nativePathEligibility(v)
 	return ok
@@ -372,7 +379,7 @@ func (v *Listener) keepAccepting() {
 					_ = conn.Close()
 					return
 				}
-				proxy.ObserveVisionIngressOrigin(conn, proxy.VisionIngressOriginGoTLS)
+				observeVisionIngressBridge(conn, proxy.VisionTransitionKindTLSConn, proxy.VisionIngressOriginGoTLS)
 			} else if v.realityConfig != nil {
 				rustDone := false
 				defer maybeLogTCPRealityHandoverMarkers(context.Background())
@@ -479,7 +486,7 @@ func (v *Listener) keepAccepting() {
 							terminalDecision = "native_success"
 							conn = deferredConn
 							rustDone = true
-							proxy.ObserveVisionIngressOrigin(conn, proxy.VisionIngressOriginNativeRealityDeferred)
+							observeVisionIngressBridge(conn, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred)
 							errors.LogDebug(context.Background(), "Rust REALITY deferred path active: wrapped as *tls.DeferredRustConn (kTLS deferred)")
 						} else if stderrors.Is(deferredErr, native.ErrRealityAuthFailed) {
 							tcpRealityMarkerRustAuthFallback.Add(1)
@@ -577,9 +584,9 @@ func (v *Listener) keepAccepting() {
 					}
 					conn = realityConn
 					if nativeAttempted {
-						proxy.ObserveVisionIngressOrigin(conn, proxy.VisionIngressOriginGoRealityFallback)
+						observeVisionIngressBridge(conn, proxy.VisionTransitionKindRealityConn, proxy.VisionIngressOriginGoRealityFallback)
 					} else {
-						proxy.ObserveVisionIngressOrigin(conn, proxy.VisionIngressOriginGoReality)
+						observeVisionIngressBridge(conn, proxy.VisionTransitionKindRealityConn, proxy.VisionIngressOriginGoReality)
 					}
 				}
 			}

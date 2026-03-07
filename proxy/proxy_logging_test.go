@@ -383,6 +383,7 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 	source.origin = VisionIngressOriginNativeRealityDeferred
 
 	LogVisionTransitionSource(context.Background(), "inbound", source)
+	LogVisionTransitionDrain(context.Background(), "deferred-detach", source, 11, 7)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 0, 1, 0, 0, true, false)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 1, 0, 0, 0, false, false)
 	LogVisionTransitionEvent(context.Background(), "downlink", source, VisionTransitionEventCommandObserved, 2, 0, 0, 0, false, true)
@@ -398,8 +399,82 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 		!strings.Contains(logs, "downlink_command2_count=1") ||
 		!strings.Contains(logs, "uplink_payload_bypass=true") ||
 		!strings.Contains(logs, "uplink_semantic=explicit_no_detach") ||
-		!strings.Contains(logs, "downlink_semantic=explicit_direct_copy") {
+		!strings.Contains(logs, "downlink_semantic=explicit_direct_copy") ||
+		!strings.Contains(logs, "drain_mode=deferred_detach") ||
+		!strings.Contains(logs, "drain_count=1") ||
+		!strings.Contains(logs, "drain_plaintext_bytes=11") ||
+		!strings.Contains(logs, "drain_raw_ahead_bytes=7") {
 		t.Fatalf("missing transition summary fields in logs: %s", logs)
+	}
+}
+
+func TestVisionTransitionSummarySnapshotWithoutDebug(t *testing.T) {
+	conn := &testTraceConn{id: 6}
+	source := NewVisionTransitionSource(conn, nil, nil)
+	source.kind = VisionTransitionKindRealityConn
+	source.origin = VisionIngressOriginGoReality
+
+	LogVisionTransitionSource(context.Background(), "inbound", source)
+	LogVisionTransitionDrain(context.Background(), "buffered-drain", source, 5, 3)
+	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 0, 1, 0, 0, true, false)
+	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 2, 0, 0, 0, false, true)
+
+	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary")
+	}
+	if summary.Kind != VisionTransitionKindRealityConn {
+		t.Fatalf("summary.Kind=%q, want %q", summary.Kind, VisionTransitionKindRealityConn)
+	}
+	if summary.IngressOrigin != VisionIngressOriginGoReality {
+		t.Fatalf("summary.IngressOrigin=%q, want %q", summary.IngressOrigin, VisionIngressOriginGoReality)
+	}
+	if summary.Uplink.Command0Count != 1 || summary.Uplink.Command2Count != 1 {
+		t.Fatalf("unexpected uplink command counts: %+v", summary.Uplink)
+	}
+	if summary.Uplink.Semantic != VisionSemanticExplicitDirect {
+		t.Fatalf("summary.Uplink.Semantic=%q, want %q", summary.Uplink.Semantic, VisionSemanticExplicitDirect)
+	}
+	if summary.DrainMode != VisionDrainModeBuffered || summary.DrainCount != 1 || summary.DrainPlaintextBytes != 5 || summary.DrainRawAheadBytes != 3 {
+		t.Fatalf("unexpected drain summary: %+v", summary)
+	}
+
+	LogVisionTransitionSummary(context.Background(), conn, nil)
+	if _, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
+		t.Fatal("expected summary state to be consumed after LogVisionTransitionSummary")
+	}
+}
+
+func TestObserveVisionTransitionProducerAPIWithoutDebug(t *testing.T) {
+	conn := &testTraceConn{id: 7}
+
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 1)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "downlink", VisionTransitionEventPayloadBypass, -1)
+	ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 9, 4)
+
+	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary")
+	}
+	if summary.Kind != VisionTransitionKindDeferredRust {
+		t.Fatalf("summary.Kind=%q, want %q", summary.Kind, VisionTransitionKindDeferredRust)
+	}
+	if summary.IngressOrigin != VisionIngressOriginNativeRealityDeferred {
+		t.Fatalf("summary.IngressOrigin=%q, want %q", summary.IngressOrigin, VisionIngressOriginNativeRealityDeferred)
+	}
+	if summary.Uplink.Command0Count != 1 || summary.Uplink.Command1Count != 1 {
+		t.Fatalf("unexpected uplink command counts: %+v", summary.Uplink)
+	}
+	if summary.Uplink.Semantic != VisionSemanticExplicitNoDetach {
+		t.Fatalf("summary.Uplink.Semantic=%q, want %q", summary.Uplink.Semantic, VisionSemanticExplicitNoDetach)
+	}
+	if !summary.Downlink.PayloadBypass || summary.Downlink.Semantic != VisionSemanticPayloadBypass {
+		t.Fatalf("unexpected downlink summary: %+v", summary.Downlink)
+	}
+	if summary.DrainMode != VisionDrainModeDeferred || summary.DrainCount != 1 || summary.DrainPlaintextBytes != 9 || summary.DrainRawAheadBytes != 4 {
+		t.Fatalf("unexpected drain summary: %+v", summary)
 	}
 }
 

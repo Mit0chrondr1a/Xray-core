@@ -9,8 +9,10 @@ import (
 
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/native"
+	"github.com/xtls/xray-core/proxy"
 	xrayreality "github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 func TestIsDeferredRealityPeekTimeout(t *testing.T) {
@@ -301,6 +303,31 @@ func TestNativePathScopeKeyUsesSemanticIdentity(t *testing.T) {
 	v.listener = &net.TCPListener{} // address/port should not affect scope
 	if got := nativePathScopeKey(v); got != "inbound-vision|reality|tcp" {
 		t.Fatalf("scope changed after listener set: %s", got)
+	}
+}
+
+func TestObserveVisionIngressBridgePrimesLegacyAndRuntimeSeamState(t *testing.T) {
+	conn := &xtls.DeferredRustConn{}
+
+	observeVisionIngressBridge(conn, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred)
+
+	summary, ok := proxy.SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary")
+	}
+	if summary.Kind != proxy.VisionTransitionKindDeferredRust {
+		t.Fatalf("summary.Kind=%q, want %q", summary.Kind, proxy.VisionTransitionKindDeferredRust)
+	}
+	if summary.IngressOrigin != proxy.VisionIngressOriginNativeRealityDeferred {
+		t.Fatalf("summary.IngressOrigin=%q, want %q", summary.IngressOrigin, proxy.VisionIngressOriginNativeRealityDeferred)
+	}
+
+	source, err := proxy.BuildVisionTransitionSource(nil, conn)
+	if err != nil {
+		t.Fatalf("BuildVisionTransitionSource() error = %v", err)
+	}
+	if got := source.Snapshot().IngressOrigin; got != proxy.VisionIngressOriginNativeRealityDeferred {
+		t.Fatalf("source ingress origin=%q, want %q", got, proxy.VisionIngressOriginNativeRealityDeferred)
 	}
 }
 

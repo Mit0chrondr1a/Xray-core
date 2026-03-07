@@ -56,6 +56,15 @@ const (
 	VisionTransitionEventPayloadBypass   VisionTransitionEvent = "payload_bypass"
 )
 
+type VisionDrainMode string
+
+const (
+	VisionDrainModeNone     VisionDrainMode = "none"
+	VisionDrainModeBuffered VisionDrainMode = "buffered_drain"
+	VisionDrainModeDeferred VisionDrainMode = "deferred_detach"
+	VisionDrainModeMixed    VisionDrainMode = "mixed"
+)
+
 type VisionSemantic string
 
 const (
@@ -79,10 +88,9 @@ type VisionTransitionSource struct {
 	origin   VisionIngressOrigin
 }
 
-var visionIngressOriginByConn sync.Map
 var visionTransitionTraceByConn sync.Map
 
-type visionTransitionDirectionTrace struct {
+type VisionTransitionDirectionSummary struct {
 	Command0Count int32
 	Command1Count int32
 	Command2Count int32
@@ -90,21 +98,26 @@ type visionTransitionDirectionTrace struct {
 	Semantic      VisionSemantic
 }
 
-type visionTransitionTraceSummary struct {
-	Kind          VisionTransitionKind
-	IngressOrigin VisionIngressOrigin
-	Uplink        visionTransitionDirectionTrace
-	Downlink      visionTransitionDirectionTrace
+type VisionTransitionSummary struct {
+	Kind                VisionTransitionKind
+	IngressOrigin       VisionIngressOrigin
+	Uplink              VisionTransitionDirectionSummary
+	Downlink            VisionTransitionDirectionSummary
+	DrainMode           VisionDrainMode
+	DrainCount          int32
+	DrainPlaintextBytes int
+	DrainRawAheadBytes  int
 }
 
-func newVisionTransitionTraceSummary() *visionTransitionTraceSummary {
-	return &visionTransitionTraceSummary{
-		Uplink: visionTransitionDirectionTrace{
+func newVisionTransitionSummary() *VisionTransitionSummary {
+	return &VisionTransitionSummary{
+		Uplink: VisionTransitionDirectionSummary{
 			Semantic: VisionSemanticUnknown,
 		},
-		Downlink: visionTransitionDirectionTrace{
+		Downlink: VisionTransitionDirectionSummary{
 			Semantic: VisionSemanticUnknown,
 		},
+		DrainMode: VisionDrainModeNone,
 	}
 }
 
@@ -188,11 +201,14 @@ func debugVisionTransitionTrace() bool {
 }
 
 func LogVisionTransitionSource(ctx context.Context, direction string, source *VisionTransitionSource) {
-	if !debugVisionTransitionTrace() || source == nil {
+	if source == nil {
+		return
+	}
+	ObserveVisionTransitionSource(source.conn, source.Kind(), source.origin)
+	if !debugVisionTransitionTrace() {
 		return
 	}
 	snap := source.Snapshot()
-	recordVisionTransitionSource(source)
 	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-source]: ",
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
@@ -206,7 +222,11 @@ func LogVisionTransitionSource(ctx context.Context, direction string, source *Vi
 }
 
 func LogVisionTransitionDrain(ctx context.Context, direction string, source *VisionTransitionSource, plaintextLen int, rawAheadLen int) {
-	if !debugVisionTransitionTrace() || source == nil {
+	if source == nil {
+		return
+	}
+	ObserveVisionTransitionDrain(source.conn, source.Kind(), source.origin, normalizeVisionDrainMode(direction), plaintextLen, rawAheadLen)
+	if !debugVisionTransitionTrace() {
 		return
 	}
 	snap := source.Snapshot()
@@ -221,11 +241,14 @@ func LogVisionTransitionDrain(ctx context.Context, direction string, source *Vis
 }
 
 func LogVisionTransitionEvent(ctx context.Context, direction string, source *VisionTransitionSource, event VisionTransitionEvent, command int, continueCount int32, remainingContent int32, remainingPadding int32, withinPadding bool, switchToDirectCopy bool) {
-	if !debugVisionTransitionTrace() || source == nil {
+	if source == nil {
+		return
+	}
+	ObserveVisionTransitionEvent(source.conn, source.Kind(), source.origin, direction, event, command)
+	if !debugVisionTransitionTrace() {
 		return
 	}
 	snap := source.Snapshot()
-	recordVisionTransitionEvent(source, direction, event, command)
 	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-event]: ",
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
@@ -241,11 +264,11 @@ func LogVisionTransitionEvent(ctx context.Context, direction string, source *Vis
 }
 
 func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, secondaryConn gonet.Conn) {
-	if !debugVisionTransitionTrace() {
-		return
-	}
 	summary, ok := consumeVisionTransitionSummary(primaryConn, secondaryConn)
 	if !ok {
+		return
+	}
+	if !debugVisionTransitionTrace() {
 		return
 	}
 	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-summary]: ",
@@ -261,101 +284,44 @@ func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, sec
 		" downlink_command2_count=", summary.Downlink.Command2Count,
 		" downlink_payload_bypass=", summary.Downlink.PayloadBypass,
 		" downlink_semantic=", summary.Downlink.Semantic,
+		" drain_mode=", summary.DrainMode,
+		" drain_count=", summary.DrainCount,
+		" drain_plaintext_bytes=", summary.DrainPlaintextBytes,
+		" drain_raw_ahead_bytes=", summary.DrainRawAheadBytes,
 	)
 }
 
-// ObserveVisionIngressOrigin records the ingress implementation that produced
-// the connection eventually handed to the Vision seam.
+// ObserveVisionTransitionSource records the runtime bridge state for a seam
+// producer without requiring a VisionTransitionSource wrapper or debug logging.
 //
-// This is an opt-in debug oracle keyed by the connection identity. It is
-// consumed once when BuildVisionTransitionSource resolves the seam so trace
-// logs can correlate Go/native ingress with the exact pre-detach contract
-// Vision observed.
-func ObserveVisionIngressOrigin(conn gonet.Conn, origin VisionIngressOrigin) {
-	if !debugVisionTransitionTrace() || conn == nil || origin == VisionIngressOriginUnknown {
-		return
-	}
-	visionIngressOriginByConn.Store(conn, origin)
-}
-
-// BuildVisionTransitionSource preserves the existing Vision buffer extraction
-// behavior while making the seam explicit. Callers remain responsible for any
-// policy/version checks that are specific to their direction.
-func BuildVisionTransitionSource(publicConn gonet.Conn, innerConn gonet.Conn) (*VisionTransitionSource, error) {
-	if publicConn == nil {
-		publicConn = innerConn
-	}
-	if source, handled, err := buildVisionTransitionSourceForConn(publicConn, publicConn); handled {
-		if source != nil {
-			source.origin = consumeVisionIngressOrigin(publicConn, innerConn)
-		}
-		return source, err
-	}
-	if innerConn != nil && innerConn != publicConn {
-		if source, handled, err := buildVisionTransitionSourceForConn(publicConn, innerConn); handled {
-			if source != nil {
-				source.origin = consumeVisionIngressOrigin(publicConn, innerConn)
-			}
-			return source, err
-		}
-	}
-	return nil, errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
-}
-
-func consumeVisionIngressOrigin(publicConn gonet.Conn, innerConn gonet.Conn) VisionIngressOrigin {
-	if !debugVisionTransitionTrace() {
-		return VisionIngressOriginUnknown
-	}
-	if origin, ok := consumeVisionIngressOriginForConn(publicConn, 0); ok {
-		return origin
-	}
-	if innerConn != nil && innerConn != publicConn {
-		if origin, ok := consumeVisionIngressOriginForConn(innerConn, 0); ok {
-			return origin
-		}
-	}
-	return VisionIngressOriginUnknown
-}
-
-func recordVisionTransitionSource(source *VisionTransitionSource) {
-	if source == nil || source.conn == nil {
-		return
-	}
-	key, ok := visionTransitionTraceKey(source.conn, 0)
-	if !ok {
-		return
-	}
-	value, _ := visionTransitionTraceByConn.LoadOrStore(key, newVisionTransitionTraceSummary())
-	summary, _ := value.(*visionTransitionTraceSummary)
+// This is the producer-grade API that future native bridge code should target.
+func ObserveVisionTransitionSource(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin) {
+	summary := ensureVisionTransitionSummary(conn)
 	if summary == nil {
 		return
 	}
-	if summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque {
-		summary.Kind = source.Kind()
+	if kind != "" && (summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque) {
+		summary.Kind = kind
 	}
-	if summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown {
-		summary.IngressOrigin = source.origin
+	if origin != "" && origin != VisionIngressOriginUnknown &&
+		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
+		summary.IngressOrigin = origin
 	}
 }
 
-func recordVisionTransitionEvent(source *VisionTransitionSource, direction string, event VisionTransitionEvent, command int) {
-	if source == nil || source.conn == nil {
-		return
-	}
-	key, ok := visionTransitionTraceKey(source.conn, 0)
-	if !ok {
-		return
-	}
-	value, _ := visionTransitionTraceByConn.LoadOrStore(key, newVisionTransitionTraceSummary())
-	summary, _ := value.(*visionTransitionTraceSummary)
+// ObserveVisionTransitionEvent records semantic progression for a seam producer
+// without requiring debug logging or a VisionTransitionSource wrapper.
+func ObserveVisionTransitionEvent(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin, direction string, event VisionTransitionEvent, command int) {
+	summary := ensureVisionTransitionSummary(conn)
 	if summary == nil {
 		return
 	}
-	if summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque {
-		summary.Kind = source.Kind()
+	if kind != "" && (summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque) {
+		summary.Kind = kind
 	}
-	if summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown {
-		summary.IngressOrigin = source.origin
+	if origin != "" && origin != VisionIngressOriginUnknown &&
+		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
+		summary.IngressOrigin = origin
 	}
 	trace := &summary.Downlink
 	if direction == "uplink" {
@@ -379,8 +345,91 @@ func recordVisionTransitionEvent(source *VisionTransitionSource, direction strin
 	}
 }
 
-func consumeVisionTransitionSummary(primaryConn gonet.Conn, secondaryConn gonet.Conn) (visionTransitionTraceSummary, bool) {
-	var merged visionTransitionTraceSummary
+// ObserveVisionTransitionDrain records buffered/drained data returned at the
+// seam without requiring debug logging or a VisionTransitionSource wrapper.
+//
+// This is the producer-grade API future native detach/bridge code should use
+// when it materializes consumed plaintext or raw-ahead bytes.
+func ObserveVisionTransitionDrain(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin, mode VisionDrainMode, plaintextLen int, rawAheadLen int) {
+	summary := ensureVisionTransitionSummary(conn)
+	if summary == nil {
+		return
+	}
+	if kind != "" && (summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque) {
+		summary.Kind = kind
+	}
+	if origin != "" && origin != VisionIngressOriginUnknown &&
+		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
+		summary.IngressOrigin = origin
+	}
+	if mode != "" {
+		summary.DrainMode = mergeVisionDrainMode(summary.DrainMode, mode)
+	}
+	summary.DrainCount++
+	summary.DrainPlaintextBytes += plaintextLen
+	summary.DrainRawAheadBytes += rawAheadLen
+}
+
+// BuildVisionTransitionSource preserves the existing Vision buffer extraction
+// behavior while making the seam explicit. Callers remain responsible for any
+// policy/version checks that are specific to their direction.
+func BuildVisionTransitionSource(publicConn gonet.Conn, innerConn gonet.Conn) (*VisionTransitionSource, error) {
+	if publicConn == nil {
+		publicConn = innerConn
+	}
+	origin := snapshotVisionIngressOrigin(publicConn, innerConn)
+	if source, handled, err := buildVisionTransitionSourceForConn(publicConn, publicConn); handled {
+		if source != nil {
+			source.origin = origin
+		}
+		return source, err
+	}
+	if innerConn != nil && innerConn != publicConn {
+		if source, handled, err := buildVisionTransitionSourceForConn(publicConn, innerConn); handled {
+			if source != nil {
+				source.origin = origin
+			}
+			return source, err
+		}
+	}
+	return nil, errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
+}
+
+func snapshotVisionIngressOrigin(publicConn gonet.Conn, innerConn gonet.Conn) VisionIngressOrigin {
+	if summary, ok := SnapshotVisionTransitionSummary(publicConn, innerConn); ok {
+		return summary.IngressOrigin
+	}
+	return VisionIngressOriginUnknown
+}
+
+func ensureVisionTransitionSummary(conn gonet.Conn) *VisionTransitionSummary {
+	key, ok := visionTransitionTraceKey(conn, 0)
+	if !ok {
+		return nil
+	}
+	value, _ := visionTransitionTraceByConn.LoadOrStore(key, newVisionTransitionSummary())
+	summary, _ := value.(*VisionTransitionSummary)
+	return summary
+}
+
+func SnapshotVisionTransitionSummary(primaryConn gonet.Conn, secondaryConn gonet.Conn) (VisionTransitionSummary, bool) {
+	var merged VisionTransitionSummary
+	found := false
+	if summary, ok := snapshotVisionTransitionSummaryForConn(primaryConn, 0); ok {
+		merged = mergeVisionTransitionSummaries(merged, summary)
+		found = true
+	}
+	if secondaryConn != nil && secondaryConn != primaryConn {
+		if summary, ok := snapshotVisionTransitionSummaryForConn(secondaryConn, 0); ok {
+			merged = mergeVisionTransitionSummaries(merged, summary)
+			found = true
+		}
+	}
+	return merged, found
+}
+
+func consumeVisionTransitionSummary(primaryConn gonet.Conn, secondaryConn gonet.Conn) (VisionTransitionSummary, bool) {
+	var merged VisionTransitionSummary
 	found := false
 	if summary, ok := consumeVisionTransitionSummaryForConn(primaryConn, 0); ok {
 		merged = mergeVisionTransitionSummaries(merged, summary)
@@ -395,18 +444,29 @@ func consumeVisionTransitionSummary(primaryConn gonet.Conn, secondaryConn gonet.
 	return merged, found
 }
 
-func consumeVisionTransitionSummaryForConn(conn gonet.Conn, depth int) (visionTransitionTraceSummary, bool) {
+func snapshotVisionTransitionSummaryForConn(conn gonet.Conn, depth int) (VisionTransitionSummary, bool) {
 	if key, ok := visionTransitionTraceKey(conn, depth); ok {
-		if value, ok := visionTransitionTraceByConn.LoadAndDelete(key); ok {
-			if summary, ok := value.(*visionTransitionTraceSummary); ok && summary != nil {
+		if value, ok := visionTransitionTraceByConn.Load(key); ok {
+			if summary, ok := value.(*VisionTransitionSummary); ok && summary != nil {
 				return *summary, true
 			}
 		}
 	}
-	return visionTransitionTraceSummary{}, false
+	return VisionTransitionSummary{}, false
 }
 
-func mergeVisionTransitionSummaries(dst visionTransitionTraceSummary, src visionTransitionTraceSummary) visionTransitionTraceSummary {
+func consumeVisionTransitionSummaryForConn(conn gonet.Conn, depth int) (VisionTransitionSummary, bool) {
+	if key, ok := visionTransitionTraceKey(conn, depth); ok {
+		if value, ok := visionTransitionTraceByConn.LoadAndDelete(key); ok {
+			if summary, ok := value.(*VisionTransitionSummary); ok && summary != nil {
+				return *summary, true
+			}
+		}
+	}
+	return VisionTransitionSummary{}, false
+}
+
+func mergeVisionTransitionSummaries(dst VisionTransitionSummary, src VisionTransitionSummary) VisionTransitionSummary {
 	if dst.Kind == "" || dst.Kind == VisionTransitionKindOpaque {
 		dst.Kind = src.Kind
 	}
@@ -423,6 +483,10 @@ func mergeVisionTransitionSummaries(dst visionTransitionTraceSummary, src vision
 	dst.Downlink.Command2Count += src.Downlink.Command2Count
 	dst.Downlink.PayloadBypass = dst.Downlink.PayloadBypass || src.Downlink.PayloadBypass
 	dst.Downlink.Semantic = mergeVisionSemantic(dst.Downlink.Semantic, src.Downlink.Semantic)
+	dst.DrainMode = mergeVisionDrainMode(dst.DrainMode, src.DrainMode)
+	dst.DrainCount += src.DrainCount
+	dst.DrainPlaintextBytes += src.DrainPlaintextBytes
+	dst.DrainRawAheadBytes += src.DrainRawAheadBytes
 	return dst
 }
 
@@ -449,6 +513,36 @@ func visionSemanticRank(semantic VisionSemantic) int {
 	}
 }
 
+func mergeVisionDrainMode(dst VisionDrainMode, src VisionDrainMode) VisionDrainMode {
+	switch {
+	case src == "" || src == VisionDrainModeNone:
+		if dst == "" {
+			return VisionDrainModeNone
+		}
+		return dst
+	case dst == "" || dst == VisionDrainModeNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		return VisionDrainModeMixed
+	}
+}
+
+func normalizeVisionDrainMode(direction string) VisionDrainMode {
+	switch direction {
+	case "buffered-drain":
+		return VisionDrainModeBuffered
+	case "deferred-detach":
+		return VisionDrainModeDeferred
+	default:
+		if direction == "" {
+			return VisionDrainModeNone
+		}
+		return VisionDrainMode(direction)
+	}
+}
+
 func visionTransitionTraceKey(conn gonet.Conn, depth int) (gonet.Conn, bool) {
 	if conn == nil || depth > 8 {
 		return nil, false
@@ -471,35 +565,6 @@ func visionTransitionTraceKey(conn gonet.Conn, depth int) (gonet.Conn, bool) {
 		}
 	}
 	return conn, true
-}
-
-func consumeVisionIngressOriginForConn(conn gonet.Conn, depth int) (VisionIngressOrigin, bool) {
-	if conn == nil || depth > 8 {
-		return VisionIngressOriginUnknown, false
-	}
-	if value, ok := visionIngressOriginByConn.LoadAndDelete(conn); ok {
-		if origin, ok := value.(VisionIngressOrigin); ok && origin != VisionIngressOriginUnknown {
-			return origin, true
-		}
-	}
-	if sc := stat.TryUnwrapStatsConn(conn); sc != nil && sc != conn {
-		if origin, ok := consumeVisionIngressOriginForConn(sc, depth+1); ok {
-			return origin, true
-		}
-	}
-	if cc, ok := conn.(*encryption.CommonConn); ok && cc != nil {
-		if origin, ok := consumeVisionIngressOriginForConn(cc.Conn, depth+1); ok {
-			return origin, true
-		}
-	}
-	if unwrap, ok := conn.(visionNetConnUnwrapper); ok {
-		if inner := unwrap.NetConn(); inner != nil && inner != conn {
-			if origin, ok := consumeVisionIngressOriginForConn(inner, depth+1); ok {
-				return origin, true
-			}
-		}
-	}
-	return VisionIngressOriginUnknown, false
 }
 
 func buildVisionTransitionSourceForConn(publicConn gonet.Conn, candidate gonet.Conn) (*VisionTransitionSource, bool, error) {
