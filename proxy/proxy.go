@@ -1995,6 +1995,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		finalizeDecision()
 		logPipelineDecision(ctx, string(decision.Path), decision.Reason, decisionCaps)
 		logPipelineSummary(ctx, decision)
+		LogVisionTransitionSummary(ctx, readerConn, writerConn)
 	}()
 	defer clearVisionTelemetryTimestamps(readerConn, writerConn)
 	registerVisionResponseWakeTarget(writerConn, readerConn)

@@ -71,6 +71,21 @@ type VisionTransitionSource struct {
 }
 
 var visionIngressOriginByConn sync.Map
+var visionTransitionTraceByConn sync.Map
+
+type visionTransitionDirectionTrace struct {
+	Command0Count int32
+	Command1Count int32
+	Command2Count int32
+	PayloadBypass bool
+}
+
+type visionTransitionTraceSummary struct {
+	Kind          VisionTransitionKind
+	IngressOrigin VisionIngressOrigin
+	Uplink        visionTransitionDirectionTrace
+	Downlink      visionTransitionDirectionTrace
+}
 
 func NewVisionTransitionSource(conn gonet.Conn, input *bytes.Reader, rawInput *bytes.Buffer) *VisionTransitionSource {
 	return &VisionTransitionSource{
@@ -156,6 +171,7 @@ func LogVisionTransitionSource(ctx context.Context, direction string, source *Vi
 		return
 	}
 	snap := source.Snapshot()
+	recordVisionTransitionSource(source)
 	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-source]: ",
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
@@ -188,6 +204,7 @@ func LogVisionTransitionEvent(ctx context.Context, direction string, source *Vis
 		return
 	}
 	snap := source.Snapshot()
+	recordVisionTransitionEvent(source, direction, event, command)
 	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-event]: ",
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
@@ -199,6 +216,28 @@ func LogVisionTransitionEvent(ctx context.Context, direction string, source *Vis
 		" remaining_padding=", remainingPadding,
 		" within_padding=", withinPadding,
 		" switch_to_direct_copy=", switchToDirectCopy,
+	)
+}
+
+func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, secondaryConn gonet.Conn) {
+	if !debugVisionTransitionTrace() {
+		return
+	}
+	summary, ok := consumeVisionTransitionSummary(primaryConn, secondaryConn)
+	if !ok {
+		return
+	}
+	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-summary]: ",
+		" transition_kind=", summary.Kind,
+		" ingress_origin=", summary.IngressOrigin,
+		" uplink_command0_count=", summary.Uplink.Command0Count,
+		" uplink_command1_count=", summary.Uplink.Command1Count,
+		" uplink_command2_count=", summary.Uplink.Command2Count,
+		" uplink_payload_bypass=", summary.Uplink.PayloadBypass,
+		" downlink_command0_count=", summary.Downlink.Command0Count,
+		" downlink_command1_count=", summary.Downlink.Command1Count,
+		" downlink_command2_count=", summary.Downlink.Command2Count,
+		" downlink_payload_bypass=", summary.Downlink.PayloadBypass,
 	)
 }
 
@@ -253,6 +292,134 @@ func consumeVisionIngressOrigin(publicConn gonet.Conn, innerConn gonet.Conn) Vis
 		}
 	}
 	return VisionIngressOriginUnknown
+}
+
+func recordVisionTransitionSource(source *VisionTransitionSource) {
+	if source == nil || source.conn == nil {
+		return
+	}
+	key, ok := visionTransitionTraceKey(source.conn, 0)
+	if !ok {
+		return
+	}
+	value, _ := visionTransitionTraceByConn.LoadOrStore(key, &visionTransitionTraceSummary{})
+	summary, _ := value.(*visionTransitionTraceSummary)
+	if summary == nil {
+		return
+	}
+	if summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque {
+		summary.Kind = source.Kind()
+	}
+	if summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown {
+		summary.IngressOrigin = source.origin
+	}
+}
+
+func recordVisionTransitionEvent(source *VisionTransitionSource, direction string, event VisionTransitionEvent, command int) {
+	if source == nil || source.conn == nil {
+		return
+	}
+	key, ok := visionTransitionTraceKey(source.conn, 0)
+	if !ok {
+		return
+	}
+	value, _ := visionTransitionTraceByConn.LoadOrStore(key, &visionTransitionTraceSummary{})
+	summary, _ := value.(*visionTransitionTraceSummary)
+	if summary == nil {
+		return
+	}
+	if summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque {
+		summary.Kind = source.Kind()
+	}
+	if summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown {
+		summary.IngressOrigin = source.origin
+	}
+	trace := &summary.Downlink
+	if direction == "uplink" {
+		trace = &summary.Uplink
+	}
+	switch event {
+	case VisionTransitionEventPayloadBypass:
+		trace.PayloadBypass = true
+	case VisionTransitionEventCommandObserved:
+		switch command {
+		case 0:
+			trace.Command0Count++
+		case 1:
+			trace.Command1Count++
+		case 2:
+			trace.Command2Count++
+		}
+	}
+}
+
+func consumeVisionTransitionSummary(primaryConn gonet.Conn, secondaryConn gonet.Conn) (visionTransitionTraceSummary, bool) {
+	var merged visionTransitionTraceSummary
+	found := false
+	if summary, ok := consumeVisionTransitionSummaryForConn(primaryConn, 0); ok {
+		merged = mergeVisionTransitionSummaries(merged, summary)
+		found = true
+	}
+	if secondaryConn != nil && secondaryConn != primaryConn {
+		if summary, ok := consumeVisionTransitionSummaryForConn(secondaryConn, 0); ok {
+			merged = mergeVisionTransitionSummaries(merged, summary)
+			found = true
+		}
+	}
+	return merged, found
+}
+
+func consumeVisionTransitionSummaryForConn(conn gonet.Conn, depth int) (visionTransitionTraceSummary, bool) {
+	if key, ok := visionTransitionTraceKey(conn, depth); ok {
+		if value, ok := visionTransitionTraceByConn.LoadAndDelete(key); ok {
+			if summary, ok := value.(*visionTransitionTraceSummary); ok && summary != nil {
+				return *summary, true
+			}
+		}
+	}
+	return visionTransitionTraceSummary{}, false
+}
+
+func mergeVisionTransitionSummaries(dst visionTransitionTraceSummary, src visionTransitionTraceSummary) visionTransitionTraceSummary {
+	if dst.Kind == "" || dst.Kind == VisionTransitionKindOpaque {
+		dst.Kind = src.Kind
+	}
+	if dst.IngressOrigin == "" || dst.IngressOrigin == VisionIngressOriginUnknown {
+		dst.IngressOrigin = src.IngressOrigin
+	}
+	dst.Uplink.Command0Count += src.Uplink.Command0Count
+	dst.Uplink.Command1Count += src.Uplink.Command1Count
+	dst.Uplink.Command2Count += src.Uplink.Command2Count
+	dst.Uplink.PayloadBypass = dst.Uplink.PayloadBypass || src.Uplink.PayloadBypass
+	dst.Downlink.Command0Count += src.Downlink.Command0Count
+	dst.Downlink.Command1Count += src.Downlink.Command1Count
+	dst.Downlink.Command2Count += src.Downlink.Command2Count
+	dst.Downlink.PayloadBypass = dst.Downlink.PayloadBypass || src.Downlink.PayloadBypass
+	return dst
+}
+
+func visionTransitionTraceKey(conn gonet.Conn, depth int) (gonet.Conn, bool) {
+	if conn == nil || depth > 8 {
+		return nil, false
+	}
+	if sc := stat.TryUnwrapStatsConn(conn); sc != nil && sc != conn {
+		if key, ok := visionTransitionTraceKey(sc, depth+1); ok {
+			return key, true
+		}
+	}
+	if cc, ok := conn.(*encryption.CommonConn); ok && cc != nil {
+		if key, ok := visionTransitionTraceKey(cc.Conn, depth+1); ok {
+			return key, true
+		}
+	}
+	if unwrap, ok := conn.(visionNetConnUnwrapper); ok {
+		if inner := unwrap.NetConn(); inner != nil && inner != conn {
+			if key, ok := visionTransitionTraceKey(inner, depth+1); ok {
+				return key, true
+			}
+		}
+	}
+	return conn, true
 }
 
 func consumeVisionIngressOriginForConn(conn gonet.Conn, depth int) (VisionIngressOrigin, bool) {

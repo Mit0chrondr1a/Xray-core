@@ -57,6 +57,11 @@ type testXHTTPFlowConn struct{ testEOFConn }
 func (testXHTTPFlowConn) LocalAddr() net.Addr  { return testDummyAddr("xhttp-local") }
 func (testXHTTPFlowConn) RemoteAddr() net.Addr { return testDummyAddr("xhttp-remote") }
 
+type testTraceConn struct {
+	testEOFConn
+	id int
+}
+
 func TestDetermineSocketCryptoHintWithSourceXHTTPFlow(t *testing.T) {
 	raw, hint, source := determineSocketCryptoHintWithSource(&testXHTTPFlowConn{})
 	if raw != nil {
@@ -178,7 +183,7 @@ func TestLogVisionTransitionSourceAndDrain(t *testing.T) {
 	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
 	clog.RegisterHandler(handler)
 
-	source := NewVisionTransitionSource(&testEOFConn{}, bytes.NewReader([]byte("plain")), bytes.NewBufferString("raw"))
+	source := NewVisionTransitionSource(&testTraceConn{id: 1}, bytes.NewReader([]byte("plain")), bytes.NewBufferString("raw"))
 	source.kind = VisionTransitionKindOpaque
 	source.origin = VisionIngressOriginGoReality
 
@@ -206,7 +211,7 @@ func TestLogVisionTransitionEvent(t *testing.T) {
 	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
 	clog.RegisterHandler(handler)
 
-	source := NewVisionTransitionSource(&testEOFConn{}, nil, nil)
+	source := NewVisionTransitionSource(&testTraceConn{id: 2}, nil, nil)
 	source.kind = VisionTransitionKindDeferredRust
 	source.origin = VisionIngressOriginNativeRealityDeferred
 
@@ -292,7 +297,7 @@ func TestVisionReaderEmitsNoDetachTransitionEvent(t *testing.T) {
 	padded := XtlsPadding(buf.FromBytes([]byte("ok")), CommandPaddingEnd, &userUUID, false, ctx, []uint32{0, 0, 0, 1})
 	reader := &singleReadReader{mb: buf.MultiBuffer{padded}}
 
-	source := NewVisionTransitionSource(&testEOFConn{}, nil, nil)
+	source := NewVisionTransitionSource(&testTraceConn{id: 3}, nil, nil)
 	source.kind = VisionTransitionKindRealityConn
 	source.origin = VisionIngressOriginGoRealityFallback
 
@@ -344,7 +349,7 @@ func TestVisionReaderEmitsPayloadBypassTransitionEvent(t *testing.T) {
 	ctx := session.ContextWithInbound(context.Background(), inbound)
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
 
-	source := NewVisionTransitionSource(&testEOFConn{}, nil, nil)
+	source := NewVisionTransitionSource(&testTraceConn{id: 4}, nil, nil)
 	source.kind = VisionTransitionKindRealityConn
 	source.origin = VisionIngressOriginGoReality
 
@@ -360,6 +365,39 @@ func TestVisionReaderEmitsPayloadBypassTransitionEvent(t *testing.T) {
 		!strings.Contains(logs, "event=payload_bypass") ||
 		!strings.Contains(logs, "ingress_origin=go_reality") {
 		t.Fatalf("missing payload bypass transition event fields in logs: %s", logs)
+	}
+}
+
+func TestLogVisionTransitionSummary(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	conn := &testTraceConn{id: 5}
+	source := NewVisionTransitionSource(conn, nil, nil)
+	source.kind = VisionTransitionKindDeferredRust
+	source.origin = VisionIngressOriginNativeRealityDeferred
+
+	LogVisionTransitionSource(context.Background(), "inbound", source)
+	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 0, 1, 0, 0, true, false)
+	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 1, 0, 0, 0, false, false)
+	LogVisionTransitionEvent(context.Background(), "downlink", source, VisionTransitionEventCommandObserved, 2, 0, 0, 0, false, true)
+	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventPayloadBypass, -1, 0, 0, 0, false, false)
+	LogVisionTransitionSummary(context.Background(), conn, nil)
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "kind=vision-transition-summary") ||
+		!strings.Contains(logs, "transition_kind=deferred_rust_conn") ||
+		!strings.Contains(logs, "ingress_origin=native_reality_deferred") ||
+		!strings.Contains(logs, "uplink_command0_count=1") ||
+		!strings.Contains(logs, "uplink_command1_count=1") ||
+		!strings.Contains(logs, "downlink_command2_count=1") ||
+		!strings.Contains(logs, "uplink_payload_bypass=true") {
+		t.Fatalf("missing transition summary fields in logs: %s", logs)
 	}
 }
 
