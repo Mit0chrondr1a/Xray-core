@@ -397,6 +397,10 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 	source.origin = VisionIngressOriginNativeRealityDeferred
 
 	LogVisionTransitionSource(context.Background(), "inbound", source)
+	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleDetachCompleted)
+	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleKTLSEnabled)
+	ObserveVisionTransportDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeDeferred, 13, 9)
 	ObserveVisionTransitionDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeDeferred, 11, 7)
 	TraceVisionTransitionDrain(context.Background(), "deferred-detach", source, 11, 7)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 0, 1, 0, 0, true, false)
@@ -418,7 +422,14 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 		!strings.Contains(logs, "drain_mode=deferred_detach") ||
 		!strings.Contains(logs, "drain_count=1") ||
 		!strings.Contains(logs, "drain_plaintext_bytes=11") ||
-		!strings.Contains(logs, "drain_raw_ahead_bytes=7") {
+		!strings.Contains(logs, "drain_raw_ahead_bytes=7") ||
+		!strings.Contains(logs, "transport_drain_mode=deferred_detach") ||
+		!strings.Contains(logs, "transport_drain_count=1") ||
+		!strings.Contains(logs, "transport_drain_plaintext_bytes=13") ||
+		!strings.Contains(logs, "transport_drain_raw_ahead_bytes=9") ||
+		!strings.Contains(logs, "transport_lifecycle_state=ktls_enabled") ||
+		!strings.Contains(logs, "transport_detach_status=completed") ||
+		!strings.Contains(logs, "transport_ktls_promotion=enabled") {
 		t.Fatalf("missing transition summary fields in logs: %s", logs)
 	}
 }
@@ -430,6 +441,10 @@ func TestVisionTransitionSummarySnapshotWithoutDebug(t *testing.T) {
 	source.origin = VisionIngressOriginGoReality
 
 	LogVisionTransitionSource(context.Background(), "inbound", source)
+	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleDetachFailed)
+	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleKTLSFailed)
+	ObserveVisionTransportDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeDeferred, 8, 6)
 	ObserveVisionTransitionDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeBuffered, 5, 3)
 	TraceVisionTransitionDrain(context.Background(), "buffered-drain", source, 5, 3)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 0, 1, 0, 0, true, false)
@@ -454,6 +469,18 @@ func TestVisionTransitionSummarySnapshotWithoutDebug(t *testing.T) {
 	if summary.DrainMode != VisionDrainModeBuffered || summary.DrainCount != 1 || summary.DrainPlaintextBytes != 5 || summary.DrainRawAheadBytes != 3 {
 		t.Fatalf("unexpected drain summary: %+v", summary)
 	}
+	if summary.TransportDrainMode != VisionDrainModeDeferred || summary.TransportDrainCount != 1 || summary.TransportDrainPlaintextLen != 8 || summary.TransportDrainRawAheadLen != 6 {
+		t.Fatalf("unexpected transport drain summary: %+v", summary)
+	}
+	if summary.TransportLifecycleState != VisionTransportLifecycleDeferredActive {
+		t.Fatalf("summary.TransportLifecycleState=%q, want %q", summary.TransportLifecycleState, VisionTransportLifecycleDeferredActive)
+	}
+	if summary.TransportDetachStatus != VisionTransportDetachStatusFailed {
+		t.Fatalf("summary.TransportDetachStatus=%q, want %q", summary.TransportDetachStatus, VisionTransportDetachStatusFailed)
+	}
+	if summary.TransportKTLSPromotion != VisionTransportKTLSPromotionFailed {
+		t.Fatalf("summary.TransportKTLSPromotion=%q, want %q", summary.TransportKTLSPromotion, VisionTransportKTLSPromotionFailed)
+	}
 
 	LogVisionTransitionSummary(context.Background(), conn, nil)
 	if _, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
@@ -468,6 +495,9 @@ func TestObserveVisionTransitionProducerAPIWithoutDebug(t *testing.T) {
 	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
 	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 1)
 	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "downlink", VisionTransitionEventPayloadBypass, -1)
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleKTLSUnsupported)
+	ObserveVisionTransportDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 6, 2)
 	ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 9, 4)
 
 	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
@@ -491,6 +521,57 @@ func TestObserveVisionTransitionProducerAPIWithoutDebug(t *testing.T) {
 	}
 	if summary.DrainMode != VisionDrainModeDeferred || summary.DrainCount != 1 || summary.DrainPlaintextBytes != 9 || summary.DrainRawAheadBytes != 4 {
 		t.Fatalf("unexpected drain summary: %+v", summary)
+	}
+	if summary.TransportDrainMode != VisionDrainModeDeferred || summary.TransportDrainCount != 1 || summary.TransportDrainPlaintextLen != 6 || summary.TransportDrainRawAheadLen != 2 {
+		t.Fatalf("unexpected transport drain summary: %+v", summary)
+	}
+	if summary.TransportLifecycleState != VisionTransportLifecycleDeferredActive {
+		t.Fatalf("summary.TransportLifecycleState=%q, want %q", summary.TransportLifecycleState, VisionTransportLifecycleDeferredActive)
+	}
+	if summary.TransportDetachStatus != VisionTransportDetachStatusNone {
+		t.Fatalf("summary.TransportDetachStatus=%q, want %q", summary.TransportDetachStatus, VisionTransportDetachStatusNone)
+	}
+	if summary.TransportKTLSPromotion != VisionTransportKTLSPromotionUnsupported {
+		t.Fatalf("summary.TransportKTLSPromotion=%q, want %q", summary.TransportKTLSPromotion, VisionTransportKTLSPromotionUnsupported)
+	}
+}
+
+func TestVisionTransitionSourceSnapshotIncludesRuntimeBridgeState(t *testing.T) {
+	conn := &testTraceConn{id: 8}
+	source := NewVisionTransitionSource(conn, nil, nil)
+	source.kind = VisionTransitionKindDeferredRust
+	source.origin = VisionIngressOriginNativeRealityDeferred
+
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 1)
+	ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeBuffered, 4, 2)
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransportDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 9, 6)
+
+	snap := source.Snapshot()
+	if snap.Kind != VisionTransitionKindDeferredRust {
+		t.Fatalf("snapshot kind = %q, want %q", snap.Kind, VisionTransitionKindDeferredRust)
+	}
+	if snap.IngressOrigin != VisionIngressOriginNativeRealityDeferred {
+		t.Fatalf("snapshot ingress origin = %q, want %q", snap.IngressOrigin, VisionIngressOriginNativeRealityDeferred)
+	}
+	if snap.UplinkSemantic != VisionSemanticExplicitNoDetach {
+		t.Fatalf("snapshot uplink semantic = %q, want %q", snap.UplinkSemantic, VisionSemanticExplicitNoDetach)
+	}
+	if snap.DrainMode != VisionDrainModeBuffered || snap.DrainCount != 1 || snap.DrainPlaintext != 4 || snap.DrainRawAhead != 2 {
+		t.Fatalf("unexpected accepted drain snapshot: %+v", snap)
+	}
+	if snap.TransportDrainMode != VisionDrainModeDeferred || snap.TransportDrainCount != 1 || snap.TransportDrainPlaintext != 9 || snap.TransportDrainRawAhead != 6 {
+		t.Fatalf("unexpected transport drain snapshot: %+v", snap)
+	}
+	if snap.TransportLifecycleState != VisionTransportLifecycleDeferredActive {
+		t.Fatalf("snapshot transport lifecycle state = %q, want %q", snap.TransportLifecycleState, VisionTransportLifecycleDeferredActive)
+	}
+	if snap.TransportDetachStatus != VisionTransportDetachStatusNone {
+		t.Fatalf("snapshot transport detach status = %q, want %q", snap.TransportDetachStatus, VisionTransportDetachStatusNone)
+	}
+	if snap.TransportKTLSPromotion != VisionTransportKTLSPromotionNone {
+		t.Fatalf("snapshot transport ktls promotion = %q, want %q", snap.TransportKTLSPromotion, VisionTransportKTLSPromotionNone)
 	}
 }
 

@@ -82,6 +82,11 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
 		deferred := &tls.DeferredRustConn{}
 		proxy.ObserveVisionTransitionSource(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred)
+		proxy.ObserveVisionTransitionEvent(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, "uplink", proxy.VisionTransitionEventCommandObserved, 2)
+		proxy.ObserveVisionTransportLifecycle(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, tls.DeferredRustLifecycleDeferredActive)
+		proxy.ObserveVisionTransportLifecycle(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, tls.DeferredRustLifecycleDetachCompleted)
+		proxy.ObserveVisionTransportLifecycle(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, tls.DeferredRustLifecycleKTLSEnabled)
+		proxy.ObserveVisionTransportDrain(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, proxy.VisionDrainModeDeferred, 12, 5)
 		source, err := proxy.BuildVisionTransitionSource(nil, deferred)
 		if err != nil {
 			t.Fatalf("BuildVisionTransitionSource() error = %v", err)
@@ -101,6 +106,21 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		}
 		if snap.HasBufferedState {
 			t.Fatalf("deferred-rust snapshot should not report buffered state, got %+v", snap)
+		}
+		if snap.UplinkSemantic != proxy.VisionSemanticExplicitDirect {
+			t.Fatalf("uplink semantic = %q, want %q", snap.UplinkSemantic, proxy.VisionSemanticExplicitDirect)
+		}
+		if snap.TransportDrainMode != proxy.VisionDrainModeDeferred || snap.TransportDrainCount != 1 || snap.TransportDrainPlaintext != 12 || snap.TransportDrainRawAhead != 5 {
+			t.Fatalf("unexpected transport drain snapshot: %+v", snap)
+		}
+		if snap.TransportLifecycleState != proxy.VisionTransportLifecycleKTLSEnabled {
+			t.Fatalf("transport lifecycle state = %q, want %q", snap.TransportLifecycleState, proxy.VisionTransportLifecycleKTLSEnabled)
+		}
+		if snap.TransportDetachStatus != proxy.VisionTransportDetachStatusCompleted {
+			t.Fatalf("transport detach status = %q, want %q", snap.TransportDetachStatus, proxy.VisionTransportDetachStatusCompleted)
+		}
+		if snap.TransportKTLSPromotion != proxy.VisionTransportKTLSPromotionEnabled {
+			t.Fatalf("transport ktls promotion = %q, want %q", snap.TransportKTLSPromotion, proxy.VisionTransportKTLSPromotionEnabled)
 		}
 	})
 

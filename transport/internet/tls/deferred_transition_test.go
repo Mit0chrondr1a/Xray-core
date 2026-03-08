@@ -1,7 +1,7 @@
 package tls
 
 import (
-	"net"
+	gonet "net"
 	"testing"
 	"time"
 
@@ -16,7 +16,7 @@ func TestDeferredRustConnDrainAndDetachWaitsForInFlightRead(t *testing.T) {
 		deferredDrainAndDetachFn = oldDrain
 	})
 
-	server, client := net.Pipe()
+	server, client := gonet.Pipe()
 	defer server.Close()
 	defer client.Close()
 
@@ -71,4 +71,150 @@ func TestDeferredRustConnDrainAndDetachWaitsForInFlightRead(t *testing.T) {
 
 	<-readDone
 	<-detachDone
+}
+
+func TestDeferredRustConnDrainAndDetachCallsObserverAfterSuccess(t *testing.T) {
+	oldDrain := deferredDrainAndDetachFn
+	oldObserver := snapshotDeferredRustDrainObserver()
+	oldLifecycle := snapshotDeferredRustLifecycleObserver()
+	t.Cleanup(func() {
+		deferredDrainAndDetachFn = oldDrain
+		SetDeferredRustDrainObserver(oldObserver)
+		SetDeferredRustLifecycleObserver(oldLifecycle)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	deferredDrainAndDetachFn = func(_ *native.DeferredSessionHandle) ([]byte, []byte, error) {
+		return []byte("plain"), []byte("raw"), nil
+	}
+
+	var (
+		gotConn gonet.Conn
+		gotP    int
+		gotR    int
+	)
+	observed := make(chan struct{}, 1)
+	SetDeferredRustDrainObserver(func(conn gonet.Conn, plaintextLen int, rawAheadLen int) {
+		gotConn = conn
+		gotP = plaintextLen
+		gotR = rawAheadLen
+		observed <- struct{}{}
+	})
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+
+	plain, raw, err := dc.DrainAndDetach()
+	if err != nil {
+		t.Fatalf("DrainAndDetach() error = %v", err)
+	}
+	if string(plain) != "plain" || string(raw) != "raw" {
+		t.Fatalf("DrainAndDetach() = (%q, %q), want (%q, %q)", plain, raw, "plain", "raw")
+	}
+
+	select {
+	case <-observed:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("DeferredRust drain observer was not called")
+	}
+
+	if gotConn != dc {
+		t.Fatalf("observer conn = %T %v, want %T %v", gotConn, gotConn, dc, dc)
+	}
+	if gotP != len("plain") || gotR != len("raw") {
+		t.Fatalf("observer lens = (%d, %d), want (%d, %d)", gotP, gotR, len("plain"), len("raw"))
+	}
+}
+
+func TestNewDeferredRustConnCallsLifecycleObserver(t *testing.T) {
+	oldObserver := snapshotDeferredRustLifecycleObserver()
+	t.Cleanup(func() {
+		SetDeferredRustLifecycleObserver(oldObserver)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	var (
+		gotConn  gonet.Conn
+		gotEvent DeferredRustLifecycleEvent
+	)
+	observed := make(chan struct{}, 1)
+	SetDeferredRustLifecycleObserver(func(conn gonet.Conn, event DeferredRustLifecycleEvent) {
+		gotConn = conn
+		gotEvent = event
+		observed <- struct{}{}
+	})
+
+	dc, err := NewDeferredRustConn(client, &native.DeferredResult{Handle: &native.DeferredSessionHandle{}})
+	if err != nil {
+		t.Fatalf("NewDeferredRustConn() error = %v", err)
+	}
+	if dc == nil {
+		t.Fatal("NewDeferredRustConn() returned nil conn")
+	}
+
+	select {
+	case <-observed:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("DeferredRust lifecycle observer was not called")
+	}
+
+	if gotConn != dc {
+		t.Fatalf("observer conn = %T %v, want %T %v", gotConn, gotConn, dc, dc)
+	}
+	if gotEvent != DeferredRustLifecycleDeferredActive {
+		t.Fatalf("observer event = %q, want %q", gotEvent, DeferredRustLifecycleDeferredActive)
+	}
+}
+
+func TestDeferredRustConnEnableKTLSOutcomeCallsLifecycleObserverForUnsupported(t *testing.T) {
+	oldSupported := nativeFullKTLSSupportedFn
+	oldObserver := snapshotDeferredRustLifecycleObserver()
+	t.Cleanup(func() {
+		nativeFullKTLSSupportedFn = oldSupported
+		SetDeferredRustLifecycleObserver(oldObserver)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	nativeFullKTLSSupportedFn = func() bool { return false }
+
+	var gotEvent DeferredRustLifecycleEvent
+	observed := make(chan struct{}, 1)
+	SetDeferredRustLifecycleObserver(func(_ gonet.Conn, event DeferredRustLifecycleEvent) {
+		gotEvent = event
+		observed <- struct{}{}
+	})
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+
+	out, err := dc.EnableKTLSOutcome()
+	if err != nil {
+		t.Fatalf("EnableKTLSOutcome() error = %v", err)
+	}
+	if out.Status != KTLSPromotionUnsupported {
+		t.Fatalf("EnableKTLSOutcome().Status = %v, want %v", out.Status, KTLSPromotionUnsupported)
+	}
+
+	select {
+	case <-observed:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("DeferredRust lifecycle observer was not called")
+	}
+
+	if gotEvent != DeferredRustLifecycleKTLSUnsupported {
+		t.Fatalf("observer event = %q, want %q", gotEvent, DeferredRustLifecycleKTLSUnsupported)
+	}
 }

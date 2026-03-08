@@ -64,6 +64,56 @@ const ktlsScopeDefault = "global"
 
 var deferredKTLSPromotionScopes sync.Map       // key string -> int64 unixNano until
 var deferredKTLSPromotionScopeMetrics sync.Map // key string -> int64 unixNano until (last set)
+var deferredRustDrainObserverMu sync.RWMutex
+var deferredRustDrainObserver func(gonet.Conn, int, int)
+var deferredRustLifecycleObserverMu sync.RWMutex
+var deferredRustLifecycleObserver func(gonet.Conn, DeferredRustLifecycleEvent)
+
+type DeferredRustLifecycleEvent string
+
+const (
+	DeferredRustLifecycleDeferredActive  DeferredRustLifecycleEvent = "deferred_active"
+	DeferredRustLifecycleDetachCompleted DeferredRustLifecycleEvent = "detach_completed"
+	DeferredRustLifecycleDetachFailed    DeferredRustLifecycleEvent = "detach_failed"
+	DeferredRustLifecycleKTLSEnabled     DeferredRustLifecycleEvent = "ktls_enabled"
+	DeferredRustLifecycleKTLSCooldown    DeferredRustLifecycleEvent = "ktls_cooldown"
+	DeferredRustLifecycleKTLSUnsupported DeferredRustLifecycleEvent = "ktls_unsupported"
+	DeferredRustLifecycleKTLSFailed      DeferredRustLifecycleEvent = "ktls_failed"
+)
+
+// SetDeferredRustDrainObserver installs a transport-level observer for
+// successful DeferredRustConn drain-and-detach completions.
+//
+// The observer is notified after a detach succeeds and after DeferredRustConn
+// releases its internal transition lock. This observation is transport-level:
+// it reports that deferred rustls completed a drain event, not that a higher
+// layer accepted the seam transition.
+func SetDeferredRustDrainObserver(observer func(gonet.Conn, int, int)) {
+	deferredRustDrainObserverMu.Lock()
+	defer deferredRustDrainObserverMu.Unlock()
+	deferredRustDrainObserver = observer
+}
+
+func snapshotDeferredRustDrainObserver() func(gonet.Conn, int, int) {
+	deferredRustDrainObserverMu.RLock()
+	defer deferredRustDrainObserverMu.RUnlock()
+	return deferredRustDrainObserver
+}
+
+// SetDeferredRustLifecycleObserver installs a transport-level observer for
+// DeferredRustConn lifecycle events such as activation, detach outcome, and
+// deferred kTLS promotion outcome.
+func SetDeferredRustLifecycleObserver(observer func(gonet.Conn, DeferredRustLifecycleEvent)) {
+	deferredRustLifecycleObserverMu.Lock()
+	defer deferredRustLifecycleObserverMu.Unlock()
+	deferredRustLifecycleObserver = observer
+}
+
+func snapshotDeferredRustLifecycleObserver() func(gonet.Conn, DeferredRustLifecycleEvent) {
+	deferredRustLifecycleObserverMu.RLock()
+	defer deferredRustLifecycleObserverMu.RUnlock()
+	return deferredRustLifecycleObserver
+}
 
 func deferredKTLSPromotionDisabledAt(now time.Time) bool {
 	return deferredKTLSPromotionDisabledForScope(now, ktlsScopeDefault)
@@ -833,7 +883,7 @@ func NewDeferredRustConn(rawConn gonet.Conn, result *native.DeferredResult) (*De
 		native.DeferredFree(result.Handle)
 		return nil, errors.New("tls: DeferredRustConn init: nil raw connection")
 	}
-	return &DeferredRustConn{
+	dc := &DeferredRustConn{
 		rawConn:   rawConn,
 		handle:    result.Handle,
 		alpn:      result.ALPN,
@@ -841,7 +891,11 @@ func NewDeferredRustConn(rawConn gonet.Conn, result *native.DeferredResult) (*De
 		cipher:    result.CipherSuite,
 		sni:       result.SNI,
 		ktlsScope: ktlsScopeDefault,
-	}, nil
+	}
+	if observer := snapshotDeferredRustLifecycleObserver(); observer != nil {
+		observer(dc, DeferredRustLifecycleDeferredActive)
+	}
+	return dc, nil
 }
 
 // SetKTLSPromotionScope allows callers to scope cooldowns to a listener / cipher / kernel path.
@@ -1337,10 +1391,25 @@ func (c *DeferredRustConn) logDeferredKTLSEIO() {
 // callers that stay on DeferredRustConn after a late detach still observe a
 // lossless stream.
 func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, err error) {
+	var notifyDrainObserver bool
+	var notifyPlaintextLen int
+	var notifyRawAheadLen int
+	var notifyConn gonet.Conn
+	var notifyLifecycleEvent DeferredRustLifecycleEvent
 	c.deferredMu.Lock()
 	defer func() {
 		c.endExclusiveDeferredTransitionLocked()
 		c.deferredMu.Unlock()
+		if notifyLifecycleEvent != "" {
+			if observer := snapshotDeferredRustLifecycleObserver(); observer != nil {
+				observer(c, notifyLifecycleEvent)
+			}
+		}
+		if notifyDrainObserver {
+			if observer := snapshotDeferredRustDrainObserver(); observer != nil {
+				observer(notifyConn, notifyPlaintextLen, notifyRawAheadLen)
+			}
+		}
 	}()
 	if c.closed.Load() {
 		return nil, nil, gonet.ErrClosed
@@ -1361,6 +1430,7 @@ func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, 
 	}
 	plaintext, rawAhead, err = deferredDrainAndDetachFn(h)
 	if err != nil {
+		notifyLifecycleEvent = DeferredRustLifecycleDetachFailed
 		// Keep handle for fallback-to-rustls behavior.
 		return nil, nil, err
 	}
@@ -1381,6 +1451,11 @@ func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, 
 	native.DeferredFree(h) // free Rust DeferredSession — restores fd state, closes dup'd fds
 	c.handle = nil
 	c.detached.Store(true)
+	notifyLifecycleEvent = DeferredRustLifecycleDetachCompleted
+	notifyDrainObserver = true
+	notifyPlaintextLen = len(plaintext)
+	notifyRawAheadLen = len(rawAhead)
+	notifyConn = c
 	return plaintext, rawAhead, nil
 }
 
@@ -1451,10 +1526,16 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 	closeAfterUnlock := false
 	closeRawConn := false
 	var rawConnToClose gonet.Conn
+	var notifyLifecycleEvent DeferredRustLifecycleEvent
 	c.deferredMu.Lock()
 	defer func() {
 		c.endExclusiveDeferredTransitionLocked()
 		c.deferredMu.Unlock()
+		if notifyLifecycleEvent != "" {
+			if observer := snapshotDeferredRustLifecycleObserver(); observer != nil {
+				observer(c, notifyLifecycleEvent)
+			}
+		}
 		if closeAfterUnlock && closeRawConn {
 			failCloseRawConn(rawConnToClose)
 		}
@@ -1471,10 +1552,12 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 	}
 	if DeferredKTLSPromotionDisabledFor(scope) {
 		out.Status = KTLSPromotionCooldown
+		notifyLifecycleEvent = DeferredRustLifecycleKTLSCooldown
 		return out, nil
 	}
 	if !nativeFullKTLSSupportedFn() {
 		out.Status = KTLSPromotionUnsupported
+		notifyLifecycleEvent = DeferredRustLifecycleKTLSUnsupported
 		return out, nil
 	}
 	c.beginExclusiveDeferredTransitionLocked()
@@ -1532,6 +1615,7 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 		c.ktlsActive = false
 	}
 	failPromotion := func(err error) error {
+		notifyLifecycleEvent = DeferredRustLifecycleKTLSFailed
 		rollbackPromotionFailure()
 		deferKTLSPromotionForCooldownScope(scope)
 		if !handleRetained {
@@ -1616,6 +1700,7 @@ func (c *DeferredRustConn) EnableKTLSOutcome() (KTLSPromotionOutcome, error) {
 
 	out.Status = KTLSPromotionEnabled
 	out.State = c.ktlsState
+	notifyLifecycleEvent = DeferredRustLifecycleKTLSEnabled
 	return out, nil
 }
 

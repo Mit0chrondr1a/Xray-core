@@ -40,13 +40,26 @@ const (
 )
 
 type VisionTransitionSnapshot struct {
-	Kind              VisionTransitionKind
-	IngressOrigin     VisionIngressOrigin
-	PublicConnType    string
-	UsesDeferredRust  bool
-	HasBufferedState  bool
-	BufferedPlaintext int
-	BufferedRawAhead  int
+	Kind                    VisionTransitionKind
+	IngressOrigin           VisionIngressOrigin
+	PublicConnType          string
+	UsesDeferredRust        bool
+	HasBufferedState        bool
+	BufferedPlaintext       int
+	BufferedRawAhead        int
+	UplinkSemantic          VisionSemantic
+	DownlinkSemantic        VisionSemantic
+	DrainMode               VisionDrainMode
+	DrainCount              int32
+	DrainPlaintext          int
+	DrainRawAhead           int
+	TransportDrainMode      VisionDrainMode
+	TransportDrainCount     int32
+	TransportDrainPlaintext int
+	TransportDrainRawAhead  int
+	TransportLifecycleState VisionTransportLifecycleState
+	TransportDetachStatus   VisionTransportDetachStatus
+	TransportKTLSPromotion  VisionTransportKTLSPromotion
 }
 
 type VisionTransitionEvent string
@@ -74,6 +87,35 @@ const (
 	VisionSemanticExplicitDirect   VisionSemantic = "explicit_direct_copy"
 )
 
+type VisionTransportLifecycleState string
+
+const (
+	VisionTransportLifecycleUnknown        VisionTransportLifecycleState = "unknown"
+	VisionTransportLifecycleDeferredActive VisionTransportLifecycleState = "deferred_active"
+	VisionTransportLifecycleDeferredDetach VisionTransportLifecycleState = "deferred_detached"
+	VisionTransportLifecycleKTLSEnabled    VisionTransportLifecycleState = "ktls_enabled"
+)
+
+type VisionTransportDetachStatus string
+
+const (
+	VisionTransportDetachStatusNone      VisionTransportDetachStatus = "none"
+	VisionTransportDetachStatusCompleted VisionTransportDetachStatus = "completed"
+	VisionTransportDetachStatusFailed    VisionTransportDetachStatus = "failed"
+	VisionTransportDetachStatusMixed     VisionTransportDetachStatus = "mixed"
+)
+
+type VisionTransportKTLSPromotion string
+
+const (
+	VisionTransportKTLSPromotionNone        VisionTransportKTLSPromotion = "none"
+	VisionTransportKTLSPromotionEnabled     VisionTransportKTLSPromotion = "enabled"
+	VisionTransportKTLSPromotionCooldown    VisionTransportKTLSPromotion = "cooldown"
+	VisionTransportKTLSPromotionUnsupported VisionTransportKTLSPromotion = "unsupported"
+	VisionTransportKTLSPromotionFailed      VisionTransportKTLSPromotion = "failed"
+	VisionTransportKTLSPromotionMixed       VisionTransportKTLSPromotion = "mixed"
+)
+
 // VisionTransitionSource makes the pre-detach Vision transition contract explicit.
 //
 // Historically Vision reached into Go TLS/REALITY internals via reflection to
@@ -99,14 +141,21 @@ type VisionTransitionDirectionSummary struct {
 }
 
 type VisionTransitionSummary struct {
-	Kind                VisionTransitionKind
-	IngressOrigin       VisionIngressOrigin
-	Uplink              VisionTransitionDirectionSummary
-	Downlink            VisionTransitionDirectionSummary
-	DrainMode           VisionDrainMode
-	DrainCount          int32
-	DrainPlaintextBytes int
-	DrainRawAheadBytes  int
+	Kind                       VisionTransitionKind
+	IngressOrigin              VisionIngressOrigin
+	Uplink                     VisionTransitionDirectionSummary
+	Downlink                   VisionTransitionDirectionSummary
+	DrainMode                  VisionDrainMode
+	DrainCount                 int32
+	DrainPlaintextBytes        int
+	DrainRawAheadBytes         int
+	TransportDrainMode         VisionDrainMode
+	TransportDrainCount        int32
+	TransportDrainPlaintextLen int
+	TransportDrainRawAheadLen  int
+	TransportLifecycleState    VisionTransportLifecycleState
+	TransportDetachStatus      VisionTransportDetachStatus
+	TransportKTLSPromotion     VisionTransportKTLSPromotion
 }
 
 func newVisionTransitionSummary() *VisionTransitionSummary {
@@ -117,8 +166,17 @@ func newVisionTransitionSummary() *VisionTransitionSummary {
 		Downlink: VisionTransitionDirectionSummary{
 			Semantic: VisionSemanticUnknown,
 		},
-		DrainMode: VisionDrainModeNone,
+		DrainMode:               VisionDrainModeNone,
+		TransportDrainMode:      VisionDrainModeNone,
+		TransportLifecycleState: VisionTransportLifecycleUnknown,
+		TransportDetachStatus:   VisionTransportDetachStatusNone,
+		TransportKTLSPromotion:  VisionTransportKTLSPromotionNone,
 	}
+}
+
+func init() {
+	tls.SetDeferredRustDrainObserver(observeVisionTransportDeferredDrain)
+	tls.SetDeferredRustLifecycleObserver(observeVisionTransportLifecycleEvent)
 }
 
 func NewVisionTransitionSource(conn gonet.Conn, input *bytes.Reader, rawInput *bytes.Buffer) *VisionTransitionSource {
@@ -153,8 +211,15 @@ func (s *VisionTransitionSource) Kind() VisionTransitionKind {
 
 func (s *VisionTransitionSource) Snapshot() VisionTransitionSnapshot {
 	snap := VisionTransitionSnapshot{
-		Kind:          s.Kind(),
-		IngressOrigin: VisionIngressOriginUnknown,
+		Kind:                    s.Kind(),
+		IngressOrigin:           VisionIngressOriginUnknown,
+		UplinkSemantic:          VisionSemanticUnknown,
+		DownlinkSemantic:        VisionSemanticUnknown,
+		DrainMode:               VisionDrainModeNone,
+		TransportDrainMode:      VisionDrainModeNone,
+		TransportLifecycleState: VisionTransportLifecycleUnknown,
+		TransportDetachStatus:   VisionTransportDetachStatusNone,
+		TransportKTLSPromotion:  VisionTransportKTLSPromotionNone,
 	}
 	if s == nil {
 		return snap
@@ -171,6 +236,21 @@ func (s *VisionTransitionSource) Snapshot() VisionTransitionSnapshot {
 	if s.rawInput != nil {
 		snap.HasBufferedState = true
 		snap.BufferedRawAhead = s.rawInput.Len()
+	}
+	if summary, ok := SnapshotVisionTransitionSummary(s.conn, nil); ok {
+		snap.UplinkSemantic = summary.Uplink.Semantic
+		snap.DownlinkSemantic = summary.Downlink.Semantic
+		snap.DrainMode = summary.DrainMode
+		snap.DrainCount = summary.DrainCount
+		snap.DrainPlaintext = summary.DrainPlaintextBytes
+		snap.DrainRawAhead = summary.DrainRawAheadBytes
+		snap.TransportDrainMode = summary.TransportDrainMode
+		snap.TransportDrainCount = summary.TransportDrainCount
+		snap.TransportDrainPlaintext = summary.TransportDrainPlaintextLen
+		snap.TransportDrainRawAhead = summary.TransportDrainRawAheadLen
+		snap.TransportLifecycleState = summary.TransportLifecycleState
+		snap.TransportDetachStatus = summary.TransportDetachStatus
+		snap.TransportKTLSPromotion = summary.TransportKTLSPromotion
 	}
 	return snap
 }
@@ -297,6 +377,13 @@ func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, sec
 		" drain_count=", summary.DrainCount,
 		" drain_plaintext_bytes=", summary.DrainPlaintextBytes,
 		" drain_raw_ahead_bytes=", summary.DrainRawAheadBytes,
+		" transport_drain_mode=", summary.TransportDrainMode,
+		" transport_drain_count=", summary.TransportDrainCount,
+		" transport_drain_plaintext_bytes=", summary.TransportDrainPlaintextLen,
+		" transport_drain_raw_ahead_bytes=", summary.TransportDrainRawAheadLen,
+		" transport_lifecycle_state=", summary.TransportLifecycleState,
+		" transport_detach_status=", summary.TransportDetachStatus,
+		" transport_ktls_promotion=", summary.TransportKTLSPromotion,
 	)
 }
 
@@ -377,6 +464,90 @@ func ObserveVisionTransitionDrain(conn gonet.Conn, kind VisionTransitionKind, or
 	summary.DrainCount++
 	summary.DrainPlaintextBytes += plaintextLen
 	summary.DrainRawAheadBytes += rawAheadLen
+}
+
+// ObserveVisionTransportDrain records transport-layer deferred detach/drain
+// observations. This is intentionally separate from ObserveVisionTransitionDrain:
+// transport observation does not imply the higher-level seam accepted the detach
+// boundary, only that the native/deferred transport completed a drain event.
+func ObserveVisionTransportDrain(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin, mode VisionDrainMode, plaintextLen int, rawAheadLen int) {
+	summary := ensureVisionTransitionSummary(conn)
+	if summary == nil {
+		return
+	}
+	if kind != "" && (summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque) {
+		summary.Kind = kind
+	}
+	if origin != "" && origin != VisionIngressOriginUnknown &&
+		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
+		summary.IngressOrigin = origin
+	}
+	if mode != "" {
+		summary.TransportDrainMode = mergeVisionDrainMode(summary.TransportDrainMode, mode)
+	}
+	summary.TransportDrainCount++
+	summary.TransportDrainPlaintextLen += plaintextLen
+	summary.TransportDrainRawAheadLen += rawAheadLen
+}
+
+func ObserveVisionTransportLifecycle(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin, event tls.DeferredRustLifecycleEvent) {
+	summary := ensureVisionTransitionSummary(conn)
+	if summary == nil {
+		return
+	}
+	if kind != "" && (summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque) {
+		summary.Kind = kind
+	}
+	if origin != "" && origin != VisionIngressOriginUnknown &&
+		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
+		summary.IngressOrigin = origin
+	}
+	switch event {
+	case tls.DeferredRustLifecycleDeferredActive:
+		summary.TransportLifecycleState = mergeVisionTransportLifecycleState(summary.TransportLifecycleState, VisionTransportLifecycleDeferredActive)
+	case tls.DeferredRustLifecycleDetachCompleted:
+		summary.TransportLifecycleState = mergeVisionTransportLifecycleState(summary.TransportLifecycleState, VisionTransportLifecycleDeferredDetach)
+		summary.TransportDetachStatus = mergeVisionTransportDetachStatus(summary.TransportDetachStatus, VisionTransportDetachStatusCompleted)
+	case tls.DeferredRustLifecycleDetachFailed:
+		summary.TransportDetachStatus = mergeVisionTransportDetachStatus(summary.TransportDetachStatus, VisionTransportDetachStatusFailed)
+	case tls.DeferredRustLifecycleKTLSEnabled:
+		summary.TransportLifecycleState = mergeVisionTransportLifecycleState(summary.TransportLifecycleState, VisionTransportLifecycleKTLSEnabled)
+		summary.TransportKTLSPromotion = mergeVisionTransportKTLSPromotion(summary.TransportKTLSPromotion, VisionTransportKTLSPromotionEnabled)
+	case tls.DeferredRustLifecycleKTLSCooldown:
+		summary.TransportKTLSPromotion = mergeVisionTransportKTLSPromotion(summary.TransportKTLSPromotion, VisionTransportKTLSPromotionCooldown)
+	case tls.DeferredRustLifecycleKTLSUnsupported:
+		summary.TransportKTLSPromotion = mergeVisionTransportKTLSPromotion(summary.TransportKTLSPromotion, VisionTransportKTLSPromotionUnsupported)
+	case tls.DeferredRustLifecycleKTLSFailed:
+		summary.TransportKTLSPromotion = mergeVisionTransportKTLSPromotion(summary.TransportKTLSPromotion, VisionTransportKTLSPromotionFailed)
+	}
+}
+
+func observeVisionTransportDeferredDrain(conn gonet.Conn, plaintextLen int, rawAheadLen int) {
+	kind := VisionTransitionKindDeferredRust
+	origin := VisionIngressOriginUnknown
+	if summary, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
+		if summary.Kind != "" {
+			kind = summary.Kind
+		}
+		if summary.IngressOrigin != "" {
+			origin = summary.IngressOrigin
+		}
+	}
+	ObserveVisionTransportDrain(conn, kind, origin, VisionDrainModeDeferred, plaintextLen, rawAheadLen)
+}
+
+func observeVisionTransportLifecycleEvent(conn gonet.Conn, event tls.DeferredRustLifecycleEvent) {
+	kind := VisionTransitionKindDeferredRust
+	origin := VisionIngressOriginUnknown
+	if summary, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
+		if summary.Kind != "" {
+			kind = summary.Kind
+		}
+		if summary.IngressOrigin != "" {
+			origin = summary.IngressOrigin
+		}
+	}
+	ObserveVisionTransportLifecycle(conn, kind, origin, event)
 }
 
 // BuildVisionTransitionSource preserves the existing Vision buffer extraction
@@ -496,6 +667,13 @@ func mergeVisionTransitionSummaries(dst VisionTransitionSummary, src VisionTrans
 	dst.DrainCount += src.DrainCount
 	dst.DrainPlaintextBytes += src.DrainPlaintextBytes
 	dst.DrainRawAheadBytes += src.DrainRawAheadBytes
+	dst.TransportDrainMode = mergeVisionDrainMode(dst.TransportDrainMode, src.TransportDrainMode)
+	dst.TransportDrainCount += src.TransportDrainCount
+	dst.TransportDrainPlaintextLen += src.TransportDrainPlaintextLen
+	dst.TransportDrainRawAheadLen += src.TransportDrainRawAheadLen
+	dst.TransportLifecycleState = mergeVisionTransportLifecycleState(dst.TransportLifecycleState, src.TransportLifecycleState)
+	dst.TransportDetachStatus = mergeVisionTransportDetachStatus(dst.TransportDetachStatus, src.TransportDetachStatus)
+	dst.TransportKTLSPromotion = mergeVisionTransportKTLSPromotion(dst.TransportKTLSPromotion, src.TransportKTLSPromotion)
 	return dst
 }
 
@@ -535,6 +713,61 @@ func mergeVisionDrainMode(dst VisionDrainMode, src VisionDrainMode) VisionDrainM
 		return dst
 	default:
 		return VisionDrainModeMixed
+	}
+}
+
+func mergeVisionTransportLifecycleState(dst VisionTransportLifecycleState, src VisionTransportLifecycleState) VisionTransportLifecycleState {
+	if visionTransportLifecycleRank(src) > visionTransportLifecycleRank(dst) {
+		return src
+	}
+	if dst == "" {
+		return VisionTransportLifecycleUnknown
+	}
+	return dst
+}
+
+func visionTransportLifecycleRank(state VisionTransportLifecycleState) int {
+	switch state {
+	case VisionTransportLifecycleKTLSEnabled:
+		return 3
+	case VisionTransportLifecycleDeferredDetach:
+		return 2
+	case VisionTransportLifecycleDeferredActive:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func mergeVisionTransportDetachStatus(dst VisionTransportDetachStatus, src VisionTransportDetachStatus) VisionTransportDetachStatus {
+	switch {
+	case src == "" || src == VisionTransportDetachStatusNone:
+		if dst == "" {
+			return VisionTransportDetachStatusNone
+		}
+		return dst
+	case dst == "" || dst == VisionTransportDetachStatusNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		return VisionTransportDetachStatusMixed
+	}
+}
+
+func mergeVisionTransportKTLSPromotion(dst VisionTransportKTLSPromotion, src VisionTransportKTLSPromotion) VisionTransportKTLSPromotion {
+	switch {
+	case src == "" || src == VisionTransportKTLSPromotionNone:
+		if dst == "" {
+			return VisionTransportKTLSPromotionNone
+		}
+		return dst
+	case dst == "" || dst == VisionTransportKTLSPromotionNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		return VisionTransportKTLSPromotionMixed
 	}
 }
 
