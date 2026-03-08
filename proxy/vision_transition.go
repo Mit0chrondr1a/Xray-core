@@ -7,10 +7,12 @@ import (
 	"os"
 	"reflect"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/pipeline"
 	"github.com/xtls/xray-core/proxy/vless/encryption"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -40,26 +42,43 @@ const (
 )
 
 type VisionTransitionSnapshot struct {
-	Kind                    VisionTransitionKind
-	IngressOrigin           VisionIngressOrigin
-	PublicConnType          string
-	UsesDeferredRust        bool
-	HasBufferedState        bool
-	BufferedPlaintext       int
-	BufferedRawAhead        int
-	UplinkSemantic          VisionSemantic
-	DownlinkSemantic        VisionSemantic
-	DrainMode               VisionDrainMode
-	DrainCount              int32
-	DrainPlaintext          int
-	DrainRawAhead           int
-	TransportDrainMode      VisionDrainMode
-	TransportDrainCount     int32
-	TransportDrainPlaintext int
-	TransportDrainRawAhead  int
-	TransportLifecycleState VisionTransportLifecycleState
-	TransportDetachStatus   VisionTransportDetachStatus
-	TransportKTLSPromotion  VisionTransportKTLSPromotion
+	Kind                            VisionTransitionKind
+	IngressOrigin                   VisionIngressOrigin
+	ScopeKey                        string
+	PublicConnType                  string
+	UsesDeferredRust                bool
+	HasBufferedState                bool
+	BufferedPlaintext               int
+	BufferedRawAhead                int
+	UplinkSemantic                  VisionSemantic
+	DownlinkSemantic                VisionSemantic
+	NativeProvisionalSemantic       VisionNativeProvisionalSemantic
+	NativeProvisionalSource         VisionNativeProvisionalSemanticSource
+	NativeProvisionalObserved       VisionNativeProvisionalSemantic
+	NativeProvisionalObservedSource VisionNativeProvisionalSemanticSource
+	NativeProvisionalOutcome        VisionNativeProvisionalOutcome
+	NativeProvisionalOutcomeSource  VisionNativeProvisionalOutcomeSource
+	DrainMode                       VisionDrainMode
+	DrainCount                      int32
+	DrainPlaintext                  int
+	DrainRawAhead                   int
+	TransportDrainMode              VisionDrainMode
+	TransportDrainCount             int32
+	TransportDrainPlaintext         int
+	TransportDrainRawAhead          int
+	DrainRelation                   VisionDrainRelation
+	BridgeAssessment                VisionBridgeAssessment
+	PendingQuality                  VisionPendingQuality
+	PendingClass                    VisionPendingClass
+	PendingGap                      VisionPendingGap
+	TransportReadOps                int32
+	TransportReadBytes              int
+	TransportWriteOps               int32
+	TransportWriteBytes             int
+	TransportProgress               VisionTransportProgressProfile
+	TransportLifecycleState         VisionTransportLifecycleState
+	TransportDetachStatus           VisionTransportDetachStatus
+	TransportKTLSPromotion          VisionTransportKTLSPromotion
 }
 
 type VisionTransitionEvent string
@@ -116,6 +135,98 @@ const (
 	VisionTransportKTLSPromotionMixed       VisionTransportKTLSPromotion = "mixed"
 )
 
+type VisionTransportProgressProfile string
+
+const (
+	VisionTransportProgressNone          VisionTransportProgressProfile = "none"
+	VisionTransportProgressWriteOnly     VisionTransportProgressProfile = "write_only"
+	VisionTransportProgressReadOnly      VisionTransportProgressProfile = "read_only"
+	VisionTransportProgressBidirectional VisionTransportProgressProfile = "bidirectional"
+)
+
+type VisionDrainRelation string
+
+const (
+	VisionDrainRelationNone          VisionDrainRelation = "none"
+	VisionDrainRelationAcceptedOnly  VisionDrainRelation = "accepted_only"
+	VisionDrainRelationTransportOnly VisionDrainRelation = "transport_only"
+	VisionDrainRelationAligned       VisionDrainRelation = "aligned"
+	VisionDrainRelationMismatch      VisionDrainRelation = "mismatch"
+)
+
+type VisionBridgeAssessment string
+
+const (
+	VisionBridgeAssessmentNone               VisionBridgeAssessment = "none"
+	VisionBridgeAssessmentGoBaseline         VisionBridgeAssessment = "go_baseline"
+	VisionBridgeAssessmentNativePending      VisionBridgeAssessment = "native_pending"
+	VisionBridgeAssessmentNativeAligned      VisionBridgeAssessment = "native_aligned"
+	VisionBridgeAssessmentNativeDivergent    VisionBridgeAssessment = "native_divergent"
+	VisionBridgeAssessmentNativeDetachFailed VisionBridgeAssessment = "native_detach_failed"
+)
+
+type VisionPendingQuality string
+
+const (
+	VisionPendingQualityNone    VisionPendingQuality = "none"
+	VisionPendingQualityBenign  VisionPendingQuality = "benign"
+	VisionPendingQualityFailure VisionPendingQuality = "user_visible_failure"
+)
+
+type VisionPendingClass string
+
+const (
+	VisionPendingClassNone             VisionPendingClass = "none"
+	VisionPendingClassCommand0Only     VisionPendingClass = "command0_only"
+	VisionPendingClassExplicitNoDetach VisionPendingClass = "explicit_no_detach"
+	VisionPendingClassPayloadBypass    VisionPendingClass = "payload_bypass"
+	VisionPendingClassOther            VisionPendingClass = "other"
+)
+
+type VisionPendingGap string
+
+const (
+	VisionPendingGapNone                       VisionPendingGap = "none"
+	VisionPendingGapCommand0BidirectionalNoDet VisionPendingGap = "command0_bidirectional_no_detach"
+	VisionPendingGapOther                      VisionPendingGap = "other"
+)
+
+type VisionNativeProvisionalSemantic string
+
+const (
+	VisionNativeProvisionalSemanticNone                  VisionNativeProvisionalSemantic = "none"
+	VisionNativeProvisionalSemanticCommand0Bidirectional VisionNativeProvisionalSemantic = "command0_bidirectional"
+)
+
+type VisionNativeProvisionalSemanticSource string
+
+const (
+	VisionNativeProvisionalSemanticSourceNone             VisionNativeProvisionalSemanticSource = "none"
+	VisionNativeProvisionalSemanticSourceDerived          VisionNativeProvisionalSemanticSource = "derived"
+	VisionNativeProvisionalSemanticSourceBridgeProducer   VisionNativeProvisionalSemanticSource = "bridge_producer"
+	VisionNativeProvisionalSemanticSourceExplicitProducer VisionNativeProvisionalSemanticSource = "explicit_producer"
+)
+
+type VisionNativeProvisionalOutcome string
+
+const (
+	VisionNativeProvisionalOutcomeNone             VisionNativeProvisionalOutcome = "none"
+	VisionNativeProvisionalOutcomeActive           VisionNativeProvisionalOutcome = "active"
+	VisionNativeProvisionalOutcomeResolvedDirect   VisionNativeProvisionalOutcome = "resolved_direct_copy"
+	VisionNativeProvisionalOutcomeResolvedNoDetach VisionNativeProvisionalOutcome = "resolved_no_detach"
+	VisionNativeProvisionalOutcomeBenignClose      VisionNativeProvisionalOutcome = "benign_pending_close"
+	VisionNativeProvisionalOutcomeFailedPending    VisionNativeProvisionalOutcome = "failed_pending"
+)
+
+type VisionNativeProvisionalOutcomeSource string
+
+const (
+	VisionNativeProvisionalOutcomeSourceNone             VisionNativeProvisionalOutcomeSource = "none"
+	VisionNativeProvisionalOutcomeSourceDerived          VisionNativeProvisionalOutcomeSource = "derived"
+	VisionNativeProvisionalOutcomeSourceBridgeProducer   VisionNativeProvisionalOutcomeSource = "bridge_producer"
+	VisionNativeProvisionalOutcomeSourceExplicitProducer VisionNativeProvisionalOutcomeSource = "explicit_producer"
+)
+
 // VisionTransitionSource makes the pre-detach Vision transition contract explicit.
 //
 // Historically Vision reached into Go TLS/REALITY internals via reflection to
@@ -131,6 +242,48 @@ type VisionTransitionSource struct {
 }
 
 var visionTransitionTraceByConn sync.Map
+var visionBridgeAssessmentStatsByScope sync.Map
+var visionBridgeProbeEpochByScope sync.Map
+var visionBridgeAssessmentNowFn = time.Now
+var visionBridgeProbeNowFn = time.Now
+var visionBridgeAssessmentBucketWidth = time.Minute
+
+const (
+	visionBridgeAssessmentUnscopedKey = "__unscoped__"
+	visionBridgeAssessmentBucketCount = 10
+)
+
+type visionBridgeAssessmentWindow struct {
+	mu                                            sync.Mutex
+	startBucket                                   int64
+	goBaseline                                    [visionBridgeAssessmentBucketCount]uint64
+	nativePending                                 [visionBridgeAssessmentBucketCount]uint64
+	nativePendingBenign                           [visionBridgeAssessmentBucketCount]uint64
+	nativePendingFailure                          [visionBridgeAssessmentBucketCount]uint64
+	nativeProvisionalCommand0Bidirectional        [visionBridgeAssessmentBucketCount]uint64
+	nativeProvisionalCommand0BidirectionalFailure [visionBridgeAssessmentBucketCount]uint64
+	nativeProvisionalActive                       [visionBridgeAssessmentBucketCount]uint64
+	nativeProvisionalResolvedDirect               [visionBridgeAssessmentBucketCount]uint64
+	nativeProvisionalResolvedNoDetach             [visionBridgeAssessmentBucketCount]uint64
+	nativeProvisionalBenignClose                  [visionBridgeAssessmentBucketCount]uint64
+	nativeProvisionalFailedPending                [visionBridgeAssessmentBucketCount]uint64
+	nativePendingCommand0Failure                  [visionBridgeAssessmentBucketCount]uint64
+	nativePendingCommand0BidirectionalFailure     [visionBridgeAssessmentBucketCount]uint64
+	nativeAligned                                 [visionBridgeAssessmentBucketCount]uint64
+	nativeDivergent                               [visionBridgeAssessmentBucketCount]uint64
+	nativeDetachFailed                            [visionBridgeAssessmentBucketCount]uint64
+}
+
+type visionBridgeProbeEpoch struct {
+	mu       sync.Mutex
+	scopeKey string
+	state    VisionBridgeProbeState
+	verdict  VisionBridgeProbeVerdict
+	started  time.Time
+	deadline time.Time
+	budget   uint64
+	stats    VisionBridgeAssessmentStats
+}
 
 type VisionTransitionDirectionSummary struct {
 	Command0Count int32
@@ -141,42 +294,129 @@ type VisionTransitionDirectionSummary struct {
 }
 
 type VisionTransitionSummary struct {
-	Kind                       VisionTransitionKind
-	IngressOrigin              VisionIngressOrigin
-	Uplink                     VisionTransitionDirectionSummary
-	Downlink                   VisionTransitionDirectionSummary
-	DrainMode                  VisionDrainMode
-	DrainCount                 int32
-	DrainPlaintextBytes        int
-	DrainRawAheadBytes         int
-	TransportDrainMode         VisionDrainMode
-	TransportDrainCount        int32
-	TransportDrainPlaintextLen int
-	TransportDrainRawAheadLen  int
-	TransportLifecycleState    VisionTransportLifecycleState
-	TransportDetachStatus      VisionTransportDetachStatus
-	TransportKTLSPromotion     VisionTransportKTLSPromotion
+	Kind                            VisionTransitionKind
+	IngressOrigin                   VisionIngressOrigin
+	ScopeKey                        string
+	Uplink                          VisionTransitionDirectionSummary
+	Downlink                        VisionTransitionDirectionSummary
+	NativeProvisionalSemantic       VisionNativeProvisionalSemantic
+	NativeProvisionalSource         VisionNativeProvisionalSemanticSource
+	NativeProvisionalObserved       VisionNativeProvisionalSemantic
+	NativeProvisionalObservedSource VisionNativeProvisionalSemanticSource
+	NativeProvisionalOutcome        VisionNativeProvisionalOutcome
+	NativeProvisionalOutcomeSource  VisionNativeProvisionalOutcomeSource
+	DrainMode                       VisionDrainMode
+	DrainCount                      int32
+	DrainPlaintextBytes             int
+	DrainRawAheadBytes              int
+	TransportDrainMode              VisionDrainMode
+	TransportDrainCount             int32
+	TransportDrainPlaintextLen      int
+	TransportDrainRawAheadLen       int
+	DrainRelation                   VisionDrainRelation
+	BridgeAssessment                VisionBridgeAssessment
+	PendingQuality                  VisionPendingQuality
+	PendingClass                    VisionPendingClass
+	PendingGap                      VisionPendingGap
+	TransportReadOps                int32
+	TransportReadBytes              int
+	TransportWriteOps               int32
+	TransportWriteBytes             int
+	TransportProgress               VisionTransportProgressProfile
+	TransportLifecycleState         VisionTransportLifecycleState
+	TransportDetachStatus           VisionTransportDetachStatus
+	TransportKTLSPromotion          VisionTransportKTLSPromotion
+}
+
+type VisionBridgeAssessmentStats struct {
+	GoBaseline                                    uint64
+	NativePending                                 uint64
+	NativePendingBenign                           uint64
+	NativePendingFailure                          uint64
+	NativeProvisionalCommand0Bidirectional        uint64
+	NativeProvisionalCommand0BidirectionalFailure uint64
+	NativeProvisionalActive                       uint64
+	NativeProvisionalResolvedDirect               uint64
+	NativeProvisionalResolvedNoDetach             uint64
+	NativeProvisionalBenignClose                  uint64
+	NativeProvisionalFailedPending                uint64
+	NativePendingCommand0Failure                  uint64
+	NativePendingCommand0BidirectionalFailure     uint64
+	NativeAligned                                 uint64
+	NativeDivergent                               uint64
+	NativeDetachFailed                            uint64
+}
+
+type VisionBridgeProbeState string
+
+const (
+	VisionBridgeProbeStateInactive  VisionBridgeProbeState = "inactive"
+	VisionBridgeProbeStateActive    VisionBridgeProbeState = "active"
+	VisionBridgeProbeStateCompleted VisionBridgeProbeState = "completed"
+)
+
+type VisionBridgeProbeVerdict string
+
+const (
+	VisionBridgeProbeVerdictNone                                   VisionBridgeProbeVerdict = "none"
+	VisionBridgeProbeVerdictNoSignal                               VisionBridgeProbeVerdict = "no_signal"
+	VisionBridgeProbeVerdictGoBaseline                             VisionBridgeProbeVerdict = "go_baseline"
+	VisionBridgeProbeVerdictNativeAligned                          VisionBridgeProbeVerdict = "native_aligned"
+	VisionBridgeProbeVerdictNativePendingBenign                    VisionBridgeProbeVerdict = "native_pending_benign"
+	VisionBridgeProbeVerdictNativePendingFailure                   VisionBridgeProbeVerdict = "native_pending_failure"
+	VisionBridgeProbeVerdictNativeProvisionalFailedPending         VisionBridgeProbeVerdict = "native_provisional_failed_pending"
+	VisionBridgeProbeVerdictNativeProvisionalCommand0Bidirectional VisionBridgeProbeVerdict = "native_provisional_command0_bidirectional_failure"
+	VisionBridgeProbeVerdictNativePendingCommand0                  VisionBridgeProbeVerdict = "native_pending_command0_failure"
+	VisionBridgeProbeVerdictNativePendingCommand0Bidirectional     VisionBridgeProbeVerdict = "native_pending_command0_bidirectional_failure"
+	VisionBridgeProbeVerdictNativeDivergent                        VisionBridgeProbeVerdict = "native_divergent"
+	VisionBridgeProbeVerdictNativeDetachFailed                     VisionBridgeProbeVerdict = "native_detach_failed"
+)
+
+type VisionBridgeProbeSnapshot struct {
+	ScopeKey  string
+	State     VisionBridgeProbeState
+	Verdict   VisionBridgeProbeVerdict
+	Budget    uint64
+	Observed  uint64
+	StartedAt time.Time
+	Deadline  time.Time
+	Remaining time.Duration
+	Stats     VisionBridgeAssessmentStats
 }
 
 func newVisionTransitionSummary() *VisionTransitionSummary {
 	return &VisionTransitionSummary{
+		ScopeKey: normalizeVisionBridgeAssessmentScope(""),
 		Uplink: VisionTransitionDirectionSummary{
 			Semantic: VisionSemanticUnknown,
 		},
 		Downlink: VisionTransitionDirectionSummary{
 			Semantic: VisionSemanticUnknown,
 		},
-		DrainMode:               VisionDrainModeNone,
-		TransportDrainMode:      VisionDrainModeNone,
-		TransportLifecycleState: VisionTransportLifecycleUnknown,
-		TransportDetachStatus:   VisionTransportDetachStatusNone,
-		TransportKTLSPromotion:  VisionTransportKTLSPromotionNone,
+		NativeProvisionalSemantic:       VisionNativeProvisionalSemanticNone,
+		NativeProvisionalSource:         VisionNativeProvisionalSemanticSourceNone,
+		NativeProvisionalObserved:       VisionNativeProvisionalSemanticNone,
+		NativeProvisionalObservedSource: VisionNativeProvisionalSemanticSourceNone,
+		NativeProvisionalOutcome:        VisionNativeProvisionalOutcomeNone,
+		NativeProvisionalOutcomeSource:  VisionNativeProvisionalOutcomeSourceNone,
+		DrainMode:                       VisionDrainModeNone,
+		TransportDrainMode:              VisionDrainModeNone,
+		DrainRelation:                   VisionDrainRelationNone,
+		BridgeAssessment:                VisionBridgeAssessmentNone,
+		PendingQuality:                  VisionPendingQualityNone,
+		PendingClass:                    VisionPendingClassNone,
+		PendingGap:                      VisionPendingGapNone,
+		TransportProgress:               VisionTransportProgressNone,
+		TransportLifecycleState:         VisionTransportLifecycleUnknown,
+		TransportDetachStatus:           VisionTransportDetachStatusNone,
+		TransportKTLSPromotion:          VisionTransportKTLSPromotionNone,
 	}
 }
 
 func init() {
 	tls.SetDeferredRustDrainObserver(observeVisionTransportDeferredDrain)
 	tls.SetDeferredRustLifecycleObserver(observeVisionTransportLifecycleEvent)
+	tls.SetDeferredRustProgressObserver(observeVisionTransportProgressEvent)
 }
 
 func NewVisionTransitionSource(conn gonet.Conn, input *bytes.Reader, rawInput *bytes.Buffer) *VisionTransitionSource {
@@ -211,15 +451,23 @@ func (s *VisionTransitionSource) Kind() VisionTransitionKind {
 
 func (s *VisionTransitionSource) Snapshot() VisionTransitionSnapshot {
 	snap := VisionTransitionSnapshot{
-		Kind:                    s.Kind(),
-		IngressOrigin:           VisionIngressOriginUnknown,
-		UplinkSemantic:          VisionSemanticUnknown,
-		DownlinkSemantic:        VisionSemanticUnknown,
-		DrainMode:               VisionDrainModeNone,
-		TransportDrainMode:      VisionDrainModeNone,
-		TransportLifecycleState: VisionTransportLifecycleUnknown,
-		TransportDetachStatus:   VisionTransportDetachStatusNone,
-		TransportKTLSPromotion:  VisionTransportKTLSPromotionNone,
+		Kind:                            s.Kind(),
+		IngressOrigin:                   VisionIngressOriginUnknown,
+		UplinkSemantic:                  VisionSemanticUnknown,
+		DownlinkSemantic:                VisionSemanticUnknown,
+		NativeProvisionalSource:         VisionNativeProvisionalSemanticSourceNone,
+		NativeProvisionalObservedSource: VisionNativeProvisionalSemanticSourceNone,
+		NativeProvisionalOutcome:        VisionNativeProvisionalOutcomeNone,
+		NativeProvisionalOutcomeSource:  VisionNativeProvisionalOutcomeSourceNone,
+		DrainMode:                       VisionDrainModeNone,
+		TransportDrainMode:              VisionDrainModeNone,
+		DrainRelation:                   VisionDrainRelationNone,
+		BridgeAssessment:                VisionBridgeAssessmentNone,
+		PendingClass:                    VisionPendingClassNone,
+		PendingGap:                      VisionPendingGapNone,
+		TransportLifecycleState:         VisionTransportLifecycleUnknown,
+		TransportDetachStatus:           VisionTransportDetachStatusNone,
+		TransportKTLSPromotion:          VisionTransportKTLSPromotionNone,
 	}
 	if s == nil {
 		return snap
@@ -238,8 +486,15 @@ func (s *VisionTransitionSource) Snapshot() VisionTransitionSnapshot {
 		snap.BufferedRawAhead = s.rawInput.Len()
 	}
 	if summary, ok := SnapshotVisionTransitionSummary(s.conn, nil); ok {
+		snap.ScopeKey = summary.ScopeKey
 		snap.UplinkSemantic = summary.Uplink.Semantic
 		snap.DownlinkSemantic = summary.Downlink.Semantic
+		snap.NativeProvisionalSemantic = summary.NativeProvisionalSemantic
+		snap.NativeProvisionalSource = summary.NativeProvisionalSource
+		snap.NativeProvisionalObserved = summary.NativeProvisionalObserved
+		snap.NativeProvisionalObservedSource = summary.NativeProvisionalObservedSource
+		snap.NativeProvisionalOutcome = summary.NativeProvisionalOutcome
+		snap.NativeProvisionalOutcomeSource = summary.NativeProvisionalOutcomeSource
 		snap.DrainMode = summary.DrainMode
 		snap.DrainCount = summary.DrainCount
 		snap.DrainPlaintext = summary.DrainPlaintextBytes
@@ -248,6 +503,16 @@ func (s *VisionTransitionSource) Snapshot() VisionTransitionSnapshot {
 		snap.TransportDrainCount = summary.TransportDrainCount
 		snap.TransportDrainPlaintext = summary.TransportDrainPlaintextLen
 		snap.TransportDrainRawAhead = summary.TransportDrainRawAheadLen
+		snap.DrainRelation = summary.DrainRelation
+		snap.BridgeAssessment = summary.BridgeAssessment
+		snap.PendingQuality = summary.PendingQuality
+		snap.PendingClass = summary.PendingClass
+		snap.PendingGap = summary.PendingGap
+		snap.TransportReadOps = summary.TransportReadOps
+		snap.TransportReadBytes = summary.TransportReadBytes
+		snap.TransportWriteOps = summary.TransportWriteOps
+		snap.TransportWriteBytes = summary.TransportWriteBytes
+		snap.TransportProgress = summary.TransportProgress
 		snap.TransportLifecycleState = summary.TransportLifecycleState
 		snap.TransportDetachStatus = summary.TransportDetachStatus
 		snap.TransportKTLSPromotion = summary.TransportKTLSPromotion
@@ -293,6 +558,7 @@ func LogVisionTransitionSource(ctx context.Context, direction string, source *Vi
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
 		" ingress_origin=", snap.IngressOrigin,
+		" bridge_scope=", snap.ScopeKey,
 		" public_conn_type=", snap.PublicConnType,
 		" uses_deferred_rust=", snap.UsesDeferredRust,
 		" has_buffered_state=", snap.HasBufferedState,
@@ -323,6 +589,7 @@ func TraceVisionTransitionDrain(ctx context.Context, direction string, source *V
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
 		" ingress_origin=", snap.IngressOrigin,
+		" bridge_scope=", snap.ScopeKey,
 		" uses_deferred_rust=", snap.UsesDeferredRust,
 		" plaintext_len=", plaintextLen,
 		" raw_ahead_len=", rawAheadLen,
@@ -342,6 +609,7 @@ func LogVisionTransitionEvent(ctx context.Context, direction string, source *Vis
 		"direction=", direction,
 		" transition_kind=", snap.Kind,
 		" ingress_origin=", snap.IngressOrigin,
+		" bridge_scope=", snap.ScopeKey,
 		" event=", event,
 		" command=", command,
 		" continue_count=", continueCount,
@@ -352,17 +620,29 @@ func LogVisionTransitionEvent(ctx context.Context, direction string, source *Vis
 	)
 }
 
-func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, secondaryConn gonet.Conn) {
+func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, secondaryConn gonet.Conn, snap *pipeline.DecisionSnapshot) {
 	summary, ok := consumeVisionTransitionSummary(primaryConn, secondaryConn)
 	if !ok {
 		return
 	}
+	finalizeVisionTransitionSummary(&summary, snap)
+	observeVisionBridgeAssessment(
+		summary.ScopeKey,
+		summary.BridgeAssessment,
+		summary.PendingQuality,
+		summary.PendingClass,
+		summary.PendingGap,
+		summary.NativeProvisionalObserved,
+		summary.NativeProvisionalObservedSource,
+		summary.NativeProvisionalOutcome,
+	)
 	if !debugVisionTransitionTrace() {
 		return
 	}
 	errors.LogInfo(ctx, "proxy markers[kind=vision-transition-summary]: ",
 		" transition_kind=", summary.Kind,
 		" ingress_origin=", summary.IngressOrigin,
+		" bridge_scope=", summary.ScopeKey,
 		" uplink_command0_count=", summary.Uplink.Command0Count,
 		" uplink_command1_count=", summary.Uplink.Command1Count,
 		" uplink_command2_count=", summary.Uplink.Command2Count,
@@ -373,6 +653,12 @@ func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, sec
 		" downlink_command2_count=", summary.Downlink.Command2Count,
 		" downlink_payload_bypass=", summary.Downlink.PayloadBypass,
 		" downlink_semantic=", summary.Downlink.Semantic,
+		" native_provisional_semantic=", summary.NativeProvisionalSemantic,
+		" native_provisional_source=", summary.NativeProvisionalSource,
+		" native_provisional_observed=", summary.NativeProvisionalObserved,
+		" native_provisional_observed_source=", summary.NativeProvisionalObservedSource,
+		" native_provisional_outcome=", summary.NativeProvisionalOutcome,
+		" native_provisional_outcome_source=", summary.NativeProvisionalOutcomeSource,
 		" drain_mode=", summary.DrainMode,
 		" drain_count=", summary.DrainCount,
 		" drain_plaintext_bytes=", summary.DrainPlaintextBytes,
@@ -381,6 +667,16 @@ func LogVisionTransitionSummary(ctx context.Context, primaryConn gonet.Conn, sec
 		" transport_drain_count=", summary.TransportDrainCount,
 		" transport_drain_plaintext_bytes=", summary.TransportDrainPlaintextLen,
 		" transport_drain_raw_ahead_bytes=", summary.TransportDrainRawAheadLen,
+		" drain_relation=", summary.DrainRelation,
+		" bridge_assessment=", summary.BridgeAssessment,
+		" pending_quality=", summary.PendingQuality,
+		" pending_class=", summary.PendingClass,
+		" pending_gap=", summary.PendingGap,
+		" transport_read_ops=", summary.TransportReadOps,
+		" transport_read_bytes=", summary.TransportReadBytes,
+		" transport_write_ops=", summary.TransportWriteOps,
+		" transport_write_bytes=", summary.TransportWriteBytes,
+		" transport_progress=", summary.TransportProgress,
 		" transport_lifecycle_state=", summary.TransportLifecycleState,
 		" transport_detach_status=", summary.TransportDetachStatus,
 		" transport_ktls_promotion=", summary.TransportKTLSPromotion,
@@ -403,6 +699,19 @@ func ObserveVisionTransitionSource(conn gonet.Conn, kind VisionTransitionKind, o
 		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
 		summary.IngressOrigin = origin
 	}
+	refreshVisionRuntimeDerivedFields(summary)
+}
+
+func ObserveVisionTransitionScope(conn gonet.Conn, scope string) {
+	summary := ensureVisionTransitionSummary(conn)
+	if summary == nil {
+		return
+	}
+	scope = normalizeVisionBridgeAssessmentScope(scope)
+	if summary.ScopeKey == "" || summary.ScopeKey == visionBridgeAssessmentUnscopedKey {
+		summary.ScopeKey = scope
+	}
+	refreshVisionRuntimeDerivedFields(summary)
 }
 
 // ObserveVisionTransitionEvent records semantic progression for a seam producer
@@ -439,6 +748,66 @@ func ObserveVisionTransitionEvent(conn gonet.Conn, kind VisionTransitionKind, or
 			trace.Semantic = mergeVisionSemantic(trace.Semantic, VisionSemanticExplicitDirect)
 		}
 	}
+	refreshVisionRuntimeDerivedFields(summary)
+}
+
+// ObserveVisionNativeProvisionalSemantic records a native-owned provisional seam
+// semantic directly. Producers may also clear the current provisional semantic
+// by publishing VisionNativeProvisionalSemanticNone when later transport/protocol
+// facts supersede the provisional state.
+func ObserveVisionNativeProvisionalSemantic(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin, semantic VisionNativeProvisionalSemantic) {
+	summary := ensureVisionTransitionSummary(conn)
+	if summary == nil {
+		return
+	}
+	if kind != "" && (summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque) {
+		summary.Kind = kind
+	}
+	if origin != "" && origin != VisionIngressOriginUnknown &&
+		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
+		summary.IngressOrigin = origin
+	}
+	if semantic == "" {
+		semantic = VisionNativeProvisionalSemanticNone
+	}
+	if semantic == VisionNativeProvisionalSemanticNone {
+		summary.NativeProvisionalSemantic = VisionNativeProvisionalSemanticNone
+		summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceNone
+		refreshVisionRuntimeDerivedFields(summary)
+		return
+	}
+	summary.NativeProvisionalSemantic = semantic
+	summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceExplicitProducer
+	refreshVisionRuntimeDerivedFields(summary)
+}
+
+// ObserveVisionNativeProvisionalOutcome records a native-owned provisional seam
+// outcome directly. Producers may also clear the current provisional outcome by
+// publishing VisionNativeProvisionalOutcomeNone when later facts supersede it.
+func ObserveVisionNativeProvisionalOutcome(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin, outcome VisionNativeProvisionalOutcome) {
+	summary := ensureVisionTransitionSummary(conn)
+	if summary == nil {
+		return
+	}
+	if kind != "" && (summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque) {
+		summary.Kind = kind
+	}
+	if origin != "" && origin != VisionIngressOriginUnknown &&
+		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
+		summary.IngressOrigin = origin
+	}
+	if outcome == "" {
+		outcome = VisionNativeProvisionalOutcomeNone
+	}
+	if outcome == VisionNativeProvisionalOutcomeNone {
+		summary.NativeProvisionalOutcome = VisionNativeProvisionalOutcomeNone
+		summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceNone
+		refreshVisionRuntimeDerivedFields(summary)
+		return
+	}
+	summary.NativeProvisionalOutcome = outcome
+	summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceExplicitProducer
+	refreshVisionRuntimeDerivedFields(summary)
 }
 
 // ObserveVisionTransitionDrain records buffered/drained data returned at the
@@ -464,6 +833,7 @@ func ObserveVisionTransitionDrain(conn gonet.Conn, kind VisionTransitionKind, or
 	summary.DrainCount++
 	summary.DrainPlaintextBytes += plaintextLen
 	summary.DrainRawAheadBytes += rawAheadLen
+	refreshVisionRuntimeDerivedFields(summary)
 }
 
 // ObserveVisionTransportDrain records transport-layer deferred detach/drain
@@ -488,6 +858,8 @@ func ObserveVisionTransportDrain(conn gonet.Conn, kind VisionTransitionKind, ori
 	summary.TransportDrainCount++
 	summary.TransportDrainPlaintextLen += plaintextLen
 	summary.TransportDrainRawAheadLen += rawAheadLen
+	syncVisionNativeProvisionalProducer(summary)
+	refreshVisionRuntimeDerivedFields(summary)
 }
 
 func ObserveVisionTransportLifecycle(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin, event tls.DeferredRustLifecycleEvent) {
@@ -520,6 +892,32 @@ func ObserveVisionTransportLifecycle(conn gonet.Conn, kind VisionTransitionKind,
 	case tls.DeferredRustLifecycleKTLSFailed:
 		summary.TransportKTLSPromotion = mergeVisionTransportKTLSPromotion(summary.TransportKTLSPromotion, VisionTransportKTLSPromotionFailed)
 	}
+	syncVisionNativeProvisionalProducer(summary)
+	refreshVisionRuntimeDerivedFields(summary)
+}
+
+func ObserveVisionTransportProgress(conn gonet.Conn, kind VisionTransitionKind, origin VisionIngressOrigin, event tls.DeferredRustProgressEvent) {
+	summary := ensureVisionTransitionSummary(conn)
+	if summary == nil {
+		return
+	}
+	if kind != "" && (summary.Kind == "" || summary.Kind == VisionTransitionKindOpaque) {
+		summary.Kind = kind
+	}
+	if origin != "" && origin != VisionIngressOriginUnknown &&
+		(summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown) {
+		summary.IngressOrigin = origin
+	}
+	switch event.Direction {
+	case tls.DeferredRustProgressRead:
+		summary.TransportReadOps++
+		summary.TransportReadBytes += event.Bytes
+	case tls.DeferredRustProgressWrite:
+		summary.TransportWriteOps++
+		summary.TransportWriteBytes += event.Bytes
+	}
+	syncVisionNativeProvisionalProducer(summary)
+	refreshVisionRuntimeDerivedFields(summary)
 }
 
 func observeVisionTransportDeferredDrain(conn gonet.Conn, plaintextLen int, rawAheadLen int) {
@@ -548,6 +946,20 @@ func observeVisionTransportLifecycleEvent(conn gonet.Conn, event tls.DeferredRus
 		}
 	}
 	ObserveVisionTransportLifecycle(conn, kind, origin, event)
+}
+
+func observeVisionTransportProgressEvent(conn gonet.Conn, event tls.DeferredRustProgressEvent) {
+	kind := VisionTransitionKindDeferredRust
+	origin := VisionIngressOriginUnknown
+	if summary, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
+		if summary.Kind != "" {
+			kind = summary.Kind
+		}
+		if summary.IngressOrigin != "" {
+			origin = summary.IngressOrigin
+		}
+	}
+	ObserveVisionTransportProgress(conn, kind, origin, event)
 }
 
 // BuildVisionTransitionSource preserves the existing Vision buffer extraction
@@ -605,7 +1017,51 @@ func SnapshotVisionTransitionSummary(primaryConn gonet.Conn, secondaryConn gonet
 			found = true
 		}
 	}
+	if found {
+		refreshVisionRuntimeDerivedFields(&merged)
+	}
 	return merged, found
+}
+
+func SnapshotVisionBridgeAssessmentStats() VisionBridgeAssessmentStats {
+	now := visionBridgeAssessmentNowFn()
+	var total VisionBridgeAssessmentStats
+	visionBridgeAssessmentStatsByScope.Range(func(_, value any) bool {
+		window, _ := value.(*visionBridgeAssessmentWindow)
+		if window == nil {
+			return true
+		}
+		total = addVisionBridgeAssessmentStats(total, window.snapshot(now))
+		return true
+	})
+	return total
+}
+
+func SnapshotVisionBridgeAssessmentStatsForScope(scope string) VisionBridgeAssessmentStats {
+	window := loadVisionBridgeAssessmentWindow(normalizeVisionBridgeAssessmentScope(scope))
+	if window == nil {
+		return VisionBridgeAssessmentStats{}
+	}
+	return window.snapshot(visionBridgeAssessmentNowFn())
+}
+
+func EnsureVisionBridgeProbeEpoch(scope string, budget uint64, duration time.Duration) VisionBridgeProbeSnapshot {
+	scope = normalizeVisionBridgeAssessmentScope(scope)
+	now := visionBridgeProbeNowFn()
+	epoch := ensureVisionBridgeProbeEpoch(scope)
+	if epoch == nil {
+		return VisionBridgeProbeSnapshot{ScopeKey: scope, State: VisionBridgeProbeStateInactive, Verdict: VisionBridgeProbeVerdictNone}
+	}
+	return epoch.ensure(now, budget, duration)
+}
+
+func SnapshotVisionBridgeProbeEpochForScope(scope string) VisionBridgeProbeSnapshot {
+	scope = normalizeVisionBridgeAssessmentScope(scope)
+	epoch := loadVisionBridgeProbeEpoch(scope)
+	if epoch == nil {
+		return VisionBridgeProbeSnapshot{ScopeKey: scope, State: VisionBridgeProbeStateInactive, Verdict: VisionBridgeProbeVerdictNone}
+	}
+	return epoch.snapshot(visionBridgeProbeNowFn())
 }
 
 func consumeVisionTransitionSummary(primaryConn gonet.Conn, secondaryConn gonet.Conn) (VisionTransitionSummary, bool) {
@@ -621,7 +1077,199 @@ func consumeVisionTransitionSummary(primaryConn gonet.Conn, secondaryConn gonet.
 			found = true
 		}
 	}
+	if found {
+		refreshVisionRuntimeDerivedFields(&merged)
+	}
 	return merged, found
+}
+
+func refreshVisionRuntimeDerivedFields(summary *VisionTransitionSummary) {
+	refreshVisionDerivedFields(summary, VisionPendingQualityNone, false)
+}
+
+func finalizeVisionTransitionSummary(summary *VisionTransitionSummary, snap *pipeline.DecisionSnapshot) {
+	refreshVisionDerivedFields(summary, deriveVisionPendingQuality(*summary, snap), true)
+}
+
+func refreshVisionDerivedFields(summary *VisionTransitionSummary, pendingQuality VisionPendingQuality, final bool) {
+	if summary == nil {
+		return
+	}
+	summary.PendingQuality = pendingQuality
+	summary.DrainRelation = deriveVisionDrainRelation(*summary)
+	summary.TransportProgress = deriveVisionTransportProgress(*summary)
+	summary.BridgeAssessment = deriveVisionBridgeAssessment(*summary)
+	summary.PendingClass = deriveVisionPendingClass(*summary)
+	summary.PendingGap = deriveVisionPendingGap(*summary)
+	derivedSemantic := deriveVisionNativeProvisionalSemantic(*summary)
+	if !isVisionNativeProvisionalProducerSource(summary.NativeProvisionalSource) {
+		summary.NativeProvisionalSemantic = derivedSemantic
+		if derivedSemantic == VisionNativeProvisionalSemanticNone {
+			summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceNone
+		} else {
+			summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceDerived
+		}
+	}
+	latchVisionNativeProvisionalObservation(summary)
+	reconcileVisionNativeProvisionalOutcome(summary, final)
+	if shouldDeriveVisionNativeProvisionalOutcome(summary, final) {
+		summary.NativeProvisionalOutcome = deriveVisionNativeProvisionalOutcome(*summary)
+		if summary.NativeProvisionalOutcome == VisionNativeProvisionalOutcomeNone {
+			summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceNone
+		} else {
+			summary.NativeProvisionalOutcomeSource = visionDerivedNativeProvisionalOutcomeSource(*summary, final)
+		}
+	}
+	applyVisionProvisionalOutcomeToPending(summary)
+}
+
+func shouldDeriveVisionNativeProvisionalOutcome(summary *VisionTransitionSummary, final bool) bool {
+	if summary == nil {
+		return false
+	}
+	if !isVisionNativeProvisionalOutcomeProducerSource(summary.NativeProvisionalOutcomeSource) {
+		return true
+	}
+	if !final || summary.NativeProvisionalOutcome != VisionNativeProvisionalOutcomeActive {
+		return false
+	}
+	switch deriveVisionNativeProvisionalOutcome(*summary) {
+	case VisionNativeProvisionalOutcomeBenignClose, VisionNativeProvisionalOutcomeFailedPending:
+		return true
+	default:
+		return false
+	}
+}
+
+func visionDerivedNativeProvisionalOutcomeSource(summary VisionTransitionSummary, final bool) VisionNativeProvisionalOutcomeSource {
+	if final && isVisionNativeProvisionalOutcomeProducerSource(summary.NativeProvisionalOutcomeSource) {
+		return VisionNativeProvisionalOutcomeSourceBridgeProducer
+	}
+	return VisionNativeProvisionalOutcomeSourceDerived
+}
+
+func reconcileVisionNativeProvisionalSemantic(summary *VisionTransitionSummary) {
+	if summary == nil {
+		return
+	}
+	if summary.IngressOrigin != VisionIngressOriginNativeRealityDeferred {
+		if summary.NativeProvisionalSource == VisionNativeProvisionalSemanticSourceBridgeProducer {
+			summary.NativeProvisionalSemantic = VisionNativeProvisionalSemanticNone
+			summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceNone
+		}
+		return
+	}
+	if shouldPromoteVisionNativeProvisionalSemantic(*summary) {
+		if summary.NativeProvisionalSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+			summary.NativeProvisionalSemantic = VisionNativeProvisionalSemanticCommand0Bidirectional
+			summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceBridgeProducer
+		}
+		return
+	}
+	if summary.NativeProvisionalSource == VisionNativeProvisionalSemanticSourceBridgeProducer {
+		summary.NativeProvisionalSemantic = VisionNativeProvisionalSemanticNone
+		summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceNone
+	}
+}
+
+func reconcileVisionNativeProvisionalOutcome(summary *VisionTransitionSummary, final bool) {
+	if summary == nil {
+		return
+	}
+	if !isVisionNativeProvisionalProducerSource(summary.NativeProvisionalObservedSource) {
+		if summary.NativeProvisionalOutcomeSource == VisionNativeProvisionalOutcomeSourceBridgeProducer {
+			summary.NativeProvisionalOutcome = VisionNativeProvisionalOutcomeNone
+			summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceNone
+		}
+		return
+	}
+	if summary.NativeProvisionalOutcomeSource == VisionNativeProvisionalOutcomeSourceExplicitProducer {
+		desired := deriveVisionNativeExplicitProducerOutcome(*summary, summary.NativeProvisionalSemantic)
+		switch desired {
+		case VisionNativeProvisionalOutcomeResolvedDirect, VisionNativeProvisionalOutcomeResolvedNoDetach:
+			summary.NativeProvisionalOutcome = desired
+			if summary.NativeProvisionalSource == VisionNativeProvisionalSemanticSourceExplicitProducer {
+				summary.NativeProvisionalSemantic = VisionNativeProvisionalSemanticNone
+				summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceNone
+			}
+			return
+		}
+		if final && summary.NativeProvisionalOutcome == VisionNativeProvisionalOutcomeActive {
+			switch deriveVisionNativeProvisionalOutcome(*summary) {
+			case VisionNativeProvisionalOutcomeBenignClose, VisionNativeProvisionalOutcomeFailedPending:
+				summary.NativeProvisionalOutcome = deriveVisionNativeProvisionalOutcome(*summary)
+			}
+		}
+		return
+	}
+	desired := deriveVisionNativeProvisionalOutcome(*summary)
+	if desired == VisionNativeProvisionalOutcomeNone {
+		if summary.NativeProvisionalOutcomeSource == VisionNativeProvisionalOutcomeSourceBridgeProducer {
+			summary.NativeProvisionalOutcome = VisionNativeProvisionalOutcomeNone
+			summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceNone
+		}
+		return
+	}
+	summary.NativeProvisionalOutcome = desired
+	summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceBridgeProducer
+}
+
+func syncVisionNativeProvisionalProducer(summary *VisionTransitionSummary) {
+	if summary == nil {
+		return
+	}
+	desiredSemantic := deriveVisionNativeProvisionalSemantic(*summary)
+	if summary.IngressOrigin != VisionIngressOriginNativeRealityDeferred {
+		if summary.NativeProvisionalSource == VisionNativeProvisionalSemanticSourceExplicitProducer {
+			summary.NativeProvisionalSemantic = VisionNativeProvisionalSemanticNone
+			summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceNone
+		}
+		if summary.NativeProvisionalOutcomeSource == VisionNativeProvisionalOutcomeSourceExplicitProducer {
+			summary.NativeProvisionalOutcome = VisionNativeProvisionalOutcomeNone
+			summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceNone
+		}
+		return
+	}
+	if desiredSemantic == VisionNativeProvisionalSemanticNone {
+		if summary.NativeProvisionalSource == VisionNativeProvisionalSemanticSourceExplicitProducer {
+			summary.NativeProvisionalSemantic = VisionNativeProvisionalSemanticNone
+			summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceNone
+		}
+	} else {
+		summary.NativeProvisionalSemantic = desiredSemantic
+		summary.NativeProvisionalSource = VisionNativeProvisionalSemanticSourceExplicitProducer
+	}
+
+	desiredOutcome := deriveVisionNativeExplicitProducerOutcome(*summary, desiredSemantic)
+	if desiredOutcome == VisionNativeProvisionalOutcomeNone {
+		if summary.NativeProvisionalOutcomeSource == VisionNativeProvisionalOutcomeSourceExplicitProducer {
+			summary.NativeProvisionalOutcome = VisionNativeProvisionalOutcomeNone
+			summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceNone
+		}
+		return
+	}
+	summary.NativeProvisionalOutcome = desiredOutcome
+	summary.NativeProvisionalOutcomeSource = VisionNativeProvisionalOutcomeSourceExplicitProducer
+}
+
+func deriveVisionNativeExplicitProducerOutcome(summary VisionTransitionSummary, desiredSemantic VisionNativeProvisionalSemantic) VisionNativeProvisionalOutcome {
+	if summary.IngressOrigin != VisionIngressOriginNativeRealityDeferred {
+		return VisionNativeProvisionalOutcomeNone
+	}
+	if summary.Uplink.Semantic == VisionSemanticExplicitDirect ||
+		summary.Downlink.Semantic == VisionSemanticExplicitDirect ||
+		summary.DrainCount > 0 ||
+		summary.DrainMode != VisionDrainModeNone {
+		return VisionNativeProvisionalOutcomeResolvedDirect
+	}
+	if summary.Uplink.Semantic == VisionSemanticExplicitNoDetach ||
+		summary.Downlink.Semantic == VisionSemanticExplicitNoDetach {
+		return VisionNativeProvisionalOutcomeResolvedNoDetach
+	}
+	if desiredSemantic != VisionNativeProvisionalSemanticNone {
+		return VisionNativeProvisionalOutcomeActive
+	}
+	return VisionNativeProvisionalOutcomeNone
 }
 
 func snapshotVisionTransitionSummaryForConn(conn gonet.Conn, depth int) (VisionTransitionSummary, bool) {
@@ -653,6 +1301,9 @@ func mergeVisionTransitionSummaries(dst VisionTransitionSummary, src VisionTrans
 	if dst.IngressOrigin == "" || dst.IngressOrigin == VisionIngressOriginUnknown {
 		dst.IngressOrigin = src.IngressOrigin
 	}
+	if dst.ScopeKey == "" || dst.ScopeKey == visionBridgeAssessmentUnscopedKey {
+		dst.ScopeKey = src.ScopeKey
+	}
 	dst.Uplink.Command0Count += src.Uplink.Command0Count
 	dst.Uplink.Command1Count += src.Uplink.Command1Count
 	dst.Uplink.Command2Count += src.Uplink.Command2Count
@@ -663,6 +1314,12 @@ func mergeVisionTransitionSummaries(dst VisionTransitionSummary, src VisionTrans
 	dst.Downlink.Command2Count += src.Downlink.Command2Count
 	dst.Downlink.PayloadBypass = dst.Downlink.PayloadBypass || src.Downlink.PayloadBypass
 	dst.Downlink.Semantic = mergeVisionSemantic(dst.Downlink.Semantic, src.Downlink.Semantic)
+	dst.NativeProvisionalSemantic = mergeVisionNativeProvisionalSemantic(dst.NativeProvisionalSemantic, src.NativeProvisionalSemantic)
+	dst.NativeProvisionalSource = mergeVisionNativeProvisionalSemanticSource(dst.NativeProvisionalSource, src.NativeProvisionalSource)
+	dst.NativeProvisionalObserved = mergeVisionNativeProvisionalSemantic(dst.NativeProvisionalObserved, src.NativeProvisionalObserved)
+	dst.NativeProvisionalObservedSource = mergeVisionNativeProvisionalSemanticSource(dst.NativeProvisionalObservedSource, src.NativeProvisionalObservedSource)
+	dst.NativeProvisionalOutcome = mergeVisionNativeProvisionalOutcome(dst.NativeProvisionalOutcome, src.NativeProvisionalOutcome)
+	dst.NativeProvisionalOutcomeSource = mergeVisionNativeProvisionalOutcomeSource(dst.NativeProvisionalOutcomeSource, src.NativeProvisionalOutcomeSource)
 	dst.DrainMode = mergeVisionDrainMode(dst.DrainMode, src.DrainMode)
 	dst.DrainCount += src.DrainCount
 	dst.DrainPlaintextBytes += src.DrainPlaintextBytes
@@ -671,6 +1328,16 @@ func mergeVisionTransitionSummaries(dst VisionTransitionSummary, src VisionTrans
 	dst.TransportDrainCount += src.TransportDrainCount
 	dst.TransportDrainPlaintextLen += src.TransportDrainPlaintextLen
 	dst.TransportDrainRawAheadLen += src.TransportDrainRawAheadLen
+	dst.DrainRelation = mergeVisionDrainRelation(dst.DrainRelation, src.DrainRelation)
+	dst.BridgeAssessment = mergeVisionBridgeAssessment(dst.BridgeAssessment, src.BridgeAssessment)
+	dst.PendingQuality = mergeVisionPendingQuality(dst.PendingQuality, src.PendingQuality)
+	dst.PendingClass = mergeVisionPendingClass(dst.PendingClass, src.PendingClass)
+	dst.PendingGap = mergeVisionPendingGap(dst.PendingGap, src.PendingGap)
+	dst.TransportReadOps += src.TransportReadOps
+	dst.TransportReadBytes += src.TransportReadBytes
+	dst.TransportWriteOps += src.TransportWriteOps
+	dst.TransportWriteBytes += src.TransportWriteBytes
+	dst.TransportProgress = mergeVisionTransportProgress(dst.TransportProgress, src.TransportProgress)
 	dst.TransportLifecycleState = mergeVisionTransportLifecycleState(dst.TransportLifecycleState, src.TransportLifecycleState)
 	dst.TransportDetachStatus = mergeVisionTransportDetachStatus(dst.TransportDetachStatus, src.TransportDetachStatus)
 	dst.TransportKTLSPromotion = mergeVisionTransportKTLSPromotion(dst.TransportKTLSPromotion, src.TransportKTLSPromotion)
@@ -769,6 +1436,959 @@ func mergeVisionTransportKTLSPromotion(dst VisionTransportKTLSPromotion, src Vis
 	default:
 		return VisionTransportKTLSPromotionMixed
 	}
+}
+
+func mergeVisionDrainRelation(dst VisionDrainRelation, src VisionDrainRelation) VisionDrainRelation {
+	switch {
+	case src == "" || src == VisionDrainRelationNone:
+		if dst == "" {
+			return VisionDrainRelationNone
+		}
+		return dst
+	case dst == "" || dst == VisionDrainRelationNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		return VisionDrainRelationMismatch
+	}
+}
+
+func deriveVisionDrainRelation(summary VisionTransitionSummary) VisionDrainRelation {
+	accepted := summary.DrainCount > 0
+	transport := summary.TransportDrainCount > 0
+	switch {
+	case !accepted && !transport:
+		return VisionDrainRelationNone
+	case accepted && !transport:
+		return VisionDrainRelationAcceptedOnly
+	case !accepted && transport:
+		return VisionDrainRelationTransportOnly
+	case summary.DrainMode == summary.TransportDrainMode &&
+		summary.DrainCount == summary.TransportDrainCount &&
+		summary.DrainPlaintextBytes == summary.TransportDrainPlaintextLen &&
+		summary.DrainRawAheadBytes == summary.TransportDrainRawAheadLen:
+		return VisionDrainRelationAligned
+	default:
+		return VisionDrainRelationMismatch
+	}
+}
+
+func mergeVisionBridgeAssessment(dst VisionBridgeAssessment, src VisionBridgeAssessment) VisionBridgeAssessment {
+	switch {
+	case src == "" || src == VisionBridgeAssessmentNone:
+		if dst == "" {
+			return VisionBridgeAssessmentNone
+		}
+		return dst
+	case dst == "" || dst == VisionBridgeAssessmentNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		if visionBridgeAssessmentRank(src) > visionBridgeAssessmentRank(dst) {
+			return src
+		}
+		return dst
+	}
+}
+
+func mergeVisionPendingQuality(dst VisionPendingQuality, src VisionPendingQuality) VisionPendingQuality {
+	switch {
+	case src == "" || src == VisionPendingQualityNone:
+		if dst == "" {
+			return VisionPendingQualityNone
+		}
+		return dst
+	case dst == "" || dst == VisionPendingQualityNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		if visionPendingQualityRank(src) > visionPendingQualityRank(dst) {
+			return src
+		}
+		return dst
+	}
+}
+
+func visionBridgeAssessmentRank(assessment VisionBridgeAssessment) int {
+	switch assessment {
+	case VisionBridgeAssessmentNativeDetachFailed:
+		return 5
+	case VisionBridgeAssessmentNativeDivergent:
+		return 4
+	case VisionBridgeAssessmentNativeAligned:
+		return 3
+	case VisionBridgeAssessmentNativePending:
+		return 2
+	case VisionBridgeAssessmentGoBaseline:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func visionPendingQualityRank(quality VisionPendingQuality) int {
+	switch quality {
+	case VisionPendingQualityFailure:
+		return 2
+	case VisionPendingQualityBenign:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func mergeVisionPendingClass(dst VisionPendingClass, src VisionPendingClass) VisionPendingClass {
+	switch {
+	case src == "" || src == VisionPendingClassNone:
+		if dst == "" {
+			return VisionPendingClassNone
+		}
+		return dst
+	case dst == "" || dst == VisionPendingClassNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		if visionPendingClassRank(src) > visionPendingClassRank(dst) {
+			return src
+		}
+		return dst
+	}
+}
+
+func mergeVisionPendingGap(dst VisionPendingGap, src VisionPendingGap) VisionPendingGap {
+	switch {
+	case src == "" || src == VisionPendingGapNone:
+		if dst == "" {
+			return VisionPendingGapNone
+		}
+		return dst
+	case dst == "" || dst == VisionPendingGapNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		if visionPendingGapRank(src) > visionPendingGapRank(dst) {
+			return src
+		}
+		return dst
+	}
+}
+
+func mergeVisionNativeProvisionalSemantic(dst VisionNativeProvisionalSemantic, src VisionNativeProvisionalSemantic) VisionNativeProvisionalSemantic {
+	switch {
+	case src == "" || src == VisionNativeProvisionalSemanticNone:
+		if dst == "" {
+			return VisionNativeProvisionalSemanticNone
+		}
+		return dst
+	case dst == "" || dst == VisionNativeProvisionalSemanticNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		if visionNativeProvisionalSemanticRank(src) > visionNativeProvisionalSemanticRank(dst) {
+			return src
+		}
+		return dst
+	}
+}
+
+func mergeVisionNativeProvisionalSemanticSource(dst VisionNativeProvisionalSemanticSource, src VisionNativeProvisionalSemanticSource) VisionNativeProvisionalSemanticSource {
+	switch {
+	case src == "" || src == VisionNativeProvisionalSemanticSourceNone:
+		if dst == "" {
+			return VisionNativeProvisionalSemanticSourceNone
+		}
+		return dst
+	case dst == "" || dst == VisionNativeProvisionalSemanticSourceNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		if visionNativeProvisionalSemanticSourceRank(src) > visionNativeProvisionalSemanticSourceRank(dst) {
+			return src
+		}
+		return dst
+	}
+}
+
+func mergeVisionNativeProvisionalOutcome(dst VisionNativeProvisionalOutcome, src VisionNativeProvisionalOutcome) VisionNativeProvisionalOutcome {
+	switch {
+	case src == "" || src == VisionNativeProvisionalOutcomeNone:
+		if dst == "" {
+			return VisionNativeProvisionalOutcomeNone
+		}
+		return dst
+	case dst == "" || dst == VisionNativeProvisionalOutcomeNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		if visionNativeProvisionalOutcomeRank(src) > visionNativeProvisionalOutcomeRank(dst) {
+			return src
+		}
+		return dst
+	}
+}
+
+func mergeVisionTransportProgress(dst VisionTransportProgressProfile, src VisionTransportProgressProfile) VisionTransportProgressProfile {
+	switch {
+	case src == "" || src == VisionTransportProgressNone:
+		if dst == "" {
+			return VisionTransportProgressNone
+		}
+		return dst
+	case dst == "" || dst == VisionTransportProgressNone:
+		return src
+	case dst == src:
+		return dst
+	default:
+		return VisionTransportProgressBidirectional
+	}
+}
+
+func visionPendingClassRank(class VisionPendingClass) int {
+	switch class {
+	case VisionPendingClassCommand0Only:
+		return 4
+	case VisionPendingClassExplicitNoDetach:
+		return 3
+	case VisionPendingClassPayloadBypass:
+		return 2
+	case VisionPendingClassOther:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func visionPendingGapRank(gap VisionPendingGap) int {
+	switch gap {
+	case VisionPendingGapCommand0BidirectionalNoDet:
+		return 2
+	case VisionPendingGapOther:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func visionNativeProvisionalSemanticRank(semantic VisionNativeProvisionalSemantic) int {
+	switch semantic {
+	case VisionNativeProvisionalSemanticCommand0Bidirectional:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func visionNativeProvisionalSemanticSourceRank(source VisionNativeProvisionalSemanticSource) int {
+	switch source {
+	case VisionNativeProvisionalSemanticSourceExplicitProducer:
+		return 3
+	case VisionNativeProvisionalSemanticSourceBridgeProducer:
+		return 2
+	case VisionNativeProvisionalSemanticSourceDerived:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func isVisionNativeProvisionalProducerSource(source VisionNativeProvisionalSemanticSource) bool {
+	switch source {
+	case VisionNativeProvisionalSemanticSourceBridgeProducer, VisionNativeProvisionalSemanticSourceExplicitProducer:
+		return true
+	default:
+		return false
+	}
+}
+
+func visionNativeProvisionalOutcomeRank(outcome VisionNativeProvisionalOutcome) int {
+	switch outcome {
+	case VisionNativeProvisionalOutcomeFailedPending:
+		return 5
+	case VisionNativeProvisionalOutcomeResolvedDirect:
+		return 4
+	case VisionNativeProvisionalOutcomeResolvedNoDetach:
+		return 3
+	case VisionNativeProvisionalOutcomeBenignClose:
+		return 2
+	case VisionNativeProvisionalOutcomeActive:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func mergeVisionNativeProvisionalOutcomeSource(dst VisionNativeProvisionalOutcomeSource, src VisionNativeProvisionalOutcomeSource) VisionNativeProvisionalOutcomeSource {
+	switch {
+	case src == "" || src == VisionNativeProvisionalOutcomeSourceNone:
+		if dst == "" {
+			return VisionNativeProvisionalOutcomeSourceNone
+		}
+		return dst
+	case dst == "" || dst == VisionNativeProvisionalOutcomeSourceNone:
+		return src
+	default:
+		if visionNativeProvisionalOutcomeSourceRank(src) > visionNativeProvisionalOutcomeSourceRank(dst) {
+			return src
+		}
+		return dst
+	}
+}
+
+func visionNativeProvisionalOutcomeSourceRank(source VisionNativeProvisionalOutcomeSource) int {
+	switch source {
+	case VisionNativeProvisionalOutcomeSourceExplicitProducer:
+		return 3
+	case VisionNativeProvisionalOutcomeSourceBridgeProducer:
+		return 2
+	case VisionNativeProvisionalOutcomeSourceDerived:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func isVisionNativeProvisionalOutcomeProducerSource(source VisionNativeProvisionalOutcomeSource) bool {
+	switch source {
+	case VisionNativeProvisionalOutcomeSourceBridgeProducer, VisionNativeProvisionalOutcomeSourceExplicitProducer:
+		return true
+	default:
+		return false
+	}
+}
+
+func deriveVisionBridgeAssessment(summary VisionTransitionSummary) VisionBridgeAssessment {
+	if summary.IngressOrigin != VisionIngressOriginNativeRealityDeferred {
+		if summary.IngressOrigin == "" || summary.IngressOrigin == VisionIngressOriginUnknown {
+			return VisionBridgeAssessmentNone
+		}
+		return VisionBridgeAssessmentGoBaseline
+	}
+	switch {
+	case summary.TransportDetachStatus == VisionTransportDetachStatusFailed:
+		return VisionBridgeAssessmentNativeDetachFailed
+	case summary.DrainRelation == VisionDrainRelationAligned:
+		return VisionBridgeAssessmentNativeAligned
+	case summary.DrainRelation == VisionDrainRelationAcceptedOnly ||
+		summary.DrainRelation == VisionDrainRelationTransportOnly ||
+		summary.DrainRelation == VisionDrainRelationMismatch:
+		return VisionBridgeAssessmentNativeDivergent
+	case summary.TransportLifecycleState != VisionTransportLifecycleUnknown ||
+		summary.TransportDetachStatus != VisionTransportDetachStatusNone ||
+		summary.TransportKTLSPromotion != VisionTransportKTLSPromotionNone:
+		return VisionBridgeAssessmentNativePending
+	default:
+		return VisionBridgeAssessmentNativePending
+	}
+}
+
+func deriveVisionPendingQuality(summary VisionTransitionSummary, snap *pipeline.DecisionSnapshot) VisionPendingQuality {
+	if summary.BridgeAssessment != VisionBridgeAssessmentNativePending || snap == nil {
+		return VisionPendingQualityNone
+	}
+	if snap.UserspaceBytes == 0 {
+		switch snap.UserspaceExit {
+		case pipeline.UserspaceExitTimeout, pipeline.UserspaceExitLocalCloseNoResponse:
+			return VisionPendingQualityFailure
+		}
+	}
+	switch snap.Reason {
+	case pipeline.ReasonControlPlaneDNSGuard, pipeline.ReasonLoopbackDNSGuard:
+		if snap.UserspaceExit == pipeline.UserspaceExitComplete {
+			return VisionPendingQualityBenign
+		}
+	case pipeline.ReasonVisionNoDetachUserspace, pipeline.ReasonVisionControlUserspace:
+		if snap.UserspaceExit == pipeline.UserspaceExitStableUserspaceClose ||
+			snap.UserspaceExit == pipeline.UserspaceExitComplete ||
+			snap.UserspaceExit == pipeline.UserspaceExitNone {
+			return VisionPendingQualityBenign
+		}
+	}
+	if snap.UserspaceBytes > 0 {
+		switch snap.UserspaceExit {
+		case pipeline.UserspaceExitStableUserspaceClose, pipeline.UserspaceExitComplete, pipeline.UserspaceExitNone:
+			return VisionPendingQualityBenign
+		}
+	}
+	return VisionPendingQualityNone
+}
+
+func deriveVisionPendingClass(summary VisionTransitionSummary) VisionPendingClass {
+	if summary.BridgeAssessment != VisionBridgeAssessmentNativePending {
+		return VisionPendingClassNone
+	}
+	if summary.Uplink.Command2Count > 0 {
+		return VisionPendingClassOther
+	}
+	if summary.Uplink.Command1Count > 0 || summary.Uplink.Semantic == VisionSemanticExplicitNoDetach {
+		return VisionPendingClassExplicitNoDetach
+	}
+	if summary.Uplink.PayloadBypass || summary.Uplink.Semantic == VisionSemanticPayloadBypass {
+		return VisionPendingClassPayloadBypass
+	}
+	if summary.Uplink.Command0Count > 0 && summary.Uplink.Command1Count == 0 && summary.Uplink.Command2Count == 0 && summary.Uplink.Semantic == VisionSemanticUnknown {
+		return VisionPendingClassCommand0Only
+	}
+	return VisionPendingClassOther
+}
+
+func deriveVisionPendingGap(summary VisionTransitionSummary) VisionPendingGap {
+	if summary.BridgeAssessment != VisionBridgeAssessmentNativePending {
+		return VisionPendingGapNone
+	}
+	if summary.NativeProvisionalSemantic == VisionNativeProvisionalSemanticCommand0Bidirectional {
+		return VisionPendingGapCommand0BidirectionalNoDet
+	}
+	if summary.PendingClass == VisionPendingClassCommand0Only &&
+		summary.TransportProgress == VisionTransportProgressBidirectional &&
+		summary.TransportDetachStatus == VisionTransportDetachStatusNone &&
+		summary.DrainRelation == VisionDrainRelationNone {
+		return VisionPendingGapCommand0BidirectionalNoDet
+	}
+	if summary.PendingClass != VisionPendingClassNone {
+		return VisionPendingGapOther
+	}
+	return VisionPendingGapNone
+}
+
+func deriveVisionNativeProvisionalSemantic(summary VisionTransitionSummary) VisionNativeProvisionalSemantic {
+	if shouldPromoteVisionNativeProvisionalSemantic(summary) {
+		return VisionNativeProvisionalSemanticCommand0Bidirectional
+	}
+	return VisionNativeProvisionalSemanticNone
+}
+
+func latchVisionNativeProvisionalObservation(summary *VisionTransitionSummary) {
+	if summary == nil {
+		return
+	}
+	if summary.NativeProvisionalSemantic == VisionNativeProvisionalSemanticNone {
+		return
+	}
+	summary.NativeProvisionalObserved = mergeVisionNativeProvisionalSemantic(summary.NativeProvisionalObserved, summary.NativeProvisionalSemantic)
+	if summary.NativeProvisionalSource != VisionNativeProvisionalSemanticSourceNone {
+		summary.NativeProvisionalObservedSource = mergeVisionNativeProvisionalSemanticSource(summary.NativeProvisionalObservedSource, summary.NativeProvisionalSource)
+	}
+}
+
+func deriveVisionNativeProvisionalOutcome(summary VisionTransitionSummary) VisionNativeProvisionalOutcome {
+	if summary.NativeProvisionalObserved == VisionNativeProvisionalSemanticNone {
+		return VisionNativeProvisionalOutcomeNone
+	}
+	if summary.Uplink.Semantic == VisionSemanticExplicitDirect || summary.Downlink.Semantic == VisionSemanticExplicitDirect || summary.BridgeAssessment == VisionBridgeAssessmentNativeAligned || summary.DrainRelation == VisionDrainRelationAligned {
+		return VisionNativeProvisionalOutcomeResolvedDirect
+	}
+	if summary.Uplink.Semantic == VisionSemanticExplicitNoDetach || summary.Downlink.Semantic == VisionSemanticExplicitNoDetach || summary.PendingClass == VisionPendingClassExplicitNoDetach {
+		return VisionNativeProvisionalOutcomeResolvedNoDetach
+	}
+	switch summary.PendingQuality {
+	case VisionPendingQualityBenign:
+		return VisionNativeProvisionalOutcomeBenignClose
+	case VisionPendingQualityFailure:
+		return VisionNativeProvisionalOutcomeFailedPending
+	}
+	if summary.NativeProvisionalSemantic != VisionNativeProvisionalSemanticNone {
+		return VisionNativeProvisionalOutcomeActive
+	}
+	return VisionNativeProvisionalOutcomeActive
+}
+
+func applyVisionProvisionalOutcomeToPending(summary *VisionTransitionSummary) {
+	if summary == nil {
+		return
+	}
+	if summary.NativeProvisionalObserved != VisionNativeProvisionalSemanticCommand0Bidirectional ||
+		!isVisionNativeProvisionalProducerSource(summary.NativeProvisionalObservedSource) {
+		return
+	}
+	switch summary.NativeProvisionalOutcome {
+	case VisionNativeProvisionalOutcomeResolvedNoDetach:
+		summary.PendingQuality = VisionPendingQualityBenign
+		summary.PendingClass = VisionPendingClassExplicitNoDetach
+		summary.PendingGap = VisionPendingGapOther
+	case VisionNativeProvisionalOutcomeBenignClose:
+		summary.PendingQuality = VisionPendingQualityBenign
+		summary.PendingClass = VisionPendingClassCommand0Only
+		summary.PendingGap = VisionPendingGapCommand0BidirectionalNoDet
+	case VisionNativeProvisionalOutcomeFailedPending:
+		summary.PendingQuality = VisionPendingQualityFailure
+		summary.PendingClass = VisionPendingClassCommand0Only
+		summary.PendingGap = VisionPendingGapCommand0BidirectionalNoDet
+	case VisionNativeProvisionalOutcomeActive:
+		summary.PendingClass = VisionPendingClassCommand0Only
+		summary.PendingGap = VisionPendingGapCommand0BidirectionalNoDet
+	}
+}
+
+func shouldPromoteVisionNativeProvisionalSemantic(summary VisionTransitionSummary) bool {
+	if summary.IngressOrigin != VisionIngressOriginNativeRealityDeferred {
+		return false
+	}
+	if summary.Uplink.Semantic != VisionSemanticUnknown ||
+		summary.Uplink.Command1Count > 0 ||
+		summary.Uplink.Command2Count > 0 {
+		return false
+	}
+	if summary.Uplink.Command0Count > 0 &&
+		deriveVisionTransportProgress(summary) == VisionTransportProgressBidirectional &&
+		summary.TransportDetachStatus == VisionTransportDetachStatusNone &&
+		summary.DrainCount == 0 &&
+		summary.TransportDrainCount == 0 {
+		return true
+	}
+	return false
+}
+
+func deriveVisionTransportProgress(summary VisionTransitionSummary) VisionTransportProgressProfile {
+	switch {
+	case summary.TransportReadOps > 0 && summary.TransportWriteOps > 0:
+		return VisionTransportProgressBidirectional
+	case summary.TransportWriteOps > 0:
+		return VisionTransportProgressWriteOnly
+	case summary.TransportReadOps > 0:
+		return VisionTransportProgressReadOnly
+	default:
+		return VisionTransportProgressNone
+	}
+}
+
+func observeVisionBridgeAssessment(scope string, assessment VisionBridgeAssessment, pendingQuality VisionPendingQuality, pendingClass VisionPendingClass, pendingGap VisionPendingGap, nativeProvisionalObserved VisionNativeProvisionalSemantic, nativeProvisionalObservedSource VisionNativeProvisionalSemanticSource, nativeProvisionalOutcome VisionNativeProvisionalOutcome) {
+	if assessment == "" || assessment == VisionBridgeAssessmentNone {
+		return
+	}
+	scope = normalizeVisionBridgeAssessmentScope(scope)
+	window := ensureVisionBridgeAssessmentWindow(scope)
+	if window == nil {
+		return
+	}
+	window.observe(visionBridgeAssessmentNowFn(), assessment, pendingQuality, pendingClass, pendingGap, nativeProvisionalObserved, nativeProvisionalObservedSource, nativeProvisionalOutcome)
+	observeVisionBridgeProbeAssessment(scope, assessment, pendingQuality, pendingClass, pendingGap, nativeProvisionalObserved, nativeProvisionalObservedSource, nativeProvisionalOutcome)
+}
+
+func resetVisionBridgeAssessmentStatsForTest() {
+	visionBridgeAssessmentStatsByScope = sync.Map{}
+	visionBridgeAssessmentNowFn = time.Now
+	visionBridgeAssessmentBucketWidth = time.Minute
+}
+
+func resetVisionBridgeProbeEpochsForTest() {
+	visionBridgeProbeEpochByScope = sync.Map{}
+	visionBridgeProbeNowFn = time.Now
+}
+
+func normalizeVisionBridgeAssessmentScope(scope string) string {
+	if scope == "" {
+		return visionBridgeAssessmentUnscopedKey
+	}
+	return scope
+}
+
+func ensureVisionBridgeAssessmentWindow(scope string) *visionBridgeAssessmentWindow {
+	value, _ := visionBridgeAssessmentStatsByScope.LoadOrStore(scope, newVisionBridgeAssessmentWindow(visionBridgeAssessmentNowFn()))
+	window, _ := value.(*visionBridgeAssessmentWindow)
+	return window
+}
+
+func ensureVisionBridgeProbeEpoch(scope string) *visionBridgeProbeEpoch {
+	value, _ := visionBridgeProbeEpochByScope.LoadOrStore(scope, &visionBridgeProbeEpoch{
+		scopeKey: scope,
+		state:    VisionBridgeProbeStateInactive,
+		verdict:  VisionBridgeProbeVerdictNone,
+	})
+	epoch, _ := value.(*visionBridgeProbeEpoch)
+	return epoch
+}
+
+func loadVisionBridgeAssessmentWindow(scope string) *visionBridgeAssessmentWindow {
+	value, ok := visionBridgeAssessmentStatsByScope.Load(scope)
+	if !ok {
+		return nil
+	}
+	window, _ := value.(*visionBridgeAssessmentWindow)
+	return window
+}
+
+func loadVisionBridgeProbeEpoch(scope string) *visionBridgeProbeEpoch {
+	value, ok := visionBridgeProbeEpochByScope.Load(scope)
+	if !ok {
+		return nil
+	}
+	epoch, _ := value.(*visionBridgeProbeEpoch)
+	return epoch
+}
+
+func newVisionBridgeAssessmentWindow(now time.Time) *visionBridgeAssessmentWindow {
+	return &visionBridgeAssessmentWindow{
+		startBucket: alignedVisionBridgeAssessmentBucket(now) - int64(visionBridgeAssessmentBucketCount-1)*visionBridgeAssessmentBucketWidth.Nanoseconds(),
+	}
+}
+
+func (w *visionBridgeAssessmentWindow) observe(now time.Time, assessment VisionBridgeAssessment, pendingQuality VisionPendingQuality, pendingClass VisionPendingClass, pendingGap VisionPendingGap, nativeProvisionalObserved VisionNativeProvisionalSemantic, nativeProvisionalObservedSource VisionNativeProvisionalSemanticSource, nativeProvisionalOutcome VisionNativeProvisionalOutcome) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	idx := w.bucketIndexLocked(now)
+	if nativeProvisionalObserved == VisionNativeProvisionalSemanticCommand0Bidirectional &&
+		isVisionNativeProvisionalProducerSource(nativeProvisionalObservedSource) {
+		w.nativeProvisionalCommand0Bidirectional[idx]++
+		switch nativeProvisionalOutcome {
+		case VisionNativeProvisionalOutcomeActive:
+			w.nativeProvisionalActive[idx]++
+		case VisionNativeProvisionalOutcomeResolvedDirect:
+			w.nativeProvisionalResolvedDirect[idx]++
+		case VisionNativeProvisionalOutcomeResolvedNoDetach:
+			w.nativeProvisionalResolvedNoDetach[idx]++
+		case VisionNativeProvisionalOutcomeBenignClose:
+			w.nativeProvisionalBenignClose[idx]++
+		case VisionNativeProvisionalOutcomeFailedPending:
+			w.nativeProvisionalFailedPending[idx]++
+		}
+	}
+	switch assessment {
+	case VisionBridgeAssessmentGoBaseline:
+		w.goBaseline[idx]++
+	case VisionBridgeAssessmentNativePending:
+		w.nativePending[idx]++
+		switch pendingQuality {
+		case VisionPendingQualityBenign:
+			w.nativePendingBenign[idx]++
+		case VisionPendingQualityFailure:
+			w.nativePendingFailure[idx]++
+			if nativeProvisionalObserved == VisionNativeProvisionalSemanticCommand0Bidirectional &&
+				isVisionNativeProvisionalProducerSource(nativeProvisionalObservedSource) {
+				w.nativeProvisionalCommand0BidirectionalFailure[idx]++
+			}
+			if pendingClass == VisionPendingClassCommand0Only {
+				w.nativePendingCommand0Failure[idx]++
+			}
+			if pendingGap == VisionPendingGapCommand0BidirectionalNoDet {
+				w.nativePendingCommand0BidirectionalFailure[idx]++
+			}
+		}
+	case VisionBridgeAssessmentNativeAligned:
+		w.nativeAligned[idx]++
+	case VisionBridgeAssessmentNativeDivergent:
+		w.nativeDivergent[idx]++
+	case VisionBridgeAssessmentNativeDetachFailed:
+		w.nativeDetachFailed[idx]++
+	}
+}
+
+func (w *visionBridgeAssessmentWindow) snapshot(now time.Time) VisionBridgeAssessmentStats {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.bucketIndexLocked(now)
+	return VisionBridgeAssessmentStats{
+		GoBaseline:                             sumVisionBridgeAssessmentBuckets(w.goBaseline[:]),
+		NativePending:                          sumVisionBridgeAssessmentBuckets(w.nativePending[:]),
+		NativePendingBenign:                    sumVisionBridgeAssessmentBuckets(w.nativePendingBenign[:]),
+		NativePendingFailure:                   sumVisionBridgeAssessmentBuckets(w.nativePendingFailure[:]),
+		NativeProvisionalCommand0Bidirectional: sumVisionBridgeAssessmentBuckets(w.nativeProvisionalCommand0Bidirectional[:]),
+		NativeProvisionalCommand0BidirectionalFailure: sumVisionBridgeAssessmentBuckets(w.nativeProvisionalCommand0BidirectionalFailure[:]),
+		NativeProvisionalActive:                       sumVisionBridgeAssessmentBuckets(w.nativeProvisionalActive[:]),
+		NativeProvisionalResolvedDirect:               sumVisionBridgeAssessmentBuckets(w.nativeProvisionalResolvedDirect[:]),
+		NativeProvisionalResolvedNoDetach:             sumVisionBridgeAssessmentBuckets(w.nativeProvisionalResolvedNoDetach[:]),
+		NativeProvisionalBenignClose:                  sumVisionBridgeAssessmentBuckets(w.nativeProvisionalBenignClose[:]),
+		NativeProvisionalFailedPending:                sumVisionBridgeAssessmentBuckets(w.nativeProvisionalFailedPending[:]),
+		NativePendingCommand0Failure:                  sumVisionBridgeAssessmentBuckets(w.nativePendingCommand0Failure[:]),
+		NativePendingCommand0BidirectionalFailure:     sumVisionBridgeAssessmentBuckets(w.nativePendingCommand0BidirectionalFailure[:]),
+		NativeAligned:                                 sumVisionBridgeAssessmentBuckets(w.nativeAligned[:]),
+		NativeDivergent:                               sumVisionBridgeAssessmentBuckets(w.nativeDivergent[:]),
+		NativeDetachFailed:                            sumVisionBridgeAssessmentBuckets(w.nativeDetachFailed[:]),
+	}
+}
+
+func (w *visionBridgeAssessmentWindow) bucketIndexLocked(now time.Time) int {
+	nowBucket := alignedVisionBridgeAssessmentBucket(now)
+	w.advanceLocked(nowBucket)
+	idx := int((nowBucket - w.startBucket) / visionBridgeAssessmentBucketWidth.Nanoseconds())
+	if idx < 0 {
+		return 0
+	}
+	if idx >= visionBridgeAssessmentBucketCount {
+		return visionBridgeAssessmentBucketCount - 1
+	}
+	return idx
+}
+
+func (w *visionBridgeAssessmentWindow) advanceLocked(nowBucket int64) {
+	width := visionBridgeAssessmentBucketWidth.Nanoseconds()
+	if width <= 0 {
+		width = time.Minute.Nanoseconds()
+	}
+	if w.startBucket == 0 {
+		w.startBucket = nowBucket - int64(visionBridgeAssessmentBucketCount-1)*width
+		return
+	}
+	newestBucket := w.startBucket + int64(visionBridgeAssessmentBucketCount-1)*width
+	if nowBucket <= newestBucket {
+		return
+	}
+	shift := int((nowBucket - newestBucket) / width)
+	if shift >= visionBridgeAssessmentBucketCount {
+		w.resetBucketsLocked()
+		w.startBucket = nowBucket - int64(visionBridgeAssessmentBucketCount-1)*width
+		return
+	}
+	w.shiftBucketsLocked(shift)
+	w.startBucket += int64(shift) * width
+}
+
+func (w *visionBridgeAssessmentWindow) resetBucketsLocked() {
+	w.goBaseline = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativePending = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativePendingBenign = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativePendingFailure = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeProvisionalCommand0Bidirectional = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeProvisionalCommand0BidirectionalFailure = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeProvisionalActive = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeProvisionalResolvedDirect = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeProvisionalResolvedNoDetach = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeProvisionalBenignClose = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeProvisionalFailedPending = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativePendingCommand0Failure = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativePendingCommand0BidirectionalFailure = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeAligned = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeDivergent = [visionBridgeAssessmentBucketCount]uint64{}
+	w.nativeDetachFailed = [visionBridgeAssessmentBucketCount]uint64{}
+}
+
+func (w *visionBridgeAssessmentWindow) shiftBucketsLocked(shift int) {
+	shiftVisionBridgeAssessmentBuckets(w.goBaseline[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativePending[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativePendingBenign[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativePendingFailure[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeProvisionalCommand0Bidirectional[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeProvisionalCommand0BidirectionalFailure[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeProvisionalActive[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeProvisionalResolvedDirect[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeProvisionalResolvedNoDetach[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeProvisionalBenignClose[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeProvisionalFailedPending[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativePendingCommand0Failure[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativePendingCommand0BidirectionalFailure[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeAligned[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeDivergent[:], shift)
+	shiftVisionBridgeAssessmentBuckets(w.nativeDetachFailed[:], shift)
+}
+
+func (e *visionBridgeProbeEpoch) ensure(now time.Time, budget uint64, duration time.Duration) VisionBridgeProbeSnapshot {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.scopeKey == "" {
+		e.scopeKey = visionBridgeAssessmentUnscopedKey
+	}
+	if budget == 0 {
+		budget = 1
+	}
+	if duration <= 0 {
+		duration = time.Minute
+	}
+	if e.state == "" {
+		e.state = VisionBridgeProbeStateInactive
+	}
+	if e.state == VisionBridgeProbeStateInactive {
+		e.state = VisionBridgeProbeStateActive
+		e.verdict = VisionBridgeProbeVerdictNoSignal
+		e.started = now
+		e.deadline = now.Add(duration)
+		e.budget = budget
+		e.stats = VisionBridgeAssessmentStats{}
+	}
+	e.refreshLocked(now)
+	return e.snapshotLocked(now)
+}
+
+func (e *visionBridgeProbeEpoch) snapshot(now time.Time) VisionBridgeProbeSnapshot {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.refreshLocked(now)
+	return e.snapshotLocked(now)
+}
+
+func (e *visionBridgeProbeEpoch) observe(now time.Time, assessment VisionBridgeAssessment, pendingQuality VisionPendingQuality, pendingClass VisionPendingClass, pendingGap VisionPendingGap, nativeProvisionalObserved VisionNativeProvisionalSemantic, nativeProvisionalObservedSource VisionNativeProvisionalSemanticSource, nativeProvisionalOutcome VisionNativeProvisionalOutcome) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.state != VisionBridgeProbeStateActive {
+		return
+	}
+	if nativeProvisionalObserved == VisionNativeProvisionalSemanticCommand0Bidirectional &&
+		isVisionNativeProvisionalProducerSource(nativeProvisionalObservedSource) {
+		e.stats.NativeProvisionalCommand0Bidirectional++
+		switch nativeProvisionalOutcome {
+		case VisionNativeProvisionalOutcomeActive:
+			e.stats.NativeProvisionalActive++
+		case VisionNativeProvisionalOutcomeResolvedDirect:
+			e.stats.NativeProvisionalResolvedDirect++
+		case VisionNativeProvisionalOutcomeResolvedNoDetach:
+			e.stats.NativeProvisionalResolvedNoDetach++
+		case VisionNativeProvisionalOutcomeBenignClose:
+			e.stats.NativeProvisionalBenignClose++
+		case VisionNativeProvisionalOutcomeFailedPending:
+			e.stats.NativeProvisionalFailedPending++
+		}
+	}
+	switch assessment {
+	case VisionBridgeAssessmentGoBaseline:
+		e.stats.GoBaseline++
+	case VisionBridgeAssessmentNativePending:
+		e.stats.NativePending++
+		switch pendingQuality {
+		case VisionPendingQualityBenign:
+			e.stats.NativePendingBenign++
+		case VisionPendingQualityFailure:
+			e.stats.NativePendingFailure++
+			if nativeProvisionalObserved == VisionNativeProvisionalSemanticCommand0Bidirectional &&
+				isVisionNativeProvisionalProducerSource(nativeProvisionalObservedSource) {
+				e.stats.NativeProvisionalCommand0BidirectionalFailure++
+			}
+			if pendingClass == VisionPendingClassCommand0Only {
+				e.stats.NativePendingCommand0Failure++
+			}
+			if pendingGap == VisionPendingGapCommand0BidirectionalNoDet {
+				e.stats.NativePendingCommand0BidirectionalFailure++
+			}
+		}
+	case VisionBridgeAssessmentNativeAligned:
+		e.stats.NativeAligned++
+	case VisionBridgeAssessmentNativeDivergent:
+		e.stats.NativeDivergent++
+	case VisionBridgeAssessmentNativeDetachFailed:
+		e.stats.NativeDetachFailed++
+	}
+	e.refreshLocked(now)
+}
+
+func (e *visionBridgeProbeEpoch) refreshLocked(now time.Time) {
+	if e.state == VisionBridgeProbeStateInactive {
+		e.verdict = VisionBridgeProbeVerdictNone
+		return
+	}
+	e.verdict = deriveVisionBridgeProbeVerdict(e.stats)
+	if e.state != VisionBridgeProbeStateActive {
+		return
+	}
+	if nativeObservedVisionBridgeAssessmentStats(e.stats) >= e.budget {
+		e.state = VisionBridgeProbeStateCompleted
+		return
+	}
+	if !e.deadline.IsZero() && !now.Before(e.deadline) {
+		e.state = VisionBridgeProbeStateCompleted
+	}
+}
+
+func (e *visionBridgeProbeEpoch) snapshotLocked(now time.Time) VisionBridgeProbeSnapshot {
+	remaining := time.Duration(0)
+	if e.state == VisionBridgeProbeStateActive && !e.deadline.IsZero() && now.Before(e.deadline) {
+		remaining = e.deadline.Sub(now)
+	}
+	return VisionBridgeProbeSnapshot{
+		ScopeKey:  e.scopeKey,
+		State:     e.state,
+		Verdict:   e.verdict,
+		Budget:    e.budget,
+		Observed:  nativeObservedVisionBridgeAssessmentStats(e.stats),
+		StartedAt: e.started,
+		Deadline:  e.deadline,
+		Remaining: remaining,
+		Stats:     e.stats,
+	}
+}
+
+func observeVisionBridgeProbeAssessment(scope string, assessment VisionBridgeAssessment, pendingQuality VisionPendingQuality, pendingClass VisionPendingClass, pendingGap VisionPendingGap, nativeProvisionalObserved VisionNativeProvisionalSemantic, nativeProvisionalObservedSource VisionNativeProvisionalSemanticSource, nativeProvisionalOutcome VisionNativeProvisionalOutcome) {
+	epoch := loadVisionBridgeProbeEpoch(scope)
+	if epoch == nil {
+		return
+	}
+	epoch.observe(visionBridgeProbeNowFn(), assessment, pendingQuality, pendingClass, pendingGap, nativeProvisionalObserved, nativeProvisionalObservedSource, nativeProvisionalOutcome)
+}
+
+func deriveVisionBridgeProbeVerdict(stats VisionBridgeAssessmentStats) VisionBridgeProbeVerdict {
+	switch {
+	case stats.NativeDetachFailed > 0:
+		return VisionBridgeProbeVerdictNativeDetachFailed
+	case stats.NativeDivergent > 0:
+		return VisionBridgeProbeVerdictNativeDivergent
+	case stats.NativeProvisionalFailedPending > 0:
+		return VisionBridgeProbeVerdictNativeProvisionalFailedPending
+	case stats.NativeProvisionalCommand0BidirectionalFailure > 0:
+		return VisionBridgeProbeVerdictNativeProvisionalCommand0Bidirectional
+	case stats.NativePendingCommand0BidirectionalFailure > 0:
+		return VisionBridgeProbeVerdictNativePendingCommand0Bidirectional
+	case stats.NativePendingCommand0Failure > 0:
+		return VisionBridgeProbeVerdictNativePendingCommand0
+	case stats.NativePendingFailure > 0:
+		return VisionBridgeProbeVerdictNativePendingFailure
+	case stats.NativeAligned > 0:
+		return VisionBridgeProbeVerdictNativeAligned
+	case stats.NativePendingBenign > 0:
+		return VisionBridgeProbeVerdictNativePendingBenign
+	case stats.GoBaseline > 0:
+		return VisionBridgeProbeVerdictGoBaseline
+	default:
+		return VisionBridgeProbeVerdictNoSignal
+	}
+}
+
+func nativeObservedVisionBridgeAssessmentStats(stats VisionBridgeAssessmentStats) uint64 {
+	return stats.NativePending + stats.NativeAligned + stats.NativeDivergent + stats.NativeDetachFailed
+}
+
+func alignedVisionBridgeAssessmentBucket(now time.Time) int64 {
+	width := visionBridgeAssessmentBucketWidth.Nanoseconds()
+	if width <= 0 {
+		width = time.Minute.Nanoseconds()
+	}
+	return (now.UnixNano() / width) * width
+}
+
+func shiftVisionBridgeAssessmentBuckets(buckets []uint64, shift int) {
+	if shift <= 0 {
+		return
+	}
+	if shift >= len(buckets) {
+		clear(buckets)
+		return
+	}
+	copy(buckets, buckets[shift:])
+	clear(buckets[len(buckets)-shift:])
+}
+
+func sumVisionBridgeAssessmentBuckets(buckets []uint64) uint64 {
+	var total uint64
+	for _, count := range buckets {
+		total += count
+	}
+	return total
+}
+
+func addVisionBridgeAssessmentStats(dst, src VisionBridgeAssessmentStats) VisionBridgeAssessmentStats {
+	dst.GoBaseline += src.GoBaseline
+	dst.NativePending += src.NativePending
+	dst.NativePendingBenign += src.NativePendingBenign
+	dst.NativePendingFailure += src.NativePendingFailure
+	dst.NativeProvisionalCommand0Bidirectional += src.NativeProvisionalCommand0Bidirectional
+	dst.NativeProvisionalCommand0BidirectionalFailure += src.NativeProvisionalCommand0BidirectionalFailure
+	dst.NativeProvisionalActive += src.NativeProvisionalActive
+	dst.NativeProvisionalResolvedDirect += src.NativeProvisionalResolvedDirect
+	dst.NativeProvisionalResolvedNoDetach += src.NativeProvisionalResolvedNoDetach
+	dst.NativeProvisionalBenignClose += src.NativeProvisionalBenignClose
+	dst.NativeProvisionalFailedPending += src.NativeProvisionalFailedPending
+	dst.NativePendingCommand0Failure += src.NativePendingCommand0Failure
+	dst.NativePendingCommand0BidirectionalFailure += src.NativePendingCommand0BidirectionalFailure
+	dst.NativeAligned += src.NativeAligned
+	dst.NativeDivergent += src.NativeDivergent
+	dst.NativeDetachFailed += src.NativeDetachFailed
+	return dst
 }
 
 func normalizeVisionDrainMode(direction string) VisionDrainMode {

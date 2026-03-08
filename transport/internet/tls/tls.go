@@ -68,8 +68,22 @@ var deferredRustDrainObserverMu sync.RWMutex
 var deferredRustDrainObserver func(gonet.Conn, int, int)
 var deferredRustLifecycleObserverMu sync.RWMutex
 var deferredRustLifecycleObserver func(gonet.Conn, DeferredRustLifecycleEvent)
+var deferredRustProgressObserverMu sync.RWMutex
+var deferredRustProgressObserver func(gonet.Conn, DeferredRustProgressEvent)
 
 type DeferredRustLifecycleEvent string
+
+type DeferredRustProgressDirection string
+
+const (
+	DeferredRustProgressRead  DeferredRustProgressDirection = "read"
+	DeferredRustProgressWrite DeferredRustProgressDirection = "write"
+)
+
+type DeferredRustProgressEvent struct {
+	Direction DeferredRustProgressDirection
+	Bytes     int
+}
 
 const (
 	DeferredRustLifecycleDeferredActive  DeferredRustLifecycleEvent = "deferred_active"
@@ -113,6 +127,22 @@ func snapshotDeferredRustLifecycleObserver() func(gonet.Conn, DeferredRustLifecy
 	deferredRustLifecycleObserverMu.RLock()
 	defer deferredRustLifecycleObserverMu.RUnlock()
 	return deferredRustLifecycleObserver
+}
+
+// SetDeferredRustProgressObserver installs a transport-level observer for
+// pre-detach DeferredRustConn read/write progress. This reports bytes that
+// actually crossed the deferred rustls transport boundary, not buffered cache
+// replays or higher-level protocol semantics.
+func SetDeferredRustProgressObserver(observer func(gonet.Conn, DeferredRustProgressEvent)) {
+	deferredRustProgressObserverMu.Lock()
+	defer deferredRustProgressObserverMu.Unlock()
+	deferredRustProgressObserver = observer
+}
+
+func snapshotDeferredRustProgressObserver() func(gonet.Conn, DeferredRustProgressEvent) {
+	deferredRustProgressObserverMu.RLock()
+	defer deferredRustProgressObserverMu.RUnlock()
+	return deferredRustProgressObserver
 }
 
 func deferredKTLSPromotionDisabledAt(now time.Time) bool {
@@ -1035,12 +1065,22 @@ func (c *DeferredRustConn) flushDeferredWritePendingLocked(h *native.DeferredSes
 	c.logDeferredKTLSError(err)
 	if err == nil && n > 0 {
 		c.writeRecords.Add(1)
+		c.observeTransportProgress(DeferredRustProgressWrite, n)
 	}
 	if err == nil && n < c.deferredWriteLen {
 		err = io.ErrShortWrite
 	}
 	c.consumeDeferredWritePendingLocked(n)
 	return err
+}
+
+func (c *DeferredRustConn) observeTransportProgress(direction DeferredRustProgressDirection, n int) {
+	if n <= 0 {
+		return
+	}
+	if observer := snapshotDeferredRustProgressObserver(); observer != nil {
+		observer(c, DeferredRustProgressEvent{Direction: direction, Bytes: n})
+	}
 }
 
 func earlierDeadline(a, b time.Time) time.Time {
@@ -1143,6 +1183,7 @@ func (c *DeferredRustConn) Read(b []byte) (int, error) {
 		} else {
 			n, err = deferredReadWithDeadlineFn(h, b, readDeadline)
 			c.logDeferredKTLSError(err)
+			c.observeTransportProgress(DeferredRustProgressRead, n)
 		}
 		if err == nil && n > 0 {
 			c.readRecords.Add(1)
@@ -1193,6 +1234,7 @@ func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, 
 	if n <= 0 {
 		return n, err
 	}
+	c.observeTransportProgress(DeferredRustProgressRead, n)
 
 	outN := copy(dst, buf[:n])
 	if outN < n {
@@ -1291,6 +1333,7 @@ func (c *DeferredRustConn) Write(b []byte) (int, error) {
 		if err == nil && n > 0 {
 			c.writeRecords.Add(1)
 		}
+		c.observeTransportProgress(DeferredRustProgressWrite, n)
 		// Transition race: reader may detach while writer is still on rustls path.
 		// Retry on raw socket once detached.
 		if err != nil && c.detached.Load() {

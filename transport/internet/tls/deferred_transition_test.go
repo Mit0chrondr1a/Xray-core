@@ -218,3 +218,105 @@ func TestDeferredRustConnEnableKTLSOutcomeCallsLifecycleObserverForUnsupported(t
 		t.Fatalf("observer event = %q, want %q", gotEvent, DeferredRustLifecycleKTLSUnsupported)
 	}
 }
+
+func TestDeferredRustConnReadCallsProgressObserver(t *testing.T) {
+	oldRead := deferredReadFn
+	oldObserver := snapshotDeferredRustProgressObserver()
+	t.Cleanup(func() {
+		deferredReadFn = oldRead
+		SetDeferredRustProgressObserver(oldObserver)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	deferredReadFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		copy(b, []byte("abc"))
+		return 3, nil
+	}
+
+	var got DeferredRustProgressEvent
+	observed := make(chan struct{}, 1)
+	SetDeferredRustProgressObserver(func(_ gonet.Conn, event DeferredRustProgressEvent) {
+		got = event
+		observed <- struct{}{}
+	})
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+
+	buf := make([]byte, 3)
+	n, err := dc.Read(buf)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("Read() = %d, want 3", n)
+	}
+
+	select {
+	case <-observed:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("DeferredRust progress observer was not called for read")
+	}
+
+	if got.Direction != DeferredRustProgressRead {
+		t.Fatalf("observer direction = %q, want %q", got.Direction, DeferredRustProgressRead)
+	}
+	if got.Bytes != 3 {
+		t.Fatalf("observer bytes = %d, want 3", got.Bytes)
+	}
+}
+
+func TestDeferredRustConnWriteCallsProgressObserver(t *testing.T) {
+	oldWrite := deferredWriteFn
+	oldObserver := snapshotDeferredRustProgressObserver()
+	t.Cleanup(func() {
+		deferredWriteFn = oldWrite
+		SetDeferredRustProgressObserver(oldObserver)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	deferredWriteFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		return len(b), nil
+	}
+
+	var got DeferredRustProgressEvent
+	observed := make(chan struct{}, 1)
+	SetDeferredRustProgressObserver(func(_ gonet.Conn, event DeferredRustProgressEvent) {
+		got = event
+		observed <- struct{}{}
+	})
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+
+	n, err := dc.Write([]byte("abcd"))
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("Write() = %d, want 4", n)
+	}
+
+	select {
+	case <-observed:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("DeferredRust progress observer was not called for write")
+	}
+
+	if got.Direction != DeferredRustProgressWrite {
+		t.Fatalf("observer direction = %q, want %q", got.Direction, DeferredRustProgressWrite)
+	}
+	if got.Bytes != 4 {
+		t.Fatalf("observer bytes = %d, want 4", got.Bytes)
+	}
+}

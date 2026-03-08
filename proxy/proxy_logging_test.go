@@ -400,6 +400,8 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleDeferredActive)
 	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleDetachCompleted)
 	ObserveVisionTransportLifecycle(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustLifecycleKTLSEnabled)
+	ObserveVisionTransportProgress(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressWrite, Bytes: 17})
+	ObserveVisionTransportProgress(source.Conn(), source.Kind(), source.origin, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressRead, Bytes: 5})
 	ObserveVisionTransportDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeDeferred, 13, 9)
 	ObserveVisionTransitionDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeDeferred, 11, 7)
 	TraceVisionTransitionDrain(context.Background(), "deferred-detach", source, 11, 7)
@@ -407,7 +409,7 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 1, 0, 0, 0, false, false)
 	LogVisionTransitionEvent(context.Background(), "downlink", source, VisionTransitionEventCommandObserved, 2, 0, 0, 0, false, true)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventPayloadBypass, -1, 0, 0, 0, false, false)
-	LogVisionTransitionSummary(context.Background(), conn, nil)
+	LogVisionTransitionSummary(context.Background(), conn, nil, nil)
 
 	logs := strings.Join(handler.msgs, "\n")
 	if !strings.Contains(logs, "kind=vision-transition-summary") ||
@@ -419,6 +421,7 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 		!strings.Contains(logs, "uplink_payload_bypass=true") ||
 		!strings.Contains(logs, "uplink_semantic=explicit_no_detach") ||
 		!strings.Contains(logs, "downlink_semantic=explicit_direct_copy") ||
+		!strings.Contains(logs, "native_provisional_semantic=none") ||
 		!strings.Contains(logs, "drain_mode=deferred_detach") ||
 		!strings.Contains(logs, "drain_count=1") ||
 		!strings.Contains(logs, "drain_plaintext_bytes=11") ||
@@ -427,6 +430,13 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 		!strings.Contains(logs, "transport_drain_count=1") ||
 		!strings.Contains(logs, "transport_drain_plaintext_bytes=13") ||
 		!strings.Contains(logs, "transport_drain_raw_ahead_bytes=9") ||
+		!strings.Contains(logs, "drain_relation=mismatch") ||
+		!strings.Contains(logs, "bridge_assessment=native_divergent") ||
+		!strings.Contains(logs, "transport_read_ops=1") ||
+		!strings.Contains(logs, "transport_read_bytes=5") ||
+		!strings.Contains(logs, "transport_write_ops=1") ||
+		!strings.Contains(logs, "transport_write_bytes=17") ||
+		!strings.Contains(logs, "transport_progress=bidirectional") ||
 		!strings.Contains(logs, "transport_lifecycle_state=ktls_enabled") ||
 		!strings.Contains(logs, "transport_detach_status=completed") ||
 		!strings.Contains(logs, "transport_ktls_promotion=enabled") {
@@ -472,6 +482,12 @@ func TestVisionTransitionSummarySnapshotWithoutDebug(t *testing.T) {
 	if summary.TransportDrainMode != VisionDrainModeDeferred || summary.TransportDrainCount != 1 || summary.TransportDrainPlaintextLen != 8 || summary.TransportDrainRawAheadLen != 6 {
 		t.Fatalf("unexpected transport drain summary: %+v", summary)
 	}
+	if summary.DrainRelation != VisionDrainRelationMismatch {
+		t.Fatalf("summary.DrainRelation=%q, want %q", summary.DrainRelation, VisionDrainRelationMismatch)
+	}
+	if summary.BridgeAssessment != VisionBridgeAssessmentGoBaseline {
+		t.Fatalf("summary.BridgeAssessment=%q, want %q", summary.BridgeAssessment, VisionBridgeAssessmentGoBaseline)
+	}
 	if summary.TransportLifecycleState != VisionTransportLifecycleDeferredActive {
 		t.Fatalf("summary.TransportLifecycleState=%q, want %q", summary.TransportLifecycleState, VisionTransportLifecycleDeferredActive)
 	}
@@ -482,7 +498,7 @@ func TestVisionTransitionSummarySnapshotWithoutDebug(t *testing.T) {
 		t.Fatalf("summary.TransportKTLSPromotion=%q, want %q", summary.TransportKTLSPromotion, VisionTransportKTLSPromotionFailed)
 	}
 
-	LogVisionTransitionSummary(context.Background(), conn, nil)
+	LogVisionTransitionSummary(context.Background(), conn, nil, nil)
 	if _, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
 		t.Fatal("expected summary state to be consumed after LogVisionTransitionSummary")
 	}
@@ -525,6 +541,12 @@ func TestObserveVisionTransitionProducerAPIWithoutDebug(t *testing.T) {
 	if summary.TransportDrainMode != VisionDrainModeDeferred || summary.TransportDrainCount != 1 || summary.TransportDrainPlaintextLen != 6 || summary.TransportDrainRawAheadLen != 2 {
 		t.Fatalf("unexpected transport drain summary: %+v", summary)
 	}
+	if summary.DrainRelation != VisionDrainRelationMismatch {
+		t.Fatalf("summary.DrainRelation=%q, want %q", summary.DrainRelation, VisionDrainRelationMismatch)
+	}
+	if summary.BridgeAssessment != VisionBridgeAssessmentNativeDivergent {
+		t.Fatalf("summary.BridgeAssessment=%q, want %q", summary.BridgeAssessment, VisionBridgeAssessmentNativeDivergent)
+	}
 	if summary.TransportLifecycleState != VisionTransportLifecycleDeferredActive {
 		t.Fatalf("summary.TransportLifecycleState=%q, want %q", summary.TransportLifecycleState, VisionTransportLifecycleDeferredActive)
 	}
@@ -543,9 +565,11 @@ func TestVisionTransitionSourceSnapshotIncludesRuntimeBridgeState(t *testing.T) 
 	source.origin = VisionIngressOriginNativeRealityDeferred
 
 	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "canary-scope|reality|tcp")
 	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 1)
 	ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeBuffered, 4, 2)
 	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressWrite, Bytes: 11})
 	ObserveVisionTransportDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 9, 6)
 
 	snap := source.Snapshot()
@@ -555,14 +579,35 @@ func TestVisionTransitionSourceSnapshotIncludesRuntimeBridgeState(t *testing.T) 
 	if snap.IngressOrigin != VisionIngressOriginNativeRealityDeferred {
 		t.Fatalf("snapshot ingress origin = %q, want %q", snap.IngressOrigin, VisionIngressOriginNativeRealityDeferred)
 	}
+	if snap.ScopeKey != "canary-scope|reality|tcp" {
+		t.Fatalf("snapshot scope key = %q, want %q", snap.ScopeKey, "canary-scope|reality|tcp")
+	}
 	if snap.UplinkSemantic != VisionSemanticExplicitNoDetach {
 		t.Fatalf("snapshot uplink semantic = %q, want %q", snap.UplinkSemantic, VisionSemanticExplicitNoDetach)
+	}
+	if snap.NativeProvisionalSemantic != VisionNativeProvisionalSemanticNone {
+		t.Fatalf("snapshot native provisional semantic = %q, want %q", snap.NativeProvisionalSemantic, VisionNativeProvisionalSemanticNone)
 	}
 	if snap.DrainMode != VisionDrainModeBuffered || snap.DrainCount != 1 || snap.DrainPlaintext != 4 || snap.DrainRawAhead != 2 {
 		t.Fatalf("unexpected accepted drain snapshot: %+v", snap)
 	}
 	if snap.TransportDrainMode != VisionDrainModeDeferred || snap.TransportDrainCount != 1 || snap.TransportDrainPlaintext != 9 || snap.TransportDrainRawAhead != 6 {
 		t.Fatalf("unexpected transport drain snapshot: %+v", snap)
+	}
+	if snap.DrainRelation != VisionDrainRelationMismatch {
+		t.Fatalf("snapshot drain relation = %q, want %q", snap.DrainRelation, VisionDrainRelationMismatch)
+	}
+	if snap.BridgeAssessment != VisionBridgeAssessmentNativeDivergent {
+		t.Fatalf("snapshot bridge assessment = %q, want %q", snap.BridgeAssessment, VisionBridgeAssessmentNativeDivergent)
+	}
+	if snap.TransportReadOps != 0 || snap.TransportReadBytes != 0 {
+		t.Fatalf("unexpected transport read snapshot: %+v", snap)
+	}
+	if snap.TransportWriteOps != 1 || snap.TransportWriteBytes != 11 {
+		t.Fatalf("unexpected transport write snapshot: %+v", snap)
+	}
+	if snap.TransportProgress != VisionTransportProgressWriteOnly {
+		t.Fatalf("snapshot transport progress = %q, want %q", snap.TransportProgress, VisionTransportProgressWriteOnly)
 	}
 	if snap.TransportLifecycleState != VisionTransportLifecycleDeferredActive {
 		t.Fatalf("snapshot transport lifecycle state = %q, want %q", snap.TransportLifecycleState, VisionTransportLifecycleDeferredActive)
@@ -572,6 +617,927 @@ func TestVisionTransitionSourceSnapshotIncludesRuntimeBridgeState(t *testing.T) 
 	}
 	if snap.TransportKTLSPromotion != VisionTransportKTLSPromotionNone {
 		t.Fatalf("snapshot transport ktls promotion = %q, want %q", snap.TransportKTLSPromotion, VisionTransportKTLSPromotionNone)
+	}
+}
+
+func TestVisionTransitionSummaryDrainRelationVariants(t *testing.T) {
+	tests := []struct {
+		name    string
+		observe func(conn *testTraceConn)
+		want    VisionDrainRelation
+	}{
+		{
+			name: "accepted only",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 5, 2)
+			},
+			want: VisionDrainRelationAcceptedOnly,
+		},
+		{
+			name: "transport only",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransportDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 5, 2)
+			},
+			want: VisionDrainRelationTransportOnly,
+		},
+		{
+			name: "aligned",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 5, 2)
+				ObserveVisionTransportDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 5, 2)
+			},
+			want: VisionDrainRelationAligned,
+		},
+		{
+			name: "mismatch",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeBuffered, 5, 2)
+				ObserveVisionTransportDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 8, 3)
+			},
+			want: VisionDrainRelationMismatch,
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &testTraceConn{id: 200 + i}
+			tc.observe(conn)
+
+			summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+			if !ok {
+				t.Fatal("SnapshotVisionTransitionSummary() returned no summary")
+			}
+			if summary.DrainRelation != tc.want {
+				t.Fatalf("summary.DrainRelation=%q, want %q", summary.DrainRelation, tc.want)
+			}
+		})
+	}
+}
+
+func TestVisionTransitionSummaryBridgeAssessmentVariants(t *testing.T) {
+	tests := []struct {
+		name    string
+		observe func(conn *testTraceConn)
+		want    VisionBridgeAssessment
+	}{
+		{
+			name: "go baseline",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindRealityConn, VisionIngressOriginGoReality)
+			},
+			want: VisionBridgeAssessmentGoBaseline,
+		},
+		{
+			name: "native pending",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+			},
+			want: VisionBridgeAssessmentNativePending,
+		},
+		{
+			name: "native aligned",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDetachCompleted)
+				ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 5, 2)
+				ObserveVisionTransportDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 5, 2)
+			},
+			want: VisionBridgeAssessmentNativeAligned,
+		},
+		{
+			name: "native divergent",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDetachCompleted)
+				ObserveVisionTransitionDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeBuffered, 5, 2)
+				ObserveVisionTransportDrain(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 8, 3)
+			},
+			want: VisionBridgeAssessmentNativeDivergent,
+		},
+		{
+			name: "native detach failed",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDetachFailed)
+			},
+			want: VisionBridgeAssessmentNativeDetachFailed,
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &testTraceConn{id: 300 + i}
+			tc.observe(conn)
+
+			summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+			if !ok {
+				t.Fatal("SnapshotVisionTransitionSummary() returned no summary")
+			}
+			if summary.BridgeAssessment != tc.want {
+				t.Fatalf("summary.BridgeAssessment=%q, want %q", summary.BridgeAssessment, tc.want)
+			}
+		})
+	}
+}
+
+func TestVisionTransitionSummaryTransportProgressVariants(t *testing.T) {
+	tests := []struct {
+		name    string
+		observe func(conn *testTraceConn)
+		want    VisionTransportProgressProfile
+	}{
+		{
+			name: "none",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+			},
+			want: VisionTransportProgressNone,
+		},
+		{
+			name: "write only",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressWrite, Bytes: 8})
+			},
+			want: VisionTransportProgressWriteOnly,
+		},
+		{
+			name: "read only",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressRead, Bytes: 5})
+			},
+			want: VisionTransportProgressReadOnly,
+		},
+		{
+			name: "bidirectional",
+			observe: func(conn *testTraceConn) {
+				ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+				ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressWrite, Bytes: 8})
+				ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressRead, Bytes: 5})
+			},
+			want: VisionTransportProgressBidirectional,
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &testTraceConn{id: 500 + i}
+			tc.observe(conn)
+
+			summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+			if !ok {
+				t.Fatal("SnapshotVisionTransitionSummary() returned no summary")
+			}
+			if summary.TransportProgress != tc.want {
+				t.Fatalf("summary.TransportProgress=%q, want %q", summary.TransportProgress, tc.want)
+			}
+		})
+	}
+}
+
+func TestLogVisionTransitionSummaryUpdatesBridgeAssessmentCountersWithoutDebug(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+
+	goConn := &testTraceConn{id: 400}
+	ObserveVisionTransitionSource(goConn, VisionTransitionKindRealityConn, VisionIngressOriginGoReality)
+	ObserveVisionTransitionScope(goConn, "scope-a|reality|tcp")
+	LogVisionTransitionSummary(context.Background(), goConn, nil, nil)
+
+	nativeConn := &testTraceConn{id: 401}
+	ObserveVisionTransitionSource(nativeConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(nativeConn, "scope-b|reality|tcp")
+	ObserveVisionTransportLifecycle(nativeConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDetachCompleted)
+	ObserveVisionTransitionDrain(nativeConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeBuffered, 5, 2)
+	ObserveVisionTransportDrain(nativeConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 8, 3)
+	LogVisionTransitionSummary(context.Background(), nativeConn, nil, nil)
+
+	stats := SnapshotVisionBridgeAssessmentStats()
+	if stats.GoBaseline != 1 {
+		t.Fatalf("stats.GoBaseline=%d, want 1", stats.GoBaseline)
+	}
+	if stats.NativeDivergent != 1 {
+		t.Fatalf("stats.NativeDivergent=%d, want 1", stats.NativeDivergent)
+	}
+	if stats.NativePending != 0 || stats.NativeAligned != 0 || stats.NativeDetachFailed != 0 {
+		t.Fatalf("unexpected assessment counters: %+v", stats)
+	}
+
+	scopeA := SnapshotVisionBridgeAssessmentStatsForScope("scope-a|reality|tcp")
+	if scopeA.GoBaseline != 1 || scopeA.NativeDivergent != 0 {
+		t.Fatalf("unexpected scope-a counters: %+v", scopeA)
+	}
+	scopeB := SnapshotVisionBridgeAssessmentStatsForScope("scope-b|reality|tcp")
+	if scopeB.NativeDivergent != 1 || scopeB.GoBaseline != 0 {
+		t.Fatalf("unexpected scope-b counters: %+v", scopeB)
+	}
+}
+
+func TestVisionBridgeAssessmentStatsExpireOutsideRollingWindow(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+
+	base := time.Unix(1_000_000, 0)
+	visionBridgeAssessmentNowFn = func() time.Time { return base }
+
+	conn := &testTraceConn{id: 402}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindRealityConn, VisionIngressOriginGoReality)
+	ObserveVisionTransitionScope(conn, "scope-expire|reality|tcp")
+	LogVisionTransitionSummary(context.Background(), conn, nil, nil)
+
+	stats := SnapshotVisionBridgeAssessmentStatsForScope("scope-expire|reality|tcp")
+	if stats.GoBaseline != 1 {
+		t.Fatalf("initial stats.GoBaseline=%d, want 1", stats.GoBaseline)
+	}
+
+	visionBridgeAssessmentNowFn = func() time.Time {
+		return base.Add(11 * visionBridgeAssessmentBucketWidth)
+	}
+	stats = SnapshotVisionBridgeAssessmentStatsForScope("scope-expire|reality|tcp")
+	if stats != (VisionBridgeAssessmentStats{}) {
+		t.Fatalf("expected expired scoped stats, got %+v", stats)
+	}
+}
+
+func TestVisionBridgeProbeEpochCollectsFreshScopedStatsAndCompletesAtBudget(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	resetVisionBridgeProbeEpochsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+	t.Cleanup(resetVisionBridgeProbeEpochsForTest)
+
+	base := time.Unix(2_000_000, 0)
+	visionBridgeAssessmentNowFn = func() time.Time { return base }
+	visionBridgeProbeNowFn = func() time.Time { return base }
+
+	scope := "scope-probe|reality|tcp"
+	start := EnsureVisionBridgeProbeEpoch(scope, 2, time.Minute)
+	if start.State != VisionBridgeProbeStateActive {
+		t.Fatalf("start.State=%q, want %q", start.State, VisionBridgeProbeStateActive)
+	}
+	if start.Observed != 0 {
+		t.Fatalf("start.Observed=%d, want 0", start.Observed)
+	}
+
+	alignedConn := &testTraceConn{id: 405}
+	ObserveVisionTransitionSource(alignedConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(alignedConn, scope)
+	ObserveVisionTransportLifecycle(alignedConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDetachCompleted)
+	ObserveVisionTransitionDrain(alignedConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 8, 3)
+	ObserveVisionTransportDrain(alignedConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 8, 3)
+	LogVisionTransitionSummary(context.Background(), alignedConn, nil, nil)
+
+	mid := SnapshotVisionBridgeProbeEpochForScope(scope)
+	if mid.State != VisionBridgeProbeStateActive {
+		t.Fatalf("mid.State=%q, want %q", mid.State, VisionBridgeProbeStateActive)
+	}
+	if mid.Observed != 1 {
+		t.Fatalf("mid.Observed=%d, want 1", mid.Observed)
+	}
+	if mid.Verdict != VisionBridgeProbeVerdictNativeAligned {
+		t.Fatalf("mid.Verdict=%q, want %q", mid.Verdict, VisionBridgeProbeVerdictNativeAligned)
+	}
+
+	failureConn := &testTraceConn{id: 406}
+	ObserveVisionTransitionSource(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(failureConn, scope)
+	ObserveVisionTransportLifecycle(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransitionEvent(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransitionEvent(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	LogVisionTransitionSummary(context.Background(), failureConn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonVisionUplinkCompleteUserspace,
+		UserspaceBytes: 0,
+		UserspaceExit:  pipeline.UserspaceExitTimeout,
+	})
+
+	final := SnapshotVisionBridgeProbeEpochForScope(scope)
+	if final.State != VisionBridgeProbeStateCompleted {
+		t.Fatalf("final.State=%q, want %q", final.State, VisionBridgeProbeStateCompleted)
+	}
+	if final.Observed != 2 {
+		t.Fatalf("final.Observed=%d, want 2", final.Observed)
+	}
+	if final.Verdict != VisionBridgeProbeVerdictNativePendingCommand0 {
+		t.Fatalf("final.Verdict=%q, want %q", final.Verdict, VisionBridgeProbeVerdictNativePendingCommand0)
+	}
+	if final.Stats.NativePendingCommand0Failure != 1 {
+		t.Fatalf("final.Stats.NativePendingCommand0Failure=%d, want 1", final.Stats.NativePendingCommand0Failure)
+	}
+}
+
+func TestVisionBridgeProbeEpochPrefersBidirectionalCommand0Verdict(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	resetVisionBridgeProbeEpochsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+	t.Cleanup(resetVisionBridgeProbeEpochsForTest)
+
+	base := time.Unix(2_100_000, 0)
+	visionBridgeAssessmentNowFn = func() time.Time { return base }
+	visionBridgeProbeNowFn = func() time.Time { return base }
+
+	scope := "scope-probe-bidi|reality|tcp"
+	start := EnsureVisionBridgeProbeEpoch(scope, 1, time.Minute)
+	if start.State != VisionBridgeProbeStateActive {
+		t.Fatalf("start.State=%q, want %q", start.State, VisionBridgeProbeStateActive)
+	}
+
+	failureConn := &testTraceConn{id: 1406}
+	ObserveVisionTransitionSource(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(failureConn, scope)
+	ObserveVisionTransportLifecycle(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransitionEvent(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransitionEvent(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransportProgress(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressWrite, Bytes: 21})
+	ObserveVisionTransportProgress(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressRead, Bytes: 9})
+	LogVisionTransitionSummary(context.Background(), failureConn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonVisionUplinkCompleteUserspace,
+		UserspaceBytes: 0,
+		UserspaceExit:  pipeline.UserspaceExitTimeout,
+	})
+
+	final := SnapshotVisionBridgeProbeEpochForScope(scope)
+	if final.State != VisionBridgeProbeStateCompleted {
+		t.Fatalf("final.State=%q, want %q", final.State, VisionBridgeProbeStateCompleted)
+	}
+	if final.Verdict != VisionBridgeProbeVerdictNativeProvisionalFailedPending {
+		t.Fatalf("final.Verdict=%q, want %q", final.Verdict, VisionBridgeProbeVerdictNativeProvisionalFailedPending)
+	}
+	if final.Stats.NativeProvisionalCommand0Bidirectional != 1 {
+		t.Fatalf("final.Stats.NativeProvisionalCommand0Bidirectional=%d, want 1", final.Stats.NativeProvisionalCommand0Bidirectional)
+	}
+	if final.Stats.NativeProvisionalCommand0BidirectionalFailure != 1 {
+		t.Fatalf("final.Stats.NativeProvisionalCommand0BidirectionalFailure=%d, want 1", final.Stats.NativeProvisionalCommand0BidirectionalFailure)
+	}
+	if final.Stats.NativeProvisionalFailedPending != 1 {
+		t.Fatalf("final.Stats.NativeProvisionalFailedPending=%d, want 1", final.Stats.NativeProvisionalFailedPending)
+	}
+	if final.Stats.NativePendingCommand0BidirectionalFailure != 1 {
+		t.Fatalf("final.Stats.NativePendingCommand0BidirectionalFailure=%d, want 1", final.Stats.NativePendingCommand0BidirectionalFailure)
+	}
+}
+
+func TestVisionBridgeProbeEpochExpiresByDuration(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	resetVisionBridgeProbeEpochsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+	t.Cleanup(resetVisionBridgeProbeEpochsForTest)
+
+	base := time.Unix(3_000_000, 0)
+	visionBridgeProbeNowFn = func() time.Time { return base }
+
+	scope := "scope-probe-expire|reality|tcp"
+	start := EnsureVisionBridgeProbeEpoch(scope, 16, 2*time.Second)
+	if start.State != VisionBridgeProbeStateActive {
+		t.Fatalf("start.State=%q, want %q", start.State, VisionBridgeProbeStateActive)
+	}
+	visionBridgeProbeNowFn = func() time.Time { return base.Add(3 * time.Second) }
+	final := SnapshotVisionBridgeProbeEpochForScope(scope)
+	if final.State != VisionBridgeProbeStateCompleted {
+		t.Fatalf("final.State=%q, want %q", final.State, VisionBridgeProbeStateCompleted)
+	}
+	if final.Verdict != VisionBridgeProbeVerdictNoSignal {
+		t.Fatalf("final.Verdict=%q, want %q", final.Verdict, VisionBridgeProbeVerdictNoSignal)
+	}
+}
+
+func TestLogVisionTransitionSummaryClassifiesPendingQuality(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+
+	benignConn := &testTraceConn{id: 403}
+	ObserveVisionTransitionSource(benignConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(benignConn, "scope-pending|reality|tcp")
+	ObserveVisionTransportLifecycle(benignConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	LogVisionTransitionSummary(context.Background(), benignConn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonControlPlaneDNSGuard,
+		UserspaceBytes: 128,
+		UserspaceExit:  pipeline.UserspaceExitComplete,
+	})
+
+	failureConn := &testTraceConn{id: 404}
+	ObserveVisionTransitionSource(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(failureConn, "scope-pending|reality|tcp")
+	ObserveVisionTransportLifecycle(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransitionEvent(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransitionEvent(failureConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	LogVisionTransitionSummary(context.Background(), failureConn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonVisionUplinkCompleteUserspace,
+		UserspaceBytes: 0,
+		UserspaceExit:  pipeline.UserspaceExitTimeout,
+	})
+
+	stats := SnapshotVisionBridgeAssessmentStatsForScope("scope-pending|reality|tcp")
+	if stats.NativePending != 2 {
+		t.Fatalf("stats.NativePending=%d, want 2", stats.NativePending)
+	}
+	if stats.NativePendingBenign != 1 {
+		t.Fatalf("stats.NativePendingBenign=%d, want 1", stats.NativePendingBenign)
+	}
+	if stats.NativePendingFailure != 1 {
+		t.Fatalf("stats.NativePendingFailure=%d, want 1", stats.NativePendingFailure)
+	}
+	if stats.NativePendingCommand0Failure != 1 {
+		t.Fatalf("stats.NativePendingCommand0Failure=%d, want 1", stats.NativePendingCommand0Failure)
+	}
+}
+
+func TestLogVisionTransitionSummaryClassifiesBidirectionalCommand0PendingGap(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+
+	conn := &testTraceConn{id: 1404}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-pending-gap|reality|tcp")
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressWrite, Bytes: 13})
+	ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressRead, Bytes: 7})
+	LogVisionTransitionSummary(context.Background(), conn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonVisionUplinkCompleteUserspace,
+		UserspaceBytes: 0,
+		UserspaceExit:  pipeline.UserspaceExitLocalCloseNoResponse,
+	})
+
+	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+	if ok {
+		t.Fatalf("expected summary to be consumed at flow end, got %+v", summary)
+	}
+	stats := SnapshotVisionBridgeAssessmentStatsForScope("scope-pending-gap|reality|tcp")
+	if stats.NativePendingFailure != 1 {
+		t.Fatalf("stats.NativePendingFailure=%d, want 1", stats.NativePendingFailure)
+	}
+	if stats.NativePendingCommand0Failure != 1 {
+		t.Fatalf("stats.NativePendingCommand0Failure=%d, want 1", stats.NativePendingCommand0Failure)
+	}
+	if stats.NativePendingCommand0BidirectionalFailure != 1 {
+		t.Fatalf("stats.NativePendingCommand0BidirectionalFailure=%d, want 1", stats.NativePendingCommand0BidirectionalFailure)
+	}
+	if stats.NativeProvisionalCommand0Bidirectional != 1 {
+		t.Fatalf("stats.NativeProvisionalCommand0Bidirectional=%d, want 1", stats.NativeProvisionalCommand0Bidirectional)
+	}
+	if stats.NativeProvisionalCommand0BidirectionalFailure != 1 {
+		t.Fatalf("stats.NativeProvisionalCommand0BidirectionalFailure=%d, want 1", stats.NativeProvisionalCommand0BidirectionalFailure)
+	}
+	if stats.NativeProvisionalFailedPending != 1 {
+		t.Fatalf("stats.NativeProvisionalFailedPending=%d, want 1", stats.NativeProvisionalFailedPending)
+	}
+}
+
+func TestVisionTransitionSummaryPublishesNativeProvisionalSemantic(t *testing.T) {
+	conn := &testTraceConn{id: 1405}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-provisional|reality|tcp")
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressWrite, Bytes: 15})
+	ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressRead, Bytes: 6})
+
+	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary")
+	}
+	if summary.NativeProvisionalSemantic != VisionNativeProvisionalSemanticCommand0Bidirectional {
+		t.Fatalf("summary.NativeProvisionalSemantic=%q, want %q", summary.NativeProvisionalSemantic, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	}
+	if summary.NativeProvisionalSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalSource=%q, want %q", summary.NativeProvisionalSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+	if summary.NativeProvisionalObserved != VisionNativeProvisionalSemanticCommand0Bidirectional {
+		t.Fatalf("summary.NativeProvisionalObserved=%q, want %q", summary.NativeProvisionalObserved, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	}
+	if summary.NativeProvisionalObservedSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalObservedSource=%q, want %q", summary.NativeProvisionalObservedSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+	if summary.NativeProvisionalOutcome != VisionNativeProvisionalOutcomeActive {
+		t.Fatalf("summary.NativeProvisionalOutcome=%q, want %q", summary.NativeProvisionalOutcome, VisionNativeProvisionalOutcomeActive)
+	}
+	if summary.NativeProvisionalOutcomeSource != VisionNativeProvisionalOutcomeSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalOutcomeSource=%q, want %q", summary.NativeProvisionalOutcomeSource, VisionNativeProvisionalOutcomeSourceExplicitProducer)
+	}
+	if summary.PendingGap != VisionPendingGapCommand0BidirectionalNoDet {
+		t.Fatalf("summary.PendingGap=%q, want %q", summary.PendingGap, VisionPendingGapCommand0BidirectionalNoDet)
+	}
+}
+
+func TestVisionTransitionSummaryClearsPublishedNativeProvisionalSemantic(t *testing.T) {
+	conn := &testTraceConn{id: 1406}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-provisional-clear|reality|tcp")
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressWrite, Bytes: 15})
+	ObserveVisionTransportProgress(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustProgressEvent{Direction: xtls.DeferredRustProgressRead, Bytes: 6})
+
+	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary")
+	}
+	if summary.NativeProvisionalSemantic != VisionNativeProvisionalSemanticCommand0Bidirectional {
+		t.Fatalf("summary.NativeProvisionalSemantic=%q, want %q", summary.NativeProvisionalSemantic, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	}
+	if summary.NativeProvisionalSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalSource=%q, want %q", summary.NativeProvisionalSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+	if summary.NativeProvisionalObserved != VisionNativeProvisionalSemanticCommand0Bidirectional {
+		t.Fatalf("summary.NativeProvisionalObserved=%q, want %q", summary.NativeProvisionalObserved, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	}
+	if summary.NativeProvisionalObservedSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalObservedSource=%q, want %q", summary.NativeProvisionalObservedSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 1)
+
+	summary, ok = SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary after explicit no-detach")
+	}
+	if summary.NativeProvisionalSemantic != VisionNativeProvisionalSemanticNone {
+		t.Fatalf("summary.NativeProvisionalSemantic=%q, want %q", summary.NativeProvisionalSemantic, VisionNativeProvisionalSemanticNone)
+	}
+	if summary.NativeProvisionalSource != VisionNativeProvisionalSemanticSourceNone {
+		t.Fatalf("summary.NativeProvisionalSource=%q, want %q", summary.NativeProvisionalSource, VisionNativeProvisionalSemanticSourceNone)
+	}
+	if summary.NativeProvisionalObserved != VisionNativeProvisionalSemanticCommand0Bidirectional {
+		t.Fatalf("summary.NativeProvisionalObserved=%q, want %q", summary.NativeProvisionalObserved, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	}
+	if summary.NativeProvisionalObservedSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalObservedSource=%q, want %q", summary.NativeProvisionalObservedSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+	if summary.NativeProvisionalOutcome != VisionNativeProvisionalOutcomeResolvedNoDetach {
+		t.Fatalf("summary.NativeProvisionalOutcome=%q, want %q", summary.NativeProvisionalOutcome, VisionNativeProvisionalOutcomeResolvedNoDetach)
+	}
+	if summary.NativeProvisionalOutcomeSource != VisionNativeProvisionalOutcomeSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalOutcomeSource=%q, want %q", summary.NativeProvisionalOutcomeSource, VisionNativeProvisionalOutcomeSourceExplicitProducer)
+	}
+}
+
+func TestObserveVisionNativeProvisionalSemanticProducerOverrideAndClear(t *testing.T) {
+	conn := &testTraceConn{id: 1407}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-provisional-producer|reality|tcp")
+
+	ObserveVisionNativeProvisionalSemantic(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+
+	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary after producer override")
+	}
+	if summary.NativeProvisionalSemantic != VisionNativeProvisionalSemanticCommand0Bidirectional {
+		t.Fatalf("summary.NativeProvisionalSemantic=%q, want %q", summary.NativeProvisionalSemantic, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	}
+	if summary.NativeProvisionalSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalSource=%q, want %q", summary.NativeProvisionalSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+	if summary.NativeProvisionalObserved != VisionNativeProvisionalSemanticCommand0Bidirectional {
+		t.Fatalf("summary.NativeProvisionalObserved=%q, want %q", summary.NativeProvisionalObserved, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	}
+	if summary.NativeProvisionalObservedSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalObservedSource=%q, want %q", summary.NativeProvisionalObservedSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+	if summary.NativeProvisionalOutcome != VisionNativeProvisionalOutcomeActive {
+		t.Fatalf("summary.NativeProvisionalOutcome=%q, want %q", summary.NativeProvisionalOutcome, VisionNativeProvisionalOutcomeActive)
+	}
+	if summary.NativeProvisionalOutcomeSource != VisionNativeProvisionalOutcomeSourceBridgeProducer {
+		t.Fatalf("summary.NativeProvisionalOutcomeSource=%q, want %q", summary.NativeProvisionalOutcomeSource, VisionNativeProvisionalOutcomeSourceBridgeProducer)
+	}
+
+	ObserveVisionNativeProvisionalOutcome(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalOutcomeFailedPending)
+
+	summary, ok = SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary after outcome producer override")
+	}
+	if summary.NativeProvisionalOutcome != VisionNativeProvisionalOutcomeFailedPending {
+		t.Fatalf("summary.NativeProvisionalOutcome=%q, want %q", summary.NativeProvisionalOutcome, VisionNativeProvisionalOutcomeFailedPending)
+	}
+	if summary.NativeProvisionalOutcomeSource != VisionNativeProvisionalOutcomeSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalOutcomeSource=%q, want %q", summary.NativeProvisionalOutcomeSource, VisionNativeProvisionalOutcomeSourceExplicitProducer)
+	}
+
+	ObserveVisionNativeProvisionalSemantic(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticNone)
+	ObserveVisionNativeProvisionalOutcome(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalOutcomeNone)
+
+	summary, ok = SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary after producer clear")
+	}
+	if summary.NativeProvisionalSemantic != VisionNativeProvisionalSemanticNone {
+		t.Fatalf("summary.NativeProvisionalSemantic=%q, want %q", summary.NativeProvisionalSemantic, VisionNativeProvisionalSemanticNone)
+	}
+	if summary.NativeProvisionalSource != VisionNativeProvisionalSemanticSourceNone {
+		t.Fatalf("summary.NativeProvisionalSource=%q, want %q", summary.NativeProvisionalSource, VisionNativeProvisionalSemanticSourceNone)
+	}
+	if summary.NativeProvisionalObserved != VisionNativeProvisionalSemanticCommand0Bidirectional {
+		t.Fatalf("summary.NativeProvisionalObserved=%q, want %q", summary.NativeProvisionalObserved, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	}
+	if summary.NativeProvisionalObservedSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalObservedSource=%q, want %q", summary.NativeProvisionalObservedSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+	if summary.NativeProvisionalOutcome != VisionNativeProvisionalOutcomeActive {
+		t.Fatalf("summary.NativeProvisionalOutcome=%q, want %q", summary.NativeProvisionalOutcome, VisionNativeProvisionalOutcomeActive)
+	}
+	if summary.NativeProvisionalOutcomeSource != VisionNativeProvisionalOutcomeSourceBridgeProducer {
+		t.Fatalf("summary.NativeProvisionalOutcomeSource=%q, want %q", summary.NativeProvisionalOutcomeSource, VisionNativeProvisionalOutcomeSourceBridgeProducer)
+	}
+}
+
+func TestVisionTransitionSummaryUsesProducerNativeProvisionalSemanticForPendingGap(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+
+	conn := &testTraceConn{id: 1408}
+	scope := "scope-provisional-gap|reality|tcp"
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, scope)
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionNativeProvisionalSemantic(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+
+	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary after producer provisional semantic")
+	}
+	if summary.PendingGap != VisionPendingGapCommand0BidirectionalNoDet {
+		t.Fatalf("summary.PendingGap=%q, want %q", summary.PendingGap, VisionPendingGapCommand0BidirectionalNoDet)
+	}
+	if summary.NativeProvisionalSource != VisionNativeProvisionalSemanticSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalSource=%q, want %q", summary.NativeProvisionalSource, VisionNativeProvisionalSemanticSourceExplicitProducer)
+	}
+	if summary.NativeProvisionalOutcomeSource != VisionNativeProvisionalOutcomeSourceBridgeProducer {
+		t.Fatalf("summary.NativeProvisionalOutcomeSource=%q, want %q", summary.NativeProvisionalOutcomeSource, VisionNativeProvisionalOutcomeSourceBridgeProducer)
+	}
+
+	LogVisionTransitionSummary(context.Background(), conn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonVisionUplinkCompleteUserspace,
+		UserspaceBytes: 0,
+		UserspaceExit:  pipeline.UserspaceExitTimeout,
+	})
+
+	stats := SnapshotVisionBridgeAssessmentStatsForScope(scope)
+	if stats.NativeProvisionalCommand0Bidirectional != 1 {
+		t.Fatalf("stats.NativeProvisionalCommand0Bidirectional=%d, want 1", stats.NativeProvisionalCommand0Bidirectional)
+	}
+	if stats.NativeProvisionalCommand0BidirectionalFailure != 1 {
+		t.Fatalf("stats.NativeProvisionalCommand0BidirectionalFailure=%d, want 1", stats.NativeProvisionalCommand0BidirectionalFailure)
+	}
+}
+
+func TestVisionTransitionSummaryDerivesNativeProvisionalOutcomeFailure(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	conn := &testTraceConn{id: 1409}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-provisional-outcome-failure|reality|tcp")
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionNativeProvisionalSemantic(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+
+	LogVisionTransitionSummary(context.Background(), conn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonVisionUplinkCompleteUserspace,
+		UserspaceBytes: 0,
+		UserspaceExit:  pipeline.UserspaceExitTimeout,
+	})
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "native_provisional_observed=command0_bidirectional") ||
+		!strings.Contains(logs, "native_provisional_observed_source=explicit_producer") ||
+		!strings.Contains(logs, "native_provisional_outcome=failed_pending") ||
+		!strings.Contains(logs, "native_provisional_outcome_source=bridge_producer") {
+		t.Fatalf("missing native provisional outcome fields in logs: %s", logs)
+	}
+}
+
+func TestObserveVisionNativeProvisionalOutcomeProducerOverrideAndClear(t *testing.T) {
+	conn := &testTraceConn{id: 1410}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-provisional-outcome-producer|reality|tcp")
+	ObserveVisionNativeProvisionalSemantic(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+
+	ObserveVisionNativeProvisionalOutcome(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalOutcomeBenignClose)
+
+	summary, ok := SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary after outcome producer override")
+	}
+	if summary.NativeProvisionalOutcome != VisionNativeProvisionalOutcomeBenignClose {
+		t.Fatalf("summary.NativeProvisionalOutcome=%q, want %q", summary.NativeProvisionalOutcome, VisionNativeProvisionalOutcomeBenignClose)
+	}
+	if summary.NativeProvisionalOutcomeSource != VisionNativeProvisionalOutcomeSourceExplicitProducer {
+		t.Fatalf("summary.NativeProvisionalOutcomeSource=%q, want %q", summary.NativeProvisionalOutcomeSource, VisionNativeProvisionalOutcomeSourceExplicitProducer)
+	}
+	if summary.PendingQuality != VisionPendingQualityBenign {
+		t.Fatalf("summary.PendingQuality=%q, want %q", summary.PendingQuality, VisionPendingQualityBenign)
+	}
+
+	ObserveVisionNativeProvisionalOutcome(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalOutcomeNone)
+
+	summary, ok = SnapshotVisionTransitionSummary(conn, nil)
+	if !ok {
+		t.Fatal("SnapshotVisionTransitionSummary() returned no summary after outcome producer clear")
+	}
+	if summary.NativeProvisionalOutcome != VisionNativeProvisionalOutcomeActive {
+		t.Fatalf("summary.NativeProvisionalOutcome=%q, want %q", summary.NativeProvisionalOutcome, VisionNativeProvisionalOutcomeActive)
+	}
+	if summary.NativeProvisionalOutcomeSource != VisionNativeProvisionalOutcomeSourceBridgeProducer {
+		t.Fatalf("summary.NativeProvisionalOutcomeSource=%q, want %q", summary.NativeProvisionalOutcomeSource, VisionNativeProvisionalOutcomeSourceBridgeProducer)
+	}
+}
+
+func TestVisionTransitionSummaryUsesProducerProvisionalFailureForPendingClassification(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	conn := &testTraceConn{id: 14135}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-provisional-failure-class|reality|tcp")
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionNativeProvisionalSemantic(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+
+	LogVisionTransitionSummary(context.Background(), conn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonDeferredTLSGuard,
+		UserspaceBytes: 0,
+		UserspaceExit:  pipeline.UserspaceExitTimeout,
+	})
+
+	if _, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
+		t.Fatalf("expected summary to be consumed after logging")
+	}
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "native_provisional_outcome=failed_pending") {
+		t.Fatalf("missing failed pending provisional outcome in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_quality=user_visible_failure") {
+		t.Fatalf("missing failure pending quality in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_class=command0_only") {
+		t.Fatalf("missing command0 pending class in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_gap=command0_bidirectional_no_detach") {
+		t.Fatalf("missing command0 bidirectional pending gap in logs: %s", logs)
+	}
+}
+
+func TestVisionTransitionSummaryUsesProducerProvisionalBenignOutcomeForPendingClassification(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	conn := &testTraceConn{id: 14137}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-provisional-benign-class|reality|tcp")
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionNativeProvisionalSemantic(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	LogVisionTransitionSummary(context.Background(), conn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonControlPlaneDNSGuard,
+		UserspaceBytes: 64,
+		UserspaceExit:  pipeline.UserspaceExitComplete,
+	})
+	if _, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
+		t.Fatalf("expected summary to be consumed after logging")
+	}
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "native_provisional_outcome=benign_pending_close") {
+		t.Fatalf("missing benign provisional outcome in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_quality=benign") {
+		t.Fatalf("missing benign pending quality in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_class=command0_only") {
+		t.Fatalf("missing command0 pending class in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_gap=command0_bidirectional_no_detach") {
+		t.Fatalf("missing command0 bidirectional pending gap in logs: %s", logs)
+	}
+}
+
+func TestVisionTransitionSummaryUsesProducerResolvedNoDetachForPendingClassification(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_VISION_TRANSITION_TRACE", "1")
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	conn := &testTraceConn{id: 14139}
+	ObserveVisionTransitionSource(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(conn, "scope-provisional-resolved-no-detach-class|reality|tcp")
+	ObserveVisionTransportLifecycle(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionNativeProvisionalSemantic(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	ObserveVisionTransitionEvent(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, "uplink", VisionTransitionEventCommandObserved, 0)
+	ObserveVisionNativeProvisionalOutcome(conn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalOutcomeResolvedNoDetach)
+
+	LogVisionTransitionSummary(context.Background(), conn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonDeferredTLSGuard,
+		UserspaceBytes: 0,
+		UserspaceExit:  pipeline.UserspaceExitTimeout,
+	})
+
+	if _, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
+		t.Fatalf("expected summary to be consumed after logging")
+	}
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "native_provisional_outcome=resolved_no_detach") {
+		t.Fatalf("missing resolved no-detach provisional outcome in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_quality=benign") {
+		t.Fatalf("missing benign pending quality in logs: %s", logs)
+	}
+	if strings.Contains(logs, "pending_quality=user_visible_failure") {
+		t.Fatalf("unexpected failure pending quality in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_class=explicit_no_detach") {
+		t.Fatalf("missing explicit no-detach pending class in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "pending_gap=other") {
+		t.Fatalf("missing no-detach pending gap in logs: %s", logs)
+	}
+}
+
+func TestLogVisionTransitionSummaryCountsNativeProvisionalOutcomes(t *testing.T) {
+	resetVisionBridgeAssessmentStatsForTest()
+	t.Cleanup(resetVisionBridgeAssessmentStatsForTest)
+
+	scope := "scope-provisional-outcomes|reality|tcp"
+
+	activeConn := &testTraceConn{id: 1410}
+	ObserveVisionTransitionSource(activeConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(activeConn, scope)
+	ObserveVisionTransportLifecycle(activeConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionNativeProvisionalSemantic(activeConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	LogVisionTransitionSummary(context.Background(), activeConn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonDeferredTLSGuard,
+		UserspaceBytes: 1,
+		UserspaceExit:  pipeline.UserspaceExitRemoteEOFNoResponse,
+	})
+
+	resolvedDirectConn := &testTraceConn{id: 1411}
+	ObserveVisionTransitionSource(resolvedDirectConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(resolvedDirectConn, scope)
+	ObserveVisionTransportLifecycle(resolvedDirectConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDetachCompleted)
+	ObserveVisionTransitionDrain(resolvedDirectConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 5, 2)
+	ObserveVisionTransportDrain(resolvedDirectConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionDrainModeDeferred, 5, 2)
+	ObserveVisionNativeProvisionalSemantic(resolvedDirectConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	LogVisionTransitionSummary(context.Background(), resolvedDirectConn, nil, nil)
+
+	benignConn := &testTraceConn{id: 1412}
+	ObserveVisionTransitionSource(benignConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred)
+	ObserveVisionTransitionScope(benignConn, scope)
+	ObserveVisionTransportLifecycle(benignConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, xtls.DeferredRustLifecycleDeferredActive)
+	ObserveVisionNativeProvisionalSemantic(benignConn, VisionTransitionKindDeferredRust, VisionIngressOriginNativeRealityDeferred, VisionNativeProvisionalSemanticCommand0Bidirectional)
+	LogVisionTransitionSummary(context.Background(), benignConn, nil, &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathUserspace,
+		Reason:         pipeline.ReasonControlPlaneDNSGuard,
+		UserspaceBytes: 64,
+		UserspaceExit:  pipeline.UserspaceExitComplete,
+	})
+
+	stats := SnapshotVisionBridgeAssessmentStatsForScope(scope)
+	if stats.NativeProvisionalActive != 1 {
+		t.Fatalf("stats.NativeProvisionalActive=%d, want 1", stats.NativeProvisionalActive)
+	}
+	if stats.NativeProvisionalResolvedDirect != 1 {
+		t.Fatalf("stats.NativeProvisionalResolvedDirect=%d, want 1", stats.NativeProvisionalResolvedDirect)
+	}
+	if stats.NativeProvisionalBenignClose != 1 {
+		t.Fatalf("stats.NativeProvisionalBenignClose=%d, want 1", stats.NativeProvisionalBenignClose)
+	}
+	if stats.NativeProvisionalResolvedNoDetach != 0 {
+		t.Fatalf("stats.NativeProvisionalResolvedNoDetach=%d, want 0", stats.NativeProvisionalResolvedNoDetach)
 	}
 }
 
