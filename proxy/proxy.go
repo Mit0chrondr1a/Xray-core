@@ -981,7 +981,8 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			}
 			storeVisionDetachTimestamp(w.source.Conn(), detachDoneUnix)
 			errors.LogDebug(w.ctx, "Vision: DeferredRustConn drained and detached; switching reader to raw socket")
-			LogVisionTransitionDrain(w.ctx, "deferred-detach", w.source, len(fut.result.plaintext), len(fut.result.rawAhead))
+			ObserveVisionTransitionDrain(w.source.Conn(), w.source.Kind(), w.source.Snapshot().IngressOrigin, VisionDrainModeDeferred, len(fut.result.plaintext), len(fut.result.rawAhead))
+			TraceVisionTransitionDrain(w.ctx, "deferred-detach", w.source, len(fut.result.plaintext), len(fut.result.rawAhead))
 			if len(fut.result.plaintext) > 0 {
 				buffer = append(buffer, buf.FromBytes(fut.result.plaintext))
 			}
@@ -991,7 +992,8 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			pipelineVisionDetachFutureByConn.Delete(dc)
 		} else {
 			plaintext, rawAhead := w.source.DrainBufferedState()
-			LogVisionTransitionDrain(w.ctx, "buffered-drain", w.source, len(plaintext), len(rawAhead))
+			ObserveVisionTransitionDrain(w.source.Conn(), w.source.Kind(), w.source.Snapshot().IngressOrigin, VisionDrainModeBuffered, len(plaintext), len(rawAhead))
+			TraceVisionTransitionDrain(w.ctx, "buffered-drain", w.source, len(plaintext), len(rawAhead))
 			if len(plaintext) > 0 {
 				buffer = append(buffer, buf.FromBytes(plaintext))
 			}

@@ -225,7 +225,16 @@ func LogVisionTransitionDrain(ctx context.Context, direction string, source *Vis
 	if source == nil {
 		return
 	}
-	ObserveVisionTransitionDrain(source.conn, source.Kind(), source.origin, normalizeVisionDrainMode(direction), plaintextLen, rawAheadLen)
+	TraceVisionTransitionDrain(ctx, direction, source, plaintextLen, rawAheadLen)
+}
+
+// TraceVisionTransitionDrain emits the debug drain marker without mutating
+// bridge state. Callers that already observed drain facts explicitly should use
+// this helper to avoid double-counting bridge summaries.
+func TraceVisionTransitionDrain(ctx context.Context, direction string, source *VisionTransitionSource, plaintextLen int, rawAheadLen int) {
+	if source == nil {
+		return
+	}
 	if !debugVisionTransitionTrace() {
 		return
 	}

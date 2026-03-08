@@ -188,7 +188,8 @@ func TestLogVisionTransitionSourceAndDrain(t *testing.T) {
 	source.origin = VisionIngressOriginGoReality
 
 	LogVisionTransitionSource(context.Background(), "inbound", source)
-	LogVisionTransitionDrain(context.Background(), "buffered-drain", source, len("plain"), len("raw"))
+	ObserveVisionTransitionDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeBuffered, len("plain"), len("raw"))
+	TraceVisionTransitionDrain(context.Background(), "buffered-drain", source, len("plain"), len("raw"))
 
 	logs := strings.Join(handler.msgs, "\n")
 	if !strings.Contains(logs, "kind=vision-transition-source") {
@@ -199,6 +200,19 @@ func TestLogVisionTransitionSourceAndDrain(t *testing.T) {
 	}
 	if !strings.Contains(logs, "kind=vision-transition-drain") || !strings.Contains(logs, "ingress_origin=go_reality") || !strings.Contains(logs, "plaintext_len=5") || !strings.Contains(logs, "raw_ahead_len=3") {
 		t.Fatalf("missing transition drain fields in logs: %s", logs)
+	}
+}
+
+func TestTraceVisionTransitionDrainDoesNotMutateSummaryWithoutObserve(t *testing.T) {
+	conn := &testTraceConn{id: 101}
+	source := NewVisionTransitionSource(conn, nil, nil)
+	source.kind = VisionTransitionKindDeferredRust
+	source.origin = VisionIngressOriginNativeRealityDeferred
+
+	TraceVisionTransitionDrain(context.Background(), "deferred-detach", source, 11, 7)
+
+	if _, ok := SnapshotVisionTransitionSummary(conn, nil); ok {
+		t.Fatal("TraceVisionTransitionDrain() should not create seam summary state without explicit observe")
 	}
 }
 
@@ -383,7 +397,8 @@ func TestLogVisionTransitionSummary(t *testing.T) {
 	source.origin = VisionIngressOriginNativeRealityDeferred
 
 	LogVisionTransitionSource(context.Background(), "inbound", source)
-	LogVisionTransitionDrain(context.Background(), "deferred-detach", source, 11, 7)
+	ObserveVisionTransitionDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeDeferred, 11, 7)
+	TraceVisionTransitionDrain(context.Background(), "deferred-detach", source, 11, 7)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 0, 1, 0, 0, true, false)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 1, 0, 0, 0, false, false)
 	LogVisionTransitionEvent(context.Background(), "downlink", source, VisionTransitionEventCommandObserved, 2, 0, 0, 0, false, true)
@@ -415,7 +430,8 @@ func TestVisionTransitionSummarySnapshotWithoutDebug(t *testing.T) {
 	source.origin = VisionIngressOriginGoReality
 
 	LogVisionTransitionSource(context.Background(), "inbound", source)
-	LogVisionTransitionDrain(context.Background(), "buffered-drain", source, 5, 3)
+	ObserveVisionTransitionDrain(source.Conn(), source.Kind(), source.origin, VisionDrainModeBuffered, 5, 3)
+	TraceVisionTransitionDrain(context.Background(), "buffered-drain", source, 5, 3)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 0, 1, 0, 0, true, false)
 	LogVisionTransitionEvent(context.Background(), "uplink", source, VisionTransitionEventCommandObserved, 2, 0, 0, 0, false, true)
 
