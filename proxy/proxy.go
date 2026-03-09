@@ -860,6 +860,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			if continueCommandsSeen != nil {
 				*continueCommandsSeen = 0
 			}
+			ResolveVisionNativeProvisionalNoDetachAtSemanticBoundary(w.source)
 			markVisionNoDetachObserved(w.ctx, w.ob)
 			if w.isUplink {
 				wakeVisionResponseLoop(w.ctx, w.source.Conn(), "command=1")

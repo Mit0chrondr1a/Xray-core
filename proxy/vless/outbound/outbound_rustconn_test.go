@@ -161,6 +161,8 @@ func TestBuildVisionTransitionSource(t *testing.T) {
 		proxy.ObserveVisionTransitionEvent(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, "uplink", proxy.VisionTransitionEventCommandObserved, 0)
 		proxy.ObserveVisionTransportProgress(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, tls.DeferredRustProgressEvent{Direction: tls.DeferredRustProgressWrite, Bytes: 23})
 		proxy.ObserveVisionTransportProgress(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, tls.DeferredRustProgressEvent{Direction: tls.DeferredRustProgressRead, Bytes: 11})
+		proxy.ObserveVisionNativeExplicitProvisionalSemantic(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, proxy.VisionNativeProvisionalSemanticCommand0Bidirectional)
+		proxy.ObserveVisionNativeExplicitProvisionalOutcome(deferred, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, proxy.VisionNativeProvisionalOutcomeActive)
 
 		source, err := proxy.BuildVisionTransitionSource(nil, deferred)
 		if err != nil {
