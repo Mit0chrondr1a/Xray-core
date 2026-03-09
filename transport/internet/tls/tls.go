@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"math/big"
 	gonet "net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -70,14 +72,54 @@ var deferredRustLifecycleObserverMu sync.RWMutex
 var deferredRustLifecycleObserver func(gonet.Conn, DeferredRustLifecycleEvent)
 var deferredRustProgressObserverMu sync.RWMutex
 var deferredRustProgressObserver func(gonet.Conn, DeferredRustProgressEvent)
+var deferredRustProvisionalObserverMu sync.RWMutex
+var deferredRustProvisionalObserver func(gonet.Conn, DeferredRustProvisionalObservation)
 
 type DeferredRustLifecycleEvent string
 
 type DeferredRustProgressDirection string
 
+type DeferredRustProvisionalSemantic string
+
+type DeferredRustProvisionalOutcome string
+
+type DeferredRustProvisionalTerminalReason string
+
+type DeferredRustProvisionalObservation struct {
+	Semantic       DeferredRustProvisionalSemantic
+	Outcome        DeferredRustProvisionalOutcome
+	TerminalReason DeferredRustProvisionalTerminalReason
+}
+
 const (
 	DeferredRustProgressRead  DeferredRustProgressDirection = "read"
 	DeferredRustProgressWrite DeferredRustProgressDirection = "write"
+)
+
+const (
+	DeferredRustProvisionalSemanticNone                  DeferredRustProvisionalSemantic = "none"
+	DeferredRustProvisionalSemanticCommand0Bidirectional DeferredRustProvisionalSemantic = "command0_bidirectional"
+)
+
+const (
+	DeferredRustProvisionalOutcomeNone              DeferredRustProvisionalOutcome = "none"
+	DeferredRustProvisionalOutcomeActive            DeferredRustProvisionalOutcome = "active"
+	DeferredRustProvisionalOutcomeResolvedDirect    DeferredRustProvisionalOutcome = "resolved_direct_copy"
+	DeferredRustProvisionalOutcomeTerminatedPending DeferredRustProvisionalOutcome = "terminated_pending"
+	DeferredRustProvisionalOutcomeBenignClose       DeferredRustProvisionalOutcome = "benign_pending_close"
+	DeferredRustProvisionalOutcomeFailedPending     DeferredRustProvisionalOutcome = "failed_pending"
+)
+
+const (
+	DeferredRustProvisionalTerminalReasonNone       DeferredRustProvisionalTerminalReason = "none"
+	DeferredRustProvisionalTerminalReasonLocalClose DeferredRustProvisionalTerminalReason = "local_close"
+	DeferredRustProvisionalTerminalReasonEOF        DeferredRustProvisionalTerminalReason = "eof"
+	DeferredRustProvisionalTerminalReasonClosed     DeferredRustProvisionalTerminalReason = "closed"
+	DeferredRustProvisionalTerminalReasonReset      DeferredRustProvisionalTerminalReason = "reset"
+	DeferredRustProvisionalTerminalReasonBrokenPipe DeferredRustProvisionalTerminalReason = "broken_pipe"
+	DeferredRustProvisionalTerminalReasonBadMessage DeferredRustProvisionalTerminalReason = "bad_message"
+	DeferredRustProvisionalTerminalReasonEIO        DeferredRustProvisionalTerminalReason = "eio"
+	DeferredRustProvisionalTerminalReasonOther      DeferredRustProvisionalTerminalReason = "other"
 )
 
 type DeferredRustProgressEvent struct {
@@ -143,6 +185,24 @@ func snapshotDeferredRustProgressObserver() func(gonet.Conn, DeferredRustProgres
 	deferredRustProgressObserverMu.RLock()
 	defer deferredRustProgressObserverMu.RUnlock()
 	return deferredRustProgressObserver
+}
+
+// SetDeferredRustProvisionalObserver installs a transport-level observer for
+// provisional semantic lifecycle events owned by DeferredRustConn itself.
+func SetDeferredRustProvisionalObserver(observer func(gonet.Conn, DeferredRustProvisionalObservation)) {
+	deferredRustProvisionalObserverMu.Lock()
+	defer deferredRustProvisionalObserverMu.Unlock()
+	deferredRustProvisionalObserver = observer
+}
+
+func snapshotDeferredRustProvisionalObserver() func(gonet.Conn, DeferredRustProvisionalObservation) {
+	deferredRustProvisionalObserverMu.RLock()
+	defer deferredRustProvisionalObserverMu.RUnlock()
+	return deferredRustProvisionalObserver
+}
+
+func (o DeferredRustProvisionalObservation) IsZero() bool {
+	return o.Semantic == "" && o.Outcome == "" && o.TerminalReason == ""
 }
 
 func deferredKTLSPromotionDisabledAt(now time.Time) bool {
@@ -865,40 +925,45 @@ func NewRustConnChecked(rawConn net.Conn, result *native.TlsResult, serverName s
 // reads/writes go through rustls (Rust FFI). After EnableKTLS(), the connection
 // transparently switches to kernel-level kTLS I/O on the raw socket.
 type DeferredRustConn struct {
-	rawConn          gonet.Conn
-	deferredMu       sync.RWMutex
-	deferredCond     *sync.Cond
-	deferredOps      int
-	deferredOpsBlock bool
-	handle           *native.DeferredSessionHandle
-	alpn             string
-	version          uint16
-	cipher           uint16
-	sni              string
-	ktlsScope        string
-	closed           atomic.Bool           // atomic: Close() may race with concurrent Read()/Write()
-	ktlsActive       bool                  // true after EnableKTLS()
-	ktlsState        KTLSState             // populated after EnableKTLS()
-	ktlsHandler      *KTLSKeyUpdateHandler // populated after EnableKTLS()
-	state            *native.TlsStateHandle
-	drainedData      []byte // from enable_ktls drain or detach read-ahead
-	drainedOff       int
-	writeRecords     atomic.Uint64
-	rotationFailures atomic.Uint32
-	detached         atomic.Bool // true after DrainAndDetach()
-	deferredReadMu   sync.Mutex
-	deferredReadBuf  []byte
-	deferredReadOff  int
-	deferredReadLen  int
-	writeBatching    atomic.Bool
-	deferredWriteMu  sync.Mutex
-	deferredWriteBuf []byte
-	deferredWriteLen int
-	deadlineMu       sync.RWMutex
-	readDeadline     time.Time
-	writeDeadline    time.Time
-	readRecords      atomic.Uint64 // kTLS RX record counter for EBADMSG diagnostics
-	readBytes        atomic.Int64  // total kTLS RX bytes for EBADMSG diagnostics
+	rawConn               gonet.Conn
+	deferredMu            sync.RWMutex
+	deferredCond          *sync.Cond
+	deferredOps           int
+	deferredOpsBlock      bool
+	handle                *native.DeferredSessionHandle
+	alpn                  string
+	version               uint16
+	cipher                uint16
+	sni                   string
+	ktlsScope             string
+	closed                atomic.Bool           // atomic: Close() may race with concurrent Read()/Write()
+	ktlsActive            bool                  // true after EnableKTLS()
+	ktlsState             KTLSState             // populated after EnableKTLS()
+	ktlsHandler           *KTLSKeyUpdateHandler // populated after EnableKTLS()
+	state                 *native.TlsStateHandle
+	drainedData           []byte // from enable_ktls drain or detach read-ahead
+	drainedOff            int
+	writeRecords          atomic.Uint64
+	rotationFailures      atomic.Uint32
+	detached              atomic.Bool // true after DrainAndDetach()
+	deferredReadMu        sync.Mutex
+	deferredReadBuf       []byte
+	deferredReadOff       int
+	deferredReadLen       int
+	writeBatching         atomic.Bool
+	deferredWriteMu       sync.Mutex
+	deferredWriteBuf      []byte
+	deferredWriteLen      int
+	provisionalMu         sync.Mutex
+	sawReadProgress       bool
+	sawWriteProgress      bool
+	provisionalSent       bool
+	provisionalTerminated bool
+	deadlineMu            sync.RWMutex
+	readDeadline          time.Time
+	writeDeadline         time.Time
+	readRecords           atomic.Uint64 // kTLS RX record counter for EBADMSG diagnostics
+	readBytes             atomic.Int64  // total kTLS RX bytes for EBADMSG diagnostics
 }
 
 // NewDeferredRustConn creates a DeferredRustConn from native deferred handshake results.
@@ -1081,6 +1146,118 @@ func (c *DeferredRustConn) observeTransportProgress(direction DeferredRustProgre
 	if observer := snapshotDeferredRustProgressObserver(); observer != nil {
 		observer(c, DeferredRustProgressEvent{Direction: direction, Bytes: n})
 	}
+	c.observeTransportProvisional(direction)
+}
+
+func (c *DeferredRustConn) observeTransportProvisional(direction DeferredRustProgressDirection) {
+	if c == nil || c.detached.Load() {
+		return
+	}
+	c.provisionalMu.Lock()
+	switch direction {
+	case DeferredRustProgressRead:
+		c.sawReadProgress = true
+	case DeferredRustProgressWrite:
+		c.sawWriteProgress = true
+	}
+	shouldPublish := c.sawReadProgress && c.sawWriteProgress && !c.provisionalSent
+	if shouldPublish {
+		c.provisionalSent = true
+	}
+	c.provisionalMu.Unlock()
+	if !shouldPublish {
+		return
+	}
+	if observer := snapshotDeferredRustProvisionalObserver(); observer != nil {
+		observer(c, DeferredRustProvisionalObservation{
+			Semantic: DeferredRustProvisionalSemanticCommand0Bidirectional,
+			Outcome:  DeferredRustProvisionalOutcomeActive,
+		})
+	}
+}
+
+func (c *DeferredRustConn) observeTransportProvisionalTerminal(obs DeferredRustProvisionalObservation) {
+	if c == nil || c.detached.Load() {
+		return
+	}
+	c.provisionalMu.Lock()
+	shouldPublish := c.provisionalSent && !c.provisionalTerminated
+	if shouldPublish {
+		c.provisionalTerminated = true
+	}
+	c.provisionalMu.Unlock()
+	if !shouldPublish {
+		return
+	}
+	if observer := snapshotDeferredRustProvisionalObserver(); observer != nil {
+		observer(c, obs)
+	}
+}
+
+func classifyDeferredProvisionalTerminationObservation(err error) (DeferredRustProvisionalObservation, bool) {
+	if err == nil {
+		return DeferredRustProvisionalObservation{}, false
+	}
+	var netErr gonet.Error
+	if stderrors.As(err, &netErr) && netErr.Timeout() {
+		return DeferredRustProvisionalObservation{}, false
+	}
+	if stderrors.Is(err, io.EOF) {
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonEOF,
+		}, true
+	}
+	if stderrors.Is(err, gonet.ErrClosed) {
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonClosed,
+		}, true
+	}
+	if isBadMessage(err) {
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonBadMessage,
+		}, true
+	}
+	if isEIO(err) {
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonEIO,
+		}, true
+	}
+	msg := err.Error()
+	switch {
+	case msg == "EOF":
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonEOF,
+		}, true
+	case containsString(msg, "use of closed network connection"):
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonClosed,
+		}, true
+	case containsString(msg, "connection reset by peer"):
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonReset,
+		}, true
+	case containsString(msg, "broken pipe"):
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonBrokenPipe,
+		}, true
+	default:
+		return DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeFailedPending,
+			TerminalReason: DeferredRustProvisionalTerminalReasonOther,
+		}, true
+	}
+}
+
+func containsString(s string, needle string) bool {
+	return len(needle) > 0 && strings.Contains(s, needle)
 }
 
 func earlierDeadline(a, b time.Time) time.Time {
@@ -1188,6 +1365,9 @@ func (c *DeferredRustConn) Read(b []byte) (int, error) {
 		if err == nil && n > 0 {
 			c.readRecords.Add(1)
 			c.readBytes.Add(int64(n))
+		}
+		if obs, ok := classifyDeferredProvisionalTerminationObservation(err); ok {
+			c.observeTransportProvisionalTerminal(obs)
 		}
 		return n, err
 	}
@@ -1334,6 +1514,9 @@ func (c *DeferredRustConn) Write(b []byte) (int, error) {
 			c.writeRecords.Add(1)
 		}
 		c.observeTransportProgress(DeferredRustProgressWrite, n)
+		if obs, ok := classifyDeferredProvisionalTerminationObservation(err); ok {
+			c.observeTransportProvisionalTerminal(obs)
+		}
 		// Transition race: reader may detach while writer is still on rustls path.
 		// Retry on raw socket once detached.
 		if err != nil && c.detached.Load() {
@@ -1439,10 +1622,16 @@ func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, 
 	var notifyRawAheadLen int
 	var notifyConn gonet.Conn
 	var notifyLifecycleEvent DeferredRustLifecycleEvent
+	var notifyProvisionalObs DeferredRustProvisionalObservation
 	c.deferredMu.Lock()
 	defer func() {
 		c.endExclusiveDeferredTransitionLocked()
 		c.deferredMu.Unlock()
+		if !notifyProvisionalObs.IsZero() {
+			if observer := snapshotDeferredRustProvisionalObserver(); observer != nil {
+				observer(c, notifyProvisionalObs)
+			}
+		}
 		if notifyLifecycleEvent != "" {
 			if observer := snapshotDeferredRustLifecycleObserver(); observer != nil {
 				observer(c, notifyLifecycleEvent)
@@ -1495,6 +1684,15 @@ func (c *DeferredRustConn) DrainAndDetach() (plaintext []byte, rawAhead []byte, 
 	c.handle = nil
 	c.detached.Store(true)
 	notifyLifecycleEvent = DeferredRustLifecycleDetachCompleted
+	c.provisionalMu.Lock()
+	if c.provisionalSent {
+		notifyProvisionalObs = DeferredRustProvisionalObservation{
+			Outcome:        DeferredRustProvisionalOutcomeResolvedDirect,
+			TerminalReason: DeferredRustProvisionalTerminalReasonNone,
+		}
+		c.provisionalTerminated = true
+	}
+	c.provisionalMu.Unlock()
 	notifyDrainObserver = true
 	notifyPlaintextLen = len(plaintext)
 	notifyRawAheadLen = len(rawAhead)
@@ -1809,6 +2007,11 @@ func (c *DeferredRustConn) Close() error {
 	c.deferredWriteBuf = nil
 	c.deferredWriteLen = 0
 	c.deferredWriteMu.Unlock()
+
+	c.observeTransportProvisionalTerminal(DeferredRustProvisionalObservation{
+		Outcome:        DeferredRustProvisionalOutcomeBenignClose,
+		TerminalReason: DeferredRustProvisionalTerminalReasonLocalClose,
+	})
 
 	return c.rawConn.Close()
 }

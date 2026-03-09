@@ -1,6 +1,7 @@
 package tls
 
 import (
+	"io"
 	gonet "net"
 	"testing"
 	"time"
@@ -318,5 +319,278 @@ func TestDeferredRustConnWriteCallsProgressObserver(t *testing.T) {
 	}
 	if got.Bytes != 4 {
 		t.Fatalf("observer bytes = %d, want 4", got.Bytes)
+	}
+}
+
+func TestDeferredRustConnPublishesProvisionalActiveAfterBidirectionalProgress(t *testing.T) {
+	oldRead := deferredReadFn
+	oldWrite := deferredWriteFn
+	oldObserver := snapshotDeferredRustProvisionalObserver()
+	t.Cleanup(func() {
+		deferredReadFn = oldRead
+		deferredWriteFn = oldWrite
+		SetDeferredRustProvisionalObserver(oldObserver)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	deferredReadFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		copy(b, []byte("abc"))
+		return 3, nil
+	}
+	deferredWriteFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		return len(b), nil
+	}
+
+	var events []DeferredRustProvisionalObservation
+	observed := make(chan DeferredRustProvisionalObservation, 4)
+	SetDeferredRustProvisionalObserver(func(_ gonet.Conn, event DeferredRustProvisionalObservation) {
+		events = append(events, event)
+		observed <- event
+	})
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+
+	if _, err := dc.Write([]byte("abcd")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	select {
+	case event := <-observed:
+		t.Fatalf("unexpected provisional event after write-only progress: %q", event)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	buf := make([]byte, 3)
+	if _, err := dc.Read(buf); err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	select {
+	case event := <-observed:
+		if event.Semantic != DeferredRustProvisionalSemanticCommand0Bidirectional || event.Outcome != DeferredRustProvisionalOutcomeActive {
+			t.Fatalf("observer event = %+v, want semantic=%q outcome=%q", event, DeferredRustProvisionalSemanticCommand0Bidirectional, DeferredRustProvisionalOutcomeActive)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("DeferredRust provisional observer was not called after bidirectional progress")
+	}
+
+	// Further transport progress should not republish the same provisional-active event.
+	if _, err := dc.Write([]byte("x")); err != nil {
+		t.Fatalf("second Write() error = %v", err)
+	}
+	select {
+	case event := <-observed:
+		t.Fatalf("unexpected duplicate provisional event after publication: %q", event)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestDeferredRustConnDrainAndDetachPublishesResolvedDirectAfterProvisionalActive(t *testing.T) {
+	oldRead := deferredReadFn
+	oldWrite := deferredWriteFn
+	oldDrain := deferredDrainAndDetachFn
+	oldObserver := snapshotDeferredRustProvisionalObserver()
+	t.Cleanup(func() {
+		deferredReadFn = oldRead
+		deferredWriteFn = oldWrite
+		deferredDrainAndDetachFn = oldDrain
+		SetDeferredRustProvisionalObserver(oldObserver)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	deferredReadFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		copy(b, []byte("abc"))
+		return 3, nil
+	}
+	deferredWriteFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		return len(b), nil
+	}
+	deferredDrainAndDetachFn = func(_ *native.DeferredSessionHandle) ([]byte, []byte, error) {
+		return []byte("plain"), []byte("raw"), nil
+	}
+
+	var events []DeferredRustProvisionalObservation
+	observed := make(chan DeferredRustProvisionalObservation, 4)
+	SetDeferredRustProvisionalObserver(func(_ gonet.Conn, event DeferredRustProvisionalObservation) {
+		events = append(events, event)
+		observed <- event
+	})
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+
+	if _, err := dc.Write([]byte("abcd")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	buf := make([]byte, 3)
+	if _, err := dc.Read(buf); err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	select {
+	case event := <-observed:
+		if event.Semantic != DeferredRustProvisionalSemanticCommand0Bidirectional || event.Outcome != DeferredRustProvisionalOutcomeActive {
+			t.Fatalf("first observer event = %+v, want semantic=%q outcome=%q", event, DeferredRustProvisionalSemanticCommand0Bidirectional, DeferredRustProvisionalOutcomeActive)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("missing provisional active event before detach")
+	}
+
+	if _, _, err := dc.DrainAndDetach(); err != nil {
+		t.Fatalf("DrainAndDetach() error = %v", err)
+	}
+
+	select {
+	case event := <-observed:
+		if event.Outcome != DeferredRustProvisionalOutcomeResolvedDirect || event.TerminalReason != DeferredRustProvisionalTerminalReasonNone {
+			t.Fatalf("second observer event = %+v, want outcome=%q terminal_reason=%q", event, DeferredRustProvisionalOutcomeResolvedDirect, DeferredRustProvisionalTerminalReasonNone)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("missing provisional resolved-direct event after detach")
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("observer events = %v, want 2 events", events)
+	}
+}
+
+func TestDeferredRustConnClosePublishesBenignPendingCloseAfterProvisionalActive(t *testing.T) {
+	oldRead := deferredReadFn
+	oldWrite := deferredWriteFn
+	oldObserver := snapshotDeferredRustProvisionalObserver()
+	t.Cleanup(func() {
+		deferredReadFn = oldRead
+		deferredWriteFn = oldWrite
+		SetDeferredRustProvisionalObserver(oldObserver)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	deferredReadFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		copy(b, []byte("abc"))
+		return 3, nil
+	}
+	deferredWriteFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		return len(b), nil
+	}
+
+	observed := make(chan DeferredRustProvisionalObservation, 4)
+	SetDeferredRustProvisionalObserver(func(_ gonet.Conn, event DeferredRustProvisionalObservation) {
+		observed <- event
+	})
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+
+	if _, err := dc.Write([]byte("abcd")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	buf := make([]byte, 3)
+	if _, err := dc.Read(buf); err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	select {
+	case event := <-observed:
+		if event.Semantic != DeferredRustProvisionalSemanticCommand0Bidirectional || event.Outcome != DeferredRustProvisionalOutcomeActive {
+			t.Fatalf("first observer event = %+v, want semantic=%q outcome=%q", event, DeferredRustProvisionalSemanticCommand0Bidirectional, DeferredRustProvisionalOutcomeActive)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("missing provisional active event before close")
+	}
+
+	if err := dc.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	select {
+	case event := <-observed:
+		if event.Outcome != DeferredRustProvisionalOutcomeBenignClose || event.TerminalReason != DeferredRustProvisionalTerminalReasonLocalClose {
+			t.Fatalf("second observer event = %+v, want outcome=%q terminal_reason=%q", event, DeferredRustProvisionalOutcomeBenignClose, DeferredRustProvisionalTerminalReasonLocalClose)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("missing provisional benign-close event after close")
+	}
+}
+
+func TestDeferredRustConnReadTerminalErrorPublishesFailedPendingAfterProvisionalActive(t *testing.T) {
+	oldRead := deferredReadFn
+	oldWrite := deferredWriteFn
+	oldObserver := snapshotDeferredRustProvisionalObserver()
+	t.Cleanup(func() {
+		deferredReadFn = oldRead
+		deferredWriteFn = oldWrite
+		SetDeferredRustProvisionalObserver(oldObserver)
+	})
+
+	server, client := gonet.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	readCount := 0
+	deferredReadFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		readCount++
+		if readCount == 1 {
+			copy(b, []byte("abc"))
+			return 3, nil
+		}
+		return 0, io.EOF
+	}
+	deferredWriteFn = func(_ *native.DeferredSessionHandle, b []byte) (int, error) {
+		return len(b), nil
+	}
+
+	observed := make(chan DeferredRustProvisionalObservation, 4)
+	SetDeferredRustProvisionalObserver(func(_ gonet.Conn, event DeferredRustProvisionalObservation) {
+		observed <- event
+	})
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+
+	if _, err := dc.Write([]byte("abcd")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	buf := make([]byte, 3)
+	if _, err := dc.Read(buf); err != nil {
+		t.Fatalf("first Read() error = %v", err)
+	}
+
+	select {
+	case event := <-observed:
+		if event.Semantic != DeferredRustProvisionalSemanticCommand0Bidirectional || event.Outcome != DeferredRustProvisionalOutcomeActive {
+			t.Fatalf("first observer event = %+v, want semantic=%q outcome=%q", event, DeferredRustProvisionalSemanticCommand0Bidirectional, DeferredRustProvisionalOutcomeActive)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("missing provisional active event before terminal read error")
+	}
+
+	if _, err := dc.Read(buf); err == nil {
+		t.Fatal("second Read() error = nil, want EOF")
+	}
+
+	select {
+	case event := <-observed:
+		if event.Outcome != DeferredRustProvisionalOutcomeFailedPending || event.TerminalReason != DeferredRustProvisionalTerminalReasonEOF {
+			t.Fatalf("second observer event = %+v, want outcome=%q terminal_reason=%q", event, DeferredRustProvisionalOutcomeFailedPending, DeferredRustProvisionalTerminalReasonEOF)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("missing provisional failed-pending event after terminal read error")
 	}
 }
