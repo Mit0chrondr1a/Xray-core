@@ -75,6 +75,7 @@ type nativeAttemptDecision struct {
 	ProbeObserved                uint64
 	ProbeRemaining               time.Duration
 	ProbeVerdict                 proxy.VisionBridgeProbeVerdict
+	ProbeFailedPendingReason     proxy.VisionNativeProvisionalTerminalReason
 }
 
 type nativeBreakerConfig struct {
@@ -452,6 +453,7 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		decision.ProbeObserved = probe.Observed
 		decision.ProbeRemaining = probe.Remaining
 		decision.ProbeVerdict = probe.Verdict
+		decision.ProbeFailedPendingReason = probe.FailedPendingReason
 	}
 	if decision.ProbeMode {
 		if decision.ProbeState == proxy.VisionBridgeProbeStateCompleted {
@@ -519,6 +521,15 @@ func classifyBridgeAssessmentGuard(stats proxy.VisionBridgeAssessmentStats) stri
 	if stats.NativeDivergent > stats.NativeAligned {
 		return "native_divergent"
 	}
+	if provisionalLocalCloseGuardCase := classifyBridgeOwnedPendingGuard(nativeObserved, stats.NativeAligned, stats.NativePendingBenign, stats.NativeProvisionalFailedPendingLocalClose, "provisional_failed_pending_local_close"); provisionalLocalCloseGuardCase != "" {
+		return provisionalLocalCloseGuardCase
+	}
+	if provisionalCommand0GuardCase := classifyTransportOwnedPendingGuard(nativeObserved, stats.NativeAligned, stats.NativePendingBenign, stats.NativeProvisionalCommand0BidirectionalFailure, "provisional_command0_bidirectional"); provisionalCommand0GuardCase != "" {
+		return provisionalCommand0GuardCase
+	}
+	if provisionalGuardCase := classifyTransportOwnedPendingGuard(nativeObserved, stats.NativeAligned, stats.NativePendingBenign, stats.NativeProvisionalFailedPending, "provisional_failed_pending"); provisionalGuardCase != "" {
+		return provisionalGuardCase
+	}
 	if stats.NativePendingFailure >= 2 && stats.NativeAligned == 0 && stats.NativePendingBenign == 0 {
 		return "cold_pending_burst"
 	}
@@ -544,6 +555,38 @@ func classifyBridgeAssessmentGuard(stats proxy.VisionBridgeAssessmentStats) stri
 		return "pending_failure_ratio"
 	}
 	return ""
+}
+
+func classifyTransportOwnedPendingGuard(nativeObserved, nativeAligned, nativePendingBenign, failures uint64, prefix string) string {
+	if failures == 0 {
+		return ""
+	}
+	if failures >= 2 && nativeAligned == 0 && nativePendingBenign == 0 {
+		return "cold_" + prefix + "_burst"
+	}
+	if nativeObserved <= 128 && failures >= 2 {
+		return "warmup_" + prefix + "_burst_small"
+	}
+	if nativeObserved <= 512 && failures >= 3 {
+		return "warmup_" + prefix + "_burst_medium"
+	}
+	if nativeObserved <= 1024 && failures >= 4 {
+		return "warmup_" + prefix + "_burst_large"
+	}
+	if nativeAligned == 0 {
+		if failures >= 3 {
+			return prefix + "_without_aligned"
+		}
+		return ""
+	}
+	if failures >= 2 && failures*100 > nativeAligned {
+		return prefix + "_ratio"
+	}
+	return ""
+}
+
+func classifyBridgeOwnedPendingGuard(nativeObserved, nativeAligned, nativePendingBenign, failures uint64, prefix string) string {
+	return classifyTransportOwnedPendingGuard(nativeObserved, nativeAligned, nativePendingBenign, failures, prefix)
 }
 
 func nativeCanaryGuardEnabled() bool {

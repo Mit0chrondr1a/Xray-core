@@ -412,6 +412,149 @@ func TestShouldAttemptNativeRealityBridgeAssessmentGuardSkipsPendingFailureNativ
 	}
 }
 
+func TestShouldAttemptNativeRealityBridgeAssessmentGuardPrefersProvisionalCommand0BidirectionalFailure(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_NATIVE_REALITY_CANARY_GUARD", "1")
+
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	oldStats := nativeBridgeAssessmentStatsFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	nativeBridgeAssessmentStatsFn = func(string) proxy.VisionBridgeAssessmentStats {
+		return proxy.VisionBridgeAssessmentStats{
+			NativeAligned:                  100,
+			NativePending:                  5,
+			NativePendingFailure:           3,
+			NativeProvisionalFailedPending: 2,
+			NativeProvisionalCommand0BidirectionalFailure: 2,
+		}
+	}
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+		nativeBridgeAssessmentStatsFn = oldStats
+	}()
+
+	v := &Listener{
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeReality(v)
+	if decision.Attempt {
+		t.Fatal("expected provisional command0 bidirectional failure to skip native attempt")
+	}
+	if !decision.SkipByPolicy {
+		t.Fatal("expected skip by policy for provisional command0 bidirectional failure")
+	}
+	if decision.SkipReason != nativeSkipReasonBridgeAssessmentGuard {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonBridgeAssessmentGuard)
+	}
+	if decision.BridgeGuardCase != "warmup_provisional_command0_bidirectional_burst_small" {
+		t.Fatalf("bridge guard case = %q, want %q", decision.BridgeGuardCase, "warmup_provisional_command0_bidirectional_burst_small")
+	}
+}
+
+func TestShouldAttemptNativeRealityBridgeAssessmentGuardPrefersGenericProvisionalFailure(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_NATIVE_REALITY_CANARY_GUARD", "1")
+
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	oldStats := nativeBridgeAssessmentStatsFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	nativeBridgeAssessmentStatsFn = func(string) proxy.VisionBridgeAssessmentStats {
+		return proxy.VisionBridgeAssessmentStats{
+			NativeAligned:                  100,
+			NativePending:                  5,
+			NativePendingFailure:           3,
+			NativeProvisionalFailedPending: 2,
+		}
+	}
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+		nativeBridgeAssessmentStatsFn = oldStats
+	}()
+
+	v := &Listener{
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeReality(v)
+	if decision.Attempt {
+		t.Fatal("expected provisional failed-pending to skip native attempt")
+	}
+	if !decision.SkipByPolicy {
+		t.Fatal("expected skip by policy for provisional failed-pending")
+	}
+	if decision.SkipReason != nativeSkipReasonBridgeAssessmentGuard {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonBridgeAssessmentGuard)
+	}
+	if decision.BridgeGuardCase != "warmup_provisional_failed_pending_burst_small" {
+		t.Fatalf("bridge guard case = %q, want %q", decision.BridgeGuardCase, "warmup_provisional_failed_pending_burst_small")
+	}
+}
+
+func TestShouldAttemptNativeRealityBridgeAssessmentGuardSkipsBridgeOwnedLocalClosePendingFailure(t *testing.T) {
+	t.Setenv("XRAY_DEBUG_NATIVE_REALITY_CANARY_GUARD", "1")
+
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	oldStats := nativeBridgeAssessmentStatsFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	nativeBridgeAssessmentStatsFn = func(string) proxy.VisionBridgeAssessmentStats {
+		return proxy.VisionBridgeAssessmentStats{
+			NativeAligned:                            100,
+			NativePending:                            5,
+			NativePendingFailure:                     3,
+			NativeProvisionalFailedPending:           2,
+			NativeProvisionalFailedPendingLocalClose: 2,
+		}
+	}
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+		nativeBridgeAssessmentStatsFn = oldStats
+	}()
+
+	v := &Listener{
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeReality(v)
+	if decision.Attempt {
+		t.Fatal("expected bridge-owned local-close provisional failed-pending to skip native attempt")
+	}
+	if !decision.SkipByPolicy {
+		t.Fatal("expected skip by policy for bridge-owned local-close provisional failed-pending")
+	}
+	if decision.SkipReason != nativeSkipReasonBridgeAssessmentGuard {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonBridgeAssessmentGuard)
+	}
+	if decision.BridgeGuardCase != "warmup_provisional_failed_pending_local_close_burst_small" {
+		t.Fatalf("bridge guard case = %q, want %q", decision.BridgeGuardCase, "warmup_provisional_failed_pending_local_close_burst_small")
+	}
+}
+
 func TestShouldAttemptNativeRealityBridgeAssessmentGuardSkipsEarlyPendingFailureBurst(t *testing.T) {
 	t.Setenv("XRAY_DEBUG_NATIVE_REALITY_CANARY_GUARD", "1")
 
