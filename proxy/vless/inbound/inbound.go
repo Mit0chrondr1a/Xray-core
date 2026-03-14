@@ -1,14 +1,17 @@
 package inbound
 
 import (
+	"bytes"
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
 	"io"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/reverse"
@@ -572,7 +575,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		// Flow: requestAddons.Flow,
 	}
 
-	transitionSource := proxy.NewVisionTransitionSource(connection, nil, nil)
+	var input *bytes.Reader
+	var rawInput *bytes.Buffer
 	deferredVisionPath := false
 	switch requestAddons.Flow {
 	case vless.XRV:
@@ -585,14 +589,23 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 				fallthrough // we will break Mux connections that contain TCP requests
 			case protocol.RequestCommandTCP:
+				var t reflect.Type
+				var p uintptr
 				if commonConn, ok := connection.(*encryption.CommonConn); ok {
 					if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
 						inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 					}
+					t = reflect.TypeOf(commonConn).Elem()
+					p = uintptr(unsafe.Pointer(commonConn))
 				} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 					if tlsConn.ConnectionState().Version != gotls.VersionTLS13 {
 						return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
 					}
+					t = reflect.TypeOf(tlsConn.Conn).Elem()
+					p = uintptr(unsafe.Pointer(tlsConn.Conn))
+				} else if realityConn, ok := iConn.(*reality.Conn); ok {
+					t = reflect.TypeOf(realityConn.Conn).Elem()
+					p = uintptr(unsafe.Pointer(realityConn.Conn))
 				} else if rc, ok := iConn.(*tls.RustConn); ok {
 					if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
 						return errors.New("RustConn without full kTLS cannot use " + requestAddons.Flow).AtWarning()
@@ -603,13 +616,20 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					// Deferred kTLS: rustls handles TLS. Vision will strip at command=2.
 					// VisionReader will call DeferredRustConn.DrainAndDetach().
 					deferredVisionPath = true
+					input = nil
+					rawInput = nil
+				} else {
+					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
-				var err error
-				transitionSource, err = proxy.BuildVisionTransitionSource(connection, iConn)
-				if err != nil {
-					return err
+				if t != nil {
+					i, iOK := t.FieldByName("input")
+					r, rOK := t.FieldByName("rawInput")
+					if !iOK || !rOK {
+						return errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+					}
+					input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
+					rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 				}
-				deferredVisionPath = transitionSource.UsesDeferredRustConn()
 			}
 		} else {
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
@@ -693,8 +713,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
 	if requestAddons.Flow == vless.XRV && !bypassVision {
-		proxy.LogVisionTransitionSource(visionReaderCtx, "inbound", transitionSource)
-		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, transitionSource, nil)
+		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, connection, input, rawInput, nil)
 	}
 
 	bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))

@@ -41,6 +41,12 @@ func TestCopyGateReasonVisionNoDetachString(t *testing.T) {
 	}
 }
 
+func TestCopyGateReasonVisionControlCompatString(t *testing.T) {
+	if got := CopyGateReasonVisionControlCompat.String(); got != "vision_control_compat" {
+		t.Fatalf("reason string=%q, want %q", got, "vision_control_compat")
+	}
+}
+
 func TestCopyGateReasonVisionUplinkCompleteString(t *testing.T) {
 	if got := CopyGateReasonVisionUplinkComplete.String(); got != "vision_uplink_complete" {
 		t.Fatalf("reason string=%q, want %q", got, "vision_uplink_complete")

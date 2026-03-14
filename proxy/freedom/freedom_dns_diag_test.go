@@ -111,7 +111,7 @@ func TestVisionUplinkDiagnosticWriterObserveWrite(t *testing.T) {
 	}
 }
 
-func TestObserveVisionPendingDetachOnUplinkCompletePromotesNoDetachButLeavesTimerOwnershipToProxy(t *testing.T) {
+func TestObserveVisionPendingDetachOnUplinkCompleteLeavesPlainNonDeferredFlowUntouched(t *testing.T) {
 	inbound := &session.Inbound{}
 	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 	outbound := &session.Outbound{}
@@ -139,16 +139,16 @@ func TestObserveVisionPendingDetachOnUplinkCompletePromotesNoDetachButLeavesTime
 	if downlinkTimeout != 10*time.Millisecond {
 		t.Fatalf("downlinkTimeout=%v, want unchanged caller timeout", downlinkTimeout)
 	}
-	if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
-		t.Fatalf("inbound state=%v, want forced_userspace", got)
+	if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+		t.Fatalf("inbound state=%v, want pending_detach", got)
 	}
-	if got := inbound.CopyGateReason(); got != session.CopyGateReasonVisionUplinkComplete {
-		t.Fatalf("inbound reason=%v, want vision_uplink_complete", got)
+	if got := inbound.CopyGateReason(); got != session.CopyGateReasonUnspecified {
+		t.Fatalf("inbound reason=%v, want unspecified", got)
 	}
-	if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
-		t.Fatalf("outbound state=%v, want forced_userspace", got)
+	if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+		t.Fatalf("outbound state=%v, want pending_detach", got)
 	}
-	if got := outbound.CopyGateReason(); got != session.CopyGateReasonVisionUplinkComplete {
-		t.Fatalf("outbound reason=%v, want vision_uplink_complete", got)
+	if got := outbound.CopyGateReason(); got != session.CopyGateReasonUnspecified {
+		t.Fatalf("outbound reason=%v, want unspecified", got)
 	}
 }
