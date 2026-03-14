@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/native"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -37,8 +36,6 @@ const (
 	nativeSkipReasonBreakerCooldown         = "breaker_cooldown_active"
 	nativeSkipReasonBreakerHalfOpenProbe    = "breaker_half_open_probe_interval"
 	nativeSkipReasonDebugDisabled           = "debug_disable_native_reality"
-	nativeSkipReasonBridgeAssessmentGuard   = "bridge_assessment_guard"
-	nativeSkipReasonProbeEpochComplete      = "probe_epoch_complete"
 )
 
 type nativeAttemptOutcome string
@@ -52,30 +49,17 @@ const (
 )
 
 type nativeAttemptDecision struct {
-	Attempt                      bool
-	PolicyMode                   string
-	AllowFallback                bool
-	TelemetryEnforce             bool
-	BreakerState                 string
-	SkipReason                   string
-	BridgeGuardCase              string
-	SkipByPolicy                 bool
-	SkipByBreaker                bool
-	Breaker                      *nativePathCircuitBreaker
-	ForceNative                  bool
-	FailStop                     bool
-	BridgeScope                  string
-	CanaryScopeMatch             bool
-	BridgeStats                  proxy.VisionBridgeAssessmentStats
-	BridgeGuardCooldownRemaining time.Duration
-	ProbeMode                    bool
-	ProbeScopeMatch              bool
-	ProbeState                   proxy.VisionBridgeProbeState
-	ProbeBudget                  uint64
-	ProbeObserved                uint64
-	ProbeRemaining               time.Duration
-	ProbeVerdict                 proxy.VisionBridgeProbeVerdict
-	ProbeFailedPendingReason     proxy.VisionNativeProvisionalTerminalReason
+	Attempt          bool
+	PolicyMode       string
+	AllowFallback    bool
+	TelemetryEnforce bool
+	BreakerState     string
+	SkipReason       string
+	SkipByPolicy     bool
+	SkipByBreaker    bool
+	Breaker          *nativePathCircuitBreaker
+	ForceNative      bool
+	FailStop         bool
 }
 
 type nativeBreakerConfig struct {
@@ -103,15 +87,10 @@ type nativePathCircuitBreaker struct {
 }
 
 var nativePathBreakerByScope sync.Map // scope key -> *nativePathCircuitBreaker
-var nativeCanaryGuardCooldownByScope sync.Map
 var untaggedNativeScopeCounter atomic.Uint64
 var untaggedNativeScopeByListener sync.Map
 var nativeEligibilityAvailableFn = native.Available
 var nativeEligibilityFullKTLSSupportedFn = tls.NativeFullKTLSSupported
-var nativeBridgeAssessmentStatsFn = proxy.SnapshotVisionBridgeAssessmentStatsForScope
-var nativeBridgeProbeEnsureFn = proxy.EnsureVisionBridgeProbeEpoch
-var nativeBridgeProbeSnapshotFn = proxy.SnapshotVisionBridgeProbeEpochForScope
-var nativeCanaryGuardNowFn = time.Now
 
 func defaultNativePathPolicy() *reality.NativePathPolicy {
 	return &reality.NativePathPolicy{
@@ -401,8 +380,6 @@ func isLoopbackAddr(addr stdnet.Addr) bool {
 
 func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativeAttemptDecision {
 	policy := effectiveNativePathPolicy(v.realityXrayConfig)
-	bridgeScope := nativePathScopeKey(v)
-	now := nativeCanaryGuardNowFn()
 	decision := nativeAttemptDecision{
 		PolicyMode:       nativePathModeName(policy.GetMode()),
 		AllowFallback:    policy.GetAllowFallback(),
@@ -410,11 +387,7 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		BreakerState:     nativeBreakerStateDisabled,
 		FailStop:         !policy.GetAllowFallback(),
 		ForceNative:      policy.GetMode() == reality.NativePathMode_FORCE_NATIVE,
-		BridgeScope:      bridgeScope,
-		BridgeStats:      nativeBridgeAssessmentStatsFn(bridgeScope),
 	}
-	decision.CanaryScopeMatch = nativeCanaryScopeMatch(v, bridgeScope)
-	decision.ProbeScopeMatch = nativeProbeScopeMatch(v, bridgeScope)
 	if decision.ForceNative {
 		decision.AllowFallback = false
 		decision.FailStop = true
@@ -440,53 +413,13 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		}
 		return decision
 	}
-	if policy.GetMode() == reality.NativePathMode_AUTO && isLoopbackAddr(localAddr) && !decision.CanaryScopeMatch && !decision.ProbeScopeMatch {
+	if policy.GetMode() == reality.NativePathMode_AUTO && isLoopbackAddr(localAddr) {
 		decision.SkipByPolicy = true
 		decision.SkipReason = nativeSkipReasonLoopbackAutoGuard
 		return decision
 	}
-	if decision.ProbeScopeMatch {
-		decision.ProbeMode = true
-		probe := nativeBridgeProbeEnsureFn(bridgeScope, nativeProbeBudget(), nativeProbeDuration())
-		decision.ProbeState = probe.State
-		decision.ProbeBudget = probe.Budget
-		decision.ProbeObserved = probe.Observed
-		decision.ProbeRemaining = probe.Remaining
-		decision.ProbeVerdict = probe.Verdict
-		decision.ProbeFailedPendingReason = probe.FailedPendingReason
-	}
-	if decision.ProbeMode {
-		if decision.ProbeState == proxy.VisionBridgeProbeStateCompleted {
-			decision.SkipByPolicy = true
-			decision.SkipReason = nativeSkipReasonProbeEpochComplete
-			decision.BridgeGuardCase = "probe_epoch_complete"
-			return decision
-		}
-	} else if remaining, ok := nativeCanaryGuardCooldownRemaining(bridgeScope, now); ok {
-		decision.SkipByPolicy = true
-		decision.SkipReason = nativeSkipReasonBridgeAssessmentGuard
-		decision.BridgeGuardCase = "guard_cooldown_active"
-		decision.BridgeGuardCooldownRemaining = remaining
-		if decision.ForceNative {
-			decision.FailStop = true
-		}
-		return decision
-	}
-	if !decision.ProbeMode {
-		if guardCase := classifyBridgeAssessmentGuard(decision.BridgeStats); guardCase != "" {
-			activateNativeCanaryGuardCooldown(bridgeScope, now)
-			decision.SkipByPolicy = true
-			decision.SkipReason = nativeSkipReasonBridgeAssessmentGuard
-			decision.BridgeGuardCase = guardCase
-			decision.BridgeGuardCooldownRemaining = nativeCanaryGuardCooldownDuration()
-			if decision.ForceNative {
-				decision.FailStop = true
-			}
-			return decision
-		}
-	}
 	breaker := getNativePathBreaker(nativePathBreakerScopeKey(v), policy)
-	skip, state, reason := breaker.shouldSkip(now)
+	skip, state, reason := breaker.shouldSkip(time.Now())
 	decision.Breaker = breaker
 	decision.BreakerState = state
 	if skip {
@@ -505,189 +438,4 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		decision.SkipReason = nativeSkipReasonPolicyModeDisabled
 	}
 	return decision
-}
-
-func classifyBridgeAssessmentGuard(stats proxy.VisionBridgeAssessmentStats) string {
-	if !nativeCanaryGuardEnabled() {
-		return ""
-	}
-	nativeObserved := stats.NativePending + stats.NativeAligned + stats.NativeDivergent + stats.NativeDetachFailed
-	if nativeObserved == 0 {
-		return ""
-	}
-	if stats.NativeDetachFailed > 0 {
-		return "detach_failed"
-	}
-	if stats.NativeDivergent > stats.NativeAligned {
-		return "native_divergent"
-	}
-	if provisionalLocalCloseGuardCase := classifyBridgeOwnedPendingGuard(nativeObserved, stats.NativeAligned, stats.NativePendingBenign, stats.NativeProvisionalFailedPendingLocalClose, "provisional_failed_pending_local_close"); provisionalLocalCloseGuardCase != "" {
-		return provisionalLocalCloseGuardCase
-	}
-	if provisionalCommand0GuardCase := classifyTransportOwnedPendingGuard(nativeObserved, stats.NativeAligned, stats.NativePendingBenign, stats.NativeProvisionalCommand0BidirectionalFailure, "provisional_command0_bidirectional"); provisionalCommand0GuardCase != "" {
-		return provisionalCommand0GuardCase
-	}
-	if provisionalGuardCase := classifyTransportOwnedPendingGuard(nativeObserved, stats.NativeAligned, stats.NativePendingBenign, stats.NativeProvisionalFailedPending, "provisional_failed_pending"); provisionalGuardCase != "" {
-		return provisionalGuardCase
-	}
-	if stats.NativePendingFailure >= 2 && stats.NativeAligned == 0 && stats.NativePendingBenign == 0 {
-		return "cold_pending_burst"
-	}
-	if nativeObserved <= 128 && stats.NativePendingFailure >= 2 {
-		return "warmup_pending_burst_small"
-	}
-	if nativeObserved <= 512 && stats.NativePendingFailure >= 3 {
-		return "warmup_pending_burst_medium"
-	}
-	if nativeObserved <= 1024 && stats.NativePendingFailure >= 4 {
-		return "warmup_pending_burst_large"
-	}
-	if stats.NativePendingFailure == 0 {
-		return ""
-	}
-	if stats.NativeAligned == 0 {
-		if stats.NativePendingFailure >= 3 {
-			return "pending_failure_without_aligned"
-		}
-		return ""
-	}
-	if stats.NativePendingFailure >= 2 && stats.NativePendingFailure*100 > stats.NativeAligned {
-		return "pending_failure_ratio"
-	}
-	return ""
-}
-
-func classifyTransportOwnedPendingGuard(nativeObserved, nativeAligned, nativePendingBenign, failures uint64, prefix string) string {
-	if failures == 0 {
-		return ""
-	}
-	if failures >= 2 && nativeAligned == 0 && nativePendingBenign == 0 {
-		return "cold_" + prefix + "_burst"
-	}
-	if nativeObserved <= 128 && failures >= 2 {
-		return "warmup_" + prefix + "_burst_small"
-	}
-	if nativeObserved <= 512 && failures >= 3 {
-		return "warmup_" + prefix + "_burst_medium"
-	}
-	if nativeObserved <= 1024 && failures >= 4 {
-		return "warmup_" + prefix + "_burst_large"
-	}
-	if nativeAligned == 0 {
-		if failures >= 3 {
-			return prefix + "_without_aligned"
-		}
-		return ""
-	}
-	if failures >= 2 && failures*100 > nativeAligned {
-		return prefix + "_ratio"
-	}
-	return ""
-}
-
-func classifyBridgeOwnedPendingGuard(nativeObserved, nativeAligned, nativePendingBenign, failures uint64, prefix string) string {
-	return classifyTransportOwnedPendingGuard(nativeObserved, nativeAligned, nativePendingBenign, failures, prefix)
-}
-
-func nativeCanaryGuardEnabled() bool {
-	return os.Getenv("XRAY_DEBUG_NATIVE_REALITY_CANARY_GUARD") == "1"
-}
-
-func nativeCanaryGuardCooldownDuration() time.Duration {
-	raw := strings.TrimSpace(os.Getenv("XRAY_DEBUG_NATIVE_REALITY_CANARY_GUARD_COOLDOWN_SECONDS"))
-	if raw == "" {
-		return 15 * time.Minute
-	}
-	secs, err := strconv.Atoi(raw)
-	if err != nil || secs <= 0 {
-		return 15 * time.Minute
-	}
-	return time.Duration(secs) * time.Second
-}
-
-func activateNativeCanaryGuardCooldown(scope string, now time.Time) {
-	if !nativeCanaryGuardEnabled() {
-		return
-	}
-	nativeCanaryGuardCooldownByScope.Store(scope, now.Add(nativeCanaryGuardCooldownDuration()))
-}
-
-func nativeCanaryGuardCooldownRemaining(scope string, now time.Time) (time.Duration, bool) {
-	if !nativeCanaryGuardEnabled() {
-		return 0, false
-	}
-	value, ok := nativeCanaryGuardCooldownByScope.Load(scope)
-	if !ok {
-		return 0, false
-	}
-	until, ok := value.(time.Time)
-	if !ok || until.IsZero() {
-		nativeCanaryGuardCooldownByScope.Delete(scope)
-		return 0, false
-	}
-	if !now.Before(until) {
-		nativeCanaryGuardCooldownByScope.Delete(scope)
-		return 0, false
-	}
-	return until.Sub(now), true
-}
-
-func nativeCanaryScopeMatch(v *Listener, scope string) bool {
-	selector := strings.TrimSpace(os.Getenv("XRAY_DEBUG_NATIVE_REALITY_CANARY_SCOPE"))
-	if selector == "" {
-		return false
-	}
-	tag := semanticScopeTag(v)
-	for _, part := range strings.Split(selector, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if part == scope || part == tag {
-			return true
-		}
-	}
-	return false
-}
-
-func nativeProbeScopeMatch(v *Listener, scope string) bool {
-	selector := strings.TrimSpace(os.Getenv("XRAY_DEBUG_NATIVE_REALITY_PROBE_SCOPE"))
-	if selector == "" {
-		return false
-	}
-	tag := semanticScopeTag(v)
-	for _, part := range strings.Split(selector, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if part == scope || part == tag {
-			return true
-		}
-	}
-	return false
-}
-
-func nativeProbeBudget() uint64 {
-	raw := strings.TrimSpace(os.Getenv("XRAY_DEBUG_NATIVE_REALITY_PROBE_BUDGET"))
-	if raw == "" {
-		return 256
-	}
-	value, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || value == 0 {
-		return 256
-	}
-	return value
-}
-
-func nativeProbeDuration() time.Duration {
-	raw := strings.TrimSpace(os.Getenv("XRAY_DEBUG_NATIVE_REALITY_PROBE_DURATION_SECONDS"))
-	if raw == "" {
-		return 2 * time.Minute
-	}
-	secs, err := strconv.Atoi(raw)
-	if err != nil || secs <= 0 {
-		return 2 * time.Minute
-	}
-	return time.Duration(secs) * time.Second
 }

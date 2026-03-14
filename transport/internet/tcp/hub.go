@@ -14,7 +14,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/ebpf"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -105,14 +104,6 @@ var (
 	// See docs/ktls-vision-incompatibility.md.
 	useNativeRealityServerFn = nativeRealityServerEligible
 )
-
-func observeVisionIngressBridge(conn net.Conn, kind proxy.VisionTransitionKind, origin proxy.VisionIngressOrigin, scope string) {
-	if conn == nil || origin == proxy.VisionIngressOriginUnknown {
-		return
-	}
-	proxy.ObserveVisionTransitionSource(conn, kind, origin)
-	proxy.ObserveVisionTransitionScope(conn, scope)
-}
 
 func nativeRealityServerEligible(v *Listener) bool {
 	ok, _ := nativePathEligibility(v)
@@ -380,7 +371,6 @@ func (v *Listener) keepAccepting() {
 					_ = conn.Close()
 					return
 				}
-				observeVisionIngressBridge(conn, proxy.VisionTransitionKindTLSConn, proxy.VisionIngressOriginGoTLS, nativePathScopeKey(v))
 			} else if v.realityConfig != nil {
 				rustDone := false
 				defer maybeLogTCPRealityHandoverMarkers(context.Background())
@@ -405,43 +395,6 @@ func (v *Listener) keepAccepting() {
 							" native_policy_mode=", decision.PolicyMode,
 							" native_breaker_state=", decision.BreakerState,
 							" native_skip_reason=", nativeSkipReason,
-							" native_bridge_guard_case=", decision.BridgeGuardCase,
-							" native_bridge_guard_cooldown_remaining_ms=", decision.BridgeGuardCooldownRemaining.Milliseconds(),
-							" native_bridge_scope=", decision.BridgeScope,
-							" native_canary_scope_match=", decision.CanaryScopeMatch,
-							" native_bridge_go_baseline=", decision.BridgeStats.GoBaseline,
-							" native_bridge_pending=", decision.BridgeStats.NativePending,
-							" native_bridge_pending_benign=", decision.BridgeStats.NativePendingBenign,
-							" native_bridge_pending_failure=", decision.BridgeStats.NativePendingFailure,
-							" native_bridge_provisional_command0_bidirectional=", decision.BridgeStats.NativeProvisionalCommand0Bidirectional,
-							" native_bridge_provisional_command0_bidirectional_failure=", decision.BridgeStats.NativeProvisionalCommand0BidirectionalFailure,
-							" native_bridge_provisional_active=", decision.BridgeStats.NativeProvisionalActive,
-							" native_bridge_provisional_resolved_direct_copy=", decision.BridgeStats.NativeProvisionalResolvedDirect,
-							" native_bridge_provisional_resolved_no_detach=", decision.BridgeStats.NativeProvisionalResolvedNoDetach,
-							" native_bridge_provisional_benign_close=", decision.BridgeStats.NativeProvisionalBenignClose,
-							" native_bridge_provisional_failed_pending=", decision.BridgeStats.NativeProvisionalFailedPending,
-							" native_bridge_provisional_failed_pending_local_close=", decision.BridgeStats.NativeProvisionalFailedPendingLocalClose,
-							" native_bridge_provisional_failed_pending_eof=", decision.BridgeStats.NativeProvisionalFailedPendingEOF,
-							" native_bridge_provisional_failed_pending_closed=", decision.BridgeStats.NativeProvisionalFailedPendingClosed,
-							" native_bridge_provisional_failed_pending_reset=", decision.BridgeStats.NativeProvisionalFailedPendingReset,
-							" native_bridge_provisional_failed_pending_broken_pipe=", decision.BridgeStats.NativeProvisionalFailedPendingBrokenPipe,
-							" native_bridge_provisional_failed_pending_bad_message=", decision.BridgeStats.NativeProvisionalFailedPendingBadMessage,
-							" native_bridge_provisional_failed_pending_eio=", decision.BridgeStats.NativeProvisionalFailedPendingEIO,
-							" native_bridge_provisional_failed_pending_other=", decision.BridgeStats.NativeProvisionalFailedPendingOther,
-							" native_bridge_pending_command0_failure=", decision.BridgeStats.NativePendingCommand0Failure,
-							" native_bridge_pending_command0_bidirectional_failure=", decision.BridgeStats.NativePendingCommand0BidirectionalFailure,
-							" native_bridge_aligned=", decision.BridgeStats.NativeAligned,
-							" native_bridge_divergent=", decision.BridgeStats.NativeDivergent,
-							" native_bridge_detach_failed=", decision.BridgeStats.NativeDetachFailed,
-							" native_bridge_observed=", decision.BridgeStats.NativePending+decision.BridgeStats.NativeAligned+decision.BridgeStats.NativeDivergent+decision.BridgeStats.NativeDetachFailed,
-							" native_probe_mode=", decision.ProbeMode,
-							" native_probe_scope_match=", decision.ProbeScopeMatch,
-							" native_probe_state=", decision.ProbeState,
-							" native_probe_budget=", decision.ProbeBudget,
-							" native_probe_observed=", decision.ProbeObserved,
-							" native_probe_remaining_ms=", decision.ProbeRemaining.Milliseconds(),
-							" native_probe_verdict=", decision.ProbeVerdict,
-							" native_probe_failed_pending_reason=", decision.ProbeFailedPendingReason,
 							" native_attempted=", nativeAttempted,
 							" native_terminal=", terminalDecision,
 							" local=", conn.LocalAddr(),
@@ -452,43 +405,6 @@ func (v *Listener) keepAccepting() {
 							" native_policy_mode=", decision.PolicyMode,
 							" native_breaker_state=", decision.BreakerState,
 							" native_skip_reason=", nativeSkipReason,
-							" native_bridge_guard_case=", decision.BridgeGuardCase,
-							" native_bridge_guard_cooldown_remaining_ms=", decision.BridgeGuardCooldownRemaining.Milliseconds(),
-							" native_bridge_scope=", decision.BridgeScope,
-							" native_canary_scope_match=", decision.CanaryScopeMatch,
-							" native_bridge_go_baseline=", decision.BridgeStats.GoBaseline,
-							" native_bridge_pending=", decision.BridgeStats.NativePending,
-							" native_bridge_pending_benign=", decision.BridgeStats.NativePendingBenign,
-							" native_bridge_pending_failure=", decision.BridgeStats.NativePendingFailure,
-							" native_bridge_provisional_command0_bidirectional=", decision.BridgeStats.NativeProvisionalCommand0Bidirectional,
-							" native_bridge_provisional_command0_bidirectional_failure=", decision.BridgeStats.NativeProvisionalCommand0BidirectionalFailure,
-							" native_bridge_provisional_active=", decision.BridgeStats.NativeProvisionalActive,
-							" native_bridge_provisional_resolved_direct_copy=", decision.BridgeStats.NativeProvisionalResolvedDirect,
-							" native_bridge_provisional_resolved_no_detach=", decision.BridgeStats.NativeProvisionalResolvedNoDetach,
-							" native_bridge_provisional_benign_close=", decision.BridgeStats.NativeProvisionalBenignClose,
-							" native_bridge_provisional_failed_pending=", decision.BridgeStats.NativeProvisionalFailedPending,
-							" native_bridge_provisional_failed_pending_local_close=", decision.BridgeStats.NativeProvisionalFailedPendingLocalClose,
-							" native_bridge_provisional_failed_pending_eof=", decision.BridgeStats.NativeProvisionalFailedPendingEOF,
-							" native_bridge_provisional_failed_pending_closed=", decision.BridgeStats.NativeProvisionalFailedPendingClosed,
-							" native_bridge_provisional_failed_pending_reset=", decision.BridgeStats.NativeProvisionalFailedPendingReset,
-							" native_bridge_provisional_failed_pending_broken_pipe=", decision.BridgeStats.NativeProvisionalFailedPendingBrokenPipe,
-							" native_bridge_provisional_failed_pending_bad_message=", decision.BridgeStats.NativeProvisionalFailedPendingBadMessage,
-							" native_bridge_provisional_failed_pending_eio=", decision.BridgeStats.NativeProvisionalFailedPendingEIO,
-							" native_bridge_provisional_failed_pending_other=", decision.BridgeStats.NativeProvisionalFailedPendingOther,
-							" native_bridge_pending_command0_failure=", decision.BridgeStats.NativePendingCommand0Failure,
-							" native_bridge_pending_command0_bidirectional_failure=", decision.BridgeStats.NativePendingCommand0BidirectionalFailure,
-							" native_bridge_aligned=", decision.BridgeStats.NativeAligned,
-							" native_bridge_divergent=", decision.BridgeStats.NativeDivergent,
-							" native_bridge_detach_failed=", decision.BridgeStats.NativeDetachFailed,
-							" native_bridge_observed=", decision.BridgeStats.NativePending+decision.BridgeStats.NativeAligned+decision.BridgeStats.NativeDivergent+decision.BridgeStats.NativeDetachFailed,
-							" native_probe_mode=", decision.ProbeMode,
-							" native_probe_scope_match=", decision.ProbeScopeMatch,
-							" native_probe_state=", decision.ProbeState,
-							" native_probe_budget=", decision.ProbeBudget,
-							" native_probe_observed=", decision.ProbeObserved,
-							" native_probe_remaining_ms=", decision.ProbeRemaining.Milliseconds(),
-							" native_probe_verdict=", decision.ProbeVerdict,
-							" native_probe_failed_pending_reason=", decision.ProbeFailedPendingReason,
 							" native_attempted=", nativeAttempted,
 							" native_terminal=", terminalDecision,
 							" local=", conn.LocalAddr(),
@@ -561,7 +477,6 @@ func (v *Listener) keepAccepting() {
 							terminalDecision = "native_success"
 							conn = deferredConn
 							rustDone = true
-							observeVisionIngressBridge(conn, proxy.VisionTransitionKindDeferredRust, proxy.VisionIngressOriginNativeRealityDeferred, nativePathScopeKey(v))
 							errors.LogDebug(context.Background(), "Rust REALITY deferred path active: wrapped as *tls.DeferredRustConn (kTLS deferred)")
 						} else if stderrors.Is(deferredErr, native.ErrRealityAuthFailed) {
 							tcpRealityMarkerRustAuthFallback.Add(1)
@@ -658,11 +573,6 @@ func (v *Listener) keepAccepting() {
 						terminalDecision = "native_failed_with_fallback"
 					}
 					conn = realityConn
-					if nativeAttempted {
-						observeVisionIngressBridge(conn, proxy.VisionTransitionKindRealityConn, proxy.VisionIngressOriginGoRealityFallback, nativePathScopeKey(v))
-					} else {
-						observeVisionIngressBridge(conn, proxy.VisionTransitionKindRealityConn, proxy.VisionIngressOriginGoReality, nativePathScopeKey(v))
-					}
 				}
 			}
 
