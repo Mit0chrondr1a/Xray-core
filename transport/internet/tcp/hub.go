@@ -393,7 +393,11 @@ func (v *Listener) keepAccepting() {
 					if decision.TelemetryEnforce && terminalDecision == "native_failstop" {
 						errors.LogWarning(context.Background(), logMsg,
 							" native_policy_mode=", decision.PolicyMode,
+							" native_allow_fallback=", decision.AllowFallback,
+							" native_force_native=", decision.ForceNative,
+							" native_failstop=", decision.FailStop,
 							" native_breaker_state=", decision.BreakerState,
+							" native_breaker_cause=", decision.BreakerCause,
 							" native_skip_reason=", nativeSkipReason,
 							" native_attempted=", nativeAttempted,
 							" native_terminal=", terminalDecision,
@@ -403,7 +407,11 @@ func (v *Listener) keepAccepting() {
 					} else {
 						errors.LogInfo(context.Background(), logMsg,
 							" native_policy_mode=", decision.PolicyMode,
+							" native_allow_fallback=", decision.AllowFallback,
+							" native_force_native=", decision.ForceNative,
+							" native_failstop=", decision.FailStop,
 							" native_breaker_state=", decision.BreakerState,
+							" native_breaker_cause=", decision.BreakerCause,
 							" native_skip_reason=", nativeSkipReason,
 							" native_attempted=", nativeAttempted,
 							" native_terminal=", terminalDecision,
