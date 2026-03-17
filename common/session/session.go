@@ -49,9 +49,6 @@ const (
 	CopyGateReasonTransportUserspace
 	CopyGateReasonVisionBypass
 	CopyGateReasonVisionNoDetach
-	CopyGateReasonVisionControlCompat
-	CopyGateReasonVisionUplinkComplete
-	CopyGateReasonVisionCommandContinue
 	CopyGateReasonDetachTimeout
 	CopyGateReasonSecurityGuard
 	CopyGateReasonMetadataMissing
@@ -69,12 +66,6 @@ func (r CopyGateReason) String() string {
 		return "vision_bypass"
 	case CopyGateReasonVisionNoDetach:
 		return "vision_no_detach"
-	case CopyGateReasonVisionControlCompat:
-		return "vision_control_compat"
-	case CopyGateReasonVisionUplinkComplete:
-		return "vision_uplink_complete"
-	case CopyGateReasonVisionCommandContinue:
-		return "vision_command_continue"
 	case CopyGateReasonDetachTimeout:
 		return "detach_timeout"
 	case CopyGateReasonSecurityGuard:
@@ -95,6 +86,38 @@ const (
 	VisionSemanticPhaseNoDetach
 	VisionSemanticPhasePostDetach
 )
+
+// VisionSignal carries explicit Vision command truth across the flow without
+// requiring the copy loop to infer semantics from transport timing.
+type VisionSignal struct {
+	Command int // 0 = pending/unresolved, 1 = no-detach, 2 = post-detach
+}
+
+type VisionTimestamps struct {
+	detachUnixNano atomic.Int64
+}
+
+func (t *VisionTimestamps) StoreDetach(unixNano int64) {
+	if t == nil || unixNano <= 0 {
+		return
+	}
+	t.detachUnixNano.Store(unixNano)
+}
+
+func (t *VisionTimestamps) ConsumeDetach() (int64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	unixNano := t.detachUnixNano.Swap(0)
+	return unixNano, unixNano > 0
+}
+
+func (t *VisionTimestamps) Clear() {
+	if t == nil {
+		return
+	}
+	t.detachUnixNano.Store(0)
+}
 
 func (p VisionSemanticPhase) String() string {
 	switch p {

@@ -455,6 +455,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	clientReader := link.Reader // .(*pipe.Reader)
 	clientWriter := link.Writer // .(*pipe.Writer)
 	trafficState := proxy.NewTrafficState(account.ID.Bytes())
+	var visionSignalCh chan session.VisionSignal
+	if requestAddons.Flow == vless.XRV {
+		visionSignalCh = make(chan session.VisionSignal, 1)
+		ctx = session.ContextWithVisionSignal(ctx, visionSignalCh)
+		ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+	}
 	if shouldRewriteUDPToMux(request.Command, requestAddons.Flow, h.cone, request.Port) {
 		request.Command = protocol.RequestCommandMux
 		request.Address = net.DomainAddress("v1.mux.cool")
@@ -550,7 +556,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			encoding.ShouldHonorResponseVisionPayloadBypass(responseAddons, request.Destination())
 
 		if requestAddons.Flow == vless.XRV && !responseBypassVisionPayload {
-			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, input, rawInput, ob)
+			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, visionSignalCh, input, rawInput, ob)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
 			if requestAddons.Flow == vless.XRV {
