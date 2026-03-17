@@ -52,6 +52,11 @@ var (
 	xhttpCapsProbeSeen atomic.Uint64
 
 	deferredKTLSPromotionDisabledFn = tls.DeferredKTLSPromotionDisabledFor
+	xhttpExtractFdFn                = tls.ExtractFd
+	xhttpRealityServerFn            = reality.Server
+	xhttpDoRustRealityDeferredFn    = func(l *kREALITYListener, fd int) (*native.DeferredResult, error) {
+		return l.doRustRealityDeferred(fd)
+	}
 )
 
 type requestHandler struct {
@@ -991,7 +996,7 @@ func (l *kREALITYListener) processConn(rawConn net.Conn) (conn net.Conn, err err
 		tryGoFallback = true
 		decision.Reason = pipeline.ReasonKTLSPromotionCooldown
 	} else {
-		fd, fdErr := tls.ExtractFd(rawConn)
+		fd, fdErr := xhttpExtractFdFn(rawConn)
 		if fdErr != nil {
 			xhttpRealityMarkerRustFDExtractFailed.Add(1)
 			errors.LogDebugInner(context.Background(), fdErr, "[kind=xhttp-handover.rust_fd_extract_failed] XHTTP Rust REALITY path skipped: failed to extract fd")
@@ -1003,7 +1008,7 @@ func (l *kREALITYListener) processConn(rawConn net.Conn) (conn net.Conn, err err
 				return nil, errors.New("XHTTP Rust REALITY path: failed to set handshake deadline").Base(err)
 			}
 			rustStart := time.Now()
-			deferredResult, deferredErr := l.doRustRealityDeferred(fd)
+			deferredResult, deferredErr := xhttpDoRustRealityDeferredFn(l, fd)
 			rustDurationNs = time.Since(rustStart).Nanoseconds()
 			xhttpRealityMarkerRustDurationNanosTotal.Add(uint64(time.Since(rustStart).Nanoseconds()))
 			xhttpRealityMarkerRustDurationSamples.Add(1)
@@ -1119,7 +1124,7 @@ func (l *kREALITYListener) processConn(rawConn net.Conn) (conn net.Conn, err err
 		// deadline wrapper around reality.Server(), so camouflage timing/flow
 		// matches the main Go path.
 		goFallbackStart := time.Now()
-		realityConn, fallbackErr := reality.Server(rawConn, l.realityConfig)
+		realityConn, fallbackErr := xhttpRealityServerFn(rawConn, l.realityConfig)
 		fallbackDurationNs = time.Since(goFallbackStart).Nanoseconds()
 		xhttpRealityMarkerGoFallbackNanosTotal.Add(uint64(time.Since(goFallbackStart).Nanoseconds()))
 		xhttpRealityMarkerGoFallbackSamples.Add(1)
