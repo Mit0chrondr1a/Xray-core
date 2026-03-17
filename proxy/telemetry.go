@@ -25,7 +25,8 @@ func logPipelineSummary(ctx context.Context, snap pipeline.DecisionSnapshot) {
 		kind = "proxy"
 	}
 	path := snap.Path
-	errors.LogInfo(ctx, "proxy markers[kind=pipeline-summary]: ",
+	args := []any{
+		"proxy markers[kind=pipeline-summary]: ",
 		"kind=", kind,
 		" path=", string(path),
 		" reason=", snap.Reason,
@@ -37,6 +38,8 @@ func logPipelineSummary(ctx context.Context, snap pipeline.DecisionSnapshot) {
 		" copy_path=", snap.CopyPath,
 		" copy_gate_state=", snap.CopyGateState,
 		" copy_gate_reason=", snap.CopyGateReason,
+	}
+	args = append(args,
 		" splice_bytes=", snap.SpliceBytes,
 		" splice_duration_ns=", snap.SpliceDurationNs,
 		" userspace_bytes=", snap.UserspaceBytes,
@@ -47,4 +50,5 @@ func logPipelineSummary(ctx context.Context, snap pipeline.DecisionSnapshot) {
 		" sockmap_supported=", snap.Caps.SockmapSupported,
 		" splice_supported=", snap.Caps.SpliceSupported,
 	)
+	errors.LogInfo(ctx, args...)
 }

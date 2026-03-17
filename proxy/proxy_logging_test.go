@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	goerrors "errors"
 	"io"
 	"net"
 	"runtime"
@@ -166,6 +167,74 @@ func TestLogPipelineSummaryIncludesUserspaceExit(t *testing.T) {
 	if !strings.Contains(logs, "userspace_exit=remote_eof_no_response") {
 		t.Fatalf("pipeline summary missing userspace_exit field: %s", logs)
 	}
+	if strings.Contains(logs, "vision_phase=") || strings.Contains(logs, "vision_semantic_phase=") {
+		t.Fatalf("pipeline summary should not include removed vision summary fields: %s", logs)
+	}
+}
+
+func TestInferTLSOffloadPathFromCryptoDetectsKTLS(t *testing.T) {
+	if got := inferTLSOffloadPathFromCrypto(ebpf.CryptoKTLSBoth, ebpf.CryptoNone); got != pipeline.TLSOffloadKTLS {
+		t.Fatalf("inferTLSOffloadPathFromCrypto(kTLS, raw)=%q, want %q", got, pipeline.TLSOffloadKTLS)
+	}
+	if got := inferTLSOffloadPathFromCrypto(ebpf.CryptoNone, ebpf.CryptoNone); got != pipeline.TLSOffloadNotRequired {
+		t.Fatalf("inferTLSOffloadPathFromCrypto(raw, raw)=%q, want %q", got, pipeline.TLSOffloadNotRequired)
+	}
+	if got := inferTLSOffloadPathFromCrypto(ebpf.CryptoUserspaceTLS, ebpf.CryptoUserspaceTLS); got != pipeline.TLSOffloadUnknown {
+		t.Fatalf("inferTLSOffloadPathFromCrypto(userspace, userspace)=%q, want %q", got, pipeline.TLSOffloadUnknown)
+	}
+}
+
+func TestAnnotateFallbackTLSOffloadOverridesUserspaceSummary(t *testing.T) {
+	ctx := context.WithValue(context.Background(), fallbackRuntimeRecoveryContextKey{}, fallbackRuntimeRecoveryMeta{
+		Tag:                    "reality-vision-main",
+		FrontendTransport:      "deferred_rust",
+		FrontendTLSOffloadPath: pipeline.TLSOffloadKTLS,
+	})
+	decision := &pipeline.DecisionSnapshot{
+		Path:           pipeline.PathSplice,
+		TLSOffloadPath: pipeline.TLSOffloadUserspace,
+	}
+
+	annotateFallbackTLSOffload(ctx, decision)
+
+	if decision.TLSOffloadPath != pipeline.TLSOffloadKTLS {
+		t.Fatalf("decision.TLSOffloadPath=%q, want %q", decision.TLSOffloadPath, pipeline.TLSOffloadKTLS)
+	}
+}
+
+func TestMaybeReportFallbackNativeRuntimeRecoveryOnRawHandoffLogsMeasuredTLSOffload(t *testing.T) {
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	oldReport := reportNativeRuntimeRecoveryByTagFn
+	t.Cleanup(func() {
+		reportNativeRuntimeRecoveryByTagFn = oldReport
+	})
+
+	reportNativeRuntimeRecoveryByTagFn = func(string) bool { return true }
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	ctx := context.WithValue(context.Background(), fallbackRuntimeRecoveryContextKey{}, fallbackRuntimeRecoveryMeta{
+		Tag:                    "reality-vision-main",
+		FrontendTransport:      "deferred_rust",
+		FrontendTLSOffloadPath: pipeline.TLSOffloadKTLS,
+		State:                  &fallbackRuntimeRecoveryState{},
+	})
+
+	if !maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff(ctx, "response") {
+		t.Fatal("maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff()=false, want true")
+	}
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "tls_offload_path=ktls") {
+		t.Fatalf("fallback runtime recovery log missing measured tls_offload_path: %s", logs)
+	}
+	if strings.Contains(logs, "copy_path=splice") {
+		t.Fatalf("fallback runtime recovery log should not hardcode copy_path before execution: %s", logs)
+	}
 }
 
 func TestCopyRawConnIfExistLogsPendingUserspaceAfterNoDetachEOF(t *testing.T) {
@@ -188,12 +257,14 @@ func TestCopyRawConnIfExistLogsPendingUserspaceAfterNoDetachEOF(t *testing.T) {
 
 	inbound := &session.Inbound{
 		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
 	}
 	outbound := &session.Outbound{
 		CanSpliceCopy: int32(session.CopyGatePendingDetach),
 		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{57, 144, 150, 192}), xnet.Port(443)),
 	}
-	ctx := session.ContextWithInbound(context.Background(), inbound)
+	visionCh := make(chan session.VisionSignal, 1)
+	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
 
 	errCh := make(chan error, 1)
@@ -202,8 +273,8 @@ func TestCopyRawConnIfExistLogsPendingUserspaceAfterNoDetachEOF(t *testing.T) {
 	}()
 
 	time.AfterFunc(100*time.Millisecond, func() {
-		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionNoDetach)
-		outbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionNoDetach)
+		markVisionNoDetachObserved(ctx, outbound)
+		sendVisionSignal(visionCh, session.VisionSignal{Command: 1})
 		_ = readerPeer.Close()
 	})
 
@@ -217,15 +288,15 @@ func TestCopyRawConnIfExistLogsPendingUserspaceAfterNoDetachEOF(t *testing.T) {
 	}
 
 	logs := strings.Join(handler.msgs, "\n")
-	if !strings.Contains(logs, "reason=vision_no_detach_pending_userspace") {
-		t.Fatalf("missing pending userspace reason in logs: %s", logs)
+	if !strings.Contains(logs, "reason=vision_no_detach_userspace") {
+		t.Fatalf("missing stable no-detach reason in logs: %s", logs)
 	}
-	if !strings.Contains(logs, "userspace_exit=remote_eof_no_response") {
-		t.Fatalf("missing pending userspace exit in logs: %s", logs)
+	if !strings.Contains(logs, "userspace_exit=stable_userspace_close") {
+		t.Fatalf("missing stable no-detach exit in logs: %s", logs)
 	}
 }
 
-func TestCopyRawConnIfExistLogsQuietUplinkTelemetryOnly(t *testing.T) {
+func TestCopyRawConnIfExistLogsUnresolvedUplinkCompleteTimeout(t *testing.T) {
 	t.Cleanup(func() {
 		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
 	})
@@ -245,42 +316,42 @@ func TestCopyRawConnIfExistLogsQuietUplinkTelemetryOnly(t *testing.T) {
 
 	inbound := &session.Inbound{
 		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
 	}
 	outbound := &session.Outbound{
 		CanSpliceCopy: int32(session.CopyGatePendingDetach),
 		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{91, 108, 56, 133}), xnet.Port(443)),
 	}
-	ctx := session.ContextWithInbound(context.Background(), inbound)
+	visionCh := make(chan session.VisionSignal, 1)
+	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
-
-	storeVisionUplinkTimestamp(writerConn, time.Now().Add(-visionFirstResponseMax).UnixNano())
 
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
 	}()
 
-	time.AfterFunc(2500*time.Millisecond, func() {
-		_ = readerPeer.Close()
+	time.AfterFunc(100*time.Millisecond, func() {
+		ObserveVisionUplinkComplete(ctx, inbound, outbound)
 	})
 
 	select {
 	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after quiet-uplink telemetry path drains on peer close", err)
+		if !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want EOF after unresolved uplink timeout", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for quiet-uplink telemetry path to drain")
+		t.Fatal("timeout waiting for unresolved uplink timeout flow")
 	}
 
 	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "kind=vision.uplink_complete_unresolved") {
+		t.Fatalf("missing unresolved uplink log after channel refactor: %s", logs)
+	}
+	if !strings.Contains(logs, "reason=userspace_idle_timeout") {
+		t.Fatalf("missing expected unresolved uplink timeout reason in logs: %s", logs)
+	}
 	if strings.Contains(logs, "kind=vision.uplink_quiesce_handoff") {
-		t.Fatalf("unexpected quiesce handoff log after telemetry-only simplification: %s", logs)
-	}
-	if strings.Contains(logs, "reason=userspace_idle_timeout") {
-		t.Fatalf("unexpected local userspace timeout reason in logs: %s", logs)
-	}
-	if !(strings.Contains(logs, "reason=userspace_complete") || strings.Contains(logs, "reason=deferred_tls_guard")) {
-		t.Fatalf("missing expected quiet-uplink terminal reason in logs: %s", logs)
+		t.Fatalf("unexpected quiesce handoff log after signal refactor: %s", logs)
 	}
 }
