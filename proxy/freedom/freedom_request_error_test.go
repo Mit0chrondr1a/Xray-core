@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 )
 
 type errReader struct {
@@ -124,5 +126,53 @@ func TestClassifyEgressDialFailureRefused(t *testing.T) {
 func TestClassifyEgressDialFailureContextCancelled(t *testing.T) {
 	if class, ok := classifyEgressDialFailure(context.Canceled); ok {
 		t.Fatalf("expected context cancel to be ignored, got %q", class)
+	}
+}
+
+func TestShouldBypassEgressFastFail(t *testing.T) {
+	tests := []struct {
+		name   string
+		ctx    context.Context
+		dest   net.Destination
+		expect bool
+	}{
+		{
+			name:   "dns_control_always_single_shot",
+			ctx:    context.Background(),
+			dest:   net.TCPDestination(net.IPAddress([]byte{1, 1, 1, 1}), net.Port(53)),
+			expect: true,
+		},
+		{
+			name:   "vision_literal_ip_tcp_single_shot",
+			ctx:    session.ContextWithVisionFlow(context.Background(), true),
+			dest:   net.TCPDestination(net.IPAddress([]byte{173, 252, 108, 21}), net.Port(5222)),
+			expect: true,
+		},
+		{
+			name:   "vision_domain_tcp_keeps_retry_path",
+			ctx:    session.ContextWithVisionFlow(context.Background(), true),
+			dest:   net.TCPDestination(net.DomainAddress("i.instagram.com"), net.Port(443)),
+			expect: false,
+		},
+		{
+			name:   "non_vision_literal_ip_tcp_keeps_retry_path",
+			ctx:    context.Background(),
+			dest:   net.TCPDestination(net.IPAddress([]byte{173, 252, 108, 21}), net.Port(5222)),
+			expect: false,
+		},
+		{
+			name:   "vision_literal_ip_udp_keeps_retry_path",
+			ctx:    session.ContextWithVisionFlow(context.Background(), true),
+			dest:   net.UDPDestination(net.IPAddress([]byte{173, 252, 108, 21}), net.Port(5222)),
+			expect: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldBypassEgressFastFail(tt.ctx, tt.dest); got != tt.expect {
+				t.Fatalf("shouldBypassEgressFastFail() = %v, want %v", got, tt.expect)
+			}
+		})
 	}
 }
