@@ -92,12 +92,6 @@ func EvaluateCopyGate(in CopyGateInput) (reason string, gate CopyGateState, gate
 		if gateReason == CopyGateReasonVisionNoDetach {
 			return ReasonVisionNoDetachUserspace, in.InboundGate, gateReason, CopyPathUserspace, true
 		}
-		if gateReason == CopyGateReasonVisionUplinkComplete {
-			return ReasonVisionUplinkCompleteUserspace, in.InboundGate, gateReason, CopyPathUserspace, true
-		}
-		if gateReason == CopyGateReasonVisionCommandContinue {
-			return ReasonVisionCommandContinueUserspace, in.InboundGate, gateReason, CopyPathUserspace, true
-		}
 		return ReasonInboundForcedUserspace, in.InboundGate, gateReason, CopyPathUserspace, true
 	}
 	if in.InboundGate == CopyGateNotApplicable {
@@ -116,12 +110,6 @@ func EvaluateCopyGate(in CopyGateInput) (reason string, gate CopyGateState, gate
 		case CopyGateForcedUserspace:
 			if r == CopyGateReasonVisionNoDetach {
 				return ReasonVisionNoDetachUserspace, g, r, CopyPathUserspace, true
-			}
-			if r == CopyGateReasonVisionUplinkComplete {
-				return ReasonVisionUplinkCompleteUserspace, g, r, CopyPathUserspace, true
-			}
-			if r == CopyGateReasonVisionCommandContinue {
-				return ReasonVisionCommandContinueUserspace, g, r, CopyPathUserspace, true
 			}
 			return ReasonOutboundForcedUserspace, g, r, CopyPathUserspace, true
 		case CopyGateNotApplicable:
