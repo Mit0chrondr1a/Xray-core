@@ -675,10 +675,10 @@ func TestShouldAttemptNativeRealityModeOverrideInvalidIgnored(t *testing.T) {
 	}
 	decision := shouldAttemptNativeRealityForAddr(v, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9443})
 	if decision.Attempt {
-		t.Fatal("expected invalid env mode override to leave loopback AUTO skip intact")
+		t.Fatal("expected invalid env mode override to fall back to AUTO loopback guard")
 	}
 	if !decision.SkipByPolicy {
-		t.Fatal("expected policy skip under invalid env mode override")
+		t.Fatal("expected invalid env mode override to hit loopback AUTO policy skip")
 	}
 	if decision.SkipReason != nativeSkipReasonLoopbackAutoGuard {
 		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonLoopbackAutoGuard)
@@ -969,7 +969,7 @@ func TestLoopbackListenerAutoSkipsNative(t *testing.T) {
 	}
 	decision := shouldAttemptNativeReality(v)
 	if decision.Attempt {
-		t.Fatal("loopback listener in AUTO should skip native path")
+		t.Fatal("loopback listener in AUTO should be guarded out of native path")
 	}
 	if !decision.SkipByPolicy {
 		t.Fatal("expected loopback listener in AUTO to skip by policy")
@@ -1038,7 +1038,7 @@ func TestLoopbackConnLocalAddrAutoSkipsNative(t *testing.T) {
 	}
 	decision := shouldAttemptNativeRealityForAddr(v, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9100})
 	if decision.Attempt {
-		t.Fatal("loopback conn local addr in AUTO should skip native path")
+		t.Fatal("loopback conn local addr in AUTO should be guarded out of native path")
 	}
 	if !decision.SkipByPolicy {
 		t.Fatal("expected loopback conn local addr in AUTO to skip by policy")

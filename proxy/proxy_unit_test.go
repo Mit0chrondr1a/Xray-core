@@ -33,6 +33,22 @@ func (c *visionDeferredWrapConn) NetConn() gonet.Conn {
 	return c.inner
 }
 
+type notifyingWriteBuffer struct {
+	bytes.Buffer
+	wrote chan struct{}
+	once  sync.Once
+}
+
+func (b *notifyingWriteBuffer) Write(p []byte) (int, error) {
+	n, err := b.Buffer.Write(p)
+	if n > 0 {
+		b.once.Do(func() {
+			close(b.wrote)
+		})
+	}
+	return n, err
+}
+
 // --- NewTrafficState ---
 
 func TestNewTrafficState(t *testing.T) {
@@ -917,48 +933,44 @@ func TestMarkVisionCommandContinueEvidenceLeavesCopyGateUntouched(t *testing.T) 
 	}
 }
 
-func TestObserveVisionUplinkCompleteLeavesNativeDeferredFlowSemanticsUntouched(t *testing.T) {
+func TestObserveVisionUplinkCompleteLocallyResolvesNativeDeferredNoDetach(t *testing.T) {
 	inbound := &session.Inbound{Conn: &tls.DeferredRustConn{}}
-	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
-	outbound := &session.Outbound{}
-	outbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
-
-	if !ObserveVisionUplinkComplete(context.Background(), inbound, outbound) {
-		t.Fatal("ObserveVisionUplinkComplete() = false, want true")
-	}
-	if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
-		t.Fatalf("inbound state=%v, want pending_detach", got)
-	}
-	if got := inbound.CopyGateReason(); got != session.CopyGateReasonUnspecified {
-		t.Fatalf("inbound reason=%v, want unspecified", got)
-	}
-	if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
-		t.Fatalf("outbound state=%v, want pending_detach", got)
-	}
-	if got := outbound.CopyGateReason(); got != session.CopyGateReasonUnspecified {
-		t.Fatalf("outbound reason=%v, want unspecified", got)
-	}
-}
-
-func TestObserveVisionUplinkCompleteRecordsPendingSignal(t *testing.T) {
-	writerConn := &tls.DeferredRustConn{}
-	inbound := &session.Inbound{Conn: writerConn}
 	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 	outbound := &session.Outbound{}
 	outbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 	visionCh := make(chan session.VisionSignal, 1)
 	ctx := session.ContextWithVisionSignal(context.Background(), visionCh)
+	ctx = session.ContextWithInbound(ctx, inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
 
 	if !ObserveVisionUplinkComplete(ctx, inbound, outbound) {
 		t.Fatal("ObserveVisionUplinkComplete() = false, want true")
 	}
+	if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+		t.Fatalf("inbound state=%v, want forced_userspace", got)
+	}
+	if got := inbound.CopyGateReason(); got != session.CopyGateReasonVisionNoDetach {
+		t.Fatalf("inbound reason=%v, want vision_no_detach", got)
+	}
+	if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+		t.Fatalf("outbound state=%v, want forced_userspace", got)
+	}
+	if got := outbound.CopyGateReason(); got != session.CopyGateReasonVisionNoDetach {
+		t.Fatalf("outbound reason=%v, want vision_no_detach", got)
+	}
+	if got := inbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseNoDetach {
+		t.Fatalf("inbound semantic=%v, want vision_no_detach", got)
+	}
+	if got := outbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseNoDetach {
+		t.Fatalf("outbound semantic=%v, want vision_no_detach", got)
+	}
 	select {
 	case sig := <-visionCh:
-		if sig.Command != 0 {
-			t.Fatalf("signal command=%d, want 0", sig.Command)
+		if sig.Command != 1 {
+			t.Fatalf("signal command=%d, want 1", sig.Command)
 		}
 	default:
-		t.Fatal("ObserveVisionUplinkComplete() did not record pending signal")
+		t.Fatal("ObserveVisionUplinkComplete() did not record local no-detach signal")
 	}
 }
 
@@ -1028,17 +1040,37 @@ func TestShouldReportNativeDeferredRuntimeRegression(t *testing.T) {
 		UserspaceExit:  pipeline.UserspaceExitTimeout,
 	}
 
-	if !shouldReportNativeDeferredRuntimeRegression(inbound, []*session.Outbound{outbound}, copyLoopPhaseAwaitSignal, true, decision) {
-		t.Fatal("shouldReportNativeDeferredRuntimeRegression() = false, want true for unresolved native deferred timeout")
+	if shouldReportNativeDeferredRuntimeRegression(inbound, []*session.Outbound{outbound}, copyLoopPhaseAwaitSignal, true, decision) {
+		t.Fatal("shouldReportNativeDeferredRuntimeRegression() = true, want false for zero-byte unresolved native deferred timeout")
 	}
 	decision.UserspaceBytes = 64
+	if shouldReportNativeDeferredRuntimeRegression(inbound, []*session.Outbound{outbound}, copyLoopPhaseAwaitSignal, true, decision) {
+		t.Fatal("shouldReportNativeDeferredRuntimeRegression() = true, want false for await-signal idle timeout after partial userspace progress")
+	}
+
+	decision.Reason = pipeline.ReasonDeferredTLSGuard
 	if !shouldReportNativeDeferredRuntimeRegression(inbound, []*session.Outbound{outbound}, copyLoopPhaseAwaitSignal, true, decision) {
-		t.Fatal("shouldReportNativeDeferredRuntimeRegression() = false, want true for unresolved native deferred timeout with userspace bytes")
+		t.Fatal("shouldReportNativeDeferredRuntimeRegression() = false, want true for unresolved native deferred TLS guard with userspace bytes")
 	}
 
 	markVisionNoDetachObserved(session.ContextWithInbound(context.Background(), inbound), outbound)
 	if shouldReportNativeDeferredRuntimeRegression(inbound, []*session.Outbound{outbound}, copyLoopPhaseAwaitSignal, true, decision) {
 		t.Fatal("shouldReportNativeDeferredRuntimeRegression() = true, want false once explicit no-detach semantic truth exists")
+	}
+}
+
+func TestShouldRetryPostSockmapSpliceProbe(t *testing.T) {
+	if !shouldRetryPostSockmapSpliceProbe(true, testTimeoutError{}, 64, 32) {
+		t.Fatal("shouldRetryPostSockmapSpliceProbe() = false, want true when probe timed out after meaningful progress")
+	}
+	if shouldRetryPostSockmapSpliceProbe(true, testTimeoutError{}, 32, 32) {
+		t.Fatal("shouldRetryPostSockmapSpliceProbe() = true, want false at stall threshold")
+	}
+	if shouldRetryPostSockmapSpliceProbe(false, testTimeoutError{}, 64, 32) {
+		t.Fatal("shouldRetryPostSockmapSpliceProbe() = true, want false when probe is inactive")
+	}
+	if shouldRetryPostSockmapSpliceProbe(true, io.EOF, 64, 32) {
+		t.Fatal("shouldRetryPostSockmapSpliceProbe() = true, want false for non-timeout errors")
 	}
 }
 
@@ -1507,136 +1539,7 @@ func TestCopyRawConnIfExistDoesNotReportNativeDeferredRuntimeRecoveryOnNoDetachS
 	}
 }
 
-func TestCopyRawConnIfExistReportsNativeDeferredRuntimeRegressionOnTimeout(t *testing.T) {
-	readerPeer, readerConn := gonet.Pipe()
-	defer readerPeer.Close()
-	defer readerConn.Close()
-
-	writerConn := &tls.DeferredRustConn{}
-	copyCtx, cancelCopy := context.WithCancel(context.Background())
-	defer cancelCopy()
-	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
-	defer timer.SetTimeout(0)
-
-	inbound := &session.Inbound{
-		Tag:           "native-vision-timeout",
-		CanSpliceCopy: int32(session.CopyGatePendingDetach),
-		Conn:          writerConn,
-	}
-	outbound := &session.Outbound{
-		CanSpliceCopy: int32(session.CopyGatePendingDetach),
-		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{163, 70, 159, 175}), xnet.Port(5222)),
-	}
-	visionCh := make(chan session.VisionSignal, 1)
-	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
-	ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
-	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
-
-	oldReport := reportNativeRuntimeRegressionByTagFn
-	var (
-		reportedTag string
-		reportCalls int
-	)
-	reportNativeRuntimeRegressionByTagFn = func(tag string) bool {
-		reportedTag = tag
-		reportCalls++
-		return true
-	}
-	defer func() {
-		reportNativeRuntimeRegressionByTagFn = oldReport
-	}()
-
-	startedAt := time.Now()
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
-	}()
-
-	select {
-	case err := <-errCh:
-		if err != nil && !goerrors.Is(err, io.EOF) {
-			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after bounded unresolved native timeout", err)
-		}
-		elapsed := time.Since(startedAt)
-		if elapsed < 2500*time.Millisecond || elapsed > 4500*time.Millisecond {
-			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want bounded unresolved native timeout", elapsed)
-		}
-		if reportCalls != 1 {
-			t.Fatalf("runtime regression reports=%d, want 1", reportCalls)
-		}
-		if reportedTag != inbound.Tag {
-			t.Fatalf("reportedTag=%q, want %q", reportedTag, inbound.Tag)
-		}
-	case <-time.After(7 * time.Second):
-		t.Fatal("timeout waiting for unresolved native timeout flow")
-	}
-}
-
-func TestCopyRawConnIfExistReportsNativeDeferredRuntimeRegressionOnTimeoutAfterUserspaceBytes(t *testing.T) {
-	readerPeer, readerConn := gonet.Pipe()
-	defer readerPeer.Close()
-	defer readerConn.Close()
-
-	writerConn := &tls.DeferredRustConn{}
-	copyCtx, cancelCopy := context.WithCancel(context.Background())
-	defer cancelCopy()
-	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
-	defer timer.SetTimeout(0)
-
-	inbound := &session.Inbound{
-		Tag:           "native-vision-timeout-bytes",
-		CanSpliceCopy: int32(session.CopyGatePendingDetach),
-		Conn:          writerConn,
-	}
-	outbound := &session.Outbound{
-		CanSpliceCopy: int32(session.CopyGatePendingDetach),
-		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{57, 144, 14, 36}), xnet.Port(443)),
-	}
-	visionCh := make(chan session.VisionSignal, 1)
-	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
-	ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
-	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
-
-	oldReport := reportNativeRuntimeRegressionByTagFn
-	var (
-		reportedTag string
-		reportCalls int
-	)
-	reportNativeRuntimeRegressionByTagFn = func(tag string) bool {
-		reportedTag = tag
-		reportCalls++
-		return true
-	}
-	defer func() {
-		reportNativeRuntimeRegressionByTagFn = oldReport
-	}()
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
-	}()
-
-	time.AfterFunc(200*time.Millisecond, func() {
-		_, _ = readerPeer.Write([]byte("early-userspace-response"))
-	})
-
-	select {
-	case err := <-errCh:
-		if err != nil && !goerrors.Is(err, io.EOF) {
-			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after bounded unresolved native timeout", err)
-		}
-		if reportCalls != 1 {
-			t.Fatalf("runtime regression reports=%d, want 1", reportCalls)
-		}
-		if reportedTag != inbound.Tag {
-			t.Fatalf("reportedTag=%q, want %q", reportedTag, inbound.Tag)
-		}
-	case <-time.After(7 * time.Second):
-		t.Fatal("timeout waiting for unresolved native timeout with userspace bytes")
-	}
-}
-
-func TestCopyRawConnIfExistWaitsForHardDeadlineAfterUnresolvedUplinkComplete(t *testing.T) {
+func TestCopyRawConnIfExistWaitsGraceForLateExplicitPostDetachSignal(t *testing.T) {
 	readerPeer, readerConn := gonet.Pipe()
 	defer readerPeer.Close()
 	defer readerConn.Close()
@@ -1674,27 +1577,509 @@ func TestCopyRawConnIfExistWaitsForHardDeadlineAfterUnresolvedUplinkComplete(t *
 	startedAt := time.Now()
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.NewWriter(io.Discard), timer, nil)
 	}()
 
 	time.AfterFunc(500*time.Millisecond, func() {
-		ObserveVisionUplinkComplete(ctx, inbound, outbound)
+		sendVisionSignal(visionCh, session.VisionSignal{Command: 0})
+	})
+	time.AfterFunc(6200*time.Millisecond, func() {
+		markVisionPostDetachObserved(ctx, outbound)
+		markDeferredRustConnDetachedForTest(writerConn)
+		sendVisionSignal(visionCh, session.VisionSignal{Command: 2})
+	})
+	time.AfterFunc(6450*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-explicit-post-detach"))
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after late explicit post-detach signal", err)
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed < 6*time.Second || elapsed > 9*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want late explicit post-detach handled after old 6s kill point and within grace window", elapsed)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if reportCalls != 0 {
+			t.Fatalf("runtime regression reports=%d, want 0 after late explicit post-detach signal", reportCalls)
+		}
+		if got := inbound.VisionSemanticPhase(); got != session.VisionSemanticPhasePostDetach {
+			t.Fatalf("inbound semantic=%v, want vision_post_detach", got)
+		}
+		if got := outbound.VisionSemanticPhase(); got != session.VisionSemanticPhasePostDetach {
+			t.Fatalf("outbound semantic=%v, want vision_post_detach", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for late explicit post-detach signal")
+	}
+}
+
+func TestCopyRawConnIfExistForwardsResponseBeforeLateNoDetachSignal(t *testing.T) {
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Tag:           "native-vision-await-signal-response-flow",
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{157, 240, 199, 175}), xnet.Port(5222)),
+	}
+	visionCh := make(chan session.VisionSignal, 1)
+	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
+	ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	oldReport := reportNativeRuntimeRegressionByTagFn
+	var reportCalls int
+	reportNativeRuntimeRegressionByTagFn = func(tag string) bool {
+		reportCalls++
+		return true
+	}
+	defer func() {
+		reportNativeRuntimeRegressionByTagFn = oldReport
+	}()
+
+	clientOutput := &notifyingWriteBuffer{wrote: make(chan struct{})}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.NewWriter(clientOutput), timer, nil)
+	}()
+
+	time.AfterFunc(1200*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("response-before-late-no-detach-signal"))
+	})
+	go func() {
+		<-clientOutput.wrote
+		markVisionNoDetachObserved(ctx, outbound)
+		sendVisionSignal(visionCh, session.VisionSignal{Command: 1})
+		_ = readerPeer.Close()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after forwarding response before late no-detach signal", err)
+		}
+		if got := clientOutput.String(); got != "response-before-late-no-detach-signal" {
+			t.Fatalf("written payload=%q, want forwarded response before late no-detach signal", got)
+		}
+		if reportCalls != 0 {
+			t.Fatalf("runtime regression reports=%d, want 0 after response-driven late no-detach signal", reportCalls)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("inbound state=%v, want forced_userspace after explicit no-detach signal", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("outbound state=%v, want forced_userspace after explicit no-detach signal", got)
+		}
+		if got := inbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseNoDetach {
+			t.Fatalf("inbound semantic=%v, want vision_no_detach", got)
+		}
+		if got := outbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseNoDetach {
+			t.Fatalf("outbound semantic=%v, want vision_no_detach", got)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("timeout waiting for response-driven late no-detach signal flow")
+	}
+}
+
+func TestCopyRawConnIfExistDoesNotReportRuntimeRegressionForZeroByteTimeoutWithoutVisionSignalChannel(t *testing.T) {
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Tag:           "native-vision-uplink-complete-late-short-flow",
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{157, 240, 199, 175}), xnet.Port(5222)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	oldReport := reportNativeRuntimeRegressionByTagFn
+	var reportCalls int
+	reportNativeRuntimeRegressionByTagFn = func(tag string) bool {
+		reportCalls++
+		return true
+	}
+	defer func() {
+		reportNativeRuntimeRegressionByTagFn = oldReport
+	}()
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+	time.AfterFunc(8*time.Second, func() {
+		_ = readerPeer.Close()
 	})
 
 	select {
 	case err := <-errCh:
 		if err != nil && !goerrors.Is(err, io.EOF) {
-			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after unresolved uplink completion", err)
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after peer closes pending no-signal flow", err)
 		}
 		elapsed := time.Since(startedAt)
-		if elapsed < 2500*time.Millisecond || elapsed > 4500*time.Millisecond {
-			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want hard pre-detach deadline after unresolved uplink completion", elapsed)
+		if elapsed < 7500*time.Millisecond || elapsed > 9*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want survival past old 6.5s kill point until peer closes", elapsed)
 		}
-		if reportCalls != 1 {
-			t.Fatalf("runtime regression reports=%d, want 1", reportCalls)
+		time.Sleep(50 * time.Millisecond)
+		if reportCalls != 0 {
+			t.Fatalf("runtime regression reports=%d, want 0 for zero-byte pending no-signal flow", reportCalls)
 		}
-	case <-time.After(4 * time.Second):
-		t.Fatal("timeout waiting for unresolved uplink completion hard deadline")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for peer close without vision signal channel")
+	}
+}
+
+func TestCopyRawConnIfExistLocallyResolvesNoDetachAfterLateUplinkComplete(t *testing.T) {
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Tag:           "native-vision-uplink-complete-late-short-flow",
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{142, 251, 45, 10}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	oldReport := reportNativeRuntimeRegressionByTagFn
+	var reportCalls int
+	reportNativeRuntimeRegressionByTagFn = func(tag string) bool {
+		reportCalls++
+		return true
+	}
+	defer func() {
+		reportNativeRuntimeRegressionByTagFn = oldReport
+	}()
+
+	var written bytes.Buffer
+	uplinkCompleteCh := make(chan time.Time, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.NewWriter(&written), timer, nil)
+	}()
+
+	time.AfterFunc(2500*time.Millisecond, func() {
+		uplinkCompleteCh <- time.Now()
+		ObserveVisionUplinkComplete(ctx, inbound, outbound)
+	})
+	time.AfterFunc(3200*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-short-flow-response"))
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after late local no-detach resolution", err)
+		}
+		var uplinkCompleteAt time.Time
+		select {
+		case uplinkCompleteAt = <-uplinkCompleteCh:
+		default:
+			t.Fatal("missing late unresolved uplink completion timestamp")
+		}
+		elapsedSinceUplinkComplete := time.Since(uplinkCompleteAt)
+		if elapsedSinceUplinkComplete < 400*time.Millisecond || elapsedSinceUplinkComplete > 2*time.Second {
+			t.Fatalf("elapsed since late uplink completion=%v, want prompt no-detach completion after local resolution", elapsedSinceUplinkComplete)
+		}
+		if reportCalls != 0 {
+			t.Fatalf("runtime regression reports=%d, want 0 for late local no-detach resolution", reportCalls)
+		}
+		if got := written.String(); got != "late-short-flow-response" {
+			t.Fatalf("written payload=%q, want late short-flow response", got)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("inbound state=%v, want forced_userspace after local no-detach resolution", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("outbound state=%v, want forced_userspace after local no-detach resolution", got)
+		}
+		if got := inbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseNoDetach {
+			t.Fatalf("inbound semantic=%v, want vision_no_detach", got)
+		}
+		if got := outbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseNoDetach {
+			t.Fatalf("outbound semantic=%v, want vision_no_detach", got)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("timeout waiting for late local no-detach short-flow completion")
+	}
+}
+
+func TestCopyRawConnIfExistWaitsPastPreDetachDeadlineWithPendingVisionSignalUntilPeerCloses(t *testing.T) {
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Tag:           "native-vision-pre-detach-deadline",
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{142, 251, 45, 11}), xnet.Port(443)),
+	}
+	visionCh := make(chan session.VisionSignal, 1)
+	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
+	ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	oldReport := reportNativeRuntimeRegressionByTagFn
+	var reportCalls int
+	reportNativeRuntimeRegressionByTagFn = func(tag string) bool {
+		reportCalls++
+		return true
+	}
+	defer func() {
+		reportNativeRuntimeRegressionByTagFn = oldReport
+	}()
+
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+	time.AfterFunc(8*time.Second, func() {
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after peer closes pending Vision silence", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed < 7500*time.Millisecond || elapsed > 9*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want survival past old 6.5s kill point until peer closes", elapsed)
+		}
+		if reportCalls != 0 {
+			t.Fatalf("runtime regression reports=%d, want 0 while pending Vision silence is paced without self-kill", reportCalls)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Fatalf("inbound state=%v, want pending_detach after peer close without semantic truth", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Fatalf("outbound state=%v, want pending_detach after peer close without semantic truth", got)
+		}
+		if got := inbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseUnset {
+			t.Fatalf("inbound semantic=%v, want vision_unset after peer close without semantic truth", got)
+		}
+		if got := outbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseUnset {
+			t.Fatalf("outbound semantic=%v, want vision_unset after peer close without semantic truth", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for peer close with pending Vision signal")
+	}
+}
+
+func TestCopyRawConnIfExistExtendsPreDetachDeadlineOnResponseProgress(t *testing.T) {
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Tag:           "native-vision-pre-detach-response-progress",
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{149, 154, 167, 50}), xnet.Port(5222)),
+	}
+	visionCh := make(chan session.VisionSignal, 1)
+	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
+	ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	oldReport := reportNativeRuntimeRegressionByTagFn
+	var reportCalls int
+	reportNativeRuntimeRegressionByTagFn = func(tag string) bool {
+		reportCalls++
+		return true
+	}
+	defer func() {
+		reportNativeRuntimeRegressionByTagFn = oldReport
+	}()
+
+	clientOutput := &notifyingWriteBuffer{wrote: make(chan struct{})}
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.NewWriter(clientOutput), timer, nil)
+	}()
+
+	time.AfterFunc(2*time.Second, func() {
+		_, _ = readerPeer.Write([]byte("response-chunk-one"))
+	})
+	time.AfterFunc(4500*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("response-chunk-two"))
+	})
+	time.AfterFunc(6800*time.Millisecond, func() {
+		markVisionNoDetachObserved(ctx, outbound)
+		sendVisionSignal(visionCh, session.VisionSignal{Command: 1})
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after extending pre-detach deadline on response progress", err)
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed < 6600*time.Millisecond || elapsed > 9*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want to survive past old 6.5s pre-detach wall clock and finish after late command", elapsed)
+		}
+		if got := clientOutput.String(); got != "response-chunk-oneresponse-chunk-two" {
+			t.Fatalf("written payload=%q, want both response chunks forwarded before late no-detach signal", got)
+		}
+		if reportCalls != 0 {
+			t.Fatalf("runtime regression reports=%d, want 0 after response progress extends pre-detach deadline", reportCalls)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("inbound state=%v, want forced_userspace after late no-detach signal", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGateForcedUserspace {
+			t.Fatalf("outbound state=%v, want forced_userspace after late no-detach signal", got)
+		}
+		if got := inbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseNoDetach {
+			t.Fatalf("inbound semantic=%v, want vision_no_detach", got)
+		}
+		if got := outbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseNoDetach {
+			t.Fatalf("outbound semantic=%v, want vision_no_detach", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for pre-detach deadline extension on response progress")
+	}
+}
+
+func TestCopyRawConnIfExistSurvivesPastPreDetachDeadlineAfterSingleResponseBurst(t *testing.T) {
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &tls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Tag:           "native-vision-pre-detach-single-burst",
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{57, 144, 152, 36}), xnet.Port(5222)),
+	}
+	visionCh := make(chan session.VisionSignal, 1)
+	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
+	ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	oldReport := reportNativeRuntimeRegressionByTagFn
+	var reportCalls int
+	reportNativeRuntimeRegressionByTagFn = func(tag string) bool {
+		reportCalls++
+		return true
+	}
+	defer func() {
+		reportNativeRuntimeRegressionByTagFn = oldReport
+	}()
+
+	clientOutput := &notifyingWriteBuffer{wrote: make(chan struct{})}
+	startedAt := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.NewWriter(clientOutput), timer, nil)
+	}()
+
+	time.AfterFunc(2*time.Second, func() {
+		_, _ = readerPeer.Write([]byte("xmpp-handshake-fragment"))
+	})
+	time.AfterFunc(8*time.Second, func() {
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after peer closes single response burst session", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed < 7500*time.Millisecond || elapsed > 9*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want single-burst session to survive past old 6.5s wall clock until peer closes", elapsed)
+		}
+		if got := clientOutput.String(); got != "xmpp-handshake-fragment" {
+			t.Fatalf("written payload=%q, want single response burst forwarded before peer closes", got)
+		}
+		if reportCalls != 0 {
+			t.Fatalf("runtime regression reports=%d, want 0 after single response burst with pending Vision silence", reportCalls)
+		}
+		if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Fatalf("inbound state=%v, want pending_detach after peer close without semantic truth", got)
+		}
+		if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+			t.Fatalf("outbound state=%v, want pending_detach after peer close without semantic truth", got)
+		}
+		if got := inbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseUnset {
+			t.Fatalf("inbound semantic=%v, want vision_unset after peer close without semantic truth", got)
+		}
+		if got := outbound.VisionSemanticPhase(); got != session.VisionSemanticPhaseUnset {
+			t.Fatalf("outbound semantic=%v, want vision_unset after peer close without semantic truth", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for peer close after single response burst")
 	}
 }
 
@@ -1735,16 +2120,19 @@ func TestCopyRawConnIfExistKeepsPersistentCommandContinueTelemetryOnly(t *testin
 			t.Errorf("outbound state=%v, want pending detach while command=0 remains telemetry-only", got)
 		}
 	})
+	time.AfterFunc(8*time.Second, func() {
+		_ = readerPeer.Close()
+	})
 
 	select {
 	case err := <-errCh:
-		if !goerrors.Is(err, io.EOF) {
-			t.Fatalf("CopyRawConnIfExist() error=%v, want EOF timeout while command=0 stays telemetry-only", err)
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after peer closes while command=0 stays telemetry-only", err)
 		}
-		if elapsed := time.Since(startedAt); elapsed < 2500*time.Millisecond || elapsed > 4*time.Second {
-			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want bounded compatibility-first timeout around 3s", elapsed)
+		if elapsed := time.Since(startedAt); elapsed < 7500*time.Millisecond || elapsed > 9*time.Second {
+			t.Fatalf("CopyRawConnIfExist() elapsed=%v, want command=0 telemetry-only flow to survive past old 6.5s wall clock until peer closes", elapsed)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for command=0 telemetry-only flow")
 	}
 }

@@ -25,7 +25,7 @@ func TestCopyFallbackRequestFlushesPreludeBeforeRawHandoff(t *testing.T) {
 	fallbackRawHandoffEligibleFn = func(net.Conn) bool { return true }
 
 	var written bytes.Buffer
-	copyRawConnIfExistFn = func(ctx context.Context, readerConn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
+	copyRawConnIfExistFn = func(ctx context.Context, readerConn, writerConn net.Conn, writer buf.Writer, timer signal.ActivityUpdater, inTimer *signal.ActivityTimer) error {
 		if got := written.String(); got != "HEAD" {
 			t.Fatalf("buffered prelude = %q, want %q before raw handoff", got, "HEAD")
 		}
@@ -63,7 +63,7 @@ func TestCopyFallbackResponseForcedUserspacePreservesPayload(t *testing.T) {
 		fallbackRawHandoffEligibleFn = oldEligible
 	})
 
-	copyRawConnIfExistFn = func(context.Context, net.Conn, net.Conn, buf.Writer, *signal.ActivityTimer, *signal.ActivityTimer) error {
+	copyRawConnIfExistFn = func(context.Context, net.Conn, net.Conn, buf.Writer, signal.ActivityUpdater, *signal.ActivityTimer) error {
 		t.Fatal("CopyRawConnIfExist should not be called when inbound forces userspace")
 		return nil
 	}
@@ -211,7 +211,7 @@ func TestCopyFallbackRawHandoffReportsRuntimeRecoveryOnceAcrossDirections(t *tes
 	})
 
 	fallbackRawHandoffEligibleFn = func(net.Conn) bool { return true }
-	copyRawConnIfExistFn = func(context.Context, net.Conn, net.Conn, buf.Writer, *signal.ActivityTimer, *signal.ActivityTimer) error {
+	copyRawConnIfExistFn = func(context.Context, net.Conn, net.Conn, buf.Writer, signal.ActivityUpdater, *signal.ActivityTimer) error {
 		return nil
 	}
 

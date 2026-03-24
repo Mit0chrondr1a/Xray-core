@@ -256,6 +256,7 @@ func TestCopyRawConnIfExistLogsPendingUserspaceAfterNoDetachEOF(t *testing.T) {
 	defer timer.SetTimeout(0)
 
 	inbound := &session.Inbound{
+		Tag:           "native-vision-logging",
 		CanSpliceCopy: int32(session.CopyGatePendingDetach),
 		Conn:          writerConn,
 	}
@@ -296,7 +297,7 @@ func TestCopyRawConnIfExistLogsPendingUserspaceAfterNoDetachEOF(t *testing.T) {
 	}
 }
 
-func TestCopyRawConnIfExistLogsUnresolvedUplinkCompleteTimeout(t *testing.T) {
+func TestCopyRawConnIfExistLogsLateExplicitPostDetachSignalDuringGrace(t *testing.T) {
 	t.Cleanup(func() {
 		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
 	})
@@ -315,6 +316,7 @@ func TestCopyRawConnIfExistLogsUnresolvedUplinkCompleteTimeout(t *testing.T) {
 	defer timer.SetTimeout(0)
 
 	inbound := &session.Inbound{
+		Tag:           "native-vision-logging",
 		CanSpliceCopy: int32(session.CopyGatePendingDetach),
 		Conn:          writerConn,
 	}
@@ -332,26 +334,220 @@ func TestCopyRawConnIfExistLogsUnresolvedUplinkCompleteTimeout(t *testing.T) {
 	}()
 
 	time.AfterFunc(100*time.Millisecond, func() {
-		ObserveVisionUplinkComplete(ctx, inbound, outbound)
+		sendVisionSignal(visionCh, session.VisionSignal{Command: 0})
+	})
+	time.AfterFunc(6200*time.Millisecond, func() {
+		markVisionPostDetachObserved(ctx, outbound)
+		markDeferredRustConnDetachedForTest(writerConn)
+		sendVisionSignal(visionCh, session.VisionSignal{Command: 2})
+	})
+	time.AfterFunc(6450*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("late-explicit-post-detach"))
+		_ = readerPeer.Close()
 	})
 
 	select {
 	case err := <-errCh:
-		if !goerrors.Is(err, io.EOF) {
-			t.Fatalf("CopyRawConnIfExist() error=%v, want EOF after unresolved uplink timeout", err)
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after late explicit post-detach signal", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for unresolved uplink timeout flow")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for late explicit post-detach signal flow")
 	}
 
 	logs := strings.Join(handler.msgs, "\n")
-	if !strings.Contains(logs, "kind=vision.uplink_complete_unresolved") {
-		t.Fatalf("missing unresolved uplink log after channel refactor: %s", logs)
+	if !strings.Contains(logs, "kind=vision.signal_received] command=2") {
+		t.Fatalf("missing late explicit post-detach signal log: %s", logs)
 	}
-	if !strings.Contains(logs, "reason=userspace_idle_timeout") {
-		t.Fatalf("missing expected unresolved uplink timeout reason in logs: %s", logs)
+	if strings.Contains(logs, "kind=vision.native_runtime_feedback") {
+		t.Fatalf("unexpected native runtime feedback log after late explicit post-detach signal: %s", logs)
 	}
-	if strings.Contains(logs, "kind=vision.uplink_quiesce_handoff") {
-		t.Fatalf("unexpected quiesce handoff log after signal refactor: %s", logs)
+	if strings.Contains(logs, "kind=vision.pre_detach_deadline_no_detach") {
+		t.Fatalf("unexpected pre-detach no-detach resolution log during late explicit post-detach signal: %s", logs)
+	}
+}
+
+func TestCopyRawConnIfExistDoesNotLogRuntimeFeedbackForZeroByteTimeoutWithoutVisionSignalChannel(t *testing.T) {
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+	oldReport := reportNativeRuntimeRegressionByTagFn
+	reportNativeRuntimeRegressionByTagFn = func(string) bool { return true }
+	t.Cleanup(func() {
+		reportNativeRuntimeRegressionByTagFn = oldReport
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Debug}
+	clog.RegisterHandler(handler)
+
+	readerPeer, readerConn := net.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &xtls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Tag:           "native-vision-logging",
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{91, 108, 56, 133}), xnet.Port(443)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+	time.AfterFunc(8*time.Second, func() {
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after peer closes paced no-signal flow", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for paced no-signal flow to finish after peer close")
+	}
+
+	logs := strings.Join(handler.msgs, "\n")
+	if strings.Contains(logs, "kind=vision.native_runtime_feedback") {
+		t.Fatalf("unexpected native runtime feedback log after zero-byte paced no-signal flow: %s", logs)
+	}
+	if strings.Contains(logs, "reason=userspace_idle_timeout") {
+		t.Fatalf("unexpected timeout reason after peer-closed paced no-signal flow: %s", logs)
+	}
+	if !strings.Contains(logs, "reason=userspace_complete") {
+		t.Fatalf("missing userspace-complete reason in paced no-signal flow logs: %s", logs)
+	}
+	if !strings.Contains(logs, "copy_gate_state=copy_pending_detach") {
+		t.Fatalf("missing pending-detach copy gate in paced no-signal summary: %s", logs)
+	}
+	if !strings.Contains(logs, "userspace_bytes=0") {
+		t.Fatalf("missing zero-byte evidence in paced no-signal summary: %s", logs)
+	}
+}
+
+func TestCopyRawConnIfExistDoesNotLogRuntimeFeedbackForPartialProgressTimeoutWithoutVisionSignalChannel(t *testing.T) {
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+	oldReport := reportNativeRuntimeRegressionByTagFn
+	reportNativeRuntimeRegressionByTagFn = func(string) bool { return true }
+	t.Cleanup(func() {
+		reportNativeRuntimeRegressionByTagFn = oldReport
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Debug}
+	clog.RegisterHandler(handler)
+
+	readerPeer, readerConn := net.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerConn := &xtls.DeferredRustConn{}
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 30*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Tag:           "native-vision-logging-partial",
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Conn:          writerConn,
+	}
+	outbound := &session.Outbound{
+		CanSpliceCopy: int32(session.CopyGatePendingDetach),
+		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{57, 144, 14, 36}), xnet.Port(5222)),
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerConn, buf.Discard, timer, nil)
+	}()
+
+	time.AfterFunc(200*time.Millisecond, func() {
+		_, _ = readerPeer.Write([]byte("partial-progress"))
+	})
+	time.AfterFunc(8*time.Second, func() {
+		_ = readerPeer.Close()
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil && !goerrors.Is(err, io.EOF) {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil/EOF after peer closes paced partial-progress flow", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for paced partial-progress flow to finish after peer close")
+	}
+
+	logs := strings.Join(handler.msgs, "\n")
+	if strings.Contains(logs, "kind=vision.native_runtime_feedback") {
+		t.Fatalf("unexpected native runtime feedback log after paced partial-progress await-signal flow: %s", logs)
+	}
+	if strings.Contains(logs, "reason=userspace_idle_timeout") {
+		t.Fatalf("unexpected timeout reason after paced partial-progress flow: %s", logs)
+	}
+	if !strings.Contains(logs, "reason=userspace_complete") {
+		t.Fatalf("missing userspace-complete reason in paced partial-progress flow logs: %s", logs)
+	}
+	if !strings.Contains(logs, "copy_gate_state=copy_pending_detach") {
+		t.Fatalf("missing pending-detach copy gate in paced partial-progress summary: %s", logs)
+	}
+	if !strings.Contains(logs, "userspace_bytes=16") {
+		t.Fatalf("missing partial-progress evidence in paced partial-progress summary: %s", logs)
+	}
+}
+
+func TestObserveVisionUplinkCompleteLogsLocalNoDetachResolution(t *testing.T) {
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Debug}
+	clog.RegisterHandler(handler)
+
+	inbound := &session.Inbound{Tag: "native-vision-log-resolution", Conn: &xtls.DeferredRustConn{}}
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	outbound := &session.Outbound{}
+	outbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	visionCh := make(chan session.VisionSignal, 1)
+	ctx := session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	if !ObserveVisionUplinkComplete(ctx, inbound, outbound) {
+		t.Fatal("ObserveVisionUplinkComplete() = false, want true")
+	}
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "kind=vision.uplink_complete_local_no_detach") {
+		t.Fatalf("missing local no-detach uplink completion log: %s", logs)
+	}
+	if !strings.Contains(logs, "tag=native-vision-log-resolution") {
+		t.Fatalf("missing native vision tag in local no-detach log: %s", logs)
+	}
+	if !strings.Contains(logs, "semantic_phase=vision_no_detach") {
+		t.Fatalf("missing vision_no_detach semantic phase in local resolution log: %s", logs)
+	}
+	if !strings.Contains(logs, "inbound_gate=copy_forced_userspace") {
+		t.Fatalf("missing forced userspace inbound gate in local resolution log: %s", logs)
+	}
+	if !strings.Contains(logs, "outbound_gates=0:copy_forced_userspace/vision_no_detach") {
+		t.Fatalf("missing forced userspace outbound gate summary in local resolution log: %s", logs)
+	}
+	if strings.Contains(logs, "command=1 observed") {
+		t.Fatalf("local resolution log should not claim command=1 was observed on wire: %s", logs)
 	}
 }
