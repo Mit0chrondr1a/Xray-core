@@ -22,6 +22,18 @@ Uses `Taskfile.yaml` + `mise` for toolchain management. **Do not look for `build
 - **eBPF** (`rust/xray-ebpf/`): SK_SKB + SK_MSG programs for kernel-level socket splicing and send-path cork batching
 - **FFI bridge:** `common/native/cgo.go` (CGO path) and `common/native/purego.go` (pure-Go fallback)
 
+## fd-Ownership Boundary (Loopback Native REALITY)
+
+DeferredRustConn's `BlockingGuard` clears `O_NONBLOCK` on the shared file description, breaking Go's deadline/poller mechanism. On loopback (0ms RTT), this causes indefinite kernel-blocked reads that Go cannot interrupt.
+
+**Permanent rule:** Loopback listeners in `AUTO` mode skip native REALITY (`native_policy.go`, reason `loopback_listener_auto_guard`). `PREFER_NATIVE` / `FORCE_NATIVE` remain available for explicit testing.
+
+**Do not remove the loopback guard** without first making Rust honor Go-passed deadlines before the first `libc::read`, not only in the post-`RestoreNonBlock` poll path.
+
+**Symptom pattern:** Server pipeline metrics show 99%+ success, but client sees intermittent mux/app failures on loopback. Restoring Go-only TLS immediately resolves it.
+
+See `docs/loopback-native-reality-best-practice-2026-03-24.md` and `docs/dns-best-practice-2026-03-06.md` for full analysis.
+
 ## eBPF Build Pitfalls
 
 1. **`RUSTUP_TOOLCHAIN` override:** mise sets `RUSTUP_TOOLCHAIN=stable`, which prevents rustup from reading `rust-toolchain.toml`. The Taskfile parses the pinned nightly channel and exports `RUSTUP_TOOLCHAIN` explicitly.
