@@ -29,6 +29,8 @@ const (
 	visionFlowKey             ctx.SessionKey = 13 // VLESS Vision flow active — skip kTLS-producing Rust paths
 	dnsFlowClassKey           ctx.SessionKey = 14 // DNS flow class resolved once near dispatch
 	dnsPlaneKey               ctx.SessionKey = 15 // DNS handling plane marker for telemetry
+	visionSignalKey           ctx.SessionKey = 16 // per-flow Vision command signal channel
+	visionTimestampsKey       ctx.SessionKey = 17 // per-flow Vision timestamp storage
 )
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -234,4 +236,28 @@ func DNSPlaneFromContext(ctx context.Context) DNSPlane {
 		return val
 	}
 	return DNSPlaneUnknown
+}
+
+// ContextWithVisionSignal stores the per-flow Vision command channel.
+func ContextWithVisionSignal(ctx context.Context, ch chan VisionSignal) context.Context {
+	return context.WithValue(ctx, visionSignalKey, ch)
+}
+
+// VisionSignalFromContext returns the per-flow Vision command channel if present.
+func VisionSignalFromContext(ctx context.Context) chan VisionSignal {
+	if val, ok := ctx.Value(visionSignalKey).(chan VisionSignal); ok {
+		return val
+	}
+	return nil
+}
+
+func ContextWithVisionTimestamps(ctx context.Context, timestamps *VisionTimestamps) context.Context {
+	return context.WithValue(ctx, visionTimestampsKey, timestamps)
+}
+
+func VisionTimestampsFromContext(ctx context.Context) *VisionTimestamps {
+	if val, ok := ctx.Value(visionTimestampsKey).(*VisionTimestamps); ok {
+		return val
+	}
+	return nil
 }

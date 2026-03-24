@@ -49,8 +49,6 @@ const (
 	CopyGateReasonTransportUserspace
 	CopyGateReasonVisionBypass
 	CopyGateReasonVisionNoDetach
-	CopyGateReasonVisionUplinkComplete
-	CopyGateReasonVisionCommandContinue
 	CopyGateReasonDetachTimeout
 	CopyGateReasonSecurityGuard
 	CopyGateReasonMetadataMissing
@@ -68,10 +66,6 @@ func (r CopyGateReason) String() string {
 		return "vision_bypass"
 	case CopyGateReasonVisionNoDetach:
 		return "vision_no_detach"
-	case CopyGateReasonVisionUplinkComplete:
-		return "vision_uplink_complete"
-	case CopyGateReasonVisionCommandContinue:
-		return "vision_command_continue"
 	case CopyGateReasonDetachTimeout:
 		return "detach_timeout"
 	case CopyGateReasonSecurityGuard:
@@ -80,6 +74,59 @@ func (r CopyGateReason) String() string {
 		return "metadata_missing"
 	default:
 		return "unspecified"
+	}
+}
+
+// VisionSemanticPhase records explicit Vision protocol truth that should
+// outlive transient local userspace phases.
+type VisionSemanticPhase int32
+
+const (
+	VisionSemanticPhaseUnset VisionSemanticPhase = iota
+	VisionSemanticPhaseNoDetach
+	VisionSemanticPhasePostDetach
+)
+
+// VisionSignal carries explicit Vision command truth across the flow without
+// requiring the copy loop to infer semantics from transport timing.
+type VisionSignal struct {
+	Command int // 0 = pending/unresolved, 1 = no-detach, 2 = post-detach
+}
+
+type VisionTimestamps struct {
+	detachUnixNano atomic.Int64
+}
+
+func (t *VisionTimestamps) StoreDetach(unixNano int64) {
+	if t == nil || unixNano <= 0 {
+		return
+	}
+	t.detachUnixNano.Store(unixNano)
+}
+
+func (t *VisionTimestamps) ConsumeDetach() (int64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	unixNano := t.detachUnixNano.Swap(0)
+	return unixNano, unixNano > 0
+}
+
+func (t *VisionTimestamps) Clear() {
+	if t == nil {
+		return
+	}
+	t.detachUnixNano.Store(0)
+}
+
+func (p VisionSemanticPhase) String() string {
+	switch p {
+	case VisionSemanticPhaseNoDetach:
+		return "vision_no_detach"
+	case VisionSemanticPhasePostDetach:
+		return "vision_post_detach"
+	default:
+		return "vision_unset"
 	}
 }
 
@@ -127,6 +174,7 @@ type Inbound struct {
 	// Values are stored using CopyGateState.
 	CanSpliceCopy  int32
 	copyGateReason int32
+	visionSemantic int32
 }
 
 // Outbound is the metadata of an outbound connection.
@@ -147,6 +195,7 @@ type Outbound struct {
 	// Values are stored using CopyGateState.
 	CanSpliceCopy  int32
 	copyGateReason int32
+	visionSemantic int32
 }
 
 // CopyGateState returns the typed copy-path gate state.
@@ -192,6 +241,32 @@ func (i *Inbound) SetCanSpliceCopy(state CopyGateState) {
 	i.SetCopyGate(state, CopyGateReasonUnspecified)
 }
 
+// VisionSemanticPhase returns the strongest explicit Vision semantic committed
+// for this connection so far.
+func (i *Inbound) VisionSemanticPhase() VisionSemanticPhase {
+	if i == nil {
+		return VisionSemanticPhaseUnset
+	}
+	return VisionSemanticPhase(atomic.LoadInt32(&i.visionSemantic))
+}
+
+// PromoteVisionSemanticPhase stores stronger explicit semantic truth without
+// allowing later weaker states to downgrade it.
+func (i *Inbound) PromoteVisionSemanticPhase(phase VisionSemanticPhase) {
+	if i == nil || phase == VisionSemanticPhaseUnset {
+		return
+	}
+	for {
+		current := atomic.LoadInt32(&i.visionSemantic)
+		if int32(phase) <= current {
+			return
+		}
+		if atomic.CompareAndSwapInt32(&i.visionSemantic, current, int32(phase)) {
+			return
+		}
+	}
+}
+
 // CopyGateState returns the typed copy-path gate state.
 func (o *Outbound) CopyGateState() CopyGateState {
 	if o == nil {
@@ -233,6 +308,32 @@ func (o *Outbound) GetCanSpliceCopy() CopyGateState {
 // SetCanSpliceCopy is a compatibility alias accepting the typed gate state.
 func (o *Outbound) SetCanSpliceCopy(state CopyGateState) {
 	o.SetCopyGate(state, CopyGateReasonUnspecified)
+}
+
+// VisionSemanticPhase returns the strongest explicit Vision semantic committed
+// for this connection so far.
+func (o *Outbound) VisionSemanticPhase() VisionSemanticPhase {
+	if o == nil {
+		return VisionSemanticPhaseUnset
+	}
+	return VisionSemanticPhase(atomic.LoadInt32(&o.visionSemantic))
+}
+
+// PromoteVisionSemanticPhase stores stronger explicit semantic truth without
+// allowing later weaker states to downgrade it.
+func (o *Outbound) PromoteVisionSemanticPhase(phase VisionSemanticPhase) {
+	if o == nil || phase == VisionSemanticPhaseUnset {
+		return
+	}
+	for {
+		current := atomic.LoadInt32(&o.visionSemantic)
+		if int32(phase) <= current {
+			return
+		}
+		if atomic.CompareAndSwapInt32(&o.visionSemantic, current, int32(phase)) {
+			return
+		}
+	}
 }
 
 // SniffingRequest controls the behavior of content sniffing. They are from inbound config. Read-only

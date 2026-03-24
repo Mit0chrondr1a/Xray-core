@@ -255,7 +255,7 @@ func (d *visionUplinkDiagnostic) log(ctx context.Context, result string, opErr e
 }
 
 func observeVisionPendingDetachOnUplinkComplete(ctx context.Context, inbound *session.Inbound, outbound *session.Outbound, result string, retErr error) {
-	if result != "copy_complete" || retErr != nil {
+	if retErr != nil {
 		return
 	}
 	proxy.ObserveVisionUplinkComplete(ctx, inbound, outbound)
@@ -294,10 +294,17 @@ func classifyDNSUplinkErr(err error) string {
 	return classifyUplinkErr(err)
 }
 
-// shouldBypassEgressFastFail is retained for interface compatibility; currently
-// all destinations use the normal dial path without fast-fail penalties.
-func shouldBypassEgressFastFail(net.Destination) bool {
-	return false
+func shouldBypassEgressFastFail(ctx context.Context, dest net.Destination) bool {
+	if isDNSDest(dest) {
+		return true
+	}
+	if dest.Network != net.Network_TCP {
+		return false
+	}
+	// For Vision flows targeting a literal IP, retrying the exact same dead
+	// address five times only stretches user-visible stalls. Domain targets keep
+	// the normal retry path so later attempts can pick a different IP.
+	return session.VisionFlowFromContext(ctx) && dest.Address != nil && dest.Address.Family().IsIP()
 }
 
 // Process implements proxy.Outbound.
@@ -334,14 +341,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 
-	proxy.RecordPipelineFlowMix(ctx, destination.Network, session.AllowedNetworkFromContext(ctx))
-
 	input := link.Reader
 	output := link.Writer
 
 	var conn stat.Connection
 
-	bypassFastFail := shouldBypassEgressFastFail(destination)
+	bypassFastFail := shouldBypassEgressFastFail(ctx, destination)
 
 	// Fast path for DNS/loopback control traffic: single-shot dial without
 	// penalty/backoff to avoid long startup corks.

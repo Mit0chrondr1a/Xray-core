@@ -191,6 +191,350 @@ func TestNativeBreakerHalfOpenProbeAndRecovery(t *testing.T) {
 	}
 }
 
+func TestReportNativeRuntimeRegressionByTagOpensExistingBreaker(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 2
+	policy.Breaker.CooldownSeconds = 10
+	scope := nativePathScopeKeyForTag("test-runtime-regression")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	if ReportNativeRuntimeRegressionByTag("test-runtime-regression") != true {
+		t.Fatal("expected runtime regression feedback to record against existing breaker")
+	}
+	if skip, state, reason := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen || reason != nativeSkipReasonBreakerCooldown {
+		t.Fatalf("expected first runtime regression to open breaker immediately, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+}
+
+func TestReportNativeRuntimeRegressionByTagRequiresExistingBreaker(t *testing.T) {
+	scope := nativePathScopeKeyForTag("test-runtime-regression-missing")
+	nativePathBreakerByScope.Delete(scope)
+	if ReportNativeRuntimeRegressionByTag("test-runtime-regression-missing") {
+		t.Fatal("expected runtime regression feedback without existing breaker to be ignored")
+	}
+}
+
+func TestRuntimeOpenedBreakerRequiresRuntimeRecoveryAfterHalfOpenHandshakeSuccess(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 1
+	policy.Breaker.CooldownSeconds = 1
+	policy.Breaker.HalfOpenProbeIntervalSeconds = 1
+	scope := nativePathScopeKeyForTag("test-runtime-recovery")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("expected runtime regression to open breaker, got skip=%v state=%s", skip, state)
+	}
+
+	probeAt := now.Add(1500 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(probeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected half-open runtime probe, got skip=%v state=%s", skip, state)
+	}
+
+	cb.recordOutcome(probeAt.Add(100*time.Millisecond), nativeAttemptOutcomeSuccess)
+	if skip, state, reason := cb.shouldSkip(probeAt.Add(200 * time.Millisecond)); !skip || state != nativeBreakerStateHalfOpen || reason != nativeSkipReasonBreakerHalfOpenProbe {
+		t.Fatalf("expected half-open breaker to wait for runtime recovery after handshake success, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+
+	if !ReportNativeRuntimeRecoveryByTag("test-runtime-recovery") {
+		t.Fatal("expected runtime recovery feedback to record against existing breaker")
+	}
+	if skip, state, _ := cb.shouldSkip(probeAt.Add(1200 * time.Millisecond)); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected single runtime recovery to keep breaker in half-open until another healthy probe, got skip=%v state=%s", skip, state)
+	}
+
+	secondProbeAt := probeAt.Add(2300 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(secondProbeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected second half-open runtime probe, got skip=%v state=%s", skip, state)
+	}
+	if !ReportNativeRuntimeRecoveryByTag("test-runtime-recovery") {
+		t.Fatal("expected second runtime recovery feedback to record against existing breaker")
+	}
+	if skip, state, _ := cb.shouldSkip(secondProbeAt.Add(100 * time.Millisecond)); skip || state != nativeBreakerStateClosed {
+		t.Fatalf("expected second runtime recovery to close breaker, got skip=%v state=%s", skip, state)
+	}
+}
+
+func TestRuntimeRegressionCountsSurviveHandshakeSuccessUntilRuntimeRecovery(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 2
+	policy.Breaker.CooldownSeconds = 1
+	policy.Breaker.HalfOpenProbeIntervalSeconds = 1
+	scope := nativePathScopeKeyForTag("test-runtime-window")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("runtime breaker should open immediately after one runtime regression: skip=%v state=%s", skip, state)
+	}
+
+	probeAt := now.Add(1500 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(probeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected half-open runtime probe, got skip=%v state=%s", skip, state)
+	}
+
+	cb.recordOutcome(probeAt.Add(100*time.Millisecond), nativeAttemptOutcomeSuccess)
+	if skip, state, reason := cb.shouldSkip(probeAt.Add(200 * time.Millisecond)); !skip || state != nativeBreakerStateHalfOpen || reason != nativeSkipReasonBreakerHalfOpenProbe {
+		t.Fatalf("handshake success should not count as runtime recovery: skip=%v state=%s reason=%s", skip, state, reason)
+	}
+}
+
+func TestRuntimeRegressionUsesTighterThresholdThanInternalErrors(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 3
+	policy.Breaker.CooldownSeconds = 10
+	scope := nativePathScopeKeyForTag("test-runtime-threshold")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, reason := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen || reason != nativeSkipReasonBreakerCooldown {
+		t.Fatalf("expected runtime regression to trip earlier than internal errors, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+}
+
+func TestRuntimeRegressionCooldownEscalatesAcrossReopens(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 3
+	policy.Breaker.CooldownSeconds = 2
+	policy.Breaker.HalfOpenProbeIntervalSeconds = 1
+	scope := nativePathScopeKeyForTag("test-runtime-cooldown-escalation")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("expected first runtime regression to open breaker, got skip=%v state=%s", skip, state)
+	}
+
+	probeAt := now.Add(2500 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(probeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected half-open runtime probe after base cooldown, got skip=%v state=%s", skip, state)
+	}
+
+	cb.recordOutcome(probeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(probeAt.Add(2500 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("expected repeated runtime regression to reopen breaker with runtime backoff, got skip=%v state=%s", skip, state)
+	}
+
+	if skip, state, _ := cb.shouldSkip(probeAt.Add(4500 * time.Millisecond)); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected escalated runtime cooldown to expire before returning to half-open, got skip=%v state=%s", skip, state)
+	}
+}
+
+func TestRuntimeRegressionWindowExpiresIndependentlyOfHandshakeSuccess(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 3
+	policy.Breaker.WindowSeconds = 1
+	policy.Breaker.CooldownSeconds = 1
+	policy.Breaker.HalfOpenProbeIntervalSeconds = 1
+	scope := nativePathScopeKeyForTag("test-runtime-window-expiry")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("expected first runtime regression to open breaker, got skip=%v state=%s", skip, state)
+	}
+
+	probeAt := now.Add(2500 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(probeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected half-open runtime probe after cooldown, got skip=%v state=%s", skip, state)
+	}
+
+	cb.recordOutcome(probeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(probeAt.Add(1200 * time.Millisecond)); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("runtime regressions separated by expired runtime window should reset cooldown escalation, got skip=%v state=%s", skip, state)
+	}
+}
+
+func TestRuntimeRecoveryResetsCooldownEscalation(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 3
+	policy.Breaker.CooldownSeconds = 2
+	policy.Breaker.HalfOpenProbeIntervalSeconds = 1
+	scope := nativePathScopeKeyForTag("test-runtime-recovery-reset")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("expected first runtime regression to open breaker, got skip=%v state=%s", skip, state)
+	}
+
+	firstProbeAt := now.Add(2500 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(firstProbeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected half-open runtime probe after cooldown, got skip=%v state=%s", skip, state)
+	}
+
+	cb.recordOutcome(firstProbeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(firstProbeAt.Add(2500 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("expected repeated runtime regression to reopen breaker, got skip=%v state=%s", skip, state)
+	}
+
+	// In-flight successes during the open cooldown should not collapse the
+	// breaker immediately.
+	cb.recordOutcome(firstProbeAt.Add(2600*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, reason := cb.shouldSkip(firstProbeAt.Add(2700 * time.Millisecond)); !skip || state != nativeBreakerStateOpen || reason != nativeSkipReasonBreakerCooldown {
+		t.Fatalf("expected open breaker to ignore in-flight runtime recovery until cooldown elapses, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+
+	secondProbeAt := firstProbeAt.Add(5000 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(secondProbeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected half-open runtime probe after cooldown, got skip=%v state=%s", skip, state)
+	}
+	cb.recordOutcome(secondProbeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, reason := cb.shouldSkip(secondProbeAt.Add(200 * time.Millisecond)); !skip || state != nativeBreakerStateHalfOpen || reason != nativeSkipReasonBreakerHalfOpenProbe {
+		t.Fatalf("expected first half-open runtime recovery to keep breaker probing, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+
+	thirdProbeAt := secondProbeAt.Add(1300 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(thirdProbeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected second half-open runtime probe, got skip=%v state=%s", skip, state)
+	}
+	cb.recordOutcome(thirdProbeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, _ := cb.shouldSkip(thirdProbeAt.Add(200 * time.Millisecond)); skip || state != nativeBreakerStateClosed {
+		t.Fatalf("expected second half-open runtime recovery to close breaker and reset runtime backoff, got skip=%v state=%s", skip, state)
+	}
+
+	cb.recordOutcome(thirdProbeAt.Add(300*time.Millisecond), nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(thirdProbeAt.Add(2500 * time.Millisecond)); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected runtime recovery to reset cooldown escalation back to base cooldown, got skip=%v state=%s", skip, state)
+	}
+}
+
+func TestRuntimeRecoveryRequiresMultipleHalfOpenHealthyOutcomes(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 3
+	policy.Breaker.CooldownSeconds = 1
+	policy.Breaker.HalfOpenProbeIntervalSeconds = 1
+	scope := nativePathScopeKeyForTag("test-runtime-recovery-threshold")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("expected runtime regression to open breaker, got skip=%v state=%s", skip, state)
+	}
+
+	firstProbeAt := now.Add(1500 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(firstProbeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected first half-open runtime probe, got skip=%v state=%s", skip, state)
+	}
+	cb.recordOutcome(firstProbeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, reason := cb.shouldSkip(firstProbeAt.Add(200 * time.Millisecond)); !skip || state != nativeBreakerStateHalfOpen || reason != nativeSkipReasonBreakerHalfOpenProbe {
+		t.Fatalf("expected first healthy probe to keep breaker half-open, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+
+	secondProbeAt := firstProbeAt.Add(1300 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(secondProbeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected second half-open runtime probe, got skip=%v state=%s", skip, state)
+	}
+	cb.recordOutcome(secondProbeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, _ := cb.shouldSkip(secondProbeAt.Add(200 * time.Millisecond)); skip || state != nativeBreakerStateClosed {
+		t.Fatalf("expected second healthy probe to close breaker, got skip=%v state=%s", skip, state)
+	}
+}
+
+func TestRuntimeRecoveryIdleGapUsesHalfOpenReentryProbe(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 3
+	policy.Breaker.CooldownSeconds = 1
+	policy.Breaker.HalfOpenProbeIntervalSeconds = 1
+	scope := nativePathScopeKeyForTag("test-runtime-idle-reentry")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(now.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateOpen {
+		t.Fatalf("expected first runtime regression to open breaker, got skip=%v state=%s", skip, state)
+	}
+
+	probeAt := now.Add(1500 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(probeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected half-open runtime probe after cooldown, got skip=%v state=%s", skip, state)
+	}
+	cb.recordOutcome(probeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, reason := cb.shouldSkip(probeAt.Add(200 * time.Millisecond)); !skip || state != nativeBreakerStateHalfOpen || reason != nativeSkipReasonBreakerHalfOpenProbe {
+		t.Fatalf("expected first runtime recovery to keep breaker half-open until the next probe window, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+	secondProbeAt := probeAt.Add(1300 * time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(secondProbeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected second half-open runtime probe after idle-gap recovery, got skip=%v state=%s", skip, state)
+	}
+	cb.recordOutcome(secondProbeAt.Add(100*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, _ := cb.shouldSkip(secondProbeAt.Add(200 * time.Millisecond)); skip || state != nativeBreakerStateClosed {
+		t.Fatalf("expected second runtime recovery to close breaker, got skip=%v state=%s", skip, state)
+	}
+
+	idleProbeAt := secondProbeAt.Add(nativeRuntimeReentryIdleFor(cb.config.cooldown) + 100*time.Millisecond)
+	if skip, state, _ := cb.shouldSkip(idleProbeAt); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected idle gap after recent runtime regression to reopen as half-open probe, got skip=%v state=%s", skip, state)
+	}
+	if cb.snapshotCause() != string(nativeAttemptOutcomeRuntimeFail) {
+		t.Fatalf("breaker cause=%s, want %s for cautious idle re-entry", cb.snapshotCause(), nativeAttemptOutcomeRuntimeFail)
+	}
+	if skip, state, reason := cb.shouldSkip(idleProbeAt.Add(100 * time.Millisecond)); !skip || state != nativeBreakerStateHalfOpen || reason != nativeSkipReasonBreakerHalfOpenProbe {
+		t.Fatalf("expected post-idle reentry to serialize native attempts via half-open probe window, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+	cb.recordOutcome(idleProbeAt.Add(200*time.Millisecond), nativeAttemptOutcomeSuccess)
+	if skip, state, reason := cb.shouldSkip(idleProbeAt.Add(300 * time.Millisecond)); !skip || state != nativeBreakerStateHalfOpen || reason != nativeSkipReasonBreakerHalfOpenProbe {
+		t.Fatalf("handshake success on cautious idle re-entry should still require runtime recovery, got skip=%v state=%s reason=%s", skip, state, reason)
+	}
+}
+
+func TestRuntimeRecoveryIdleGapProbeExpiresAfterRegressionMemory(t *testing.T) {
+	policy := defaultNativePathPolicy()
+	policy.Breaker.InternalErrorThreshold = 3
+	policy.Breaker.CooldownSeconds = 1
+	policy.Breaker.HalfOpenProbeIntervalSeconds = 1
+	scope := nativePathScopeKeyForTag("test-runtime-idle-memory-expiry")
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	cb := getNativePathBreaker(scope, policy)
+	now := time.Now()
+
+	cb.recordOutcome(now, nativeAttemptOutcomeRuntimeFail)
+	if skip, state, _ := cb.shouldSkip(now.Add(1500 * time.Millisecond)); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected half-open runtime probe after cooldown, got skip=%v state=%s", skip, state)
+	}
+	cb.recordOutcome(now.Add(1600*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, _ := cb.shouldSkip(now.Add(2800 * time.Millisecond)); skip || state != nativeBreakerStateHalfOpen {
+		t.Fatalf("expected first runtime recovery to keep breaker half-open, got skip=%v state=%s", skip, state)
+	}
+	cb.recordOutcome(now.Add(2900*time.Millisecond), nativeAttemptOutcomeRuntimeOK)
+	if skip, state, _ := cb.shouldSkip(now.Add(3 * time.Second)); skip || state != nativeBreakerStateClosed {
+		t.Fatalf("expected second runtime recovery to close breaker, got skip=%v state=%s", skip, state)
+	}
+
+	afterMemory := now.Add(3*time.Second + nativeRuntimeRegressionMemoryFor(cb.config.cooldown) + nativeRuntimeReentryIdleFor(cb.config.cooldown) + time.Second)
+	if skip, state, _ := cb.shouldSkip(afterMemory); skip || state != nativeBreakerStateClosed {
+		t.Fatalf("expected stale runtime-regression history to stop forcing cautious idle re-entry, got skip=%v state=%s", skip, state)
+	}
+}
+
 func TestShouldAttemptNativeRealityDisabledByPolicy(t *testing.T) {
 	v := &Listener{
 		realityXrayConfig: &xrayreality.Config{
@@ -236,6 +580,108 @@ func TestShouldAttemptNativeRealityDisabledByDebugEnv(t *testing.T) {
 	}
 	if decision.SkipReason != nativeSkipReasonDebugDisabled {
 		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonDebugDisabled)
+	}
+}
+
+func TestShouldAttemptNativeRealityModeOverridePrefersNative(t *testing.T) {
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+	}()
+	t.Setenv(nativeRealityModeEnv, "prefer_native")
+
+	v := &Listener{
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_AUTO,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeRealityForAddr(v, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9443})
+	if !decision.Attempt {
+		t.Fatal("expected loopback AUTO to attempt native path under env PREFER_NATIVE override")
+	}
+	if decision.SkipByPolicy {
+		t.Fatalf("unexpected policy skip under env PREFER_NATIVE override: %s", decision.SkipReason)
+	}
+	if decision.PolicyMode != "PREFER_NATIVE" {
+		t.Fatalf("policy mode = %s, want PREFER_NATIVE", decision.PolicyMode)
+	}
+}
+
+func TestShouldAttemptNativeRealityModeOverrideForceNative(t *testing.T) {
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+	}()
+	t.Setenv(nativeRealityModeEnv, "force")
+
+	v := &Listener{
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_AUTO,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeRealityForAddr(v, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9443})
+	if !decision.Attempt {
+		t.Fatal("expected native attempt under env FORCE override")
+	}
+	if !decision.ForceNative {
+		t.Fatal("expected ForceNative=true under env FORCE override")
+	}
+	if decision.AllowFallback {
+		t.Fatal("expected AllowFallback=false under env FORCE override")
+	}
+	if !decision.FailStop {
+		t.Fatal("expected FailStop=true under env FORCE override")
+	}
+}
+
+func TestShouldAttemptNativeRealityModeOverrideInvalidIgnored(t *testing.T) {
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+	}()
+	t.Setenv(nativeRealityModeEnv, "not-a-mode")
+
+	v := &Listener{
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_AUTO,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeRealityForAddr(v, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9443})
+	if decision.Attempt {
+		t.Fatal("expected invalid env mode override to fall back to AUTO loopback guard")
+	}
+	if !decision.SkipByPolicy {
+		t.Fatal("expected invalid env mode override to hit loopback AUTO policy skip")
+	}
+	if decision.SkipReason != nativeSkipReasonLoopbackAutoGuard {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonLoopbackAutoGuard)
 	}
 }
 
@@ -288,6 +734,65 @@ func TestShouldAttemptNativeRealitySkipByBreaker(t *testing.T) {
 	}
 	if second.SkipReason != nativeSkipReasonBreakerCooldown {
 		t.Fatalf("skip reason = %s, want %s", second.SkipReason, nativeSkipReasonBreakerCooldown)
+	}
+	if second.BreakerCause != string(nativeAttemptOutcomeInternalFail) {
+		t.Fatalf("breaker cause = %s, want %s", second.BreakerCause, nativeAttemptOutcomeInternalFail)
+	}
+	if second.FailStop {
+		t.Fatal("best-effort breaker skip should not become fail-stop when fallback is allowed")
+	}
+}
+
+func TestShouldAttemptNativeRealityReportsRuntimeBreakerCause(t *testing.T) {
+	oldUseNative := useNativeRealityServerFn
+	useNativeRealityServerFn = func(*Listener) bool { return true }
+	defer func() { useNativeRealityServerFn = oldUseNative }()
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+	}()
+
+	v := &Listener{
+		inboundTag: "runtime-breaker-cause",
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker: &xrayreality.NativePathBreaker{
+					Enabled:                      true,
+					PeekTimeoutThreshold:         3,
+					InternalErrorThreshold:       1,
+					WindowSeconds:                60,
+					CooldownSeconds:              30,
+					HalfOpenProbeIntervalSeconds: 2,
+				},
+			},
+		},
+	}
+	scope := nativePathBreakerScopeKey(v)
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+
+	first := shouldAttemptNativeReality(v)
+	if !first.Attempt || first.Breaker == nil {
+		t.Fatal("expected initial native attempt with breaker")
+	}
+	first.Breaker.recordOutcome(time.Now(), nativeAttemptOutcomeRuntimeFail)
+
+	second := shouldAttemptNativeReality(v)
+	if !second.SkipByBreaker {
+		t.Fatal("expected runtime-open breaker to skip native attempt")
+	}
+	if second.BreakerCause != string(nativeAttemptOutcomeRuntimeFail) {
+		t.Fatalf("breaker cause = %s, want %s", second.BreakerCause, nativeAttemptOutcomeRuntimeFail)
+	}
+	if second.FailStop {
+		t.Fatal("runtime-open breaker skip should remain best-effort when fallback is allowed")
 	}
 }
 
@@ -464,7 +969,7 @@ func TestLoopbackListenerAutoSkipsNative(t *testing.T) {
 	}
 	decision := shouldAttemptNativeReality(v)
 	if decision.Attempt {
-		t.Fatal("loopback listener in AUTO should skip native path")
+		t.Fatal("loopback listener in AUTO should be guarded out of native path")
 	}
 	if !decision.SkipByPolicy {
 		t.Fatal("expected loopback listener in AUTO to skip by policy")
@@ -533,7 +1038,7 @@ func TestLoopbackConnLocalAddrAutoSkipsNative(t *testing.T) {
 	}
 	decision := shouldAttemptNativeRealityForAddr(v, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9100})
 	if decision.Attempt {
-		t.Fatal("loopback conn local addr in AUTO should skip native path")
+		t.Fatal("loopback conn local addr in AUTO should be guarded out of native path")
 	}
 	if !decision.SkipByPolicy {
 		t.Fatal("expected loopback conn local addr in AUTO to skip by policy")

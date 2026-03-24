@@ -30,7 +30,6 @@ import (
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/pipeline"
-	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
@@ -42,6 +41,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/ebpf"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	xtcptunnel "github.com/xtls/xray-core/transport/internet/tcp"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -67,194 +67,66 @@ const (
 	CommandPaddingContinue byte = 0x00
 	CommandPaddingEnd      byte = 0x01
 	CommandPaddingDirect   byte = 0x02
-
-	pipelineMarkerLogInterval = 30 * time.Second
 )
 
-// pipelineTelemetryV2Enabled gates legacy per-interval marker dumps.
-func pipelineTelemetryV2Enabled() bool {
-	return platform.NewEnvFlag("xray.pipeline.telemetry.v2").GetValue(func() string { return "" }) != "off"
+type copyLoopPhase uint8
+
+const (
+	copyLoopPhaseAwaitSignal copyLoopPhase = iota
+	copyLoopPhaseUserspaceOnly
+	copyLoopPhaseRawReady
+	copyLoopPhaseStreaming
+)
+
+func copyLoopPhaseName(phase copyLoopPhase) string {
+	switch phase {
+	case copyLoopPhaseAwaitSignal:
+		return "await_signal"
+	case copyLoopPhaseUserspaceOnly:
+		return "userspace_only"
+	case copyLoopPhaseRawReady:
+		return "raw_ready"
+	case copyLoopPhaseStreaming:
+		return "streaming"
+	default:
+		return "unknown"
+	}
 }
 
 func debugVisionExplicitOnly() bool {
 	return os.Getenv("XRAY_DEBUG_VISION_EXPLICIT_ONLY") == "1"
 }
 
+var reportNativeRuntimeRegressionByTagFn = xtcptunnel.ReportNativeRuntimeRegressionByTag
+var reportNativeRuntimeRecoveryByTagFn = xtcptunnel.ReportNativeRuntimeRecoveryByTag
+
 func init() {
 	startupHealthOnce.Do(logStartupHealth)
 }
 
+func sendVisionSignal(ch chan session.VisionSignal, sig session.VisionSignal) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- sig:
+	default:
+	}
+}
+
 var (
-	pipelineMarkerDeferredRawUnwrapWarning    atomic.Uint64
-	pipelineMarkerRawUnwrapToDetachNanosTotal atomic.Uint64
-	pipelineMarkerRawUnwrapToDetachSamples    atomic.Uint64
-	pipelineMarkerRawUnwrapToDetachLt5ms      atomic.Uint64
-	pipelineMarkerRawUnwrapToDetach5To20ms    atomic.Uint64
-	pipelineMarkerRawUnwrapToDetach20To100ms  atomic.Uint64
-	pipelineMarkerRawUnwrapToDetachGe100ms    atomic.Uint64
-	pipelineMarkerDeferredSpliceGuardHit      atomic.Uint64
-	pipelineMarkerVisionDrainDetachAttempt    atomic.Uint64
-	pipelineMarkerVisionDrainDetachSuccess    atomic.Uint64
-	pipelineMarkerVisionDrainDetachFail       atomic.Uint64
-	pipelineMarkerVisionRestoreNBAttempt      atomic.Uint64
-	pipelineMarkerVisionRestoreNBFail         atomic.Uint64
-	pipelineMarkerVisionPaddingPhaseNanos     atomic.Uint64
-	pipelineMarkerVisionPaddingPhaseCount     atomic.Uint64
-	pipelineMarkerVisionDetachPhaseNanos      atomic.Uint64
-	pipelineMarkerVisionDetachPhaseCount      atomic.Uint64
-	pipelineMarkerVisionPostDetachNanos       atomic.Uint64
-	pipelineMarkerVisionPostDetachCount       atomic.Uint64
-	pipelineMarkerVisionPostDetachSplice      atomic.Uint64
-	pipelineMarkerVisionPostDetachUserspace   atomic.Uint64
-	pipelineMarkerVisionPostDetachSockmap     atomic.Uint64
-	pipelineMarkerVisionDetachTimeout         atomic.Uint64
-	pipelineMarkerSockmapPolicyRefresh        atomic.Uint64
-	pipelineMarkerSockmapPolicyRefreshFail    atomic.Uint64
-	pipelineMarkerSpliceAttempts              atomic.Uint64
-	pipelineMarkerSpliceCompleted             atomic.Uint64
-	pipelineMarkerSpliceExpectedTeardown      atomic.Uint64
-	pipelineMarkerSpliceExpectedBrokenPipe    atomic.Uint64
-	pipelineMarkerSpliceExpectedConnReset     atomic.Uint64
-	pipelineMarkerSpliceExpectedClosedConn    atomic.Uint64
-	pipelineMarkerSpliceExpectedCanceled      atomic.Uint64
-	pipelineMarkerSpliceExpectedNotConn       atomic.Uint64
-	pipelineMarkerSpliceExpectedShutdown      atomic.Uint64
-	pipelineMarkerSpliceExpectedOther         atomic.Uint64
-	pipelineMarkerSpliceUnexpectedError       atomic.Uint64
-	pipelineMarkerSpliceBytesTotal            atomic.Uint64
-	pipelineMarkerSpliceDurationNanosTotal    atomic.Uint64
-	pipelineMarkerSpliceBytesLt4K             atomic.Uint64
-	pipelineMarkerSpliceBytes4KTo64K          atomic.Uint64
-	pipelineMarkerSpliceBytes64KTo1M          atomic.Uint64
-	pipelineMarkerSpliceBytesGe1M             atomic.Uint64
-	pipelineMarkerSpliceDurLt1ms              atomic.Uint64
-	pipelineMarkerSpliceDur1To5ms             atomic.Uint64
-	pipelineMarkerSpliceDur5To20ms            atomic.Uint64
-	pipelineMarkerSpliceDur20To100ms          atomic.Uint64
-	pipelineMarkerSpliceDurGe100ms            atomic.Uint64
-	pipelineMarkerUserspaceCopyReads          atomic.Uint64
-	pipelineMarkerUserspaceCopyBytesTotal     atomic.Uint64
-	pipelineMarkerUserspaceRawReaderHits      atomic.Uint64
-	pipelineMarkerUserspaceTLSReaderHits      atomic.Uint64
-	pipelineMarkerEnsureRawFailOS             atomic.Uint64
-	pipelineMarkerEnsureRawFailNilConn        atomic.Uint64
-	pipelineMarkerEnsureRawFailWriterType     atomic.Uint64
-	pipelineMarkerSockmapSkipMgr              atomic.Uint64
-	pipelineMarkerSockmapSkipContention       atomic.Uint64
-	pipelineMarkerSockmapSkipKTLSSockhash     atomic.Uint64
-	pipelineMarkerSockmapSkipUserspaceTLS     atomic.Uint64
-	pipelineMarkerSockmapSkipAsymmetric       atomic.Uint64
-	pipelineMarkerSockmapSkipOther            atomic.Uint64
-	pipelineMarkerSockmapRegisterAttempt      atomic.Uint64
-	pipelineMarkerSockmapRegisterSuccess      atomic.Uint64
-	pipelineMarkerSockmapRegisterFail         atomic.Uint64
-	pipelineMarkerSockmapWaitSuccess          atomic.Uint64
-	pipelineMarkerSockmapWaitFallback         atomic.Uint64
-	pipelineMarkerSockmapWaitError            atomic.Uint64
-	pipelineMarkerFlowMuxUDP                  atomic.Uint64
-	pipelineMarkerFlowPureTCP                 atomic.Uint64
-	pipelineMarkerFlowMuxTCP                  atomic.Uint64
-	pipelineMarkerFlowOther                   atomic.Uint64
-	pipelineMarkerDNSGuardFirstResponseNanos  atomic.Uint64
-	pipelineMarkerDNSGuardFirstResponseCount  atomic.Uint64
-	pipelineMarkerDNSGuardFirstRespLt20ms     atomic.Uint64
-	pipelineMarkerDNSGuardFirstResp20To100ms  atomic.Uint64
-	pipelineMarkerDNSGuardFirstResp100msTo1s  atomic.Uint64
-	pipelineMarkerDNSGuardFirstRespGe1s       atomic.Uint64
-	pipelineMarkerDNSGuardZeroByteTimeout     atomic.Uint64
-
-	// previous snapshot totals for per-interval deltas
-	pipelineMarkerLastDeferredRawUnwrapWarning    atomic.Uint64
-	pipelineMarkerLastRawUnwrapToDetachNanosTotal atomic.Uint64
-	pipelineMarkerLastRawUnwrapToDetachSamples    atomic.Uint64
-	pipelineMarkerLastRawUnwrapToDetachLt5ms      atomic.Uint64
-	pipelineMarkerLastRawUnwrapToDetach5To20ms    atomic.Uint64
-	pipelineMarkerLastRawUnwrapToDetach20To100ms  atomic.Uint64
-	pipelineMarkerLastRawUnwrapToDetachGe100ms    atomic.Uint64
-	pipelineMarkerLastDeferredSpliceGuardHit      atomic.Uint64
-	pipelineMarkerLastVisionDrainDetachAttempt    atomic.Uint64
-	pipelineMarkerLastVisionDrainDetachSuccess    atomic.Uint64
-	pipelineMarkerLastVisionDrainDetachFail       atomic.Uint64
-	pipelineMarkerLastVisionRestoreNBAttempt      atomic.Uint64
-	pipelineMarkerLastVisionRestoreNBFail         atomic.Uint64
-	pipelineMarkerLastVisionPaddingPhaseNanos     atomic.Uint64
-	pipelineMarkerLastVisionPaddingPhaseCount     atomic.Uint64
-	pipelineMarkerLastVisionDetachPhaseNanos      atomic.Uint64
-	pipelineMarkerLastVisionDetachPhaseCount      atomic.Uint64
-	pipelineMarkerLastVisionPostDetachNanos       atomic.Uint64
-	pipelineMarkerLastVisionPostDetachCount       atomic.Uint64
-	pipelineMarkerLastVisionPostDetachSplice      atomic.Uint64
-	pipelineMarkerLastVisionPostDetachUserspace   atomic.Uint64
-	pipelineMarkerLastVisionPostDetachSockmap     atomic.Uint64
-	pipelineMarkerLastVisionDetachTimeout         atomic.Uint64
-	pipelineMarkerLastSockmapPolicyRefresh        atomic.Uint64
-	pipelineMarkerLastSockmapPolicyRefreshFail    atomic.Uint64
-	pipelineMarkerLastSpliceAttempts              atomic.Uint64
-	pipelineMarkerLastSpliceCompleted             atomic.Uint64
-	pipelineMarkerLastSpliceExpectedTeardown      atomic.Uint64
-	pipelineMarkerLastSpliceExpectedBrokenPipe    atomic.Uint64
-	pipelineMarkerLastSpliceExpectedConnReset     atomic.Uint64
-	pipelineMarkerLastSpliceExpectedClosedConn    atomic.Uint64
-	pipelineMarkerLastSpliceExpectedCanceled      atomic.Uint64
-	pipelineMarkerLastSpliceExpectedNotConn       atomic.Uint64
-	pipelineMarkerLastSpliceExpectedShutdown      atomic.Uint64
-	pipelineMarkerLastSpliceExpectedOther         atomic.Uint64
-	pipelineMarkerLastSpliceUnexpectedError       atomic.Uint64
-	pipelineMarkerLastSpliceBytesTotal            atomic.Uint64
-	pipelineMarkerLastSpliceDurationNanosTotal    atomic.Uint64
-	pipelineMarkerLastSpliceBytesLt4K             atomic.Uint64
-	pipelineMarkerLastSpliceBytes4KTo64K          atomic.Uint64
-	pipelineMarkerLastSpliceBytes64KTo1M          atomic.Uint64
-	pipelineMarkerLastSpliceBytesGe1M             atomic.Uint64
-	pipelineMarkerLastSpliceDurLt1ms              atomic.Uint64
-	pipelineMarkerLastSpliceDur1To5ms             atomic.Uint64
-	pipelineMarkerLastSpliceDur5To20ms            atomic.Uint64
-	pipelineMarkerLastSpliceDur20To100ms          atomic.Uint64
-	pipelineMarkerLastSpliceDurGe100ms            atomic.Uint64
-	pipelineMarkerLastUserspaceCopyReads          atomic.Uint64
-	pipelineMarkerLastUserspaceCopyBytesTotal     atomic.Uint64
-	pipelineMarkerLastUserspaceRawReaderHits      atomic.Uint64
-	pipelineMarkerLastUserspaceTLSReaderHits      atomic.Uint64
-	pipelineMarkerLastEnsureRawFailOS             atomic.Uint64
-	pipelineMarkerLastEnsureRawFailNilConn        atomic.Uint64
-	pipelineMarkerLastEnsureRawFailWriterType     atomic.Uint64
-	pipelineMarkerLastSockmapSkipMgr              atomic.Uint64
-	pipelineMarkerLastSockmapSkipContention       atomic.Uint64
-	pipelineMarkerLastSockmapSkipKTLSSockhash     atomic.Uint64
-	pipelineMarkerLastSockmapSkipUserspaceTLS     atomic.Uint64
-	pipelineMarkerLastSockmapSkipAsymmetric       atomic.Uint64
-	pipelineMarkerLastSockmapSkipOther            atomic.Uint64
-	pipelineMarkerLastSockmapRegisterAttempt      atomic.Uint64
-	pipelineMarkerLastSockmapRegisterSuccess      atomic.Uint64
-	pipelineMarkerLastSockmapRegisterFail         atomic.Uint64
-	pipelineMarkerLastSockmapWaitSuccess          atomic.Uint64
-	pipelineMarkerLastSockmapWaitFallback         atomic.Uint64
-	pipelineMarkerLastSockmapWaitError            atomic.Uint64
-	pipelineMarkerLastFlowMuxUDP                  atomic.Uint64
-	pipelineMarkerLastFlowPureTCP                 atomic.Uint64
-	pipelineMarkerLastFlowMuxTCP                  atomic.Uint64
-	pipelineMarkerLastFlowOther                   atomic.Uint64
-
-	pipelineMarkerLastSummaryUnix     atomic.Int64
-	pipelineVisionDetachUnixByConn    sync.Map
-	pipelineVisionRawUnwrapUnixByConn sync.Map
-	pipelineVisionUplinkUnixByConn    sync.Map
-	pipelineVisionDetachFutureByConn  sync.Map
-	pipelineVisionResponseWakeByConn  sync.Map
-	startupHealthOnce                 sync.Once
+	startupHealthOnce sync.Once
 )
 
 const (
 	visionDetachTimeoutMin   = 500 * time.Millisecond
 	visionDetachTimeoutMax   = 1 * time.Second
 	visionDetachTimeoutSlack = 150 * time.Millisecond
-	// Healthy Vision direct-copy candidates usually reach detach within a
-	// sub-second envelope. Keep speculative pre-detach grace short so
-	// command-0-only residue does not build visible cork-pop cohorts.
-	visionFirstResponseGrace = 750 * time.Millisecond
 	visionFirstResponseMax   = 2 * time.Second
-	visionUplinkQuietWindow  = 250 * time.Millisecond
-	visionPreDetachPollTick  = 250 * time.Millisecond
 )
 
 var visionDetachBudgetNanos atomic.Int64
@@ -486,26 +358,55 @@ func unwrapVisionDeferredConnRecurse(conn net.Conn, depth int) *tls.DeferredRust
 	return nil
 }
 
-func startVisionDetach(dc *tls.DeferredRustConn) *visionDetachFuture {
+// VisionReader is used to read xtls vision protocol
+// Note Vision probably only make sense as the inner most layer of reader, since it need assess traffic state from origin proxy traffic
+type VisionReader struct {
+	buf.Reader
+	trafficState *TrafficState
+	ctx          context.Context
+	isUplink     bool
+	conn         net.Conn
+	signalCh     chan session.VisionSignal
+	detachFuture *visionDetachFuture
+	input        *bytes.Reader
+	rawInput     *bytes.Buffer
+	ob           *session.Outbound
+
+	// internal
+	directReadCounter stats.Counter
+}
+
+func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, signalCh chan session.VisionSignal, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
+	return &VisionReader{
+		Reader:       reader,
+		trafficState: trafficState,
+		ctx:          ctx,
+		isUplink:     isUplink,
+		conn:         conn,
+		signalCh:     signalCh,
+		input:        input,
+		rawInput:     rawInput,
+		ob:           ob,
+	}
+}
+
+func (w *VisionReader) startDetach(dc *tls.DeferredRustConn) *visionDetachFuture {
 	if dc == nil {
 		return nil
 	}
-	futAny, _ := pipelineVisionDetachFutureByConn.LoadOrStore(dc, &visionDetachFuture{
-		done: make(chan struct{}),
-	})
-	fut := futAny.(*visionDetachFuture)
-
+	if w.detachFuture == nil {
+		w.detachFuture = &visionDetachFuture{
+			done: make(chan struct{}),
+		}
+	}
+	fut := w.detachFuture
 	fut.once.Do(func() {
 		fut.state.Store(visionDetachPending)
 		fut.startedAt = time.Now()
-		pipelineMarkerVisionDrainDetachAttempt.Add(1)
 		go func() {
 			plaintext, rawAhead, err := dc.DrainAndDetach()
 			duration := time.Since(fut.startedAt)
-			if err != nil {
-				pipelineMarkerVisionDrainDetachFail.Add(1)
-			} else {
-				pipelineMarkerVisionDrainDetachSuccess.Add(1)
+			if err == nil {
 				recordVisionDetachBudget(duration)
 			}
 			fut.result = visionDetachResult{
@@ -521,35 +422,6 @@ func startVisionDetach(dc *tls.DeferredRustConn) *visionDetachFuture {
 		}()
 	})
 	return fut
-}
-
-// VisionReader is used to read xtls vision protocol
-// Note Vision probably only make sense as the inner most layer of reader, since it need assess traffic state from origin proxy traffic
-type VisionReader struct {
-	buf.Reader
-	trafficState *TrafficState
-	ctx          context.Context
-	isUplink     bool
-	conn         net.Conn
-	input        *bytes.Reader
-	rawInput     *bytes.Buffer
-	ob           *session.Outbound
-
-	// internal
-	directReadCounter stats.Counter
-}
-
-func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
-	return &VisionReader{
-		Reader:       reader,
-		trafficState: trafficState,
-		ctx:          ctx,
-		isUplink:     isUplink,
-		conn:         conn,
-		input:        input,
-		rawInput:     rawInput,
-		ob:           ob,
-	}
 }
 
 func shouldObserveVisionPayloadBypass(ts *TrafficState, isUplink bool, ctx context.Context, buffer buf.MultiBuffer) bool {
@@ -601,9 +473,36 @@ func markVisionPayloadBypassObserved(ctx context.Context, ts *TrafficState, ob *
 }
 
 func markVisionNoDetachObserved(ctx context.Context, ob *session.Outbound) {
-	changed := applyVisionNoDetachCopyGate(session.InboundFromContext(ctx), ob)
+	inbound := session.InboundFromContext(ctx)
+	outbounds := session.OutboundsFromContext(ctx)
+	if ob != nil {
+		outbounds = append(outbounds, ob)
+	}
+	promoteVisionSemanticPhase(session.VisionSemanticPhaseNoDetach, inbound, outbounds)
+	changed := applyVisionNoDetachCopyGate(inbound, ob)
 	if changed {
 		errors.LogInfo(ctx, "Vision: command=1 observed; detach/direct-copy disabled for this flow, switching to userspace path")
+	}
+}
+
+func markVisionPostDetachObserved(ctx context.Context, ob *session.Outbound) {
+	inbound := session.InboundFromContext(ctx)
+	outbounds := session.OutboundsFromContext(ctx)
+	if ob != nil {
+		outbounds = append(outbounds, ob)
+	}
+	promoteVisionSemanticPhase(session.VisionSemanticPhasePostDetach, inbound, outbounds)
+}
+
+func promoteVisionSemanticPhase(phase session.VisionSemanticPhase, inbound *session.Inbound, outbounds []*session.Outbound) {
+	if inbound != nil {
+		inbound.PromoteVisionSemanticPhase(phase)
+	}
+	for _, ob := range outbounds {
+		if ob == nil {
+			continue
+		}
+		ob.PromoteVisionSemanticPhase(phase)
 	}
 }
 
@@ -615,8 +514,7 @@ func applyVisionNoDetachCopyGate(inbound *session.Inbound, ob *session.Outbound)
 			inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionNoDetach)
 			changed = true
 		case session.CopyGateForcedUserspace:
-			if inbound.CopyGateReason() == session.CopyGateReasonVisionCommandContinue ||
-				inbound.CopyGateReason() == session.CopyGateReasonVisionUplinkComplete {
+			if inbound.CopyGateReason() == session.CopyGateReasonUnspecified {
 				inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionNoDetach)
 				changed = true
 			}
@@ -628,8 +526,7 @@ func applyVisionNoDetachCopyGate(inbound *session.Inbound, ob *session.Outbound)
 			ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionNoDetach)
 			changed = true
 		case session.CopyGateForcedUserspace:
-			if ob.CopyGateReason() == session.CopyGateReasonVisionCommandContinue ||
-				ob.CopyGateReason() == session.CopyGateReasonVisionUplinkComplete {
+			if ob.CopyGateReason() == session.CopyGateReasonUnspecified {
 				ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionNoDetach)
 				changed = true
 			}
@@ -638,96 +535,265 @@ func applyVisionNoDetachCopyGate(inbound *session.Inbound, ob *session.Outbound)
 	return changed
 }
 
-func applyVisionUplinkCompleteCopyGate(inbound *session.Inbound, ob *session.Outbound) bool {
-	changed := false
+func visionOutboundGateSummary(outbounds []*session.Outbound) string {
+	var summary bytes.Buffer
+	wrote := false
+	seen := make(map[*session.Outbound]struct{}, len(outbounds))
+	for i, ob := range outbounds {
+		if ob == nil {
+			continue
+		}
+		if _, ok := seen[ob]; ok {
+			continue
+		}
+		seen[ob] = struct{}{}
+		if wrote {
+			summary.WriteByte(',')
+		}
+		summary.WriteString(strconv.Itoa(i))
+		summary.WriteByte(':')
+		summary.WriteString(ob.GetCanSpliceCopy().String())
+		summary.WriteByte('/')
+		summary.WriteString(ob.CopyGateReason().String())
+		wrote = true
+	}
+	if !wrote {
+		return "none"
+	}
+	return summary.String()
+}
+
+func appendVisionFlowStateLogFields(fields []interface{}, inbound *session.Inbound, outbounds []*session.Outbound) []interface{} {
+	inboundGate := session.CopyGateUnset
+	inboundGateReason := session.CopyGateReasonUnspecified
 	if inbound != nil {
-		switch inbound.GetCanSpliceCopy() {
-		case session.CopyGatePendingDetach:
-			inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionUplinkComplete)
-			changed = true
-		case session.CopyGateForcedUserspace:
-			if inbound.CopyGateReason() == session.CopyGateReasonVisionCommandContinue {
-				inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionUplinkComplete)
-				changed = true
-			}
-		}
+		inboundGate = inbound.GetCanSpliceCopy()
+		inboundGateReason = inbound.CopyGateReason()
 	}
-	if ob != nil {
-		switch ob.GetCanSpliceCopy() {
-		case session.CopyGatePendingDetach:
-			ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionUplinkComplete)
-			changed = true
-		case session.CopyGateForcedUserspace:
-			if ob.CopyGateReason() == session.CopyGateReasonVisionCommandContinue {
-				ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionUplinkComplete)
-				changed = true
-			}
-		}
-	}
-	return changed
+	return append(fields,
+		" semantic_phase=", committedVisionSemanticPhase(inbound, outbounds),
+		" inbound_gate=", inboundGate,
+		" inbound_gate_reason=", inboundGateReason,
+		" outbound_gates=", visionOutboundGateSummary(outbounds),
+	)
 }
 
-func registerVisionResponseWakeTarget(conn gonet.Conn, wakeTarget gonet.Conn) {
-	if conn == nil || wakeTarget == nil {
-		return
-	}
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
-		return
-	}
-	pipelineVisionResponseWakeByConn.Store(dc, wakeTarget)
+func appendVisionAwaitSignalLogFields(fields []interface{}, inbound *session.Inbound, outbounds []*session.Outbound, phase copyLoopPhase, deferredTLSActive, readerDeferredTLS, writerDeferredTLS bool) []interface{} {
+	fields = append(fields, " phase=", copyLoopPhaseName(phase))
+	fields = appendVisionFlowStateLogFields(fields, inbound, outbounds)
+	return append(fields,
+		" deferred_tls_active=", deferredTLSActive,
+		" reader_deferred_tls=", readerDeferredTLS,
+		" writer_deferred_tls=", writerDeferredTLS,
+	)
 }
 
-func unregisterVisionResponseWakeTarget(conn gonet.Conn) {
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
-		return
+func isNativeDeferredVisionFrontier(inbound *session.Inbound) bool {
+	if inbound == nil || inbound.Conn == nil {
+		return false
 	}
-	pipelineVisionResponseWakeByConn.Delete(dc)
+	return unwrapVisionDeferredConn(inbound.Conn) != nil
 }
 
-func wakeVisionResponseLoop(ctx context.Context, conn gonet.Conn, reason string) {
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
+func shouldReportNativeDeferredRuntimeRegression(inbound *session.Inbound, outbounds []*session.Outbound, phase copyLoopPhase, deferredTLSActive bool, decision *pipeline.DecisionSnapshot) bool {
+	if inbound == nil || inbound.Tag == "" || decision == nil {
+		return false
+	}
+	if phase != copyLoopPhaseAwaitSignal || !deferredTLSActive {
+		return false
+	}
+	if !isNativeDeferredVisionFrontier(inbound) {
+		return false
+	}
+	if inbound.GetCanSpliceCopy() != session.CopyGatePendingDetach {
+		return false
+	}
+	if committedVisionSemanticPhase(inbound, outbounds) != session.VisionSemanticPhaseUnset {
+		return false
+	}
+	if decision.Reason == pipeline.ReasonUserspaceIdleTimeout {
+		return false
+	}
+	if decision.UserspaceBytes == 0 {
+		return false
+	}
+	switch decision.Reason {
+	case pipeline.ReasonDeferredTLSGuard:
+		return true
+	default:
+		return false
+	}
+}
+
+func maybeReportNativeDeferredRuntimeRegression(ctx context.Context, inbound *session.Inbound, outbounds []*session.Outbound, phase copyLoopPhase, deferredTLSActive, readerDeferredTLS, writerDeferredTLS bool, decision *pipeline.DecisionSnapshot) bool {
+	if !shouldReportNativeDeferredRuntimeRegression(inbound, outbounds, phase, deferredTLSActive, decision) {
+		return false
+	}
+	if reportNativeRuntimeRegressionByTagFn == nil || !reportNativeRuntimeRegressionByTagFn(inbound.Tag) {
+		return false
+	}
+	fields := []interface{}{
+		"[kind=vision.native_runtime_feedback] reported unresolved native deferred runtime regression to shared-listener breaker; tag=",
+		inbound.Tag,
+		" reason=",
+		decision.Reason,
+		" userspace_bytes=",
+		decision.UserspaceBytes,
+		" userspace_exit=",
+		decision.UserspaceExit,
+		" userspace_duration_ns=",
+		decision.UserspaceDurationNs,
+	}
+	fields = appendVisionAwaitSignalLogFields(fields, inbound, outbounds, phase, deferredTLSActive, readerDeferredTLS, writerDeferredTLS)
+	errors.LogWarning(ctx, fields...)
+	return true
+}
+
+func shouldReportNativeDeferredRuntimeRecovery(inbound *session.Inbound, outbounds []*session.Outbound, decision *pipeline.DecisionSnapshot) bool {
+	if inbound == nil || inbound.Tag == "" || decision == nil {
+		return false
+	}
+	if !isNativeDeferredVisionFrontier(inbound) {
+		return false
+	}
+	if committedVisionSemanticPhase(inbound, outbounds) == session.VisionSemanticPhaseUnset {
+		return false
+	}
+	switch decision.Path {
+	case pipeline.PathSplice:
+		return decision.SpliceBytes > 0 || decision.UserspaceExit == pipeline.UserspaceExitPostDetachRetrySuccess
+	case pipeline.PathSockmap:
+		return decision.SockmapSuccess || decision.UserspaceExit == pipeline.UserspaceExitPostDetachRetrySuccess
+	}
+	return false
+}
+
+func maybeReportNativeDeferredRuntimeRecovery(ctx context.Context, inbound *session.Inbound, outbounds []*session.Outbound, decision *pipeline.DecisionSnapshot) bool {
+	if !shouldReportNativeDeferredRuntimeRecovery(inbound, outbounds, decision) {
+		return false
+	}
+	if reportNativeRuntimeRecoveryByTagFn == nil || !reportNativeRuntimeRecoveryByTagFn(inbound.Tag) {
+		return false
+	}
+	errors.LogInfo(ctx,
+		"[kind=vision.native_runtime_recovery] reported healthy native deferred runtime outcome to shared-listener breaker; tag=",
+		inbound.Tag,
+		" reason=",
+		decision.Reason,
+		" path=",
+		decision.Path,
+		" userspace_exit=",
+		decision.UserspaceExit,
+	)
+	return true
+}
+
+func shouldRetryPostSockmapSpliceProbe(postSockmapSpliceProbe bool, err error, written, min int64) bool {
+	return postSockmapSpliceProbe && isNetTimeout(err) && written > min
+}
+
+func shouldReportFallbackNativeRuntimeRecovery(ctx context.Context, decision *pipeline.DecisionSnapshot) (fallbackRuntimeRecoveryMeta, bool) {
+	if decision == nil {
+		return fallbackRuntimeRecoveryMeta{}, false
+	}
+	meta, ok := fallbackRuntimeRecoveryMetaFromContext(ctx)
+	if !ok || meta.Tag == "" {
+		return fallbackRuntimeRecoveryMeta{}, false
+	}
+	switch decision.Path {
+	case pipeline.PathSplice:
+		return meta, decision.SpliceBytes > 0
+	case pipeline.PathSockmap:
+		return meta, decision.SockmapSuccess
+	default:
+		return fallbackRuntimeRecoveryMeta{}, false
+	}
+}
+
+func maybeReportFallbackNativeRuntimeRecovery(ctx context.Context, decision *pipeline.DecisionSnapshot) bool {
+	meta, ok := shouldReportFallbackNativeRuntimeRecovery(ctx, decision)
+	if !ok {
+		return false
+	}
+	if meta.State != nil && !meta.State.reported.CompareAndSwap(false, true) {
+		return false
+	}
+	if reportNativeRuntimeRecoveryByTagFn == nil || !reportNativeRuntimeRecoveryByTagFn(meta.Tag) {
+		return false
+	}
+	errors.LogInfo(ctx,
+		"[kind=fallback.native_runtime_recovery] reported healthy native fallback raw outcome to shared-listener breaker; tag=",
+		meta.Tag,
+		" path=",
+		decision.Path,
+		" transport=",
+		meta.FrontendTransport,
+		" splice_bytes=",
+		decision.SpliceBytes,
+		" sockmap_success=",
+		decision.SockmapSuccess,
+	)
+	return true
+}
+
+func shouldReportFallbackNativeRuntimeRecoveryOnRawHandoff(ctx context.Context) (fallbackRuntimeRecoveryMeta, bool) {
+	meta, ok := fallbackRuntimeRecoveryMetaFromContext(ctx)
+	if !ok || meta.Tag == "" {
+		return fallbackRuntimeRecoveryMeta{}, false
+	}
+	switch meta.FrontendTransport {
+	case "deferred_rust", "rust":
+		return meta, true
+	default:
+		return fallbackRuntimeRecoveryMeta{}, false
+	}
+}
+
+func maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff(ctx context.Context, direction string) bool {
+	meta, ok := shouldReportFallbackNativeRuntimeRecoveryOnRawHandoff(ctx)
+	if !ok {
+		return false
+	}
+	if meta.State != nil && !meta.State.reported.CompareAndSwap(false, true) {
+		return false
+	}
+	if reportNativeRuntimeRecoveryByTagFn == nil || !reportNativeRuntimeRecoveryByTagFn(meta.Tag) {
+		return false
+	}
+	errors.LogInfo(ctx,
+		"[kind=fallback.native_runtime_recovery] reported healthy native fallback raw handoff to shared-listener breaker; tag=",
+		meta.Tag,
+		" transport=",
+		meta.FrontendTransport,
+		" direction=",
+		direction,
+		" tls_offload_path=",
+		meta.FrontendTLSOffloadPath,
+		" raw_handoff=",
+		true,
+	)
+	return true
+}
+
+func annotateFallbackTLSOffload(ctx context.Context, decision *pipeline.DecisionSnapshot) {
+	if decision == nil {
 		return
 	}
-	value, ok := pipelineVisionResponseWakeByConn.Load(dc)
+	switch decision.Path {
+	case pipeline.PathSplice, pipeline.PathSockmap:
+	default:
+		return
+	}
+	meta, ok := fallbackRuntimeRecoveryMetaFromContext(ctx)
 	if !ok {
 		return
 	}
-	wakeTarget, ok := value.(gonet.Conn)
-	if !ok || wakeTarget == nil {
-		return
+	switch meta.FrontendTLSOffloadPath {
+	case pipeline.TLSOffloadKTLS, pipeline.TLSOffloadNotRequired:
+		decision.TLSOffloadPath = meta.FrontendTLSOffloadPath
 	}
-	if err := wakeTarget.SetReadDeadline(time.Now()); err != nil {
-		errors.LogDebugInner(ctx, err, "[kind=vision.response_wake_failed] unable to wake response loop; reason=", reason)
-		return
-	}
-	errors.LogDebug(ctx, "[kind=vision.response_wake] explicit Vision signal woke response loop; reason=", reason)
 }
 
-// prepareVisionStableUserspaceRead transitions from a provisional response wait
-// into the long-lived no-detach userspace path.
-//
-// Wakeups use an immediate read deadline only to interrupt the blocked
-// pre-detach wait. Once we commit to stable userspace, that deadline must be
-// cleared; otherwise the subsequent readV loop can fail immediately before any
-// real response bytes have a chance to arrive.
-func prepareVisionStableUserspaceRead(readerConn gonet.Conn, writerConn gonet.Conn) {
-	if readerConn != nil {
-		_ = readerConn.SetReadDeadline(time.Time{})
-	}
-	unregisterVisionResponseWakeTarget(writerConn)
-}
-
-// ObserveVisionUplinkComplete records that a pending-detach Vision request
-// uplink completed from the outbound side.
-//
-// For a main-branch client, clean request completion is the strongest
-// compatibility-safe signal that a command=0-only flow will never produce a
-// later command=2. Once the request side is truly complete, collapse the
-// provisional pending-detach metadata to an inferred no-detach userspace class
-// and wake the waiting response loop so it can re-evaluate immediately.
 func ObserveVisionUplinkComplete(ctx context.Context, inbound *session.Inbound, ob *session.Outbound) bool {
 	pending := false
 	if inbound != nil && inbound.GetCanSpliceCopy() == session.CopyGatePendingDetach {
@@ -736,37 +802,41 @@ func ObserveVisionUplinkComplete(ctx context.Context, inbound *session.Inbound, 
 	if ob != nil && ob.GetCanSpliceCopy() == session.CopyGatePendingDetach {
 		pending = true
 	}
-	if pending {
-		if debugVisionExplicitOnly() {
-			errors.LogDebug(ctx, "[kind=vision.uplink_complete_handoff] request uplink completed without direct-copy signal; telemetry only because XRAY_DEBUG_VISION_EXPLICIT_ONLY=1")
-			return true
-		}
-		if applyVisionUplinkCompleteCopyGate(inbound, ob) {
-			errors.LogDebug(ctx, "[kind=vision.uplink_complete_handoff] request uplink completed without direct-copy signal; promoting to inferred no-detach userspace for main-client compatibility")
-			if inbound != nil && inbound.Conn != nil {
-				wakeVisionResponseLoop(ctx, inbound.Conn, "uplink-complete")
-			}
-		} else {
-			errors.LogDebug(ctx, "[kind=vision.uplink_complete_handoff] request uplink completed without direct-copy signal; explicit protocol state already resolved")
-		}
+	if !pending {
+		return false
 	}
-	return pending
+	outbounds := session.OutboundsFromContext(ctx)
+	if ob != nil {
+		outbounds = append(outbounds, ob)
+	}
+	if isNativeDeferredVisionFrontier(inbound) &&
+		inbound.GetCanSpliceCopy() == session.CopyGatePendingDetach &&
+		committedVisionSemanticPhase(inbound, outbounds) == session.VisionSemanticPhaseUnset {
+		promoteVisionSemanticPhase(session.VisionSemanticPhaseNoDetach, inbound, outbounds)
+		applyVisionNoDetachCopyGate(inbound, ob)
+		fields := []interface{}{
+			"[kind=vision.uplink_complete_local_no_detach] request uplink completed without explicit Vision command; locally resolved no-detach semantics after uplink closure",
+			" tag=", inbound.Tag,
+		}
+		fields = appendVisionFlowStateLogFields(fields, inbound, outbounds)
+		errors.LogDebug(ctx, fields...)
+		sendVisionSignal(session.VisionSignalFromContext(ctx), session.VisionSignal{Command: 1})
+		return true
+	}
+	errors.LogDebug(ctx, "[kind=vision.uplink_complete_handoff] request uplink completed without explicit Vision command; telemetry only")
+	return true
 }
 
 func markVisionCommandContinueEvidence(ctx context.Context, conn gonet.Conn, ob *session.Outbound) bool {
-	changed := false
-	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.GetCanSpliceCopy() == session.CopyGatePendingDetach && inbound.CopyGateReason() == session.CopyGateReasonUnspecified {
-		inbound.SetCopyGateReason(session.CopyGateReasonVisionCommandContinue)
-		changed = true
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil || inbound.GetCanSpliceCopy() != session.CopyGatePendingDetach {
+		return false
 	}
-	if ob != nil && ob.GetCanSpliceCopy() == session.CopyGatePendingDetach && ob.CopyGateReason() == session.CopyGateReasonUnspecified {
-		ob.SetCopyGateReason(session.CopyGateReasonVisionCommandContinue)
-		changed = true
+	if ob != nil && ob.GetCanSpliceCopy() != session.CopyGatePendingDetach {
+		return false
 	}
-	if changed {
-		errors.LogDebug(ctx, "[kind=vision.command_continue_evidence] repeated command=0 observed; recording telemetry only")
-	}
-	return changed
+	errors.LogDebug(ctx, "[kind=vision.command_continue_evidence] repeated command=0 observed; recording telemetry only")
+	return true
 }
 
 func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -785,6 +855,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 	defer unlock()
+	visionTimestamps := session.VisionTimestampsFromContext(w.ctx)
 
 	var withinPaddingBuffers *bool
 	var remainingContent *int32
@@ -809,9 +880,6 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	if *switchToDirectCopy {
-		if w.isUplink {
-			storeVisionUplinkTimestamp(w.conn, time.Now().UnixNano())
-		}
 		if w.directReadCounter != nil {
 			w.directReadCounter.Add(int64(buffer.Len()))
 		}
@@ -819,16 +887,10 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	if shouldObserveVisionPayloadBypass(ts, w.isUplink, w.ctx, buffer) {
-		if w.isUplink {
-			storeVisionUplinkTimestamp(w.conn, time.Now().UnixNano())
-		}
 		markVisionPayloadBypassObserved(w.ctx, ts, w.ob)
 		return buffer, err
 	}
 	if ts.VisionPayloadBypassObserved {
-		if w.isUplink {
-			storeVisionUplinkTimestamp(w.conn, time.Now().UnixNano())
-		}
 		return buffer, err
 	}
 
@@ -858,7 +920,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			}
 			markVisionNoDetachObserved(w.ctx, w.ob)
 			if w.isUplink {
-				wakeVisionResponseLoop(w.ctx, w.conn, "command=1")
+				sendVisionSignal(w.signalCh, session.VisionSignal{Command: 1})
 			}
 		} else if *currentCommand == 2 {
 			*withinPaddingBuffers = false
@@ -876,9 +938,6 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if ts.NumberOfPacketToFilter > 0 {
 		XtlsFilterTls(buffer, ts, w.ctx)
 	}
-	if w.isUplink && !buffer.IsEmpty() {
-		storeVisionUplinkTimestamp(w.conn, time.Now().UnixNano())
-	}
 
 	if *switchToDirectCopy {
 		if isDNSPortOutbound(w.ctx) {
@@ -888,7 +947,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			return buffer, err
 		}
 		if dc := unwrapVisionDeferredConn(w.conn); dc != nil {
-			fut := startVisionDetach(dc)
+			fut := w.startDetach(dc)
 			wait := visionDetachWaitBudget()
 			if !fut.startedAt.IsZero() {
 				if elapsed := time.Since(fut.startedAt); elapsed < wait {
@@ -913,8 +972,6 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				}
 				ts.Lock()
 				locked = true
-				pipelineMarkerVisionDetachTimeout.Add(1)
-				maybeLogPipelineRuntimeSummary(w.ctx)
 				errors.LogWarning(w.ctx, "[kind=vision.drain_detach_timeout] DeferredRustConn drain still pending; staying on rustls path")
 				*switchToDirectCopy = false
 				fut.state.Store(visionDetachTimedOut)
@@ -930,36 +987,21 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			ts.Lock()
 			locked = true
 			detachDoneUnix := time.Now().UnixNano()
-			if fut.result.duration > 0 {
-				pipelineMarkerVisionDetachPhaseNanos.Add(uint64(fut.result.duration.Nanoseconds()))
-				pipelineMarkerVisionDetachPhaseCount.Add(1)
-			}
 			if fut.result.err != nil {
-				maybeLogPipelineRuntimeSummary(w.ctx)
 				// Cannot safely strip outer TLS. Keep rustls active for correctness.
 				errors.LogWarning(w.ctx, "[kind=vision.drain_detach_failed] DeferredRustConn drain failed, keeping rustls active: ", fut.result.err)
 				*switchToDirectCopy = false
-				pipelineVisionDetachFutureByConn.Delete(dc)
+				w.detachFuture = nil
 				return buffer, err
 			}
 			// If this future had timed out earlier, treat completion as informational and
 			// keep rustls path (no late state flip).
 			if fut.state.Load() == visionDetachTimedOut {
-				pipelineVisionDetachFutureByConn.Delete(dc)
+				w.detachFuture = nil
 				errors.LogWarning(w.ctx, "[kind=vision.drain_detach_late] DeferredRustConn detach completed after timeout; keeping rustls path")
 				return buffer, err
 			}
-			if ts != nil && ts.CreatedAtUnixNano > 0 && detachDoneUnix > ts.CreatedAtUnixNano {
-				pipelineMarkerVisionPaddingPhaseNanos.Add(uint64(detachDoneUnix - ts.CreatedAtUnixNano))
-				pipelineMarkerVisionPaddingPhaseCount.Add(1)
-			}
-			if rawUnwrapUnix, ok := consumeVisionRawUnwrapWarningTimestamp(w.conn); ok && detachDoneUnix > rawUnwrapUnix {
-				unwrapToDetachNs := uint64(detachDoneUnix - rawUnwrapUnix)
-				pipelineMarkerRawUnwrapToDetachNanosTotal.Add(unwrapToDetachNs)
-				pipelineMarkerRawUnwrapToDetachSamples.Add(1)
-				recordRawUnwrapToDetachHistogram(unwrapToDetachNs)
-			}
-			storeVisionDetachTimestamp(w.conn, detachDoneUnix)
+			visionTimestamps.StoreDetach(detachDoneUnix)
 			errors.LogDebug(w.ctx, "Vision: DeferredRustConn drained and detached; switching reader to raw socket")
 			if len(fut.result.plaintext) > 0 {
 				buffer = append(buffer, buf.FromBytes(fut.result.plaintext))
@@ -967,7 +1009,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			if len(fut.result.rawAhead) > 0 {
 				buffer = append(buffer, buf.FromBytes(fut.result.rawAhead))
 			}
-			pipelineVisionDetachFutureByConn.Delete(dc)
+			w.detachFuture = nil
 		} else {
 			// XTLS Vision processes TLS-like conn's input and rawInput
 			if w.input != nil {
@@ -993,11 +1035,6 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			switch inbound.GetCanSpliceCopy() {
 			case session.CopyGatePendingDetach:
 				inbound.SetCanSpliceCopy(session.CopyGateEligible)
-			case session.CopyGateForcedUserspace:
-				if inbound.CopyGateReason() == session.CopyGateReasonVisionCommandContinue ||
-					inbound.CopyGateReason() == session.CopyGateReasonVisionUplinkComplete {
-					inbound.SetCanSpliceCopy(session.CopyGateEligible)
-				}
 			}
 		}
 
@@ -1009,16 +1046,12 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				switch w.ob.GetCanSpliceCopy() {
 				case session.CopyGatePendingDetach:
 					w.ob.SetCanSpliceCopy(session.CopyGateEligible)
-				case session.CopyGateForcedUserspace:
-					if w.ob.CopyGateReason() == session.CopyGateReasonVisionCommandContinue ||
-						w.ob.CopyGateReason() == session.CopyGateReasonVisionUplinkComplete {
-						w.ob.SetCanSpliceCopy(session.CopyGateEligible)
-					}
 				}
 			}
 		}
+		markVisionPostDetachObserved(w.ctx, w.ob)
 		if w.isUplink {
-			wakeVisionResponseLoop(w.ctx, w.conn, "command=2")
+			sendVisionSignal(w.signalCh, session.VisionSignal{Command: 2})
 		}
 		readerConn, readCounter, _, readerHandler := UnwrapRawConn(w.conn)
 		w.directReadCounter = readCounter
@@ -1626,9 +1659,6 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 				conn = rc.NetConn()
 			} else if dc, ok := conn.(*tls.DeferredRustConn); ok {
 				if !dc.IsDetached() && !dc.KTLSEnabled().Enabled {
-					storeVisionRawUnwrapWarningTimestamp(dc, time.Now().UnixNano())
-					pipelineMarkerDeferredRawUnwrapWarning.Add(1)
-					maybeLogPipelineRuntimeSummary(context.Background())
 					// Deny raw unwrap: keep the deferred connection intact and return
 					// the wrapper so callers don't crash on nil.
 					return dc, readCounter, writerCounter, handler
@@ -1878,6 +1908,25 @@ func extractAddrIP(addr gonet.Addr) net.IP {
 	return net.ParseAddress(host).IP()
 }
 
+func cryptoHintUsesKTLS(h ebpf.CryptoHint) bool {
+	switch h {
+	case ebpf.CryptoKTLSBoth, ebpf.CryptoKTLSTxOnly, ebpf.CryptoKTLSRxOnly:
+		return true
+	default:
+		return false
+	}
+}
+
+func inferTLSOffloadPathFromCrypto(readerCrypto, writerCrypto ebpf.CryptoHint) pipeline.TLSOffloadPath {
+	if cryptoHintUsesKTLS(readerCrypto) || cryptoHintUsesKTLS(writerCrypto) {
+		return pipeline.TLSOffloadKTLS
+	}
+	if readerCrypto == ebpf.CryptoNone && writerCrypto == ebpf.CryptoNone {
+		return pipeline.TLSOffloadNotRequired
+	}
+	return pipeline.TLSOffloadUnknown
+}
+
 func mapCopyGateState(state session.CopyGateState) pipeline.CopyGateState {
 	switch state {
 	case session.CopyGateEligible:
@@ -1905,10 +1954,6 @@ func mapCopyGateReason(reason session.CopyGateReason) pipeline.CopyGateReason {
 		return pipeline.CopyGateReasonVisionBypass
 	case session.CopyGateReasonVisionNoDetach:
 		return pipeline.CopyGateReasonVisionNoDetach
-	case session.CopyGateReasonVisionUplinkComplete:
-		return pipeline.CopyGateReasonVisionUplinkComplete
-	case session.CopyGateReasonVisionCommandContinue:
-		return pipeline.CopyGateReasonVisionCommandContinue
 	case session.CopyGateReasonDetachTimeout:
 		return pipeline.CopyGateReasonDetachTimeout
 	case session.CopyGateReasonSecurityGuard:
@@ -1923,10 +1968,12 @@ func mapCopyGateReason(reason session.CopyGateReason) pipeline.CopyGateReason {
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
-func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
+func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer signal.ActivityUpdater, inTimer *signal.ActivityTimer) error {
 	disableAccel := os.Getenv("XRAY_DEBUG_DISABLE_ACCEL") == "1"
 	disableIdle := os.Getenv("XRAY_DEBUG_IDLE_INFINITE") == "1"
 	userspaceReader := buf.NewReader(readerConn)
+	visionCh := session.VisionSignalFromContext(ctx)
+	visionTimestamps := session.VisionTimestampsFromContext(ctx)
 
 	decisionCaps := pipelineCapabilities()
 	dnsFlowClass := session.ResolveDNSFlowClass(ctx)
@@ -1944,7 +1991,18 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		DNSPlane:       string(dnsPlane),
 	}
 	postDetachRetrySeen := false
+	var (
+		readerCrypto       ebpf.CryptoHint
+		writerCrypto       ebpf.CryptoHint
+		readerCryptoSource string
+		writerCryptoSource string
+	)
+	var inbound *session.Inbound
+	var outbounds []*session.Outbound
 	finalizeDecision := func() {
+		if inferred := inferTLSOffloadPathFromCrypto(readerCrypto, writerCrypto); inferred != pipeline.TLSOffloadUnknown {
+			decision.TLSOffloadPath = inferred
+		}
 		if decision.CopyPath != pipeline.CopyPathNotApplicable {
 			switch decision.Path {
 			case pipeline.PathSplice:
@@ -1957,6 +2015,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				}
 			}
 		}
+		annotateFallbackTLSOffload(ctx, &decision)
 		if decision.TLSOffloadPath == pipeline.TLSOffloadUnknown {
 			if decision.Path == pipeline.PathKTLS {
 				decision.TLSOffloadPath = pipeline.TLSOffloadKTLS
@@ -1979,12 +2038,12 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 	defer func() {
 		finalizeDecision()
+		maybeReportNativeDeferredRuntimeRecovery(ctx, inbound, outbounds, &decision)
+		maybeReportFallbackNativeRuntimeRecovery(ctx, &decision)
 		logPipelineDecision(ctx, string(decision.Path), decision.Reason, decisionCaps)
 		logPipelineSummary(ctx, decision)
 	}()
-	defer clearVisionTelemetryTimestamps(readerConn, writerConn)
-	registerVisionResponseWakeTarget(writerConn, readerConn)
-	defer unregisterVisionResponseWakeTarget(writerConn)
+	defer visionTimestamps.Clear()
 
 	var (
 		rawReady                     bool
@@ -1993,10 +2052,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		readerHandler, writerHandler *tls.KTLSKeyUpdateHandler
 		rawWriterTCP                 *net.TCPConn
 		rawUserspaceReader           buf.Reader
-		readerCrypto                 ebpf.CryptoHint
-		writerCrypto                 ebpf.CryptoHint
-		readerCryptoSource           string
-		writerCryptoSource           string
 	)
 	ensureRaw := func() bool {
 		if rawReady {
@@ -2006,18 +2061,15 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		candidateWriterConn, _, candidateWriteCounter, candidateWriterHandler := UnwrapRawConn(writerConn)
 
 		if runtime.GOOS != "linux" && runtime.GOOS != "android" {
-			pipelineMarkerEnsureRawFailOS.Add(1)
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: unsupported OS ", runtime.GOOS)
 			return false
 		}
 		if candidateReaderConn == nil || candidateWriterConn == nil {
-			pipelineMarkerEnsureRawFailNilConn.Add(1)
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: nil raw conn(s) readerType=", connTypeName(candidateReaderConn), " writerType=", connTypeName(candidateWriterConn))
 			return false
 		}
 		tc, ok := candidateWriterConn.(*net.TCPConn)
 		if !ok {
-			pipelineMarkerEnsureRawFailWriterType.Add(1)
 			errors.LogDebug(ctx, "CopyRawConn fallback to readv: writer is not *net.TCPConn (writerType=", connTypeName(candidateWriterConn), ")")
 			return false
 		}
@@ -2039,7 +2091,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		return true
 	}
 
-	inbound := session.InboundFromContext(ctx)
+	inbound = session.InboundFromContext(ctx)
 	if inbound == nil {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: missing inbound metadata")
 		decision.Reason = pipeline.ReasonMissingInboundMetadata
@@ -2056,7 +2108,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 	decision.CopyGateState = mapCopyGateState(inbound.CopyGateState())
 	decision.CopyGateReason = mapCopyGateReason(inbound.CopyGateReason())
-	outbounds := session.OutboundsFromContext(ctx)
+	outbounds = session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		errors.LogDebug(ctx, "CopyRawConn fallback to readv: no outbound metadata")
 		decision.Reason = pipeline.ReasonMissingOutboundMetadata
@@ -2101,14 +2153,13 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		if copyPath != pipeline.CopyPathUnknown {
 			decision.CopyPath = copyPath
 		}
-		prepareVisionStableUserspaceRead(readerConn, writerConn)
 		sc := &buf.SizeCounter{}
 		start := time.Now()
 		err := readV(ctx, userspaceReader, writer, timer, nil, sc)
 		decision.UserspaceBytes = sc.Size
 		decision.UserspaceDurationNs = time.Since(start).Nanoseconds()
 		decision.Path = pipeline.PathUserspace
-		applyUserspaceExit(&decision, err, isStableUserspaceReason(reason))
+		applyUserspaceExit(&decision, err, reason == pipeline.ReasonVisionNoDetachUserspace)
 		return err
 	}
 
@@ -2125,96 +2176,112 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 
 	loggedUserspaceLoop := false
-	loggedFirstByteGrace := false
 	userspaceStart := time.Now()
 	forceUserspaceAfterSockmap := false
+	spliceProbeCompleted := false
 	dnsGuardFirstResponseSeen := false
 	var dnsGuardResponseTracker *dnsTCPResponseTracker
 	if dnsControlPlaneFlow && dnsFlowClass == session.DNSFlowClassTCPControl {
 		dnsGuardResponseTracker = &dnsTCPResponseTracker{}
 	}
 
-	// Phase-aware idle policy:
-	// - preDetach: while deferred TLS still active; keep tight to surface jam early.
-	// - noDetach: deferred TLS continues without detach; enforce tighter timeout.
-	// - inferredNoDetach: request uplink completed without explicit command=1;
-	//   keep userspace but with a shorter bounded response budget than real
-	//   long-lived no-detach sessions.
-	// - postDetach: after detach/promotion; give a bit more headroom.
-	// - streaming: once payload flows, grow gently up to a cap.
-	const (
-		userspacePhasePreDetach        = "pre_detach"
-		userspacePhaseNoDetach         = "no_detach"
-		userspacePhaseInferredNoDetach = "inferred_no_detach"
-		userspacePhaseControlCompat    = "control_compat"
-		userspacePhasePostDetach       = "post_detach"
-		userspacePhaseStreaming        = "streaming"
-	)
 	var (
-		// Keep pre-detach bounded for ambiguous command-0 flows, but let the
-		// shared inactivity timer own that budget. Individual reads only poll
-		// for explicit Vision progress instead of turning each poll into a hard
-		// timeout decision.
-		idlePreDetach        = 3 * time.Second
-		idleNoDetach         = 10 * time.Second
-		idleInferredNoDetach = 3 * time.Second
-		idleControlCompat    = 3 * time.Second
-		idlePostDetach       = 20 * time.Second
-		idleStreamingMax     = 60 * time.Second
-		noDetachMinAge       = 5 * time.Second
-		noDetachMaxWallDur   = 60 * time.Second
-		spliceProbeTimeout   = 3 * time.Second
-		spliceProbeMinByte   = int64(32)
+		idlePreDetach = 3 * time.Second
+		// No-detach userspace should follow the connection-level idle backstop,
+		// not a short branch-local ceiling that kills healthy keep-alive flows.
+		idleNoDetach       = 5 * time.Minute
+		idlePostDetach     = 20 * time.Second
+		idleStreamingMax   = 60 * time.Second
+		spliceProbeTimeout = 3 * time.Second
+		spliceProbeMinByte = int64(32)
 	)
 	if disableIdle {
-		// For debugging correctness: practically disable idle timeouts.
 		idlePreDetach = 10 * time.Minute
 		idleNoDetach = 10 * time.Minute
-		idleInferredNoDetach = 10 * time.Minute
-		idleControlCompat = 10 * time.Minute
 		idlePostDetach = 10 * time.Minute
 		idleStreamingMax = 2 * time.Hour
-		noDetachMinAge = 10 * time.Minute
-		noDetachMaxWallDur = 2 * time.Hour
 	}
 	idleTimeout := idlePreDetach
-	phase := userspacePhasePreDetach
-	deferredPayloadSeen := false
-	noDetachSince := time.Time{}
+	preDetachDeadline := time.Now().Add(idlePreDetach + 500*time.Millisecond)
+	preDetachGraceUsed := false
+	phase := copyLoopPhaseAwaitSignal
 	postDetachPhaseMarked := false
-	lastUserspaceTimerTimeout := time.Duration(0)
-	setUserspaceTimerTimeout := func(timeout time.Duration) {
-		if timer == nil || timeout <= 0 || timeout == lastUserspaceTimerTimeout {
-			return
-		}
-		timer.SetTimeout(timeout)
-		lastUserspaceTimerTimeout = timeout
-	}
-	markPostDetachPhase := func(path string) {
+	deferredTLSActive := deferredConnRequiresTLS(readerConn) || deferredConnRequiresTLS(writerConn)
+	markPostDetachPhase := func(_ string) {
 		if postDetachPhaseMarked {
 			return
 		}
-		detachUnix, ok := consumeVisionDetachTimestamp(writerConn)
+		detachUnix, ok := visionTimestamps.ConsumeDetach()
 		if !ok {
-			detachUnix, ok = consumeVisionDetachTimestamp(readerConn)
-			if !ok {
-				return
+			return
+		}
+		_ = detachUnix
+		postDetachPhaseMarked = true
+	}
+	applyStableNoDetachDecision := func() {
+		phase = copyLoopPhaseUserspaceOnly
+		idleTimeout = idleNoDetach
+		decision.Path = pipeline.PathUserspace
+		decision.Reason = pipeline.ReasonVisionNoDetachUserspace
+		decision.CopyGateState = pipeline.CopyGateForcedUserspace
+		decision.CopyGateReason = pipeline.CopyGateReasonVisionNoDetach
+	}
+	applyExplicitPostDetachDecision := func() {
+		phase = copyLoopPhaseRawReady
+		idleTimeout = idlePostDetach
+		decision.Reason = pipeline.ReasonDefault
+		postDetachRetrySeen = true
+	}
+	finishUserspaceTimeout := func() error {
+		decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
+		if dnsControlPlaneFlow && decision.UserspaceBytes == 0 {
+			decision.DNSGuardZeroByteTimeout = true
+		}
+		if !dnsControlPlaneFlow {
+			if phase == copyLoopPhaseUserspaceOnly {
+				decision.Reason = pipeline.ReasonUserspaceNoDetachIdleTimeout
+			} else {
+				decision.Reason = pipeline.ReasonUserspaceIdleTimeout
+			}
+		} else {
+			switch dnsFlowClass {
+			case session.DNSFlowClassTCPControl, session.DNSFlowClassUDPControl:
+				decision.Reason = pipeline.ReasonControlPlaneDNSGuard
+			default:
+				decision.Reason = pipeline.ReasonLoopbackDNSGuard
 			}
 		}
-		nowUnix := time.Now().UnixNano()
-		if nowUnix > detachUnix {
-			pipelineMarkerVisionPostDetachNanos.Add(uint64(nowUnix - detachUnix))
+		decision.Path = pipeline.PathUserspace
+		decision.UserspaceExit = pipeline.UserspaceExitTimeout
+		maybeReportNativeDeferredRuntimeRegression(
+			ctx,
+			inbound,
+			outbounds,
+			phase,
+			deferredTLSActive,
+			deferredConnRequiresTLS(readerConn),
+			deferredConnRequiresTLS(writerConn),
+			&decision,
+		)
+		// Treat idle timeout as clean close to avoid marking failures upstream.
+		return io.EOF
+	}
+	handleVisionSignal := func(sig session.VisionSignal) {
+		errors.LogDebug(ctx, "[kind=vision.signal_received] command=", sig.Command)
+		switch sig.Command {
+		case 1:
+			applyStableNoDetachDecision()
+		case 2:
+			applyExplicitPostDetachDecision()
 		}
-		pipelineMarkerVisionPostDetachCount.Add(1)
-		switch path {
-		case "splice":
-			pipelineMarkerVisionPostDetachSplice.Add(1)
-		case "sockmap":
-			pipelineMarkerVisionPostDetachSockmap.Add(1)
-		default:
-			pipelineMarkerVisionPostDetachUserspace.Add(1)
+	}
+	switch committedVisionSemanticPhase(inbound, outbounds) {
+	case session.VisionSemanticPhaseNoDetach:
+		applyStableNoDetachDecision()
+	case session.VisionSemanticPhasePostDetach:
+		if !deferredTLSActive {
+			applyExplicitPostDetachDecision()
 		}
-		postDetachPhaseMarked = true
 	}
 	for {
 		inboundGate := inbound.GetCanSpliceCopy()
@@ -2238,46 +2305,25 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			// Control-plane DNS stays on guarded userspace path by design.
 			splice = false
 		}
-		noDetachGuardEnabled := visionNoDetachGuardEnabled(inbound, outbounds)
+		if visionCh != nil {
+			select {
+			case sig := <-visionCh:
+				handleVisionSignal(sig)
+			default:
+			}
+		}
 		readerStillUsesDeferredTLS := deferredConnRequiresTLS(readerConn)
 		writerStillUsesDeferredTLS := deferredConnRequiresTLS(writerConn)
-		deferredTLSActive := readerStillUsesDeferredTLS || writerStillUsesDeferredTLS
-		if deferredTLSActive {
-			if phase == userspacePhasePreDetach && deferredPayloadSeen && time.Since(userspaceStart) >= noDetachMinAge && noDetachGuardEnabled {
-				phase = userspacePhaseNoDetach
-				idleTimeout = idleNoDetach
-				if noDetachSince.IsZero() {
-					noDetachSince = time.Now()
-				}
-			}
-		} else if phase == userspacePhasePreDetach || phase == userspacePhaseNoDetach || phase == userspacePhaseControlCompat {
-			phase = userspacePhasePostDetach
-			idleTimeout = idlePostDetach
+		deferredTLSActive = readerStillUsesDeferredTLS || writerStillUsesDeferredTLS
+		if phase == copyLoopPhaseAwaitSignal && inboundGate == session.CopyGatePendingDetach {
+			splice = false
 		}
-		if phase == userspacePhaseNoDetach {
+		if phase == copyLoopPhaseUserspaceOnly {
 			decision.Path = pipeline.PathUserspace
 			if decision.Reason == pipeline.ReasonDefault || decision.Reason == pipeline.ReasonDeferredTLSGuard {
 				decision.Reason = pipeline.ReasonVisionNoDetachUserspace
 			}
-		} else if phase == userspacePhaseInferredNoDetach {
-			decision.Path = pipeline.PathUserspace
-			if decision.Reason == pipeline.ReasonDefault || decision.Reason == pipeline.ReasonDeferredTLSGuard {
-				decision.Reason = pipeline.ReasonVisionUplinkCompleteUserspace
-			}
-		} else if phase == userspacePhaseControlCompat {
-			decision.Path = pipeline.PathUserspace
-			if decision.Reason == pipeline.ReasonDefault || decision.Reason == pipeline.ReasonDeferredTLSGuard {
-				decision.Reason = pipeline.ReasonVisionControlUserspace
-			}
 		}
-		if phase == userspacePhaseNoDetach && noDetachGuardEnabled && !noDetachSince.IsZero() && time.Since(noDetachSince) >= noDetachMaxWallDur {
-			decision.Path = pipeline.PathUserspace
-			decision.Reason = pipeline.ReasonUserspaceNoDetachIdleTimeout
-			decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
-			errors.LogWarning(ctx, "[kind=vision.no_detach_timeout] deferred userspace phase exceeded guard window")
-			return io.EOF
-		}
-		setUserspaceTimerTimeout(idleTimeout)
 		if splice {
 			if inboundGate == session.CopyGateEligible && !deferredTLSActive {
 				_ = ensureRaw()
@@ -2308,8 +2354,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 			if decision.Path != pipeline.PathSplice {
 				splice = false
-				pipelineMarkerDeferredSpliceGuardHit.Add(1)
-				maybeLogPipelineRuntimeSummary(ctx)
 			}
 		}
 		var caps pipeline.CapabilitySummary
@@ -2349,16 +2393,13 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 
 			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
 			if !caps.SockmapSupported {
-				pipelineMarkerSockmapSkipOther.Add(1)
 				decision.Path = pipeline.PathSplice
 				decision.Reason = pipeline.ReasonSockmapCapabilityUnsupported
 			} else if mgr := ebpf.GlobalSockmapManager(); mgr == nil {
-				pipelineMarkerSockmapSkipMgr.Add(1)
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: manager unavailable")
 				decision.Path = pipeline.PathSplice
 				decision.Reason = pipeline.ReasonSockmapManagerUnavailable
 			} else if mgr.ShouldFallbackToSplice() {
-				pipelineMarkerSockmapSkipContention.Add(1)
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: contention fallback active")
 				decision.Path = pipeline.PathSplice
 				decision.Reason = pipeline.ReasonSockmapContention
@@ -2366,43 +2407,34 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				errors.LogDebug(ctx, "CopyRawConn crypto hint: reader=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] source=", readerCryptoSource, " writer=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] source=", writerCryptoSource)
 				switch {
 				case !ebpf.KTLSSockhashCompatible() && (readerCrypto == ebpf.CryptoKTLSBoth || writerCrypto == ebpf.CryptoKTLSBoth):
-					pipelineMarkerSockmapSkipKTLSSockhash.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: kTLS+SOCKHASH not supported on this kernel, using splice")
 					mgr.IncrementKTLSSpliceFallback()
 					decision.Path = pipeline.PathSplice
 					decision.Reason = pipeline.ReasonSockmapKTLSSockhashIncompatible
 				case readerCrypto == ebpf.CryptoUserspaceTLS || writerCrypto == ebpf.CryptoUserspaceTLS:
-					pipelineMarkerSockmapSkipUserspaceTLS.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 					decision.Path = pipeline.PathSplice
 					decision.Reason = pipeline.ReasonSockmapUserspaceTLS
 				case (readerCrypto == ebpf.CryptoKTLSBoth) != (writerCrypto == ebpf.CryptoKTLSBoth):
-					pipelineMarkerSockmapSkipAsymmetric.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: asymmetric kTLS state (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 					decision.Path = pipeline.PathSplice
 					decision.Reason = pipeline.ReasonSockmapAsymmetricKTLS
 				default:
-					pipelineMarkerSockmapSkipOther.Add(1)
 					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
 					decision.Path = pipeline.PathSplice
 					decision.Reason = pipeline.ReasonSockmapOtherPolicy
 				}
 			} else {
 				if pair, ok := mgr.GetStats(rawReaderConn, rawWriterConn); ok && (pair.InboundCrypto != readerCrypto || pair.OutboundCrypto != writerCrypto) {
-					pipelineMarkerSockmapPolicyRefresh.Add(1)
 					if err := mgr.UnregisterPair(rawReaderConn, rawWriterConn); err != nil {
-						pipelineMarkerSockmapPolicyRefreshFail.Add(1)
 						decision.Path = pipeline.PathSplice
 						decision.Reason = pipeline.ReasonSockmapRegisterFail
 						errors.LogDebugInner(ctx, err, "CopyRawConn sockmap policy refresh (unregister) failed, falling back to splice")
-						maybeLogPipelineRuntimeSummary(ctx)
 						continue
 					}
 				}
 
-				pipelineMarkerSockmapRegisterAttempt.Add(1)
 				if err := mgr.RegisterPairWithCrypto(rawReaderConn, rawWriterConn, readerCrypto, writerCrypto); err == nil {
-					pipelineMarkerSockmapRegisterSuccess.Add(1)
 					markPostDetachPhase("sockmap")
 					decision.Path = pipeline.PathSockmap
 					decision.Reason = pipeline.ReasonSockmapActive
@@ -2410,7 +2442,10 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 					lw, rw := connAddrs(rawWriterConn)
 					errors.LogInfo(ctx, "CopyRawConn sockmap start: crypto reader=", int(readerCrypto), " writer=", int(writerCrypto), " reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw, " loopback=", isLoopbackConnPair(rawReaderConn, rawWriterConn))
 					writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
-					timer.SetTimeout(24 * time.Hour)
+					// Splice takes over connection lifecycle. Transfer timer ownership explicitly.
+					if activityTimer, ok := timer.(*signal.ActivityTimer); ok && activityTimer != nil {
+						activityTimer.SetTimeout(24 * time.Hour)
+					}
 					if inTimer != nil {
 						inTimer.SetTimeout(24 * time.Hour)
 					}
@@ -2423,21 +2458,18 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 					runtime.KeepAlive(rawReaderConn)
 					runtime.KeepAlive(rawWriterConn)
 					if waitErr != nil {
-						pipelineMarkerSockmapWaitError.Add(1)
 						errors.LogWarningInner(ctx, waitErr, "CopyRawConn sockmap wait failed, switching to guarded userspace fallback; reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw)
 						decision.Path = pipeline.PathUserspace
 						decision.Reason = pipeline.ReasonSockmapWaitErrorUserspaceGuard
 						forceUserspaceAfterSockmap = true
 						continue
 					} else if !fallbackToSplice {
-						pipelineMarkerSockmapWaitSuccess.Add(1)
 						decision.Path = pipeline.PathSockmap
 						decision.Reason = pipeline.ReasonForwardSuccess
 						errors.LogInfo(ctx, "CopyRawConn sockmap forward success: reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw)
 						decision.SockmapSuccess = true
 						return nil
 					} else {
-						pipelineMarkerSockmapWaitFallback.Add(1)
 						errors.LogWarning(ctx, "CopyRawConn sockmap inactive, switching to guarded userspace fallback; reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw)
 						decision.Path = pipeline.PathUserspace
 						decision.Reason = pipeline.ReasonSockmapWaitFallbackUserspaceGuard
@@ -2445,7 +2477,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 						continue
 					}
 				} else {
-					pipelineMarkerSockmapRegisterFail.Add(1)
 					errors.LogDebugInner(ctx, err, "CopyRawConn sockmap register failed, falling back to splice")
 					decision.Path = pipeline.PathSplice
 					decision.Reason = pipeline.ReasonSockmapRegisterFail
@@ -2457,18 +2488,19 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if decision.Reason == pipeline.ReasonDefault || decision.Reason == pipeline.ReasonSockmapActive {
 				decision.Reason = pipeline.ReasonSplicePrimary
 			}
-			postSockmapSpliceProbe := decision.Reason == pipeline.ReasonSockmapRegisterFail
+			postSockmapSpliceProbe := !spliceProbeCompleted && decision.Reason == pipeline.ReasonSockmapRegisterFail
 			errors.LogDebug(ctx, "CopyRawConn splice")
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
 			//runtime.Gosched() // necessary
-			time.Sleep(time.Millisecond)     // without this, there will be a rare ssl error for freedom splice
-			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
+			time.Sleep(time.Millisecond) // without this, there will be a rare ssl error for freedom splice
+			// Splice takes over connection lifecycle. Transfer timer ownership explicitly.
+			if activityTimer, ok := timer.(*signal.ActivityTimer); ok && activityTimer != nil {
+				activityTimer.SetTimeout(24 * time.Hour) // prevent leak, just in case
+			}
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
 			writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
-			pipelineMarkerSpliceAttempts.Add(1)
-			maybeLogPipelineRuntimeSummary(ctx)
 			spliceStart := time.Now()
 			markPostDetachPhase("splice")
 			if postSockmapSpliceProbe {
@@ -2482,9 +2514,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			writerMonitor.Stop()
 			spliceDuration := time.Since(spliceStart)
 			decision.SpliceDurationNs = spliceDuration.Nanoseconds()
-			pipelineMarkerSpliceBytesTotal.Add(uint64(w))
-			pipelineMarkerSpliceDurationNanosTotal.Add(uint64(spliceDuration.Nanoseconds()))
-			recordSpliceHistogram(uint64(w), uint64(spliceDuration.Nanoseconds()))
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
 			}
@@ -2495,11 +2524,14 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				statWriter.Counter.Add(w) // user stats
 			}
 			if postSockmapSpliceProbe && isNetTimeout(err) && w <= spliceProbeMinByte {
-				pipelineMarkerSpliceCompleted.Add(1)
 				decision.Reason = pipeline.ReasonSplicePostSockmapStall
-				maybeLogPipelineRuntimeSummary(ctx)
 				errors.LogWarning(ctx, "[kind=vision.splice_post_sockmap_stall] splice made no progress after sockmap fallback: bytes=", w, " timeout=", spliceProbeTimeout)
 				return io.EOF
+			}
+			if shouldRetryPostSockmapSpliceProbe(postSockmapSpliceProbe, err, w, spliceProbeMinByte) {
+				spliceProbeCompleted = true
+				decision.Reason = pipeline.ReasonSplicePrimary
+				continue
 			}
 			if err != nil && readerHandler != nil && tls.IsKeyExpired(err) {
 				if herr := readerHandler.Handle(); herr != nil {
@@ -2508,22 +2540,14 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				continue // retry splice after key update
 			}
 			if err == nil || errors.Cause(err) == io.EOF {
-				pipelineMarkerSpliceCompleted.Add(1)
-				maybeLogPipelineRuntimeSummary(ctx)
 				return nil
 			}
 			if isExpectedSpliceReadFromError(err) {
-				pipelineMarkerSpliceExpectedTeardown.Add(1)
 				recordSpliceExpectedTeardownClass(err)
-				pipelineMarkerSpliceCompleted.Add(1)
-				maybeLogPipelineRuntimeSummary(ctx)
 				errors.LogWarning(ctx, "[kind=vision.splice_expected_teardown] splice/readfrom closed by peer or stream teardown: ", err)
 				return nil
 			}
-			// Unexpected splice error: record and also flag as acceleration fault for learning.
 			recordSpliceUnexpectedReset(err)
-			pipelineMarkerSpliceUnexpectedError.Add(1)
-			maybeLogPipelineRuntimeSummary(ctx)
 			errors.LogWarning(ctx, "[kind=vision.splice_unexpected_error] splice/readfrom failed: ", err)
 			return err
 		}
@@ -2543,105 +2567,59 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			loggedUserspaceLoop = true
 		}
 		currentReader := userspaceReader
-		usingRawUserspaceReader := false
-		// After Vision command=2, inbound switches to raw direct-copy mode.
-		// If splice is disabled by peer metadata, userspace fallback must read
-		// from the same unwrapped/raw layer to avoid waiting for TLS framing.
 		if inbound.GetCanSpliceCopy() == session.CopyGateEligible && !readerStillUsesDeferredTLS && ensureRaw() && rawUserspaceReader != nil {
 			currentReader = rawUserspaceReader
-			usingRawUserspaceReader = true
 		}
-		deferredPhaseActive := phase == userspacePhasePreDetach || phase == userspacePhaseNoDetach
-		preDetachHeuristicActive := phase == userspacePhasePreDetach
-		preDetachCompatibilityWait := preDetachHeuristicActive && !dnsControlPlaneFlow && decision.UserspaceBytes == 0
-		if shouldRetryVisionPostDetachTransition(readerConn, writerConn, decision.UserspaceBytes, dnsControlPlaneFlow, deferredTLSActive, deferredPhaseActive) {
-			phase = userspacePhasePostDetach
-			idleTimeout = idlePostDetach
-			setUserspaceTimerTimeout(idleTimeout)
-			decision.Reason = pipeline.ReasonDefault
-			errors.LogDebug(ctx, "[kind=vision.post_detach_recheck] deferred TLS cleared before fallback read; retrying post-detach path")
-			continue
-		}
-		if gate, gateReason, ok := visionStableUserspaceGateActive(inbound, outbounds); ok {
-			if gateReason == pipeline.CopyGateReasonVisionUplinkComplete && phase != userspacePhasePreDetach {
-				goto userspaceReadLoop
-			}
-			phase = userspacePhaseNoDetach
-			idleTimeout = idleNoDetach
-			if gateReason == pipeline.CopyGateReasonVisionUplinkComplete {
-				phase = userspacePhaseInferredNoDetach
-				idleTimeout = idleInferredNoDetach
-			}
-			setUserspaceTimerTimeout(idleTimeout)
-			decision.Path = pipeline.PathUserspace
-			decision.Reason = visionUserspaceReasonForGate(gateReason)
-			decision.CopyGateState = gate
-			decision.CopyGateReason = gateReason
-			prepareVisionStableUserspaceRead(readerConn, writerConn)
-			if gateReason == pipeline.CopyGateReasonVisionUplinkComplete {
-				errors.LogDebug(ctx, "[kind=vision.stable_userspace_handoff] inferred no-detach flow will stay on local response loop until first response byte")
+		if phase == copyLoopPhaseAwaitSignal && inboundGate == session.CopyGatePendingDetach {
+			remaining := time.Until(preDetachDeadline)
+			if remaining <= 0 {
+				switch committedVisionSemanticPhase(inbound, outbounds) {
+				case session.VisionSemanticPhaseNoDetach:
+					applyStableNoDetachDecision()
+					continue
+				case session.VisionSemanticPhaseUnset:
+					if visionCh != nil && !preDetachGraceUsed {
+						preDetachDeadline = time.Now().Add(idlePreDetach)
+						preDetachGraceUsed = true
+						continue
+					}
+				}
+				// Keep await-signal alive under a short read-timeout cadence and
+				// leave termination to the parent session context/backstop.
+				preDetachDeadline = time.Now().Add(idlePreDetach + 500*time.Millisecond)
 				continue
 			}
-			sc := &buf.SizeCounter{}
-			err := readV(ctx, currentReader, writer, timer, nil, sc)
-			decision.UserspaceBytes += sc.Size
-			decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
-			applyUserspaceExit(&decision, err, isStableUserspaceReason(decision.Reason))
-			return err
 		}
-
-	userspaceReadLoop:
 		readTimeout := idleTimeout
-		if preDetachCompatibilityWait {
-			readTimeout = visionPreDetachPollTick
+		if phase == copyLoopPhaseAwaitSignal && inboundGate == session.CopyGatePendingDetach {
+			if remaining := time.Until(preDetachDeadline); remaining < readTimeout {
+				readTimeout = remaining
+			}
 		}
-
 		_ = readerConn.SetReadDeadline(time.Now().Add(readTimeout))
 		buffer, err := currentReader.ReadMultiBuffer()
 		_ = readerConn.SetReadDeadline(time.Time{})
 		if !buffer.IsEmpty() {
 			dnsGuardResponseComplete := dnsGuardResponseTracker != nil && dnsGuardResponseTracker.Observe(buffer)
-			pipelineMarkerUserspaceCopyReads.Add(1)
-			pipelineMarkerUserspaceCopyBytesTotal.Add(uint64(buffer.Len()))
 			decision.UserspaceBytes += int64(buffer.Len())
-			if phase == userspacePhaseInferredNoDetach {
-				phase = userspacePhaseNoDetach
+			// Active response traffic proves the session is still alive while
+			// awaiting Vision truth from the request path, so keep the
+			// pre-detach deadline tied to liveness rather than wall clock.
+			if phase == copyLoopPhaseAwaitSignal && inboundGate == session.CopyGatePendingDetach {
+				preDetachDeadline = time.Now().Add(idlePreDetach + 500*time.Millisecond)
+				preDetachGraceUsed = false
+			}
+			if phase == copyLoopPhaseUserspaceOnly {
 				idleTimeout = idleNoDetach
-				if noDetachSince.IsZero() {
-					noDetachSince = time.Now()
-				}
-				setUserspaceTimerTimeout(idleTimeout)
-			} else if phase == userspacePhaseControlCompat {
-				phase = userspacePhaseNoDetach
-				idleTimeout = idleNoDetach
-				if noDetachSince.IsZero() {
-					noDetachSince = time.Now()
-				}
-				setUserspaceTimerTimeout(idleTimeout)
 			}
 			if dnsControlPlaneFlow && !dnsGuardFirstResponseSeen {
 				firstResponseNs := uint64(time.Since(userspaceStart).Nanoseconds())
-				pipelineMarkerDNSGuardFirstResponseNanos.Add(firstResponseNs)
-				pipelineMarkerDNSGuardFirstResponseCount.Add(1)
-				recordDNSGuardFirstResponseHistogram(firstResponseNs)
 				decision.DNSGuardFirstResponseNs = int64(firstResponseNs)
 				dnsGuardFirstResponseSeen = true
 			}
-			if deferredTLSActive {
-				deferredPayloadSeen = true
-				if phase == userspacePhasePreDetach && time.Since(userspaceStart) >= noDetachMinAge {
-					phase = userspacePhaseNoDetach
-					idleTimeout = idleNoDetach
-					if noDetachSince.IsZero() {
-						noDetachSince = time.Now()
-					}
-				}
-				if phase == userspacePhaseNoDetach && idleTimeout > idleNoDetach {
-					idleTimeout = idleNoDetach
-				}
-			} else {
-				if phase != userspacePhaseStreaming {
-					phase = userspacePhaseStreaming
+			if !deferredTLSActive {
+				if phase != copyLoopPhaseStreaming {
+					phase = copyLoopPhaseStreaming
 					if idleTimeout < idlePostDetach {
 						idleTimeout = idlePostDetach
 					}
@@ -2652,11 +2630,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 						idleTimeout = idleStreamingMax
 					}
 				}
-			}
-			if usingRawUserspaceReader {
-				pipelineMarkerUserspaceRawReaderHits.Add(1)
-			} else {
-				pipelineMarkerUserspaceTLSReaderHits.Add(1)
 			}
 			timer.Update()
 			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
@@ -2679,141 +2652,35 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		if err != nil {
 			decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				if shouldRetryVisionPostDetachTransition(readerConn, writerConn, decision.UserspaceBytes, dnsControlPlaneFlow, deferredTLSActive, deferredPhaseActive) {
-					phase = userspacePhasePostDetach
-					idleTimeout = idlePostDetach
-					setUserspaceTimerTimeout(idleTimeout)
-					decision.Reason = pipeline.ReasonDefault
-					postDetachRetrySeen = true
-					errors.LogDebug(ctx, "[kind=vision.post_detach_retry] deferred TLS cleared during response wait; retrying with post-detach budget")
+				if phase == copyLoopPhaseAwaitSignal && inboundGate == session.CopyGatePendingDetach {
 					continue
 				}
-				if phase == userspacePhasePreDetach && applyVisionStableUserspaceGateDecision(&decision, inbound, outbounds) {
-					if decision.CopyGateReason == pipeline.CopyGateReasonVisionUplinkComplete {
-						phase = userspacePhaseInferredNoDetach
-						idleTimeout = idleInferredNoDetach
-					} else {
-						phase = userspacePhaseNoDetach
-						idleTimeout = idleNoDetach
-					}
-					setUserspaceTimerTimeout(idleTimeout)
-					errors.LogDebug(ctx, "[kind=vision.stable_userspace_handoff] Vision flow confirmed for stable userspace path during response wait")
-					continue
-				}
-				if preDetachCompatibilityWait && time.Since(userspaceStart) < idleTimeout {
-					continue
-				}
-				now := time.Now()
-				if remaining, ok := shouldDeferVisionFirstByteTimeout(writerConn, decision.UserspaceBytes, dnsControlPlaneFlow, deferredTLSActive, preDetachHeuristicActive, userspaceStart, now); ok {
-					if !loggedFirstByteGrace {
-						loggedFirstByteGrace = true
-						errors.LogDebug(ctx, "[kind=vision.userspace_first_byte_grace] deferring zero-byte response timeout while uplink remains active")
-					}
-					idleTimeout = remaining
-					setUserspaceTimerTimeout(idleTimeout)
-					continue
-				}
-				if shouldPromoteVisionNoDetachResponsePhase(writerConn, decision.UserspaceBytes, dnsControlPlaneFlow, deferredTLSActive, preDetachHeuristicActive, now) {
-					errors.LogDebug(ctx, "[kind=vision.uplink_quiesce_handoff] uplink has gone quiet without direct-copy signal; telemetry only for main-client compatibility")
-				}
-				if phase == userspacePhasePreDetach &&
-					decision.UserspaceBytes == 0 &&
-					!dnsControlPlaneFlow &&
-					!debugVisionExplicitOnly() &&
-					visionControlUserspaceCompatible(outbounds) {
-					phase = userspacePhaseControlCompat
-					idleTimeout = idleControlCompat
-					setUserspaceTimerTimeout(idleTimeout)
-					decision.Path = pipeline.PathUserspace
-					decision.Reason = pipeline.ReasonVisionControlUserspace
-					errors.LogDebug(ctx, "[kind=vision.control_userspace_handoff] control-compatible flow stayed command=0; granting bounded local response window before final timeout")
-					continue
-				}
-				if dnsControlPlaneFlow && decision.UserspaceBytes == 0 {
-					pipelineMarkerDNSGuardZeroByteTimeout.Add(1)
-					decision.DNSGuardZeroByteTimeout = true
-				}
-				if !dnsControlPlaneFlow {
-					if phase == userspacePhaseNoDetach {
-						decision.Reason = pipeline.ReasonUserspaceNoDetachIdleTimeout
-					} else if phase == userspacePhaseControlCompat {
-						decision.Reason = pipeline.ReasonVisionControlUserspace
-					} else if phase == userspacePhaseInferredNoDetach {
-						decision.Reason = pipeline.ReasonVisionUplinkCompleteUserspace
-					} else {
-						decision.Reason = pipeline.ReasonUserspaceIdleTimeout
-					}
-				} else {
-					switch dnsFlowClass {
-					case session.DNSFlowClassTCPControl, session.DNSFlowClassUDPControl:
-						decision.Reason = pipeline.ReasonControlPlaneDNSGuard
-					default:
-						decision.Reason = pipeline.ReasonLoopbackDNSGuard
-					}
-				}
-				decision.Path = pipeline.PathUserspace
-				applyUserspaceExit(&decision, err, phase == userspacePhaseNoDetach || phase == userspacePhaseInferredNoDetach || isStableUserspaceReason(decision.Reason))
-				// Treat idle timeout as clean close to avoid marking failures upstream.
-				return io.EOF
+				return finishUserspaceTimeout()
+			}
+			if phase == copyLoopPhaseAwaitSignal && committedVisionSemanticPhase(inbound, outbounds) == session.VisionSemanticPhaseNoDetach {
+				applyStableNoDetachDecision()
 			}
 			if errors.Cause(err) == io.EOF {
-				if shouldRetryVisionPostDetachTransition(readerConn, writerConn, decision.UserspaceBytes, dnsControlPlaneFlow, deferredTLSActive, deferredPhaseActive) {
-					phase = userspacePhasePostDetach
-					idleTimeout = idlePostDetach
-					setUserspaceTimerTimeout(idleTimeout)
-					decision.Reason = pipeline.ReasonDefault
-					postDetachRetrySeen = true
-					errors.LogDebug(ctx, "[kind=vision.post_detach_eof_retry] deferred TLS cleared on EOF; retrying with post-detach budget")
-					continue
-				}
-				if phase == userspacePhasePreDetach && applyVisionStableUserspaceGateDecision(&decision, inbound, outbounds) {
-					if decision.CopyGateReason == pipeline.CopyGateReasonVisionUplinkComplete {
-						phase = userspacePhaseInferredNoDetach
-						idleTimeout = idleInferredNoDetach
-					} else {
-						phase = userspacePhaseNoDetach
-						idleTimeout = idleNoDetach
-					}
-					setUserspaceTimerTimeout(idleTimeout)
-				}
-				if (phase == userspacePhaseNoDetach || phase == userspacePhaseInferredNoDetach || phase == userspacePhaseControlCompat) &&
+				if phase == copyLoopPhaseUserspaceOnly &&
 					(decision.Reason == pipeline.ReasonDefault || decision.Reason == pipeline.ReasonDeferredTLSGuard) {
 					decision.Reason = pipeline.ReasonVisionNoDetachUserspace
-					if phase == userspacePhaseInferredNoDetach {
-						decision.Reason = pipeline.ReasonVisionUplinkCompleteUserspace
-					} else if phase == userspacePhaseControlCompat {
-						decision.Reason = pipeline.ReasonVisionControlUserspace
-					}
 					decision.Path = pipeline.PathUserspace
 				}
 				if decision.Reason == pipeline.ReasonDefault {
 					decision.Reason = pipeline.ReasonUserspaceComplete
 					decision.Path = pipeline.PathUserspace
 				}
-				applyUserspaceExit(&decision, err, phase == userspacePhaseNoDetach || phase == userspacePhaseInferredNoDetach || phase == userspacePhaseControlCompat || isStableUserspaceReason(decision.Reason))
+				applyUserspaceExit(&decision, err, phase == copyLoopPhaseUserspaceOnly)
+				maybeReportNativeDeferredRuntimeRegression(ctx, inbound, outbounds, phase, deferredTLSActive, readerStillUsesDeferredTLS, writerStillUsesDeferredTLS, &decision)
 				return nil
 			}
-			if phase == userspacePhasePreDetach && applyVisionStableUserspaceGateDecision(&decision, inbound, outbounds) {
-				if decision.CopyGateReason == pipeline.CopyGateReasonVisionUplinkComplete {
-					phase = userspacePhaseInferredNoDetach
-					idleTimeout = idleInferredNoDetach
-				} else {
-					phase = userspacePhaseNoDetach
-					idleTimeout = idleNoDetach
-				}
-				setUserspaceTimerTimeout(idleTimeout)
-			}
-			if (phase == userspacePhaseNoDetach || phase == userspacePhaseInferredNoDetach || phase == userspacePhaseControlCompat) &&
+			if phase == copyLoopPhaseUserspaceOnly &&
 				(decision.Reason == pipeline.ReasonDefault || decision.Reason == pipeline.ReasonDeferredTLSGuard) {
 				decision.Reason = pipeline.ReasonVisionNoDetachUserspace
-				if phase == userspacePhaseInferredNoDetach {
-					decision.Reason = pipeline.ReasonVisionUplinkCompleteUserspace
-				} else if phase == userspacePhaseControlCompat {
-					decision.Reason = pipeline.ReasonVisionControlUserspace
-				}
 				decision.Path = pipeline.PathUserspace
 			}
-			applyUserspaceExit(&decision, err, phase == userspacePhaseNoDetach || phase == userspacePhaseInferredNoDetach || phase == userspacePhaseControlCompat || isStableUserspaceReason(decision.Reason))
+			applyUserspaceExit(&decision, err, phase == copyLoopPhaseUserspaceOnly)
+			maybeReportNativeDeferredRuntimeRegression(ctx, inbound, outbounds, phase, deferredTLSActive, readerStillUsesDeferredTLS, writerStillUsesDeferredTLS, &decision)
 			return err
 		}
 		decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
@@ -2894,26 +2761,6 @@ func appendCryptoHintSource(source, step string) string {
 	return source + " -> " + step
 }
 
-func RecordPipelineFlowMix(ctx context.Context, destNet net.Network, allowedNet net.Network) {
-	switch {
-	case destNet == net.Network_TCP && allowedNet == net.Network_UDP:
-		pipelineMarkerFlowMuxUDP.Add(1)
-	case destNet == net.Network_TCP && allowedNet == net.Network_Unknown:
-		pipelineMarkerFlowPureTCP.Add(1)
-	case destNet == net.Network_TCP && allowedNet == net.Network_TCP:
-		pipelineMarkerFlowMuxTCP.Add(1)
-	default:
-		pipelineMarkerFlowOther.Add(1)
-	}
-}
-
-func maybeLogPipelineRuntimeSummary(ctx context.Context) {
-	if pipelineTelemetryV2Enabled() {
-		return
-	}
-	// Legacy runtime summary logging has been replaced by v2 telemetry markers.
-}
-
 func logStartupHealth() {
 	ctx := context.Background()
 	bpffsMounted := false
@@ -2945,317 +2792,20 @@ func logStartupHealth() {
 	)
 }
 
-func markerSnapshot(total *atomic.Uint64, last *atomic.Uint64) (current uint64, delta uint64) {
-	current = total.Load()
-	prev := last.Swap(current)
-	if current >= prev {
-		delta = current - prev
-	}
-	return current, delta
-}
-
-func fmtMarkerWithDelta(current, delta uint64) string {
-	if delta == 0 {
-		return strconv.FormatUint(current, 10)
-	}
-	return strconv.FormatUint(current, 10) + "(+" + strconv.FormatUint(delta, 10) + ")"
-}
-
-func fmtAverageNanos(total uint64, count uint64) string {
-	if count == 0 {
-		return "0"
-	}
-	return strconv.FormatUint(total/count, 10)
-}
-
-func recordSpliceHistogram(bytes uint64, durationNs uint64) {
-	switch {
-	case bytes < 4*1024:
-		pipelineMarkerSpliceBytesLt4K.Add(1)
-	case bytes < 64*1024:
-		pipelineMarkerSpliceBytes4KTo64K.Add(1)
-	case bytes < 1024*1024:
-		pipelineMarkerSpliceBytes64KTo1M.Add(1)
-	default:
-		pipelineMarkerSpliceBytesGe1M.Add(1)
-	}
-	switch {
-	case durationNs < uint64(time.Millisecond):
-		pipelineMarkerSpliceDurLt1ms.Add(1)
-	case durationNs < uint64(5*time.Millisecond):
-		pipelineMarkerSpliceDur1To5ms.Add(1)
-	case durationNs < uint64(20*time.Millisecond):
-		pipelineMarkerSpliceDur5To20ms.Add(1)
-	case durationNs < uint64(100*time.Millisecond):
-		pipelineMarkerSpliceDur20To100ms.Add(1)
-	default:
-		pipelineMarkerSpliceDurGe100ms.Add(1)
-	}
-}
-
-func recordRawUnwrapToDetachHistogram(durationNs uint64) {
-	switch {
-	case durationNs < uint64(5*time.Millisecond):
-		pipelineMarkerRawUnwrapToDetachLt5ms.Add(1)
-	case durationNs < uint64(20*time.Millisecond):
-		pipelineMarkerRawUnwrapToDetach5To20ms.Add(1)
-	case durationNs < uint64(100*time.Millisecond):
-		pipelineMarkerRawUnwrapToDetach20To100ms.Add(1)
-	default:
-		pipelineMarkerRawUnwrapToDetachGe100ms.Add(1)
-	}
-}
-
-func recordDNSGuardFirstResponseHistogram(durationNs uint64) {
-	switch {
-	case durationNs < uint64(20*time.Millisecond):
-		pipelineMarkerDNSGuardFirstRespLt20ms.Add(1)
-	case durationNs < uint64(100*time.Millisecond):
-		pipelineMarkerDNSGuardFirstResp20To100ms.Add(1)
-	case durationNs < uint64(time.Second):
-		pipelineMarkerDNSGuardFirstResp100msTo1s.Add(1)
-	default:
-		pipelineMarkerDNSGuardFirstRespGe1s.Add(1)
-	}
-}
-
-// visionNoDetachGuardEnabled determines whether the no-detach watchdog should
-// run for the current splice decision, based on inbound/outbound splice hints.
-func visionNoDetachGuardEnabled(inbound *session.Inbound, outbounds []*session.Outbound) bool {
-	if inbound == nil {
-		return false
-	}
-	if inbound.GetCanSpliceCopy() == session.CopyGateForcedUserspace || inbound.GetCanSpliceCopy() == session.CopyGateNotApplicable {
-		return false
+func committedVisionSemanticPhase(inbound *session.Inbound, outbounds []*session.Outbound) session.VisionSemanticPhase {
+	phase := session.VisionSemanticPhaseUnset
+	if inbound != nil && inbound.VisionSemanticPhase() > phase {
+		phase = inbound.VisionSemanticPhase()
 	}
 	for _, ob := range outbounds {
-		if ob != nil && (ob.GetCanSpliceCopy() == session.CopyGateForcedUserspace || ob.GetCanSpliceCopy() == session.CopyGateNotApplicable) {
-			return false
-		}
-	}
-	return true
-}
-
-func clearVisionTelemetryTimestamps(conns ...gonet.Conn) {
-	for _, conn := range conns {
-		dc := unwrapVisionDeferredConn(conn)
-		if dc == nil {
-			continue
-		}
-		pipelineVisionRawUnwrapUnixByConn.Delete(dc)
-		pipelineVisionDetachUnixByConn.Delete(dc)
-		pipelineVisionUplinkUnixByConn.Delete(dc)
-		pipelineVisionDetachFutureByConn.Delete(dc)
-		pipelineVisionResponseWakeByConn.Delete(dc)
-	}
-}
-
-func storeVisionRawUnwrapWarningTimestamp(conn gonet.Conn, unixNano int64) {
-	if unixNano <= 0 {
-		return
-	}
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
-		return
-	}
-	if _, loaded := pipelineVisionRawUnwrapUnixByConn.LoadOrStore(dc, unixNano); loaded {
-		return
-	}
-}
-
-func consumeVisionRawUnwrapWarningTimestamp(conn gonet.Conn) (int64, bool) {
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
-		return 0, false
-	}
-	value, ok := pipelineVisionRawUnwrapUnixByConn.LoadAndDelete(dc)
-	if !ok {
-		return 0, false
-	}
-	unixNano, ok := value.(int64)
-	if !ok || unixNano <= 0 {
-		return 0, false
-	}
-	return unixNano, true
-}
-
-func storeVisionUplinkTimestamp(conn gonet.Conn, unixNano int64) {
-	if unixNano <= 0 {
-		return
-	}
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
-		return
-	}
-	pipelineVisionUplinkUnixByConn.Store(dc, unixNano)
-}
-
-func loadVisionUplinkTimestamp(conn gonet.Conn) (int64, bool) {
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
-		return 0, false
-	}
-	value, ok := pipelineVisionUplinkUnixByConn.Load(dc)
-	if !ok {
-		return 0, false
-	}
-	unixNano, ok := value.(int64)
-	if !ok || unixNano <= 0 {
-		return 0, false
-	}
-	return unixNano, true
-}
-
-func remainingVisionUplinkGraceAt(conn gonet.Conn, grace time.Duration, now time.Time) time.Duration {
-	if grace <= 0 || now.IsZero() {
-		return 0
-	}
-	unixNano, ok := loadVisionUplinkTimestamp(conn)
-	if !ok {
-		return 0
-	}
-	age := now.Sub(time.Unix(0, unixNano))
-	if age < 0 {
-		age = 0
-	}
-	if age >= grace {
-		return 0
-	}
-	return grace - age
-}
-
-func shouldDeferVisionFirstByteTimeout(conn gonet.Conn, userspaceBytes int64, dnsControlPlaneFlow bool, deferredTLSActive bool, deferredPhaseActive bool, userspaceStart time.Time, now time.Time) (time.Duration, bool) {
-	if conn == nil || userspaceBytes != 0 || dnsControlPlaneFlow || !deferredTLSActive || !deferredPhaseActive || userspaceStart.IsZero() || now.IsZero() {
-		return 0, false
-	}
-	elapsed := now.Sub(userspaceStart)
-	if elapsed < 0 || elapsed >= visionFirstResponseMax {
-		return 0, false
-	}
-	remaining := remainingVisionUplinkGraceAt(conn, visionFirstResponseGrace, now)
-	if remaining <= 0 {
-		return 0, false
-	}
-	if maxRemaining := visionFirstResponseMax - elapsed; remaining > maxRemaining {
-		remaining = maxRemaining
-	}
-	if remaining <= 0 {
-		return 0, false
-	}
-	if remaining < 100*time.Millisecond {
-		remaining = 100 * time.Millisecond
-	}
-	return remaining, true
-}
-
-func shouldPromoteVisionNoDetachResponsePhase(conn gonet.Conn, userspaceBytes int64, dnsControlPlaneFlow bool, deferredTLSActive bool, deferredPhaseActive bool, now time.Time) bool {
-	if conn == nil || userspaceBytes != 0 || dnsControlPlaneFlow || !deferredTLSActive || !deferredPhaseActive || now.IsZero() {
-		return false
-	}
-	unixNano, ok := loadVisionUplinkTimestamp(conn)
-	if !ok {
-		return false
-	}
-	age := now.Sub(time.Unix(0, unixNano))
-	if age < 0 {
-		age = 0
-	}
-	return age >= visionUplinkQuietWindow
-}
-
-var visionDeferredTLSRequiredFn = deferredConnRequiresTLS
-
-func shouldRetryVisionPostDetachTransition(readerConn, writerConn gonet.Conn, userspaceBytes int64, dnsControlPlaneFlow bool, deferredTLSActive bool, deferredPhaseActive bool) bool {
-	if userspaceBytes != 0 || dnsControlPlaneFlow || !deferredTLSActive || !deferredPhaseActive {
-		return false
-	}
-	return !visionDeferredTLSRequiredFn(readerConn) && !visionDeferredTLSRequiredFn(writerConn)
-}
-
-func visionUserspaceReasonForGate(gateReason pipeline.CopyGateReason) string {
-	switch gateReason {
-	case pipeline.CopyGateReasonVisionUplinkComplete:
-		return pipeline.ReasonVisionUplinkCompleteUserspace
-	case pipeline.CopyGateReasonVisionNoDetach:
-		return pipeline.ReasonVisionNoDetachUserspace
-	default:
-		return pipeline.ReasonVisionNoDetachUserspace
-	}
-}
-
-func isStableUserspaceReason(reason string) bool {
-	switch reason {
-	case pipeline.ReasonVisionNoDetachUserspace,
-		pipeline.ReasonVisionControlUserspace,
-		pipeline.ReasonVisionUplinkCompleteUserspace,
-		pipeline.ReasonVisionCommandContinueUserspace:
-		return true
-	default:
-		return false
-	}
-}
-
-func visionControlUserspaceCompatible(outbounds []*session.Outbound) bool {
-	for i := len(outbounds) - 1; i >= 0; i-- {
-		ob := outbounds[i]
 		if ob == nil {
 			continue
 		}
-		dest := ob.Target
-		if !dest.IsValid() {
-			dest = ob.RouteTarget
-		}
-		if !dest.IsValid() {
-			dest = ob.OriginalTarget
-		}
-		if !dest.IsValid() {
-			continue
-		}
-		return dest.Network == net.Network_TCP && dest.Port == net.Port(5222)
-	}
-	return false
-}
-
-func visionStableUserspaceGateActive(inbound *session.Inbound, outbounds []*session.Outbound) (pipeline.CopyGateState, pipeline.CopyGateReason, bool) {
-	if inbound != nil && inbound.GetCanSpliceCopy() == session.CopyGateForcedUserspace {
-		if inbound.CopyGateReason() == session.CopyGateReasonVisionNoDetach {
-			return pipeline.CopyGateForcedUserspace, pipeline.CopyGateReasonVisionNoDetach, true
+		if ob.VisionSemanticPhase() > phase {
+			phase = ob.VisionSemanticPhase()
 		}
 	}
-	for _, ob := range outbounds {
-		if ob == nil || ob.GetCanSpliceCopy() != session.CopyGateForcedUserspace {
-			continue
-		}
-		if ob.CopyGateReason() == session.CopyGateReasonVisionNoDetach {
-			return pipeline.CopyGateForcedUserspace, pipeline.CopyGateReasonVisionNoDetach, true
-		}
-	}
-	if inbound != nil && inbound.GetCanSpliceCopy() == session.CopyGateForcedUserspace {
-		if inbound.CopyGateReason() == session.CopyGateReasonVisionUplinkComplete {
-			return pipeline.CopyGateForcedUserspace, pipeline.CopyGateReasonVisionUplinkComplete, true
-		}
-	}
-	for _, ob := range outbounds {
-		if ob == nil || ob.GetCanSpliceCopy() != session.CopyGateForcedUserspace {
-			continue
-		}
-		if ob.CopyGateReason() == session.CopyGateReasonVisionUplinkComplete {
-			return pipeline.CopyGateForcedUserspace, pipeline.CopyGateReasonVisionUplinkComplete, true
-		}
-	}
-	return pipeline.CopyGateUnset, pipeline.CopyGateReasonUnspecified, false
-}
-
-func applyVisionStableUserspaceGateDecision(decision *pipeline.DecisionSnapshot, inbound *session.Inbound, outbounds []*session.Outbound) bool {
-	gate, gateReason, ok := visionStableUserspaceGateActive(inbound, outbounds)
-	if !ok {
-		return false
-	}
-	decision.Path = pipeline.PathUserspace
-	decision.Reason = visionUserspaceReasonForGate(gateReason)
-	decision.CopyGateState = gate
-	decision.CopyGateReason = gateReason
-	return true
+	return phase
 }
 
 func isLocalUserspaceClose(err error) bool {
@@ -3315,33 +2865,6 @@ func applyUserspaceExit(decision *pipeline.DecisionSnapshot, err error, stableUs
 	}
 }
 
-func storeVisionDetachTimestamp(conn gonet.Conn, unixNano int64) {
-	if unixNano <= 0 {
-		return
-	}
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
-		return
-	}
-	pipelineVisionDetachUnixByConn.Store(dc, unixNano)
-}
-
-func consumeVisionDetachTimestamp(conn gonet.Conn) (int64, bool) {
-	dc := unwrapVisionDeferredConn(conn)
-	if dc == nil {
-		return 0, false
-	}
-	value, ok := pipelineVisionDetachUnixByConn.LoadAndDelete(dc)
-	if !ok {
-		return 0, false
-	}
-	unixNano, ok := value.(int64)
-	if !ok || unixNano <= 0 {
-		return 0, false
-	}
-	return unixNano, true
-}
-
 func deferredConnRequiresTLS(conn gonet.Conn) bool {
 	dc := unwrapVisionDeferredConn(conn)
 	if dc == nil {
@@ -3367,38 +2890,9 @@ func isExpectedSpliceReadFromError(err error) bool {
 		goerrors.Is(cause, syscall.ESHUTDOWN)
 }
 
-func recordSpliceExpectedTeardownClass(err error) {
-	cause := errors.Cause(err)
-	if cause == nil {
-		cause = err
-	}
-	switch {
-	case goerrors.Is(cause, io.ErrClosedPipe) || goerrors.Is(cause, syscall.EPIPE):
-		pipelineMarkerSpliceExpectedBrokenPipe.Add(1)
-	case goerrors.Is(cause, syscall.ECONNRESET):
-		pipelineMarkerSpliceExpectedConnReset.Add(1)
-	case goerrors.Is(cause, gonet.ErrClosed):
-		pipelineMarkerSpliceExpectedClosedConn.Add(1)
-	case goerrors.Is(cause, context.Canceled):
-		pipelineMarkerSpliceExpectedCanceled.Add(1)
-	case goerrors.Is(cause, syscall.ENOTCONN):
-		pipelineMarkerSpliceExpectedNotConn.Add(1)
-	case goerrors.Is(cause, syscall.ESHUTDOWN):
-		pipelineMarkerSpliceExpectedShutdown.Add(1)
-	default:
-		pipelineMarkerSpliceExpectedOther.Add(1)
-	}
-}
+func recordSpliceExpectedTeardownClass(error) {}
 
-func recordSpliceUnexpectedReset(err error) {
-	cause := errors.Cause(err)
-	if cause == nil {
-		cause = err
-	}
-	if goerrors.Is(cause, syscall.EPIPE) || goerrors.Is(cause, syscall.ECONNRESET) {
-		pipelineMarkerSpliceExpectedBrokenPipe.Add(1) // reuse existing counter for visibility
-	}
-}
+func recordSpliceUnexpectedReset(error) {}
 
 func ktlsStateName(txReady, rxReady bool) string {
 	switch {

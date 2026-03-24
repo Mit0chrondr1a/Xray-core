@@ -3,9 +3,11 @@ package proxy
 import (
 	"context"
 	gonet "net"
+	"sync/atomic"
 
 	"github.com/pires/go-proxyproto"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/pipeline"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/proxy/vless/encryption"
@@ -16,6 +18,19 @@ import (
 
 var copyRawConnIfExistFn = CopyRawConnIfExist
 var fallbackRawHandoffEligibleFn = fallbackRawHandoffEligible
+
+type fallbackRuntimeRecoveryContextKey struct{}
+
+type fallbackRuntimeRecoveryMeta struct {
+	Tag                    string
+	FrontendTransport      string
+	FrontendTLSOffloadPath pipeline.TLSOffloadPath
+	State                  *fallbackRuntimeRecoveryState
+}
+
+type fallbackRuntimeRecoveryState struct {
+	reported atomic.Bool
+}
 
 func fallbackRawHandoffEligible(conn gonet.Conn) bool {
 	conn = stat.TryUnwrapStatsConn(conn)
@@ -39,6 +54,78 @@ func fallbackRawHandoffEligible(conn gonet.Conn) bool {
 	default:
 		return false
 	}
+}
+
+func fallbackRuntimeRecoveryTransport(conn gonet.Conn) (string, pipeline.TLSOffloadPath, bool) {
+	conn = stat.TryUnwrapStatsConn(conn)
+	switch c := conn.(type) {
+	case *tls.DeferredRustConn:
+		if c.IsDetached() {
+			return "deferred_rust", pipeline.TLSOffloadNotRequired, true
+		}
+		state := c.KTLSEnabled()
+		if state.TxReady && state.RxReady {
+			return "deferred_rust", pipeline.TLSOffloadKTLS, true
+		}
+		return "deferred_rust", pipeline.TLSOffloadUserspace, true
+	case *tls.RustConn:
+		state := c.KTLSEnabled()
+		if state.TxReady && state.RxReady {
+			return "rust", pipeline.TLSOffloadKTLS, true
+		}
+		return "rust", pipeline.TLSOffloadUserspace, true
+	case *tls.Conn:
+		state := c.KTLSEnabled()
+		if state.TxReady && state.RxReady {
+			return "go_tls", pipeline.TLSOffloadKTLS, true
+		}
+		return "go_tls", pipeline.TLSOffloadUserspace, true
+	default:
+		return "", pipeline.TLSOffloadUnknown, false
+	}
+}
+
+func withFallbackRuntimeRecoveryContext(ctx context.Context, inbound *session.Inbound, clientConn gonet.Conn) context.Context {
+	if inbound == nil || inbound.Tag == "" || clientConn == nil {
+		return ctx
+	}
+	transport, tlsOffloadPath, ok := fallbackRuntimeRecoveryTransport(clientConn)
+	if !ok {
+		return ctx
+	}
+	if meta, ok := fallbackRuntimeRecoveryMetaFromContext(ctx); ok {
+		if meta.State == nil {
+			meta.State = &fallbackRuntimeRecoveryState{}
+		}
+		if meta.Tag == inbound.Tag &&
+			meta.FrontendTransport == transport &&
+			meta.FrontendTLSOffloadPath == tlsOffloadPath {
+			return ctx
+		}
+		meta.Tag = inbound.Tag
+		meta.FrontendTransport = transport
+		meta.FrontendTLSOffloadPath = tlsOffloadPath
+		return context.WithValue(ctx, fallbackRuntimeRecoveryContextKey{}, meta)
+	}
+	meta := fallbackRuntimeRecoveryMeta{
+		Tag:                    inbound.Tag,
+		FrontendTransport:      transport,
+		FrontendTLSOffloadPath: tlsOffloadPath,
+		State:                  &fallbackRuntimeRecoveryState{},
+	}
+	return context.WithValue(ctx, fallbackRuntimeRecoveryContextKey{}, meta)
+}
+
+// WithFallbackRuntimeRecoveryContext annotates a fallback parent context once so
+// both request/response raw-handoff legs share the same native recovery state.
+func WithFallbackRuntimeRecoveryContext(ctx context.Context, clientConn gonet.Conn) context.Context {
+	inbound := session.InboundFromContext(ctx)
+	return withFallbackRuntimeRecoveryContext(ctx, inbound, clientConn)
+}
+
+func fallbackRuntimeRecoveryMetaFromContext(ctx context.Context) (fallbackRuntimeRecoveryMeta, bool) {
+	meta, ok := ctx.Value(fallbackRuntimeRecoveryContextKey{}).(fallbackRuntimeRecoveryMeta)
+	return meta, ok
 }
 
 func fallbackRawCopyContext(ctx context.Context, clientConn, backendConn gonet.Conn) (context.Context, bool) {
@@ -65,6 +152,7 @@ func fallbackRawCopyContext(ctx context.Context, clientConn, backendConn gonet.C
 
 	copyCtx := session.ContextWithInbound(ctx, &clonedInbound)
 	copyCtx = session.ContextWithOutbounds(copyCtx, []*session.Outbound{outbound})
+	copyCtx = withFallbackRuntimeRecoveryContext(copyCtx, inbound, clientConn)
 	return copyCtx, true
 }
 
@@ -102,6 +190,7 @@ func CopyFallbackRequest(ctx context.Context, clientConn, backendConn gonet.Conn
 	if err := flushFallbackBufferedPrelude(reader, writer, timer); err != nil {
 		return err
 	}
+	maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff(copyCtx, "request")
 	return copyRawConnIfExistFn(copyCtx, clientConn, backendConn, writer, timer, nil)
 }
 
@@ -112,5 +201,6 @@ func CopyFallbackResponse(ctx context.Context, backendConn, clientConn gonet.Con
 	if !rawEligible {
 		return copyFallbackUserspace(buf.NewReader(backendConn), writer, timer)
 	}
+	maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff(copyCtx, "response")
 	return copyRawConnIfExistFn(copyCtx, backendConn, clientConn, writer, timer, nil)
 }

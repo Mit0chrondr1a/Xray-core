@@ -40,15 +40,3 @@ func TestCopyGateReasonVisionNoDetachString(t *testing.T) {
 		t.Fatalf("reason string=%q, want %q", got, "vision_no_detach")
 	}
 }
-
-func TestCopyGateReasonVisionUplinkCompleteString(t *testing.T) {
-	if got := CopyGateReasonVisionUplinkComplete.String(); got != "vision_uplink_complete" {
-		t.Fatalf("reason string=%q, want %q", got, "vision_uplink_complete")
-	}
-}
-
-func TestCopyGateReasonVisionCommandContinueString(t *testing.T) {
-	if got := CopyGateReasonVisionCommandContinue.String(); got != "vision_command_continue" {
-		t.Fatalf("reason string=%q, want %q", got, "vision_command_continue")
-	}
-}

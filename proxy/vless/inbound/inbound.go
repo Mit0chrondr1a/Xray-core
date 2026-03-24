@@ -48,7 +48,44 @@ import (
 var (
 	reverseOutboundWaitTimeout  = 5 * time.Second
 	reverseOutboundPollInterval = 200 * time.Millisecond
+	visionInputFieldType        = reflect.TypeOf(bytes.Reader{})
+	visionRawInputFieldType     = reflect.TypeOf(bytes.Buffer{})
 )
+
+func resolveVisionInternalReaders(t reflect.Type, base uintptr) (*bytes.Reader, *bytes.Buffer, error) {
+	if t == nil {
+		return nil, nil, nil
+	}
+	inputField, inputOK := t.FieldByName("input")
+	rawInputField, rawInputOK := t.FieldByName("rawInput")
+	if !inputOK || !rawInputOK {
+		return nil, nil, errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+	}
+	if inputField.Type != visionInputFieldType || rawInputField.Type != visionRawInputFieldType {
+		return nil, nil, errors.New(
+			"XTLS Vision internal layout mismatch for ", t.String(),
+			": unexpected input/rawInput types (input=", inputField.Type.String(),
+			", rawInput=", rawInputField.Type.String(), ")",
+		).AtWarning()
+	}
+	input := (*bytes.Reader)(unsafe.Pointer(base + inputField.Offset))
+	rawInput := (*bytes.Buffer)(unsafe.Pointer(base + rawInputField.Offset))
+	return input, rawInput, nil
+}
+
+func applyVisionExecutionGate(inbound *session.Inbound, deferredVisionPath bool) {
+	if inbound == nil {
+		return
+	}
+	if deferredVisionPath {
+		inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+		return
+	}
+	// The legacy Go TLS/REALITY path does not have a reliable detach signal
+	// boundary. Keep it on the userspace path from the start instead of sending
+	// the generic copy loop into pending-detach prediction mode.
+	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonUnspecified)
+}
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
@@ -353,9 +390,37 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				alpn = cs.NegotiatedProtocol
 				errors.LogInfo(ctx, "realName = "+name)
 				errors.LogInfo(ctx, "realAlpn = "+alpn)
+				inbound := session.InboundFromContext(ctx)
+				tag := ""
+				if inbound != nil {
+					tag = inbound.Tag
+				}
 				if outcome, ktlsErr := dc.EnableKTLSOutcome(); ktlsErr != nil {
 					return errors.New("deferred kTLS enable failed in fallback").Base(ktlsErr).AtWarning()
+				} else if outcome.Status == tls.KTLSPromotionEnabled {
+					errors.LogInfo(
+						ctx,
+						"[kind=fallback.ktls_enabled] tag=",
+						tag,
+						" transport=deferred_rust status=",
+						outcome.Status.String(),
+						" server_name=",
+						name,
+						" alpn=",
+						alpn,
+					)
 				} else if outcome.Status != tls.KTLSPromotionEnabled {
+					errors.LogWarning(
+						ctx,
+						"[kind=fallback.ktls_status] tag=",
+						tag,
+						" transport=deferred_rust status=",
+						outcome.Status.String(),
+						" server_name=",
+						name,
+						" alpn=",
+						alpn,
+					)
 					errors.LogWarning(ctx, "deferred kTLS not enabled in fallback path: ", outcome.Status)
 					// Continue on rustls; handle is still valid.
 				}
@@ -532,6 +597,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				return nil
 			}
 
+			ctx = proxy.WithFallbackRuntimeRecoveryContext(ctx, connection)
+
 			if err := task.Run(ctx, task.OnSuccess(postRequest, task.Close(serverWriter)), task.OnSuccess(getResponse, task.Close(writer))); err != nil {
 				common.Interrupt(serverReader)
 				common.Interrupt(serverWriter)
@@ -581,7 +648,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	switch requestAddons.Flow {
 	case vless.XRV:
 		if account.Flow == requestAddons.Flow {
-			inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 			switch request.Command {
 			case protocol.RequestCommandUDP:
 				return errors.New(requestAddons.Flow + " doesn't support UDP").AtWarning()
@@ -622,14 +688,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
 				if t != nil {
-					i, iOK := t.FieldByName("input")
-					r, rOK := t.FieldByName("rawInput")
-					if !iOK || !rOK {
-						return errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+					var layoutErr error
+					input, rawInput, layoutErr = resolveVisionInternalReaders(t, p)
+					if layoutErr != nil {
+						return layoutErr
 					}
-					input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-					rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 				}
+				applyVisionExecutionGate(inbound, deferredVisionPath)
 			}
 		} else {
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
@@ -691,9 +756,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 	visionReaderCtx := ctx
 	visionWriterCtx := ctx
+	var visionSignalCh chan session.VisionSignal
 	// Vision uplink/downlink processing can run concurrently, so each direction
 	// needs its own arena because buf.Arena is not thread-safe.
 	if requestAddons.Flow == vless.XRV {
+		visionSignalCh = make(chan session.VisionSignal, 1)
+		ctx = session.ContextWithVisionSignal(ctx, visionSignalCh)
+		ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
 		readerArena := buf.NewArena(8 * buf.Size)
 		writerArena := buf.NewArena(8 * buf.Size)
 		visionReaderCtx = buf.ContextWithArena(ctx, readerArena)
@@ -713,7 +782,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
 	if requestAddons.Flow == vless.XRV && !bypassVision {
-		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, connection, input, rawInput, nil)
+		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, connection, visionSignalCh, input, rawInput, nil)
 	}
 
 	bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))

@@ -38,6 +38,10 @@ const (
 	nativeSkipReasonDebugDisabled           = "debug_disable_native_reality"
 )
 
+const (
+	nativeRealityModeEnv = "XRAY_DEBUG_NATIVE_REALITY_MODE"
+)
+
 type nativeAttemptOutcome string
 
 const (
@@ -46,6 +50,8 @@ const (
 	nativeAttemptOutcomePeekTimeout  nativeAttemptOutcome = "peek_timeout"
 	nativeAttemptOutcomePeerAbort    nativeAttemptOutcome = "peer_abort"
 	nativeAttemptOutcomeInternalFail nativeAttemptOutcome = "internal_error"
+	nativeAttemptOutcomeRuntimeFail  nativeAttemptOutcome = "runtime_regression"
+	nativeAttemptOutcomeRuntimeOK    nativeAttemptOutcome = "runtime_recovery"
 )
 
 type nativeAttemptDecision struct {
@@ -54,6 +60,7 @@ type nativeAttemptDecision struct {
 	AllowFallback    bool
 	TelemetryEnforce bool
 	BreakerState     string
+	BreakerCause     string
 	SkipReason       string
 	SkipByPolicy     bool
 	SkipByBreaker    bool
@@ -66,6 +73,7 @@ type nativeBreakerConfig struct {
 	enabled               bool
 	peekTimeoutThreshold  uint32
 	internalErrThreshold  uint32
+	runtimeErrThreshold   uint32
 	window                time.Duration
 	cooldown              time.Duration
 	halfOpenProbeInterval time.Duration
@@ -77,10 +85,17 @@ type nativePathCircuitBreaker struct {
 	config nativeBreakerConfig
 
 	state string
+	cause nativeAttemptOutcome
 
-	windowStart      time.Time
-	peekTimeoutCount uint32
-	internalErrCount uint32
+	windowStart        time.Time
+	runtimeWindowStart time.Time
+	lastOutcomeAt      time.Time
+	lastRuntimeFailAt  time.Time
+	peekTimeoutCount   uint32
+	internalErrCount   uint32
+	runtimeErrCount    uint32
+	runtimeOpenStreak  uint32
+	runtimeOKCount     uint32
 
 	openUntil   time.Time
 	nextProbeAt time.Time
@@ -111,6 +126,9 @@ func defaultNativePathPolicy() *reality.NativePathPolicy {
 func effectiveNativePathPolicy(cfg *reality.Config) *reality.NativePathPolicy {
 	base := defaultNativePathPolicy()
 	if cfg == nil || cfg.GetNativePathPolicy() == nil {
+		if override, ok := debugNativePathModeOverride(); ok {
+			base.Mode = override
+		}
 		return base
 	}
 	in := cfg.GetNativePathPolicy()
@@ -135,7 +153,30 @@ func effectiveNativePathPolicy(cfg *reality.Config) *reality.NativePathPolicy {
 			base.Breaker.HalfOpenProbeIntervalSeconds = in.GetBreaker().GetHalfOpenProbeIntervalSeconds()
 		}
 	}
+	if override, ok := debugNativePathModeOverride(); ok {
+		base.Mode = override
+	}
 	return base
+}
+
+func debugNativePathModeOverride() (reality.NativePathMode, bool) {
+	raw := strings.TrimSpace(os.Getenv(nativeRealityModeEnv))
+	if raw == "" {
+		return reality.NativePathMode_AUTO, false
+	}
+	normalized := strings.ToUpper(strings.ReplaceAll(raw, "-", "_"))
+	switch normalized {
+	case "AUTO":
+		return reality.NativePathMode_AUTO, true
+	case "PREFER_NATIVE", "PREFER":
+		return reality.NativePathMode_PREFER_NATIVE, true
+	case "FORCE_NATIVE", "FORCE":
+		return reality.NativePathMode_FORCE_NATIVE, true
+	case "DISABLE_NATIVE", "DISABLE", "OFF":
+		return reality.NativePathMode_DISABLE_NATIVE, true
+	default:
+		return reality.NativePathMode_AUTO, false
+	}
 }
 
 func nativePathModeName(mode reality.NativePathMode) string {
@@ -164,11 +205,19 @@ func nativePathIneligibleReason(v *Listener) string {
 func nativePathScopeKey(v *Listener) string {
 	tag := semanticScopeTag(v)
 	// semantic identity: inbound_tag | security | transport
-	return strings.Join([]string{tag, "reality", "tcp"}, "|")
+	return nativePathScopeKeyForTag(tag)
 }
 
 func nativePathBreakerScopeKey(v *Listener) string {
 	return nativePathScopeKey(v)
+}
+
+func nativePathScopeKeyForTag(tag string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return ""
+	}
+	return strings.Join([]string{tag, "reality", "tcp"}, "|")
 }
 
 func semanticScopeTag(v *Listener) string {
@@ -237,6 +286,7 @@ func nativeBreakerFromPolicy(policy *reality.NativePathPolicy) nativeBreakerConf
 	if cfg.internalErrThreshold == 0 {
 		cfg.internalErrThreshold = 3
 	}
+	cfg.runtimeErrThreshold = runtimeRegressionThresholdFor(cfg.internalErrThreshold)
 	if cfg.window <= 0 {
 		cfg.window = 60 * time.Second
 	}
@@ -277,9 +327,15 @@ func (cb *nativePathCircuitBreaker) updateConfig(cfg nativeBreakerConfig) {
 	cb.config = cfg
 	if !cfg.enabled {
 		cb.state = nativeBreakerStateClosed
+		cb.cause = ""
 		cb.peekTimeoutCount = 0
 		cb.internalErrCount = 0
+		cb.runtimeErrCount = 0
+		cb.runtimeOpenStreak = 0
 		cb.windowStart = time.Time{}
+		cb.runtimeWindowStart = time.Time{}
+		cb.lastOutcomeAt = time.Time{}
+		cb.lastRuntimeFailAt = time.Time{}
 		cb.openUntil = time.Time{}
 		cb.nextProbeAt = time.Time{}
 	}
@@ -300,6 +356,7 @@ func (cb *nativePathCircuitBreaker) shouldSkip(now time.Time) (skip bool, state 
 			return true, nativeBreakerStateOpen, nativeSkipReasonBreakerCooldown
 		}
 		cb.state = nativeBreakerStateHalfOpen
+		cb.runtimeOKCount = 0
 		cb.nextProbeAt = now
 		fallthrough
 	case nativeBreakerStateHalfOpen:
@@ -309,8 +366,27 @@ func (cb *nativePathCircuitBreaker) shouldSkip(now time.Time) (skip bool, state 
 		cb.nextProbeAt = now.Add(cb.config.halfOpenProbeInterval)
 		return false, nativeBreakerStateHalfOpen, ""
 	default:
+		if cb.shouldRequireIdleRuntimeProbeLocked(now) {
+			cb.state = nativeBreakerStateHalfOpen
+			// Keep runtime-regression causality on the cautious re-entry probe so
+			// a mere handshake success does not immediately restore fully-open
+			// native admission after a quiet period.
+			cb.cause = nativeAttemptOutcomeRuntimeFail
+			cb.runtimeOKCount = 0
+			cb.nextProbeAt = now.Add(cb.config.halfOpenProbeInterval)
+			return false, nativeBreakerStateHalfOpen, ""
+		}
 		return false, nativeBreakerStateClosed, ""
 	}
+}
+
+func (cb *nativePathCircuitBreaker) snapshotCause() string {
+	if cb == nil {
+		return ""
+	}
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return string(cb.cause)
 }
 
 func (cb *nativePathCircuitBreaker) recordOutcome(now time.Time, outcome nativeAttemptOutcome) {
@@ -322,10 +398,50 @@ func (cb *nativePathCircuitBreaker) recordOutcome(now time.Time, outcome nativeA
 	if cb.state == "" {
 		cb.state = nativeBreakerStateClosed
 	}
-	if outcome == nativeAttemptOutcomeSuccess {
+	cb.lastOutcomeAt = now
+	if outcome == nativeAttemptOutcomeRuntimeOK {
+		if cb.cause == nativeAttemptOutcomeRuntimeFail {
+			switch cb.state {
+			case nativeBreakerStateOpen:
+				// Healthy outcomes arriving from sessions that were already in
+				// flight when the breaker opened are useful evidence, but they
+				// should not collapse the runtime cooldown immediately while
+				// sibling unresolved flows may still be reporting regressions.
+				return
+			case nativeBreakerStateHalfOpen:
+				cb.runtimeOKCount++
+				if cb.runtimeOKCount < runtimeRecoveryThresholdFor() {
+					cb.nextProbeAt = now.Add(cb.config.halfOpenProbeInterval)
+					return
+				}
+			}
+		}
 		cb.state = nativeBreakerStateClosed
+		cb.cause = ""
 		cb.peekTimeoutCount = 0
 		cb.internalErrCount = 0
+		cb.runtimeErrCount = 0
+		cb.runtimeOpenStreak = 0
+		cb.runtimeOKCount = 0
+		cb.windowStart = now
+		cb.runtimeWindowStart = now
+		cb.openUntil = time.Time{}
+		cb.nextProbeAt = time.Time{}
+		return
+	}
+	if outcome == nativeAttemptOutcomeSuccess {
+		if cb.state == nativeBreakerStateHalfOpen && cb.cause == nativeAttemptOutcomeRuntimeFail {
+			// Runtime-induced half-open needs proof that the post-admission
+			// execution is healthy again, not just a successful handshake.
+			return
+		}
+		cb.state = nativeBreakerStateClosed
+		cb.cause = ""
+		cb.peekTimeoutCount = 0
+		cb.internalErrCount = 0
+		// Successful handshakes do not prove post-admission runtime health.
+		// Keep runtime regressions pending until explicit runtime recovery or
+		// the observation window rolls over.
 		cb.windowStart = now
 		cb.openUntil = time.Time{}
 		cb.nextProbeAt = time.Time{}
@@ -344,19 +460,136 @@ func (cb *nativePathCircuitBreaker) recordOutcome(now time.Time, outcome nativeA
 		cb.peekTimeoutCount++
 	case nativeAttemptOutcomeInternalFail:
 		cb.internalErrCount++
+	case nativeAttemptOutcomeRuntimeFail:
+		cb.lastRuntimeFailAt = now
+		if cb.runtimeWindowStart.IsZero() || now.Sub(cb.runtimeWindowStart) >= cb.config.window {
+			cb.runtimeWindowStart = now
+			cb.runtimeErrCount = 0
+			cb.runtimeOpenStreak = 0
+		}
+		cb.runtimeErrCount++
 	}
 	if cb.state == nativeBreakerStateHalfOpen {
-		cb.openLocked(now)
+		cb.openLocked(now, outcome)
 		return
 	}
-	if cb.peekTimeoutCount >= cb.config.peekTimeoutThreshold || cb.internalErrCount >= cb.config.internalErrThreshold {
-		cb.openLocked(now)
+	if cb.peekTimeoutCount >= cb.config.peekTimeoutThreshold ||
+		cb.internalErrCount >= cb.config.internalErrThreshold ||
+		cb.runtimeErrCount >= cb.config.runtimeErrThreshold {
+		cb.openLocked(now, outcome)
 	}
 }
 
-func (cb *nativePathCircuitBreaker) openLocked(now time.Time) {
+func runtimeRegressionThresholdFor(internalErrThreshold uint32) uint32 {
+	// Runtime regressions are user-visible post-admission compatibility failures.
+	// On the shared listener, one confirmed regression is enough to prefer the
+	// already-proven Go/fallback path until a robust runtime recovery happens.
+	return 1
+}
+
+func nativeRuntimeReentryIdleFor(base time.Duration) time.Duration {
+	idle := 4 * base
+	if idle < 2*time.Minute {
+		idle = 2 * time.Minute
+	}
+	return idle
+}
+
+func nativeRuntimeRegressionMemoryFor(base time.Duration) time.Duration {
+	window := 20 * base
+	if window < 10*time.Minute {
+		window = 10 * time.Minute
+	}
+	return window
+}
+
+func runtimeRecoveryThresholdFor() uint32 {
+	// A single healthy native session is not enough to reopen the shared
+	// listener after runtime regressions because in-flight siblings from the
+	// same burst may still be failing. Require multiple serialized half-open
+	// runtime successes before returning to fully closed admission.
+	return 2
+}
+
+// ReportNativeRuntimeRegressionByTag records a post-admission runtime regression
+// against the existing native breaker for the semantic inbound scope identified
+// by tag. It is intentionally conservative: if the breaker does not already
+// exist for that scope, no new breaker is created.
+func ReportNativeRuntimeRegressionByTag(tag string) bool {
+	scope := nativePathScopeKeyForTag(tag)
+	if scope == "" {
+		return false
+	}
+	existing, ok := nativePathBreakerByScope.Load(scope)
+	if !ok {
+		return false
+	}
+	cb, _ := existing.(*nativePathCircuitBreaker)
+	if cb == nil {
+		return false
+	}
+	cb.recordOutcome(time.Now(), nativeAttemptOutcomeRuntimeFail)
+	return true
+}
+
+// ReportNativeRuntimeRecoveryByTag records a healthy post-admission runtime
+// outcome for an existing native breaker scope.
+func ReportNativeRuntimeRecoveryByTag(tag string) bool {
+	scope := nativePathScopeKeyForTag(tag)
+	if scope == "" {
+		return false
+	}
+	existing, ok := nativePathBreakerByScope.Load(scope)
+	if !ok {
+		return false
+	}
+	cb, _ := existing.(*nativePathCircuitBreaker)
+	if cb == nil {
+		return false
+	}
+	cb.recordOutcome(time.Now(), nativeAttemptOutcomeRuntimeOK)
+	return true
+}
+
+func (cb *nativePathCircuitBreaker) openLocked(now time.Time, cause nativeAttemptOutcome) {
 	cb.state = nativeBreakerStateOpen
-	cb.openUntil = now.Add(cb.config.cooldown)
+	cb.cause = cause
+	cb.runtimeOKCount = 0
+	cooldown := cb.config.cooldown
+	if cause == nativeAttemptOutcomeRuntimeFail {
+		cb.runtimeOpenStreak++
+		cooldown = nativeRuntimeCooldownFor(cb.config.cooldown, cb.runtimeOpenStreak)
+	} else {
+		cb.runtimeOpenStreak = 0
+	}
+	cb.openUntil = now.Add(cooldown)
+}
+
+func (cb *nativePathCircuitBreaker) shouldRequireIdleRuntimeProbeLocked(now time.Time) bool {
+	if cb == nil || cb.state != nativeBreakerStateClosed {
+		return false
+	}
+	if cb.lastOutcomeAt.IsZero() || cb.lastRuntimeFailAt.IsZero() {
+		return false
+	}
+	if now.Sub(cb.lastRuntimeFailAt) >= nativeRuntimeRegressionMemoryFor(cb.config.cooldown) {
+		return false
+	}
+	return now.Sub(cb.lastOutcomeAt) >= nativeRuntimeReentryIdleFor(cb.config.cooldown)
+}
+
+func nativeRuntimeCooldownFor(base time.Duration, streak uint32) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	if streak <= 1 {
+		return base
+	}
+	shift := streak - 1
+	if shift > 2 {
+		shift = 2
+	}
+	return base << shift
 }
 
 func shouldAttemptNativeReality(v *Listener) nativeAttemptDecision {
@@ -425,6 +658,7 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 	if skip {
 		decision.SkipByBreaker = true
 		decision.SkipReason = reason
+		decision.BreakerCause = breaker.snapshotCause()
 		if decision.ForceNative {
 			decision.FailStop = true
 		}

@@ -508,7 +508,10 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn xray_vision_is_complete_record(data: *const u8, data_len: u32) -> i32 {
     ffi_catch_i32!({
-        if data.is_null() || data_len == 0 {
+        if data_len == 0 {
+            return 1;
+        }
+        if data.is_null() {
             return 0;
         }
         let buf = core::slice::from_raw_parts(data, data_len as usize);
@@ -917,7 +920,7 @@ mod tests {
     #[test]
     fn test_empty_record() {
         let rc = unsafe { xray_vision_is_complete_record(core::ptr::null(), 0) };
-        assert_eq!(rc, 0, "empty/null data");
+        assert_eq!(rc, 1, "empty data is a complete zero-record sequence");
     }
 
     #[test]

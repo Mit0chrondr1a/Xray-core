@@ -16,9 +16,8 @@ use aya::{
     programs::{SkMsg, SkSkb},
     Ebpf,
 };
-use libc::close;
 use std::ffi::{c_char, CStr};
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -57,9 +56,9 @@ struct EbpfState {
     /// Aya Ebpf handle — keeps programs loaded as long as it lives.
     _bpf: Ebpf,
     /// SOCKHASH map fd for register/unregister operations.
-    sockhash_fd: i32,
+    sockhash_fd: OwnedFd,
     /// Policy map fd for register/unregister operations.
-    policy_fd: i32,
+    policy_fd: OwnedFd,
     /// Pin path for map lifecycle management.
     pin_path: String,
 }
@@ -166,35 +165,39 @@ fn setup_sockmap_impl(
                 .ok_or("missing SOCKHASH")?
                 .try_into()
                 .map_err(|e| format!("sockhash map type: {e}"))?;
+            let runtime_fd = sockhash
+                .fd()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| format!("clone SOCKHASH runtime fd: {e}"))?;
             let map_fd = sockhash
                 .fd()
                 .try_clone()
-                .map_err(|e| format!("clone SOCKHASH fd: {e}"))?;
+                .map_err(|e| format!("clone SOCKHASH attach fd: {e}"))?;
             sockhash
                 .pin(pin_dir.join("sockhash"))
                 .map_err(|e| format!("pin sockhash: {e}"))?;
-            let fd = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(pin_dir.join("sockhash"))
-                .map_err(|e| format!("open pinned sockhash: {e}"))?
-                .into_raw_fd();
-            (fd, map_fd)
+            // Keep using the Aya-owned map FD for runtime map updates. Pinning is
+            // for persistence and cross-process discovery, not for reopening the
+            // same map object via plain file I/O on bpffs.
+            (runtime_fd, map_fd)
         };
 
         let policy_map_any = bpf.map_mut("POLICY_MAP").ok_or("missing POLICY_MAP")?;
+        let policy_fd = match policy_map_any {
+            aya::maps::Map::HashMap(data) | aya::maps::Map::LruHashMap(data) => data
+                .fd()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| format!("clone policy runtime fd: {e}"))?,
+            _ => return Err("POLICY_MAP has unexpected map type".into()),
+        };
         let policy_map: HashMap<_, u64, u32> = policy_map_any
             .try_into()
             .map_err(|e| format!("policy map type: {e}"))?;
         policy_map
             .pin(pin_dir.join("policy"))
             .map_err(|e| format!("pin policy: {e}"))?;
-        let policy_fd = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(pin_dir.join("policy"))
-            .map_err(|e| format!("open pinned policy: {e}"))?
-            .into_raw_fd();
 
         // Set 0600 permissions on pinned files.
         set_pin_permissions(pin_dir);
@@ -323,10 +326,6 @@ fn teardown_impl() -> Result<(), String> {
         e.into_inner()
     });
     if let Some(state) = guard.take() {
-        unsafe {
-            close(state.policy_fd);
-            close(state.sockhash_fd);
-        }
         // Unpin maps (best-effort).
         let pin_dir = Path::new(&state.pin_path);
         let _ = std::fs::remove_file(pin_dir.join("sockhash"));
@@ -358,22 +357,22 @@ fn register_pair_impl(
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENODEV))?;
 
     // Write policy entries.
-    bpf_map_update_u64_u32(state.policy_fd, inbound_cookie, policy_flags)?;
-    if let Err(e) = bpf_map_update_u64_u32(state.policy_fd, outbound_cookie, policy_flags) {
-        let _ = bpf_map_delete_u64(state.policy_fd, inbound_cookie);
+    bpf_map_update_u64_u32(state.policy_fd.as_raw_fd(), inbound_cookie, policy_flags)?;
+    if let Err(e) = bpf_map_update_u64_u32(state.policy_fd.as_raw_fd(), outbound_cookie, policy_flags) {
+        let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), inbound_cookie);
         return Err(e);
     }
 
     // Insert into SOCKHASH: inbound_cookie -> outbound_fd, outbound_cookie -> inbound_fd.
-    if let Err(e) = bpf_sockhash_update(state.sockhash_fd, inbound_cookie, outbound_fd) {
-        let _ = bpf_map_delete_u64(state.policy_fd, inbound_cookie);
-        let _ = bpf_map_delete_u64(state.policy_fd, outbound_cookie);
+    if let Err(e) = bpf_sockhash_update(state.sockhash_fd.as_raw_fd(), inbound_cookie, outbound_fd) {
+        let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), inbound_cookie);
+        let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), outbound_cookie);
         return Err(e);
     }
-    if let Err(e) = bpf_sockhash_update(state.sockhash_fd, outbound_cookie, inbound_fd) {
-        let _ = bpf_sockhash_delete(state.sockhash_fd, inbound_cookie);
-        let _ = bpf_map_delete_u64(state.policy_fd, inbound_cookie);
-        let _ = bpf_map_delete_u64(state.policy_fd, outbound_cookie);
+    if let Err(e) = bpf_sockhash_update(state.sockhash_fd.as_raw_fd(), outbound_cookie, inbound_fd) {
+        let _ = bpf_sockhash_delete(state.sockhash_fd.as_raw_fd(), inbound_cookie);
+        let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), inbound_cookie);
+        let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), outbound_cookie);
         return Err(e);
     }
 
@@ -390,10 +389,10 @@ fn unregister_pair_impl(inbound_cookie: u64, outbound_cookie: u64) -> std::io::R
         .as_ref()
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENODEV))?;
 
-    let _ = bpf_sockhash_delete(state.sockhash_fd, inbound_cookie);
-    let _ = bpf_sockhash_delete(state.sockhash_fd, outbound_cookie);
-    let _ = bpf_map_delete_u64(state.policy_fd, inbound_cookie);
-    let _ = bpf_map_delete_u64(state.policy_fd, outbound_cookie);
+    let _ = bpf_sockhash_delete(state.sockhash_fd.as_raw_fd(), inbound_cookie);
+    let _ = bpf_sockhash_delete(state.sockhash_fd.as_raw_fd(), outbound_cookie);
+    let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), inbound_cookie);
+    let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), outbound_cookie);
 
     Ok(())
 }

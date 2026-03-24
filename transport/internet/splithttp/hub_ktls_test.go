@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/pipeline"
@@ -298,6 +299,239 @@ func TestXHTTPListenerApplyBackoff(t *testing.T) {
 				t.Fatalf("xhttpListenerApplyBackoff() duration = %v, want %v", got[0], tc.wantDur)
 			}
 		})
+	}
+}
+
+func TestKREALITYProcessConnCooldownFallsBackToGoReality(t *testing.T) {
+	origCooldown := deferredKTLSPromotionDisabledFn
+	origExtract := xhttpExtractFdFn
+	origFallback := xhttpRealityServerFn
+	origDeferred := xhttpDoRustRealityDeferredFn
+	t.Cleanup(func() {
+		deferredKTLSPromotionDisabledFn = origCooldown
+		xhttpExtractFdFn = origExtract
+		xhttpRealityServerFn = origFallback
+		xhttpDoRustRealityDeferredFn = origDeferred
+	})
+
+	deferredKTLSPromotionDisabledFn = func(string) bool { return true }
+	xhttpExtractFdFn = func(stdnet.Conn) (int, error) {
+		t.Fatal("ExtractFd should not be called when deferred kTLS promotion is globally paused")
+		return 0, nil
+	}
+	xhttpDoRustRealityDeferredFn = func(*kREALITYListener, int) (*native.DeferredResult, error) {
+		t.Fatal("native deferred handshake should not run when deferred kTLS promotion is globally paused")
+		return nil, nil
+	}
+
+	client, peer := stdnet.Pipe()
+	defer client.Close()
+	defer peer.Close()
+
+	fallbackCalled := false
+	xhttpRealityServerFn = func(conn stdnet.Conn, _ *goreality.Config) (stdnet.Conn, error) {
+		fallbackCalled = true
+		if conn != client {
+			t.Fatalf("fallback conn mismatch: got %T %v", conn, conn)
+		}
+		return conn, nil
+	}
+
+	l := &kREALITYListener{
+		realityConfig:     &goreality.Config{},
+		realityXrayConfig: &reality.Config{},
+	}
+
+	gotConn, err := l.processConn(client)
+	if err != nil {
+		t.Fatalf("processConn() error = %v, want nil", err)
+	}
+	if !fallbackCalled {
+		t.Fatal("expected Go REALITY fallback to be used during deferred kTLS cooldown")
+	}
+	if gotConn != client {
+		t.Fatalf("processConn() returned %T, want original raw connection fallback", gotConn)
+	}
+}
+
+func TestKREALITYProcessConnFDExtractFailureFallsBackToGoReality(t *testing.T) {
+	origCooldown := deferredKTLSPromotionDisabledFn
+	origExtract := xhttpExtractFdFn
+	origFallback := xhttpRealityServerFn
+	origDeferred := xhttpDoRustRealityDeferredFn
+	t.Cleanup(func() {
+		deferredKTLSPromotionDisabledFn = origCooldown
+		xhttpExtractFdFn = origExtract
+		xhttpRealityServerFn = origFallback
+		xhttpDoRustRealityDeferredFn = origDeferred
+	})
+
+	deferredKTLSPromotionDisabledFn = func(string) bool { return false }
+	xhttpExtractFdFn = func(stdnet.Conn) (int, error) {
+		return 0, errors.New("no fd in test")
+	}
+	xhttpDoRustRealityDeferredFn = func(*kREALITYListener, int) (*native.DeferredResult, error) {
+		t.Fatal("native deferred handshake should not run after fd extraction failure")
+		return nil, nil
+	}
+
+	client, peer := stdnet.Pipe()
+	defer client.Close()
+	defer peer.Close()
+
+	fallbackCalled := false
+	xhttpRealityServerFn = func(conn stdnet.Conn, _ *goreality.Config) (stdnet.Conn, error) {
+		fallbackCalled = true
+		return conn, nil
+	}
+
+	l := &kREALITYListener{
+		realityConfig:     &goreality.Config{},
+		realityXrayConfig: &reality.Config{},
+	}
+
+	gotConn, err := l.processConn(client)
+	if err != nil {
+		t.Fatalf("processConn() error = %v, want nil", err)
+	}
+	if !fallbackCalled {
+		t.Fatal("expected Go REALITY fallback after fd extraction failure")
+	}
+	if gotConn != client {
+		t.Fatalf("processConn() returned %T, want original raw connection fallback", gotConn)
+	}
+}
+
+func TestKREALITYProcessConnAuthFailureFallsBackToGoReality(t *testing.T) {
+	origCooldown := deferredKTLSPromotionDisabledFn
+	origExtract := xhttpExtractFdFn
+	origFallback := xhttpRealityServerFn
+	origDeferred := xhttpDoRustRealityDeferredFn
+	t.Cleanup(func() {
+		deferredKTLSPromotionDisabledFn = origCooldown
+		xhttpExtractFdFn = origExtract
+		xhttpRealityServerFn = origFallback
+		xhttpDoRustRealityDeferredFn = origDeferred
+	})
+
+	deferredKTLSPromotionDisabledFn = func(string) bool { return false }
+	xhttpExtractFdFn = func(stdnet.Conn) (int, error) { return 42, nil }
+	xhttpDoRustRealityDeferredFn = func(*kREALITYListener, int) (*native.DeferredResult, error) {
+		return nil, native.ErrRealityAuthFailed
+	}
+
+	client, peer := stdnet.Pipe()
+	defer client.Close()
+	defer peer.Close()
+
+	fallbackCalled := false
+	xhttpRealityServerFn = func(conn stdnet.Conn, _ *goreality.Config) (stdnet.Conn, error) {
+		fallbackCalled = true
+		return conn, nil
+	}
+
+	l := &kREALITYListener{
+		realityConfig:     &goreality.Config{},
+		realityXrayConfig: &reality.Config{},
+		timeout:           time.Second,
+	}
+
+	gotConn, err := l.processConn(client)
+	if err != nil {
+		t.Fatalf("processConn() error = %v, want nil", err)
+	}
+	if !fallbackCalled {
+		t.Fatal("expected Go REALITY fallback after native auth failure")
+	}
+	if gotConn != client {
+		t.Fatalf("processConn() returned %T, want original raw connection fallback", gotConn)
+	}
+}
+
+func TestKREALITYProcessConnPeekTimeoutFallsBackToGoReality(t *testing.T) {
+	origCooldown := deferredKTLSPromotionDisabledFn
+	origExtract := xhttpExtractFdFn
+	origFallback := xhttpRealityServerFn
+	origDeferred := xhttpDoRustRealityDeferredFn
+	t.Cleanup(func() {
+		deferredKTLSPromotionDisabledFn = origCooldown
+		xhttpExtractFdFn = origExtract
+		xhttpRealityServerFn = origFallback
+		xhttpDoRustRealityDeferredFn = origDeferred
+	})
+
+	deferredKTLSPromotionDisabledFn = func(string) bool { return false }
+	xhttpExtractFdFn = func(stdnet.Conn) (int, error) { return 42, nil }
+	xhttpDoRustRealityDeferredFn = func(*kREALITYListener, int) (*native.DeferredResult, error) {
+		return nil, fmt.Errorf("%w: simulated", native.ErrRealityDeferredPeekTimeout)
+	}
+
+	client, peer := stdnet.Pipe()
+	defer client.Close()
+	defer peer.Close()
+
+	fallbackCalled := false
+	xhttpRealityServerFn = func(conn stdnet.Conn, _ *goreality.Config) (stdnet.Conn, error) {
+		fallbackCalled = true
+		return conn, nil
+	}
+
+	l := &kREALITYListener{
+		realityConfig:     &goreality.Config{},
+		realityXrayConfig: &reality.Config{},
+		timeout:           time.Second,
+	}
+
+	gotConn, err := l.processConn(client)
+	if err != nil {
+		t.Fatalf("processConn() error = %v, want nil", err)
+	}
+	if !fallbackCalled {
+		t.Fatal("expected Go REALITY fallback after native peek timeout")
+	}
+	if gotConn != client {
+		t.Fatalf("processConn() returned %T, want original raw connection fallback", gotConn)
+	}
+}
+
+func TestKREALITYProcessConnFatalDeferredErrorDoesNotFallback(t *testing.T) {
+	origCooldown := deferredKTLSPromotionDisabledFn
+	origExtract := xhttpExtractFdFn
+	origFallback := xhttpRealityServerFn
+	origDeferred := xhttpDoRustRealityDeferredFn
+	t.Cleanup(func() {
+		deferredKTLSPromotionDisabledFn = origCooldown
+		xhttpExtractFdFn = origExtract
+		xhttpRealityServerFn = origFallback
+		xhttpDoRustRealityDeferredFn = origDeferred
+	})
+
+	deferredKTLSPromotionDisabledFn = func(string) bool { return false }
+	xhttpExtractFdFn = func(stdnet.Conn) (int, error) { return 42, nil }
+	xhttpDoRustRealityDeferredFn = func(*kREALITYListener, int) (*native.DeferredResult, error) {
+		return nil, errors.New("native deferred handshake blew up")
+	}
+	xhttpRealityServerFn = func(stdnet.Conn, *goreality.Config) (stdnet.Conn, error) {
+		t.Fatal("Go REALITY fallback should not run after fatal native deferred error")
+		return nil, nil
+	}
+
+	client, peer := stdnet.Pipe()
+	defer client.Close()
+	defer peer.Close()
+
+	l := &kREALITYListener{
+		realityConfig:     &goreality.Config{},
+		realityXrayConfig: &reality.Config{},
+		timeout:           time.Second,
+	}
+
+	gotConn, err := l.processConn(client)
+	if err == nil {
+		t.Fatal("processConn() error = nil, want fatal native deferred handshake error")
+	}
+	if gotConn != nil {
+		t.Fatalf("processConn() returned %T, want nil on fatal native deferred error", gotConn)
 	}
 }
 

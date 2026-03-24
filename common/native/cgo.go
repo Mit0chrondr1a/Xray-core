@@ -1706,7 +1706,7 @@ func VisionFilterTls(data []byte, state *VisionFilterState) bool {
 // well-formed TLS application data records.
 func VisionIsCompleteRecord(data []byte) bool {
 	if len(data) == 0 {
-		return false
+		return true
 	}
 	rc := C.xray_vision_is_complete_record(
 		(*C.uint8_t)(unsafe.Pointer(&data[0])), C.uint32_t(len(data)),
