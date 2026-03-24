@@ -255,7 +255,7 @@ func (d *visionUplinkDiagnostic) log(ctx context.Context, result string, opErr e
 }
 
 func observeVisionPendingDetachOnUplinkComplete(ctx context.Context, inbound *session.Inbound, outbound *session.Outbound, result string, retErr error) {
-	if result != "copy_complete" || retErr != nil {
+	if retErr != nil {
 		return
 	}
 	proxy.ObserveVisionUplinkComplete(ctx, inbound, outbound)
