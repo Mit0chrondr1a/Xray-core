@@ -93,22 +93,6 @@ func (h *Handler) closePreConnPool(pool chan *ConnExpire) {
 	}
 }
 
-// applyVisionFlow marks outbound context based on flow and destination.
-func applyVisionFlow(ctx context.Context, flow string, dest net.Destination) context.Context {
-	ctx = session.ContextWithDNSFlowClass(ctx, session.ClassifyDNSFlow(dest))
-	visionFlow := strings.HasPrefix(flow, vless.XRV)
-	return session.ContextWithVisionFlow(ctx, visionFlow)
-}
-
-func effectiveRequestFlow(ctx context.Context, accountFlow string, dest net.Destination) string {
-	if strings.HasPrefix(accountFlow, vless.XRV) && session.ShouldDowngradeVisionFlow(ctx, dest) {
-		return ""
-	}
-	return accountFlow
-}
-
-// Vision flow does not support raw UDP on inbound; keep outbound UDP on the
-// established Mux tunnel semantics.
 func shouldRewriteUDPToMux(cmd protocol.RequestCommand, flow string, cone bool, port net.Port) bool {
 	if cmd != protocol.RequestCommandUDP {
 		return false
@@ -117,6 +101,15 @@ func shouldRewriteUDPToMux(cmd protocol.RequestCommand, flow string, cone bool, 
 		return true
 	}
 	return cone && port != 53 && port != 443
+}
+
+func isVisionSharedParentCommand(cmd protocol.RequestCommand) bool {
+	switch cmd {
+	case protocol.RequestCommandMux, protocol.RequestCommandRvs:
+		return true
+	default:
+		return false
+	}
 }
 
 func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, input *bytes.Reader, rawInput *bytes.Buffer, err error) {
@@ -221,12 +214,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var conn stat.Connection
 	accountFlow := rec.User.Account.(*vless.MemoryAccount).Flow
 	target := ob.Target
-	requestFlow := effectiveRequestFlow(ctx, accountFlow, target)
-	ctx = applyVisionFlow(ctx, requestFlow, target)
-	if requestFlow == "" && strings.HasPrefix(accountFlow, vless.XRV) {
-		ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneOther)
-		errors.LogDebug(ctx, "loopback TCP DNS flow: downgrading Vision request to plain VLESS")
-	}
+	requestFlow := accountFlow
+	ctx = session.ContextWithVisionFlow(ctx, strings.HasPrefix(requestFlow, vless.XRV))
 	visionFlowActive := session.VisionFlowFromContext(ctx)
 	h.preVisionFlow.Store(visionFlowActive)
 
@@ -454,27 +443,26 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	clientReader := link.Reader // .(*pipe.Reader)
 	clientWriter := link.Writer // .(*pipe.Writer)
-	trafficState := proxy.NewTrafficState(account.ID.Bytes())
-	var visionSignalCh chan session.VisionSignal
-	if requestAddons.Flow == vless.XRV {
-		visionSignalCh = make(chan session.VisionSignal, 1)
-		ctx = session.ContextWithVisionSignal(ctx, visionSignalCh)
-		ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
-	}
+	muxGlobalID := [8]byte{}
 	if shouldRewriteUDPToMux(request.Command, requestAddons.Flow, h.cone, request.Port) {
+		muxGlobalID = xudp.GetGlobalID(ctx)
 		request.Command = protocol.RequestCommandMux
 		request.Address = net.DomainAddress("v1.mux.cool")
 		request.Port = net.Port(666)
-		if session.ResolveDNSFlowClass(ctx) == session.DNSFlowClassUDPControl {
-			ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneMuxXUDP)
-		}
 	}
-	bypassVisionPayload := requestAddons.Flow == vless.XRV &&
-		encoding.ShouldRequestVisionPayloadBypass(ctx, request.Destination())
-	if bypassVisionPayload {
-		requestAddons.BypassVisionPayload = true
-		ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionBypass)
-		ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneVisionGuard)
+	visionSharedParent := requestAddons.Flow == vless.XRV && isVisionSharedParentCommand(request.Command)
+	trafficState := proxy.NewTrafficState(account.ID.Bytes())
+	if visionSharedParent {
+		ctx = proxy.ApplyVisionSharedParentCompat(ctx, trafficState)
+		ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
+	}
+	var visionSignalCh chan session.VisionSignal
+	if requestAddons.Flow == vless.XRV {
+		if !visionSharedParent {
+			visionSignalCh = make(chan session.VisionSignal, 1)
+			ctx = session.ContextWithVisionSignal(ctx, visionSignalCh)
+			ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+		}
 	}
 
 	postRequest := func() error {
@@ -486,14 +474,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		// default: serverWriter := bufferWriter
-		var serverWriter buf.Writer
-		if bypassVisionPayload {
-			serverWriter = bufferWriter
-		} else {
-			serverWriter = encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, true, ctx, conn, ob)
-		}
+		serverWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, true, ctx, conn, ob)
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
-			serverWriter = xudp.NewPacketWriter(serverWriter, target, xudp.GetGlobalID(ctx))
+			serverWriter = xudp.NewPacketWriter(serverWriter, target, muxGlobalID)
 		}
 		timeoutReader, ok := clientReader.(buf.TimeoutReader)
 		if ok {
@@ -552,10 +535,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		// default: serverReader := buf.NewReader(conn)
 		serverReader := encoding.DecodeBodyAddons(conn, request, responseAddons)
-		responseBypassVisionPayload := bypassVisionPayload ||
-			encoding.ShouldHonorResponseVisionPayloadBypass(responseAddons, request.Destination())
-
-		if requestAddons.Flow == vless.XRV && !responseBypassVisionPayload {
+		if requestAddons.Flow == vless.XRV {
 			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, visionSignalCh, input, rawInput, ob)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
@@ -566,7 +546,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if requestAddons.Flow == vless.XRV && !responseBypassVisionPayload {
+		if requestAddons.Flow == vless.XRV {
 			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
 		} else {
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer

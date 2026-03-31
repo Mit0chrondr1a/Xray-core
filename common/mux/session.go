@@ -159,7 +159,9 @@ type Session struct {
 	output       buf.Writer
 	parent       *SessionManager
 	ID           uint16
+	target       net.Destination
 	transferType protocol.TransferType
+	idleTimeout  time.Duration
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP

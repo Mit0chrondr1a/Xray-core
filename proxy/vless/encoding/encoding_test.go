@@ -53,9 +53,7 @@ func TestRequestSerialization(t *testing.T) {
 	}
 
 	addonsComparer := func(x, y *Addons) bool {
-		return (x.Flow == y.Flow) &&
-			(x.BypassVisionPayload == y.BypassVisionPayload) &&
-			(cmp.Equal(x.Seed, y.Seed))
+		return (x.Flow == y.Flow) && (cmp.Equal(x.Seed, y.Seed))
 	}
 	if r := cmp.Diff(actualAddons, expectedAddons, cmp.Comparer(addonsComparer)); r != "" {
 		t.Error(r)
@@ -127,54 +125,9 @@ func TestMuxRequest(t *testing.T) {
 	}
 
 	addonsComparer := func(x, y *Addons) bool {
-		return (x.Flow == y.Flow) &&
-			(x.BypassVisionPayload == y.BypassVisionPayload) &&
-			(cmp.Equal(x.Seed, y.Seed))
+		return (x.Flow == y.Flow) && (cmp.Equal(x.Seed, y.Seed))
 	}
 	if r := cmp.Diff(actualAddons, expectedAddons, cmp.Comparer(addonsComparer)); r != "" {
 		t.Error(r)
-	}
-}
-
-func TestRequestSerializationWithVisionPayloadBypass(t *testing.T) {
-	user := &protocol.MemoryUser{
-		Level: 0,
-		Email: "test@example.com",
-	}
-	id := uuid.New()
-	account := &vless.Account{
-		Id: id.String(),
-	}
-	user.Account = toAccount(account)
-
-	expectedRequest := &protocol.RequestHeader{
-		Version: Version,
-		User:    user,
-		Command: protocol.RequestCommandTCP,
-		Address: net.IPAddress([]byte{1, 1, 1, 1}),
-		Port:    net.Port(53),
-	}
-	expectedAddons := &Addons{
-		Flow:                vless.XRV,
-		BypassVisionPayload: true,
-	}
-
-	buffer := buf.StackNew()
-	common.Must(EncodeRequestHeader(&buffer, expectedRequest, expectedAddons))
-
-	validator := new(vless.MemoryValidator)
-	validator.Add(user)
-
-	_, actualRequest, actualAddons, _, err := DecodeRequestHeader(false, nil, &buffer, validator)
-	common.Must(err)
-
-	if r := cmp.Diff(actualRequest, expectedRequest, cmp.AllowUnexported(protocol.ID{})); r != "" {
-		t.Error(r)
-	}
-	if actualAddons.GetBypassVisionPayload() != expectedAddons.GetBypassVisionPayload() {
-		t.Fatalf("BypassVisionPayload=%v, want %v", actualAddons.GetBypassVisionPayload(), expectedAddons.GetBypassVisionPayload())
-	}
-	if actualAddons.GetFlow() != expectedAddons.GetFlow() {
-		t.Fatalf("Flow=%q, want %q", actualAddons.GetFlow(), expectedAddons.GetFlow())
 	}
 }

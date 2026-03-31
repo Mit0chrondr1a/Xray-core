@@ -7,6 +7,7 @@ import (
 	"io"
 	gonet "net"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -59,33 +60,70 @@ type Handler struct {
 }
 
 type dnsUplinkDiagnostic struct {
-	startedAt    time.Time
-	destination  net.Destination
-	flowClass    session.DNSFlowClass
-	dnsPlane     session.DNSPlane
-	firstWriteNs int64
-	totalBytes   int64
+	startedAt       time.Time
+	destination     net.Destination
+	flowClass       string
+	dnsPlane        string
+	firstWriteNs    atomic.Int64
+	lastWriteNs     atomic.Int64
+	totalBytes      atomic.Int64
+	firstResponseNs atomic.Int64
+	lastResponseNs  atomic.Int64
+	responseBytes   atomic.Int64
 }
 
 type visionUplinkDiagnostic struct {
 	startedAt    time.Time
 	destination  net.Destination
 	firstWriteNs int64
+	lastWriteNs  int64
 	totalBytes   int64
+	timings      *session.FlowTimings
 }
 
 type dnsUplinkDiagnosticWriter struct {
 	Writer buf.Writer
 	dns    *dnsUplinkDiagnostic
 	vision *visionUplinkDiagnostic
+	guard  *udpFirstResponseGuard
 }
 
+type dnsResponseDiagnosticWriter struct {
+	Writer  buf.Writer
+	dns     *dnsUplinkDiagnostic
+	timings *session.FlowTimings
+}
+
+const (
+	dnsUDPFirstResponseTimeout      = 1500 * time.Millisecond
+	dnsUDPFirstResponseMaxTotalWait = 1800 * time.Millisecond
+)
+
+var errDNSUDPFirstResponseTimeout = goerrors.New("dns_udp_first_response_timeout")
+
 func (w *dnsUplinkDiagnosticWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	hadPayload := !mb.IsEmpty()
 	if w.dns != nil {
 		w.dns.observeWrite(int(mb.Len()))
 	}
 	if w.vision != nil {
 		w.vision.observeWrite(int(mb.Len()))
+	}
+	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
+		return err
+	}
+	if hadPayload && w.guard != nil {
+		w.guard.ObserveWrite()
+	}
+	return nil
+}
+
+func (w *dnsResponseDiagnosticWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if w.dns != nil {
+		w.dns.observeResponse(int(mb.Len()))
+	}
+	if w.timings != nil && mb.Len() > 0 {
+		w.timings.StoreFirstResponse(time.Now().UnixNano())
 	}
 	return w.Writer.WriteMultiBuffer(mb)
 }
@@ -156,22 +194,34 @@ func isDNSDest(dest net.Destination) bool {
 	}
 }
 
-func newDNSUplinkDiagnostic(ctx context.Context, destination net.Destination) *dnsUplinkDiagnostic {
-	if !isDNSDest(destination) {
-		return nil
+func classifyDNSFlowString(dest net.Destination) string {
+	if dest.Port != net.Port(53) && dest.Port != net.Port(853) {
+		return "non_dns"
 	}
-	if !session.ShouldBypassVisionDetach(ctx) {
+	switch dest.Network {
+	case net.Network_TCP:
+		return "dns_tcp_control"
+	case net.Network_UDP:
+		return "dns_udp_control"
+	default:
+		return "non_dns"
+	}
+}
+
+func newDNSUplinkDiagnostic(ctx context.Context, destination net.Destination) *dnsUplinkDiagnostic {
+	_ = ctx
+	if !isDNSDest(destination) {
 		return nil
 	}
 	return &dnsUplinkDiagnostic{
 		startedAt:   time.Now(),
 		destination: destination,
-		flowClass:   session.ResolveDNSFlowClass(ctx),
-		dnsPlane:    session.DNSPlaneFromContext(ctx),
+		flowClass:   classifyDNSFlowString(destination),
+		dnsPlane:    "unknown",
 	}
 }
 
-func newVisionUplinkDiagnostic(inbound *session.Inbound, destination net.Destination) *visionUplinkDiagnostic {
+func newVisionUplinkDiagnostic(inbound *session.Inbound, destination net.Destination, timings *session.FlowTimings) *visionUplinkDiagnostic {
 	if inbound == nil || destination.Network != net.Network_TCP || isDNSDest(destination) {
 		return nil
 	}
@@ -181,6 +231,7 @@ func newVisionUplinkDiagnostic(inbound *session.Inbound, destination net.Destina
 	return &visionUplinkDiagnostic{
 		startedAt:   time.Now(),
 		destination: destination,
+		timings:     timings,
 	}
 }
 
@@ -188,20 +239,64 @@ func (d *dnsUplinkDiagnostic) observeWrite(n int) {
 	if d == nil || n <= 0 {
 		return
 	}
-	if d.firstWriteNs == 0 {
-		d.firstWriteNs = time.Since(d.startedAt).Nanoseconds()
+	nowNs := time.Since(d.startedAt).Nanoseconds()
+	if d.firstWriteNs.Load() == 0 {
+		d.firstWriteNs.CompareAndSwap(0, nowNs)
 	}
-	d.totalBytes += int64(n)
+	d.lastWriteNs.Store(nowNs)
+	d.totalBytes.Add(int64(n))
+}
+
+func (d *dnsUplinkDiagnostic) observeResponse(n int) {
+	if d == nil || n <= 0 {
+		return
+	}
+	nowNs := time.Since(d.startedAt).Nanoseconds()
+	if d.firstResponseNs.Load() == 0 {
+		d.firstResponseNs.CompareAndSwap(0, nowNs)
+	}
+	d.lastResponseNs.Store(nowNs)
+	d.responseBytes.Add(int64(n))
+}
+
+func (d *dnsUplinkDiagnostic) requestTTFBNs() int64 {
+	if d == nil {
+		return 0
+	}
+	firstWrite := d.firstWriteNs.Load()
+	firstResponse := d.firstResponseNs.Load()
+	if firstWrite <= 0 || firstResponse < firstWrite {
+		return 0
+	}
+	return firstResponse - firstWrite
+}
+
+func (d *dnsUplinkDiagnostic) responseCompleteNs() int64 {
+	if d == nil {
+		return 0
+	}
+	firstWrite := d.firstWriteNs.Load()
+	lastResponse := d.lastResponseNs.Load()
+	if firstWrite <= 0 || lastResponse < firstWrite {
+		return 0
+	}
+	return lastResponse - firstWrite
 }
 
 func (d *visionUplinkDiagnostic) observeWrite(n int) {
 	if d == nil || n <= 0 {
 		return
 	}
+	now := time.Now()
+	nowNs := now.Sub(d.startedAt).Nanoseconds()
 	if d.firstWriteNs == 0 {
-		d.firstWriteNs = time.Since(d.startedAt).Nanoseconds()
+		d.firstWriteNs = nowNs
 	}
+	d.lastWriteNs = nowNs
 	d.totalBytes += int64(n)
+	if d.timings != nil {
+		d.timings.ObserveUplinkWrite(now.UnixNano(), n)
+	}
 }
 
 func (d *dnsUplinkDiagnostic) log(ctx context.Context, result string, opErr error, inbound *session.Inbound, outbound *session.Outbound) {
@@ -216,18 +311,53 @@ func (d *dnsUplinkDiagnostic) log(ctx context.Context, result string, opErr erro
 	if outbound != nil {
 		outboundGate = outbound.GetCanSpliceCopy()
 	}
-	errors.LogDebug(ctx, "proxy markers[kind=dns-uplink-diagnostic]: ",
+	args := []any{
+		"proxy markers[kind=dns-uplink-diagnostic]: ",
 		"result=", result,
-		" dns_flow_class=", d.flowClass.String(),
-		" dns_plane=", string(d.dnsPlane),
+		" dns_flow_class=", d.flowClass,
+		" dns_plane=", d.dnsPlane,
 		" dns_destination=", d.destination.String(),
-		" uplink_first_write_ns=", d.firstWriteNs,
-		" uplink_bytes=", d.totalBytes,
-		" uplink_duration_ns=", time.Since(d.startedAt).Nanoseconds(),
+	}
+	args = append(args,
+		" uplink_first_write_ns=", d.firstWriteNs.Load(),
+		" uplink_bytes=", d.totalBytes.Load(),
+		" uplink_useful_duration_ns=", d.lastWriteNs.Load(),
+		" uplink_total_duration_ns=", time.Since(d.startedAt).Nanoseconds(),
 		" inbound_copy_gate=", inboundGate.String(),
 		" outbound_copy_gate=", outboundGate.String(),
 		" err_class=", classifyDNSUplinkErr(opErr),
 	)
+	errors.LogDebug(ctx, args...)
+}
+
+func (d *dnsUplinkDiagnostic) logResponseSummary(ctx context.Context, result string, opErr error, inbound *session.Inbound, outbound *session.Outbound) {
+	if d == nil {
+		return
+	}
+	inboundGate := session.CopyGateUnset
+	if inbound != nil {
+		inboundGate = inbound.GetCanSpliceCopy()
+	}
+	outboundGate := session.CopyGateUnset
+	if outbound != nil {
+		outboundGate = outbound.GetCanSpliceCopy()
+	}
+	args := []any{
+		"proxy markers[kind=dns-control-summary]: ",
+		"result=", result,
+		" dns_flow_class=", d.flowClass,
+		" dns_plane=", d.dnsPlane,
+		" dns_destination=", d.destination.String(),
+	}
+	args = append(args,
+		" dns_request_ttfb_ns=", d.requestTTFBNs(),
+		" dns_response_complete_ns=", d.responseCompleteNs(),
+		" dns_response_bytes=", d.responseBytes.Load(),
+		" inbound_copy_gate=", inboundGate.String(),
+		" outbound_copy_gate=", outboundGate.String(),
+		" err_class=", classifyDNSUplinkErr(opErr),
+	)
+	errors.LogDebug(ctx, args...)
 }
 
 func (d *visionUplinkDiagnostic) log(ctx context.Context, result string, opErr error, inbound *session.Inbound, outbound *session.Outbound) {
@@ -242,12 +372,17 @@ func (d *visionUplinkDiagnostic) log(ctx context.Context, result string, opErr e
 	if outbound != nil {
 		outboundGate = outbound.GetCanSpliceCopy()
 	}
+	now := time.Now()
+	if d.timings != nil {
+		d.timings.StoreUplinkComplete(now.UnixNano())
+	}
 	errors.LogDebug(ctx, "proxy markers[kind=vision-uplink-diagnostic]: ",
 		"result=", result,
 		" destination=", d.destination.String(),
 		" uplink_first_write_ns=", d.firstWriteNs,
 		" uplink_bytes=", d.totalBytes,
-		" uplink_duration_ns=", time.Since(d.startedAt).Nanoseconds(),
+		" uplink_useful_duration_ns=", d.lastWriteNs,
+		" uplink_total_duration_ns=", now.Sub(d.startedAt).Nanoseconds(),
 		" inbound_copy_gate=", inboundGate.String(),
 		" outbound_copy_gate=", outboundGate.String(),
 		" err_class=", classifyUplinkErr(opErr),
@@ -291,7 +426,21 @@ func classifyUplinkErr(err error) string {
 }
 
 func classifyDNSUplinkErr(err error) string {
+	cause := errors.Cause(err)
+	if cause == nil {
+		cause = err
+	}
+	if goerrors.Is(cause, errDNSUDPFirstResponseTimeout) {
+		return "first_response_timeout"
+	}
 	return classifyUplinkErr(err)
+}
+
+func shouldFastFailDNSUDPFirstResponse(ctx context.Context, destination net.Destination) bool {
+	if destination.Network != net.Network_UDP || destination.Port != net.Port(853) {
+		return false
+	}
+	return session.IsControlPlaneLoopbackIngress(session.InboundFromContext(ctx))
 }
 
 func shouldBypassEgressFastFail(ctx context.Context, dest net.Destination) bool {
@@ -345,6 +494,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	output := link.Writer
 
 	var conn stat.Connection
+	flowTimings := session.FlowTimingsFromContext(ctx)
+	if flowTimings == nil {
+		flowTimings = &session.FlowTimings{}
+		ctx = session.ContextWithFlowTimings(ctx, flowTimings)
+	}
+	flowTimings.StoreRequestStart(time.Now().UnixNano())
 
 	bypassFastFail := shouldBypassEgressFastFail(ctx, destination)
 
@@ -364,6 +519,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					return err
 				}
 			} else {
+				flowTimings.StoreDNSResolved(time.Now().UnixNano())
 				dialDest = net.Destination{
 					Network: dialDest.Network,
 					Address: net.IPAddress(ips[dice.Roll(len(ips))]),
@@ -373,10 +529,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
+		connectStart := time.Now()
+		flowTimings.StoreConnectStart(connectStart.UnixNano())
 		rawConn, err := dialer.Dial(ctx, dialDest)
 		if err != nil {
 			return errors.New("failed to open connection to ", dialDest).Base(err)
 		}
+		flowTimings.StoreConnectOpen(time.Now().UnixNano())
 		if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
 			version := byte(h.config.ProxyProtocol)
 			srcAddr := inbound.Source.RawNetAddr()
@@ -404,6 +563,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 						return err
 					}
 				} else {
+					flowTimings.StoreDNSResolved(time.Now().UnixNano())
 					dialDest = net.Destination{
 						Network: dialDest.Network,
 						Address: net.IPAddress(ips[dice.Roll(len(ips))]),
@@ -413,10 +573,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 			}
 
+			connectStart := time.Now()
+			flowTimings.StoreConnectStart(connectStart.UnixNano())
 			rawConn, err := dialer.Dial(ctx, dialDest)
 			if err != nil {
 				return err
 			}
+			flowTimings.StoreConnectOpen(time.Now().UnixNano())
 
 			if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
 				version := byte(h.config.ProxyProtocol)
@@ -443,6 +606,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
 		newCtx, newCancel = context.WithCancel(context.Background())
+		newCtx = session.ContextWithFlowTimings(newCtx, flowTimings)
 	}
 
 	plcy := h.policy()
@@ -453,6 +617,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			newCancel()
 		}
 	}, plcy.Timeouts.ConnectionIdle)
+	dnsDiag := newDNSUplinkDiagnostic(ctx, destination)
+	dnsFirstResponseGuard := (*udpFirstResponseGuard)(nil)
+	if shouldFastFailDNSUDPFirstResponse(ctx, destination) {
+		// Keep the DoQ fast-fail tied to outbound activity, but also clamp the
+		// total wait budget so a dead path cannot stretch through a full QUIC
+		// retransmission train before the client falls back to TCP DNS.
+		dnsFirstResponseGuard = newUDPFirstResponseGuard(conn, dnsUDPFirstResponseTimeout)
+	}
 
 	requestDone := func() (retErr error) {
 		downlinkTimeout := plcy.Timeouts.DownlinkOnly
@@ -468,13 +640,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				timer.SetTimeout(downlinkTimeout)
 			}
 		}()
-		uplinkDiag := newDNSUplinkDiagnostic(ctx, destination)
-		visionDiag := newVisionUplinkDiagnostic(inbound, destination)
+		visionDiag := newVisionUplinkDiagnostic(inbound, destination, flowTimings)
 		uplinkResult := "copy_complete"
-		if uplinkDiag != nil || visionDiag != nil {
+		flowTimings.StoreUplinkStart(time.Now().UnixNano())
+		if dnsDiag != nil || visionDiag != nil {
 			defer func() {
-				if uplinkDiag != nil {
-					uplinkDiag.log(ctx, uplinkResult, retErr, inbound, ob)
+				if dnsDiag != nil {
+					dnsDiag.log(ctx, uplinkResult, retErr, inbound, ob)
 				}
 				if visionDiag != nil {
 					visionDiag.log(ctx, uplinkResult, retErr, inbound, ob)
@@ -508,11 +680,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 			}
 		}
-		if uplinkDiag != nil || visionDiag != nil {
+		if dnsDiag != nil || visionDiag != nil {
 			writer = &dnsUplinkDiagnosticWriter{
 				Writer: writer,
-				dns:    uplinkDiag,
+				dns:    dnsDiag,
 				vision: visionDiag,
+				guard:  dnsFirstResponseGuard,
 			}
 		}
 
@@ -540,8 +713,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return nil
 	}
 
-	responseDone := func() error {
+	responseDone := func() (retErr error) {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+		responseResult := "copy_complete"
+		if dnsDiag != nil {
+			defer func() {
+				dnsDiag.logResponseSummary(ctx, responseResult, retErr, inbound, ob)
+			}()
+		}
 		if destination.Network == net.Network_TCP && useSplice && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 			var writeConn net.Conn
 			var inTimer *signal.ActivityTimer
@@ -549,16 +728,46 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				writeConn = inbound.Conn
 				inTimer = inbound.Timer
 			}
-			return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
+			writer := link.Writer
+			if dnsDiag != nil {
+				writer = &dnsResponseDiagnosticWriter{
+					Writer:  link.Writer,
+					dns:     dnsDiag,
+					timings: flowTimings,
+				}
+			}
+			if err := proxy.CopyRawConnIfExist(ctx, conn, writeConn, writer, timer, inTimer); err != nil {
+				responseResult = "copy_error"
+				retErr = err
+				return retErr
+			}
+			return nil
 		}
 		var reader buf.Reader
 		if destination.Network == net.Network_TCP {
 			reader = buf.NewReader(conn)
 		} else {
 			reader = NewPacketReader(conn, UDPOverride, destination)
+			if dnsFirstResponseGuard != nil {
+				// Dead DoQ paths can otherwise sit through multi-second QUIC
+				// retransmission backoff before the client falls back to TCP DNS.
+				// Refresh the deadline from each outbound packet until the first
+				// response datagram arrives.
+				reader = newUDPFirstResponseTimeoutReader(reader, dnsFirstResponseGuard)
+			}
 		}
-		if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
-			return errors.New("failed to process response").Base(err)
+		writer := output
+		if dnsDiag != nil {
+			writer = &dnsResponseDiagnosticWriter{
+				Writer:  output,
+				dns:     dnsDiag,
+				timings: flowTimings,
+			}
+		}
+		if err := buf.Copy(reader, writer, buf.UpdateActivity(timer)); err != nil {
+			responseResult = "copy_error"
+			retErr = errors.New("failed to process response").Base(err)
+			return retErr
 		}
 		return nil
 	}
@@ -640,6 +849,101 @@ type PacketReader struct {
 	IsOverridden      bool
 	InitUnchangedAddr net.Address
 	InitChangedAddr   net.Address
+}
+
+type udpFirstResponseTimeoutReader struct {
+	reader buf.Reader
+	guard  *udpFirstResponseGuard
+}
+
+type udpFirstResponseGuard struct {
+	conn         gonet.Conn
+	timeout      time.Duration
+	maxTotalWait time.Duration
+	firstWriteNs atomic.Int64
+	armed        atomic.Bool
+	responseSeen atomic.Bool
+}
+
+func newUDPFirstResponseGuard(conn gonet.Conn, timeout time.Duration) *udpFirstResponseGuard {
+	return newUDPFirstResponseGuardWithBudget(conn, timeout, dnsUDPFirstResponseMaxTotalWait)
+}
+
+func newUDPFirstResponseGuardWithBudget(conn gonet.Conn, timeout, maxTotalWait time.Duration) *udpFirstResponseGuard {
+	if conn == nil || timeout <= 0 {
+		return nil
+	}
+	return &udpFirstResponseGuard{
+		conn:         conn,
+		timeout:      timeout,
+		maxTotalWait: maxTotalWait,
+	}
+}
+
+func (g *udpFirstResponseGuard) ObserveWrite() {
+	if g == nil || g.responseSeen.Load() {
+		return
+	}
+	now := time.Now()
+	firstWriteNs := g.firstWriteNs.Load()
+	if firstWriteNs == 0 {
+		firstWriteNs = now.UnixNano()
+		if !g.firstWriteNs.CompareAndSwap(0, firstWriteNs) {
+			firstWriteNs = g.firstWriteNs.Load()
+		}
+	}
+	deadline := now.Add(g.timeout)
+	if g.maxTotalWait > 0 && firstWriteNs > 0 {
+		maxDeadline := time.Unix(0, firstWriteNs).Add(g.maxTotalWait)
+		if maxDeadline.Before(deadline) {
+			deadline = maxDeadline
+		}
+	}
+	g.armed.Store(true)
+	_ = g.conn.SetReadDeadline(deadline)
+}
+
+func (g *udpFirstResponseGuard) ObserveResponse() {
+	if g == nil {
+		return
+	}
+	if g.responseSeen.Swap(true) {
+		return
+	}
+	_ = g.conn.SetReadDeadline(time.Time{})
+}
+
+func (g *udpFirstResponseGuard) TranslateReadError(err error) error {
+	if g == nil || err == nil {
+		return err
+	}
+	if ne, ok := err.(interface{ Timeout() bool }); ok && ne.Timeout() &&
+		g.armed.Load() && !g.responseSeen.Load() {
+		_ = g.conn.SetReadDeadline(time.Time{})
+		return errDNSUDPFirstResponseTimeout
+	}
+	return err
+}
+
+func newUDPFirstResponseTimeoutReader(reader buf.Reader, guard *udpFirstResponseGuard) buf.Reader {
+	if reader == nil || guard == nil {
+		return reader
+	}
+	return &udpFirstResponseTimeoutReader{
+		reader: reader,
+		guard:  guard,
+	}
+}
+
+func (r *udpFirstResponseTimeoutReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.reader.ReadMultiBuffer()
+	if err != nil {
+		return nil, r.guard.TranslateReadError(err)
+	}
+	if !mb.IsEmpty() {
+		r.guard.ObserveResponse()
+	}
+	return mb, nil
 }
 
 func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {

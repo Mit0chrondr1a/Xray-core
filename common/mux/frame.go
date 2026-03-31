@@ -62,64 +62,6 @@ type FrameMetadata struct {
 	SessionStatus SessionStatus
 	GlobalID      [8]byte
 	Inbound       *session.Inbound
-	DNSFlowClass  session.DNSFlowClass
-	DNSPlane      session.DNSPlane
-}
-
-const (
-	frameMetadataExtensionMarker byte = 0x00
-	frameMetadataExtensionDNS    byte = 0x01
-)
-
-func encodeDNSPlane(plane session.DNSPlane) byte {
-	switch plane {
-	case session.DNSPlaneVisionGuard:
-		return 1
-	case session.DNSPlaneXHTTPSplit:
-		return 2
-	case session.DNSPlaneMuxXUDP:
-		return 3
-	case session.DNSPlaneOther:
-		return 4
-	default:
-		return 0
-	}
-}
-
-func decodeDNSPlane(code byte) session.DNSPlane {
-	switch code {
-	case 1:
-		return session.DNSPlaneVisionGuard
-	case 2:
-		return session.DNSPlaneXHTTPSplit
-	case 3:
-		return session.DNSPlaneMuxXUDP
-	case 4:
-		return session.DNSPlaneOther
-	default:
-		return session.DNSPlaneUnknown
-	}
-}
-
-func (f FrameMetadata) writeDNSExtension(b *buf.Buffer) {
-	if f.DNSFlowClass == session.DNSFlowClassUnset && f.DNSPlane == session.DNSPlaneUnknown {
-		return
-	}
-	common.Must(b.WriteByte(frameMetadataExtensionMarker))
-	common.Must(b.WriteByte(frameMetadataExtensionDNS))
-	common.Must(b.WriteByte(byte(f.DNSFlowClass)))
-	common.Must(b.WriteByte(encodeDNSPlane(f.DNSPlane)))
-}
-
-func (f *FrameMetadata) readDNSExtension(b *buf.Buffer) {
-	if b.Len() < 4 || b.Byte(0) != frameMetadataExtensionMarker {
-		return
-	}
-	if b.Byte(1) != frameMetadataExtensionDNS {
-		return
-	}
-	f.DNSFlowClass = session.DNSFlowClass(b.Byte(2))
-	f.DNSPlane = decodeDNSPlane(b.Byte(3))
 }
 
 func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
@@ -158,7 +100,6 @@ func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
 		} else if b.UDP != nil { // make sure it's user's proxy request
 			b.Write(f.GlobalID[:]) // no need to check whether it's empty
 		}
-		f.writeDNSExtension(b)
 	} else if b.UDP != nil {
 		b.WriteByte(byte(TargetNetworkUDP))
 		addrParser.WriteAddressPort(b, b.UDP.Address, b.UDP.Port)
@@ -198,8 +139,6 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer, readSourceAndLocal bo
 	f.Target = net.Destination{}
 	f.GlobalID = [8]byte{}
 	f.Inbound = nil
-	f.DNSFlowClass = session.DNSFlowClassUnset
-	f.DNSPlane = session.DNSPlaneUnknown
 	f.SessionID = binary.BigEndian.Uint16(b.BytesTo(2))
 	f.SessionStatus = SessionStatus(b.Byte(2))
 	f.Option = bitmask.Byte(b.Byte(3))
@@ -235,10 +174,6 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer, readSourceAndLocal bo
 		if b.Len() == 0 {
 			return nil // for heartbeat, etc.
 		}
-		if b.Byte(0) == frameMetadataExtensionMarker {
-			f.readDNSExtension(b)
-			return nil
-		}
 		network := TargetNetwork(b.Byte(0))
 		if network == 0 {
 			return nil // may be padding
@@ -260,10 +195,6 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer, readSourceAndLocal bo
 		if b.Len() == 0 {
 			return nil
 		}
-		if b.Byte(0) == frameMetadataExtensionMarker {
-			f.readDNSExtension(b)
-			return nil
-		}
 		network = TargetNetwork(b.Byte(0))
 		if network == 0 {
 			return nil
@@ -281,8 +212,6 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer, readSourceAndLocal bo
 		default:
 			return errors.New("reading local: unknown network type: ", network)
 		}
-
-		f.readDNSExtension(b)
 		return nil
 	}
 
@@ -292,7 +221,6 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer, readSourceAndLocal bo
 		copy(f.GlobalID[:], b.BytesRange(0, 8))
 		b.Advance(8)
 	}
-	f.readDNSExtension(b)
 
 	return nil
 }

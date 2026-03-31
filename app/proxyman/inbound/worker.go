@@ -58,12 +58,17 @@ func getTProxyType(s *internet.MemoryStreamConfig) internet.SocketConfig_TProxyM
 	return s.SocketSettings.Tproxy
 }
 
-func (w *tcpWorker) callback(conn stat.Connection) {
+func (w *tcpWorker) callback(conn stat.Connection, acceptStartUnixNano int64) {
 	ctx, cancel := context.WithCancel(w.ctx)
 	defer cancel()
 	defer conn.Close()
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
+	flowTimings := &session.FlowTimings{}
+	if acceptStartUnixNano > 0 {
+		flowTimings.StoreAcceptStart(acceptStartUnixNano)
+	}
+	ctx = session.ContextWithFlowTimings(ctx, flowTimings)
 
 	outbounds := []*session.Outbound{{}}
 	if w.recvOrigDest {
@@ -137,7 +142,7 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 
 // launchHandler starts a goroutine that runs the connection callback with
 // panic recovery and semaphore release.
-func (w *tcpWorker) launchHandler(conn stat.Connection) {
+func (w *tcpWorker) launchHandler(conn stat.Connection, acceptStartUnixNano int64) {
 	go func() {
 		defer func() { <-w.connSemaphore }()
 		defer func() {
@@ -145,7 +150,7 @@ func (w *tcpWorker) launchHandler(conn stat.Connection) {
 				errors.LogError(w.ctx, "panic in TCP connection handler: ", r)
 			}
 		}()
-		w.callback(conn)
+		w.callback(conn, acceptStartUnixNano)
 	}()
 }
 
@@ -153,10 +158,11 @@ func (w *tcpWorker) Start() error {
 	w.connSemaphore = make(chan struct{}, getMaxConnections())
 	ctx := context.Background()
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
+		acceptStartUnixNano := tcp.TakeAcceptStartUnixNano(conn)
 		// Fast path: try non-blocking acquire first (zero allocation).
 		select {
 		case w.connSemaphore <- struct{}{}:
-			w.launchHandler(conn)
+			w.launchHandler(conn, acceptStartUnixNano)
 			return
 		default:
 		}
@@ -165,13 +171,13 @@ func (w *tcpWorker) Start() error {
 		select {
 		case w.connSemaphore <- struct{}{}:
 			timer.Stop()
-			w.launchHandler(conn)
+			w.launchHandler(conn, acceptStartUnixNano)
 		case <-timer.C:
 			// Final non-blocking attempt before rejecting (avoids select race
 			// where both timer and semaphore are ready simultaneously).
 			select {
 			case w.connSemaphore <- struct{}{}:
-				w.launchHandler(conn)
+				w.launchHandler(conn, acceptStartUnixNano)
 				return
 			default:
 			}

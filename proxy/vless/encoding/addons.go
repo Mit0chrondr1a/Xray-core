@@ -7,7 +7,6 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
-	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/proxy"
@@ -83,42 +82,6 @@ func DecodeBodyAddons(reader io.Reader, request *protocol.RequestHeader, addons 
 		}
 	}
 	return buf.NewReader(reader)
-}
-
-// SupportsVisionPayloadBypass reports whether the destination is eligible for
-// unframed payload transport on the Vision wire.
-func SupportsVisionPayloadBypass(dest xnet.Destination) bool {
-	return session.IsDNSControlPlaneDestination(dest)
-}
-
-// ShouldRequestVisionPayloadBypass reports whether the local endpoint wants to
-// send unframed payload for this Vision request.
-func ShouldRequestVisionPayloadBypass(ctx context.Context, dest xnet.Destination) bool {
-	if !SupportsVisionPayloadBypass(dest) {
-		return false
-	}
-	return session.IsControlPlaneLoopbackIngress(session.InboundFromContext(ctx))
-}
-
-// ShouldHonorInboundVisionPayloadBypass reports whether the server should honor
-// an explicit client request to bypass Vision payload framing.
-func ShouldHonorInboundVisionPayloadBypass(addons *Addons, ctx context.Context, dest xnet.Destination) bool {
-	if addons == nil || !addons.GetBypassVisionPayload() {
-		return false
-	}
-	if !SupportsVisionPayloadBypass(dest) {
-		return false
-	}
-	return session.IsControlPlaneLoopbackIngress(session.InboundFromContext(ctx))
-}
-
-// ShouldHonorResponseVisionPayloadBypass reports whether the client should read
-// the response body as raw payload based on the response header.
-func ShouldHonorResponseVisionPayloadBypass(addons *Addons, dest xnet.Destination) bool {
-	if addons == nil || !addons.GetBypassVisionPayload() {
-		return false
-	}
-	return SupportsVisionPayloadBypass(dest)
 }
 
 func NewMultiLengthPacketWriter(writer buf.Writer) *MultiLengthPacketWriter {
@@ -225,20 +188,4 @@ func (r *LengthPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		mb = append(mb, b)
 	}
 	return mb, nil
-}
-
-// ShouldBypassVisionDNS reports whether this request should skip Vision
-// payload framing for loopback DNS control traffic.
-func ShouldBypassVisionDNS(ctx context.Context, dest xnet.Destination) bool {
-	if session.ClassifyDNSFlow(dest) != session.DNSFlowClassTCPControl {
-		return false
-	}
-	return ShouldRequestVisionPayloadBypass(ctx, dest)
-}
-
-// ShouldBypassVisionLoopbackUDP reports whether this request should skip Vision
-// payload framing for loopback DNS-over-UDP control traffic.
-func ShouldBypassVisionLoopbackUDP(ctx context.Context, dest xnet.Destination) bool {
-	return session.ClassifyDNSFlow(dest) == session.DNSFlowClassUDPControl &&
-		ShouldRequestVisionPayloadBypass(ctx, dest)
 }

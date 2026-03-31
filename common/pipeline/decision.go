@@ -101,6 +101,7 @@ const (
 	ReasonSockmapWaitError                  = "sockmap_wait_error"
 	ReasonSockmapWaitErrorUserspaceGuard    = "sockmap_wait_error_userspace_guard"
 	ReasonForwardSuccess                    = "forward_success"
+	ReasonSockmapAdmissionIdle              = "sockmap_admission_idle"
 	ReasonSockmapWaitFallback               = "sockmap_wait_fallback"
 	ReasonSockmapWaitFallbackUserspaceGuard = "sockmap_wait_fallback_userspace_guard"
 	ReasonSockmapRegisterFail               = "sockmap_register_fail"
@@ -128,16 +129,34 @@ const (
 
 // DecisionSnapshot carries per-connection pipeline outcomes for logging/telemetry.
 type DecisionSnapshot struct {
-	Path                Path
-	Reason              string
-	Caps                CapabilitySummary
-	SpliceBytes         int64
-	SpliceDurationNs    int64
-	UserspaceBytes      int64
-	UserspaceDurationNs int64
-	SockmapSuccess      bool
-	ErrorClass          string
-	Kind                string // optional: component-specific tag (e.g., proxy, xhttp)
+	Path                  Path
+	Reason                string
+	Caps                  CapabilitySummary
+	Target                string
+	LatencyVisibilityHint string
+	SpliceBytes           int64
+	SpliceDurationNs      int64
+	UserspaceBytes        int64
+	UserspaceDurationNs   int64
+	SockmapSuccess        bool
+	ErrorClass            string
+	Kind                  string // optional: component-specific tag (e.g., proxy, xhttp)
+	// Latency attribution for user-visible stalls.
+	VisionSignalSource        string
+	VisionSignalWaitNs        int64
+	VisionLocalNoDetachWaitNs int64
+	AcceptToRequestParseNs    int64
+	AcceptToVisionCommandNs   int64
+	FlowTTFBNs                int64
+	TargetConnectNs           int64
+	VisionPreDetachNs         int64
+	TargetFirstByteNs         int64
+	DNSResolutionNs           int64
+	UplinkUsefulDurationNs    int64
+	UplinkTotalDurationNs     int64
+	PostDetachHandoffPath     string
+	PostDetachHandoffNs       int64
+	SockmapFallbackProbeNs    int64
 	// Telemetry planes
 	TLSOffloadPath TLSOffloadPath
 	CopyPath       CopyPath

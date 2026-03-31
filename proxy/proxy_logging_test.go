@@ -172,6 +172,96 @@ func TestLogPipelineSummaryIncludesUserspaceExit(t *testing.T) {
 	}
 }
 
+func TestLogPipelineSummaryIncludesLatencyFieldsWhenPresent(t *testing.T) {
+	t.Cleanup(func() {
+		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
+	})
+
+	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
+	clog.RegisterHandler(handler)
+
+	logPipelineSummary(context.Background(), pipeline.DecisionSnapshot{
+		Kind:                      "proxy",
+		Path:                      pipeline.PathSplice,
+		Reason:                    pipeline.ReasonSplicePrimary,
+		Target:                    "tcp:api.example:443",
+		LatencyVisibilityHint:     "possible_blocking_wait_fallback",
+		Caps:                      pipeline.CapabilitySummary{KTLSSupported: true, SockmapSupported: true, SpliceSupported: true},
+		CopyPath:                  pipeline.CopyPathSplice,
+		TLSOffloadPath:            pipeline.TLSOffloadUserspace,
+		CopyGateState:             pipeline.CopyGatePendingDetach,
+		CopyGateReason:            pipeline.CopyGateReasonUnspecified,
+		VisionSignalSource:        "command_2",
+		VisionSignalWaitNs:        int64((250 * time.Millisecond).Nanoseconds()),
+		VisionLocalNoDetachWaitNs: int64((80 * time.Millisecond).Nanoseconds()),
+		AcceptToRequestParseNs:    int64((43 * time.Millisecond).Nanoseconds()),
+		AcceptToVisionCommandNs:   int64((105 * time.Millisecond).Nanoseconds()),
+		FlowTTFBNs:                int64((420 * time.Millisecond).Nanoseconds()),
+		TargetConnectNs:           int64((70 * time.Millisecond).Nanoseconds()),
+		VisionPreDetachNs:         int64((120 * time.Millisecond).Nanoseconds()),
+		TargetFirstByteNs:         int64((180 * time.Millisecond).Nanoseconds()),
+		DNSResolutionNs:           int64((35 * time.Millisecond).Nanoseconds()),
+		UplinkUsefulDurationNs:    int64((45 * time.Millisecond).Nanoseconds()),
+		UplinkTotalDurationNs:     int64((7 * time.Second).Nanoseconds()),
+		PostDetachHandoffPath:     "sockmap",
+		PostDetachHandoffNs:       int64((80 * time.Millisecond).Nanoseconds()),
+		SockmapFallbackProbeNs:    int64((750 * time.Millisecond).Nanoseconds()),
+	})
+
+	logs := strings.Join(handler.msgs, "\n")
+	if !strings.Contains(logs, "vision_signal_source=command_2") {
+		t.Fatalf("pipeline summary missing vision_signal_source field: %s", logs)
+	}
+	if !strings.Contains(logs, "target=tcp:api.example:443") {
+		t.Fatalf("pipeline summary missing target field: %s", logs)
+	}
+	if !strings.Contains(logs, "latency_visibility_hint=possible_blocking_wait_fallback") {
+		t.Fatalf("pipeline summary missing latency_visibility_hint field: %s", logs)
+	}
+	if !strings.Contains(logs, "vision_signal_wait_ns=250000000") {
+		t.Fatalf("pipeline summary missing vision_signal_wait_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "vision_local_no_detach_wait_ns=80000000") {
+		t.Fatalf("pipeline summary missing vision_local_no_detach_wait_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "accept_to_request_parse_ns=43000000") {
+		t.Fatalf("pipeline summary missing accept_to_request_parse_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "accept_to_vision_command_ns=105000000") {
+		t.Fatalf("pipeline summary missing accept_to_vision_command_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "post_detach_handoff_path=sockmap") {
+		t.Fatalf("pipeline summary missing post_detach_handoff_path field: %s", logs)
+	}
+	if !strings.Contains(logs, "post_detach_handoff_ns=80000000") {
+		t.Fatalf("pipeline summary missing post_detach_handoff_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "flow_ttfb_ns=420000000") {
+		t.Fatalf("pipeline summary missing flow_ttfb_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "target_connect_ns=70000000") {
+		t.Fatalf("pipeline summary missing target_connect_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "vision_predetach_ns=120000000") {
+		t.Fatalf("pipeline summary missing vision_predetach_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "target_first_byte_ns=180000000") {
+		t.Fatalf("pipeline summary missing target_first_byte_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "dns_resolution_ns=35000000") {
+		t.Fatalf("pipeline summary missing dns_resolution_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "uplink_useful_duration_ns=45000000") {
+		t.Fatalf("pipeline summary missing uplink_useful_duration_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "uplink_total_duration_ns=7000000000") {
+		t.Fatalf("pipeline summary missing uplink_total_duration_ns field: %s", logs)
+	}
+	if !strings.Contains(logs, "sockmap_fallback_probe_ns=750000000") {
+		t.Fatalf("pipeline summary missing sockmap_fallback_probe_ns field: %s", logs)
+	}
+}
+
 func TestInferTLSOffloadPathFromCryptoDetectsKTLS(t *testing.T) {
 	if got := inferTLSOffloadPathFromCrypto(ebpf.CryptoKTLSBoth, ebpf.CryptoNone); got != pipeline.TLSOffloadKTLS {
 		t.Fatalf("inferTLSOffloadPathFromCrypto(kTLS, raw)=%q, want %q", got, pipeline.TLSOffloadKTLS)

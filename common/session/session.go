@@ -94,7 +94,8 @@ type VisionSignal struct {
 }
 
 type VisionTimestamps struct {
-	detachUnixNano atomic.Int64
+	detachUnixNano   atomic.Int64
+	noDetachUnixNano atomic.Int64
 }
 
 func (t *VisionTimestamps) StoreDetach(unixNano int64) {
@@ -112,11 +113,27 @@ func (t *VisionTimestamps) ConsumeDetach() (int64, bool) {
 	return unixNano, unixNano > 0
 }
 
+func (t *VisionTimestamps) StoreNoDetach(unixNano int64) {
+	if t == nil || unixNano <= 0 {
+		return
+	}
+	t.noDetachUnixNano.Store(unixNano)
+}
+
+func (t *VisionTimestamps) ConsumeNoDetach() (int64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	unixNano := t.noDetachUnixNano.Swap(0)
+	return unixNano, unixNano > 0
+}
+
 func (t *VisionTimestamps) Clear() {
 	if t == nil {
 		return
 	}
 	t.detachUnixNano.Store(0)
+	t.noDetachUnixNano.Store(0)
 }
 
 func (p VisionSemanticPhase) String() string {

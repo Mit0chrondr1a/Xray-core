@@ -7,6 +7,7 @@ import (
 	"io"
 	gonet "net"
 	"reflect"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -108,6 +109,18 @@ func TestNewTrafficStateInboundDefaults(t *testing.T) {
 	}
 	if in.DownlinkWriterDirectCopy {
 		t.Fatal("Inbound.DownlinkWriterDirectCopy should be false initially")
+	}
+}
+
+func TestApplyVisionSharedParentCompat(t *testing.T) {
+	ts := NewTrafficState(nil)
+	ctx := ApplyVisionSharedParentCompat(context.Background(), ts)
+
+	if got := ts.NumberOfPacketToFilter; got != visionPacketsToFilterMainCompat {
+		t.Fatalf("NumberOfPacketToFilter=%d, want %d", got, visionPacketsToFilterMainCompat)
+	}
+	if !session.VisionSharedParentFromContext(ctx) {
+		t.Fatal("VisionSharedParentFromContext() = false, want true")
 	}
 }
 
@@ -820,6 +833,7 @@ func TestBuildVisionDecisionInputForCopyGatePrefersRawEligibleVisionPath(t *test
 		caps,
 		false,
 		session.CopyGateEligible,
+		false,
 	)
 	if got.ReaderCrypto != "none" {
 		t.Fatalf("ReaderCrypto=%q, want none when Vision direct-copy gate is eligible", got.ReaderCrypto)
@@ -848,12 +862,194 @@ func TestBuildVisionDecisionInputForCopyGateKeepsWrapperGuardBeforeEligibility(t
 		caps,
 		false,
 		session.CopyGatePendingDetach,
+		false,
 	)
 	if got.ReaderCrypto != "userspace-tls" {
 		t.Fatalf("ReaderCrypto=%q, want userspace-tls before Vision direct-copy eligibility", got.ReaderCrypto)
 	}
 	if snap := pipeline.DecideVisionPath(got); snap.Reason != pipeline.ReasonUserspaceTLSGuard {
 		t.Fatalf("DecideVisionPath(...).Reason=%q, want %q", snap.Reason, pipeline.ReasonUserspaceTLSGuard)
+	}
+}
+
+func TestBuildVisionDecisionInputForCopyGatePreservesWrappedCryptoForFallbackKTLS(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	wrappedReader := &tls.DeferredRustConn{}
+	caps := pipeline.CapabilitySummary{SpliceSupported: true}
+
+	got, _, _, _, _ := buildVisionDecisionInputForCopyGate(
+		wrappedReader,
+		right,
+		left,
+		right,
+		caps,
+		false,
+		session.CopyGateEligible,
+		true,
+	)
+	if got.ReaderCrypto != "userspace-tls" {
+		t.Fatalf("ReaderCrypto=%q, want userspace-tls when fallback kTLS preserves wrapped hints", got.ReaderCrypto)
+	}
+}
+
+func TestShouldPreserveWrappedCryptoHintsForCopyGate(t *testing.T) {
+	ctx := context.WithValue(context.Background(), fallbackRuntimeRecoveryContextKey{}, fallbackRuntimeRecoveryMeta{
+		FrontendTLSOffloadPath: pipeline.TLSOffloadKTLS,
+	})
+	if !shouldPreserveWrappedCryptoHintsForCopyGate(ctx) {
+		t.Fatal("shouldPreserveWrappedCryptoHintsForCopyGate()=false, want true for fallback kTLS")
+	}
+
+	ctx = context.WithValue(context.Background(), fallbackRuntimeRecoveryContextKey{}, fallbackRuntimeRecoveryMeta{
+		FrontendTLSOffloadPath: pipeline.TLSOffloadUserspace,
+	})
+	if shouldPreserveWrappedCryptoHintsForCopyGate(ctx) {
+		t.Fatal("shouldPreserveWrappedCryptoHintsForCopyGate()=true, want false for non-kTLS fallback")
+	}
+}
+
+func TestShouldStagePostDetachSockmapAdmission(t *testing.T) {
+	if !shouldStagePostDetachSockmapAdmission(copyLoopPhaseRawReady, true, false) {
+		t.Fatal("shouldStagePostDetachSockmapAdmission()=false, want true for raw-ready pending Vision flow")
+	}
+	if !shouldStagePostDetachSockmapAdmission(copyLoopPhaseStreaming, true, false) {
+		t.Fatal("shouldStagePostDetachSockmapAdmission()=false, want true while staged admission is still pending")
+	}
+	if shouldStagePostDetachSockmapAdmission(copyLoopPhaseRawReady, false, false) {
+		t.Fatal("shouldStagePostDetachSockmapAdmission()=true, want false after admission is resolved")
+	}
+	if shouldStagePostDetachSockmapAdmission(copyLoopPhaseRawReady, true, true) {
+		t.Fatal("shouldStagePostDetachSockmapAdmission()=true, want false when fallback kTLS preserves wrapped hints")
+	}
+}
+
+func TestShouldPromoteSockmapAfterAdmission(t *testing.T) {
+	if shouldPromoteSockmapAfterAdmission(1024, 1) {
+		t.Fatal("shouldPromoteSockmapAfterAdmission()=true, want false for a lone small burst")
+	}
+	if !shouldPromoteSockmapAfterAdmission(postDetachSockmapAdmissionMinBytes, 1) {
+		t.Fatal("shouldPromoteSockmapAfterAdmission()=false, want true once byte threshold is met")
+	}
+	if !shouldPromoteSockmapAfterAdmission(1024, postDetachSockmapAdmissionMinReads) {
+		t.Fatal("shouldPromoteSockmapAfterAdmission()=false, want true once read-event threshold is met")
+	}
+}
+
+func TestShouldBypassVisionDetachInProxy(t *testing.T) {
+	tests := []struct {
+		name    string
+		inbound *session.Inbound
+		target  xnet.Destination
+		want    bool
+	}{
+		{
+			name: "loopback tcp dns stays on the normal path",
+			inbound: &session.Inbound{
+				Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+			},
+			target: xnet.TCPDestination(xnet.IPAddress([]byte{1, 0, 0, 1}), xnet.Port(53)),
+			want:   false,
+		},
+		{
+			name: "native loopback udp dns stays on normal path",
+			inbound: &session.Inbound{
+				Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+				Conn:  &tls.DeferredRustConn{},
+			},
+			target: xnet.UDPDestination(xnet.IPAddress([]byte{1, 0, 0, 1}), xnet.Port(853)),
+			want:   false,
+		},
+		{
+			name: "non-native loopback udp dns stays on normal policy",
+			inbound: &session.Inbound{
+				Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+			},
+			target: xnet.UDPDestination(xnet.IPAddress([]byte{1, 0, 0, 1}), xnet.Port(853)),
+			want:   false,
+		},
+		{
+			name: "native loopback non-dns udp does not bypass",
+			inbound: &session.Inbound{
+				Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+				Conn:  &tls.DeferredRustConn{},
+			},
+			target: xnet.UDPDestination(xnet.IPAddress([]byte{8, 8, 8, 8}), xnet.Port(443)),
+			want:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := session.ContextWithInbound(context.Background(), tc.inbound)
+			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: tc.target}})
+			if got := shouldBypassVisionDetachInProxy(ctx, tc.inbound); got != tc.want {
+				t.Fatalf("shouldBypassVisionDetachInProxy()=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCopyRawConnIfExistRetiresGuardedTCPDNSControlFlowAfterOneResponseFrame(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+		t.Skip("CopyRawConnIfExist TCP guard path is only exercised on linux/android")
+	}
+
+	readerPeer, readerConn := gonet.Pipe()
+	defer readerPeer.Close()
+	defer readerConn.Close()
+
+	writerClient, writerServer := mustTCPPair(t)
+	defer writerClient.Close()
+	defer writerServer.Close()
+
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	defer cancelCopy()
+	timer := signal.CancelAfterInactivity(copyCtx, cancelCopy, 15*time.Second)
+	defer timer.SetTimeout(0)
+
+	inbound := &session.Inbound{
+		Local: xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
+	}
+	inbound.SetCopyGate(session.CopyGateNotApplicable, session.CopyGateReasonTransportNonRawSplitConn)
+	outbound := &session.Outbound{
+		Target: xnet.TCPDestination(xnet.IPAddress([]byte{1, 0, 0, 1}), xnet.Port(53)),
+	}
+	outbound.SetCopyGate(session.CopyGateEligible, session.CopyGateReasonUnspecified)
+
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	clientOutput := &notifyingWriteBuffer{wrote: make(chan struct{})}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyRawConnIfExist(ctx, readerConn, writerClient, buf.NewWriter(clientOutput), timer, nil)
+	}()
+
+	framedResponse := []byte{0, 3, 'f', 'o', 'o'}
+	time.AfterFunc(100*time.Millisecond, func() {
+		_, _ = readerPeer.Write(framedResponse)
+	})
+
+	select {
+	case <-clientOutput.wrote:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for guarded TCP DNS response to be forwarded")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CopyRawConnIfExist() error=%v, want nil after one framed TCP DNS response", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for guarded TCP DNS flow to retire after one framed response")
+	}
+
+	if got := clientOutput.Bytes(); !bytes.Equal(got, framedResponse) {
+		t.Fatalf("forwarded payload=%v, want %v", got, framedResponse)
 	}
 }
 
@@ -1025,6 +1221,34 @@ func TestObserveVisionUplinkCompleteLeavesNonDeferredFlowUntouched(t *testing.T)
 	}
 }
 
+func TestObserveVisionUplinkCompleteSkipsVisionSharedParentCompat(t *testing.T) {
+	inbound := &session.Inbound{Conn: &tls.DeferredRustConn{}}
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	outbound := &session.Outbound{}
+	outbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
+	visionCh := make(chan session.VisionSignal, 1)
+	ctx := session.ContextWithVisionSharedParent(
+		session.ContextWithInbound(session.ContextWithVisionSignal(context.Background(), visionCh), inbound),
+		true,
+	)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+
+	if ObserveVisionUplinkComplete(ctx, inbound, outbound) {
+		t.Fatal("ObserveVisionUplinkComplete() = true, want false for shared-parent compat flow")
+	}
+	if got := inbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+		t.Fatalf("inbound state=%v, want pending_detach", got)
+	}
+	if got := outbound.GetCanSpliceCopy(); got != session.CopyGatePendingDetach {
+		t.Fatalf("outbound state=%v, want pending_detach", got)
+	}
+	select {
+	case sig := <-visionCh:
+		t.Fatalf("unexpected signal command=%d for shared-parent compat flow", sig.Command)
+	default:
+	}
+}
+
 func TestShouldReportNativeDeferredRuntimeRegression(t *testing.T) {
 	inbound := &session.Inbound{
 		Tag:  "native-vision",
@@ -1071,6 +1295,232 @@ func TestShouldRetryPostSockmapSpliceProbe(t *testing.T) {
 	}
 	if shouldRetryPostSockmapSpliceProbe(true, io.EOF, 64, 32) {
 		t.Fatal("shouldRetryPostSockmapSpliceProbe() = true, want false for non-timeout errors")
+	}
+}
+
+func TestShouldEnablePostSockmapSpliceProbe(t *testing.T) {
+	if !shouldEnablePostSockmapSpliceProbe(false, pipeline.ReasonSockmapRegisterFail) {
+		t.Fatal("shouldEnablePostSockmapSpliceProbe() = false, want true for sockmap register failure")
+	}
+	if shouldEnablePostSockmapSpliceProbe(false, pipeline.ReasonSockmapWaitFallback) {
+		t.Fatal("shouldEnablePostSockmapSpliceProbe() = true, want false for sockmap inactive fallback")
+	}
+	if shouldEnablePostSockmapSpliceProbe(true, pipeline.ReasonSockmapWaitFallback) {
+		t.Fatal("shouldEnablePostSockmapSpliceProbe() = true, want false once probe already completed")
+	}
+	if shouldEnablePostSockmapSpliceProbe(false, pipeline.ReasonSplicePrimary) {
+		t.Fatal("shouldEnablePostSockmapSpliceProbe() = true, want false for non-sockmap reasons")
+	}
+}
+
+func TestSelectDecisionTargetPrefersLastValidTarget(t *testing.T) {
+	outbounds := []*session.Outbound{
+		{
+			OriginalTarget: xnet.TCPDestination(xnet.DomainAddress("fallback.example"), xnet.Port(443)),
+		},
+		{
+			Target: xnet.TCPDestination(xnet.DomainAddress("api.example"), xnet.Port(443)),
+		},
+	}
+
+	if got, want := selectDecisionTarget(outbounds), "tcp:api.example:443"; got != want {
+		t.Fatalf("selectDecisionTarget()=%q, want %q", got, want)
+	}
+}
+
+func TestClassifyLatencyVisibilityHint(t *testing.T) {
+	t.Run("wait fallback idle tail", func(t *testing.T) {
+		snap := &pipeline.DecisionSnapshot{
+			Path:             pipeline.PathSplice,
+			Reason:           pipeline.ReasonSockmapWaitFallback,
+			SpliceBytes:      63,
+			SpliceDurationNs: int64((60 * time.Second).Nanoseconds()),
+		}
+		if got, want := classifyLatencyVisibilityHint(snap), "likely_background_idle_tail"; got != want {
+			t.Fatalf("classifyLatencyVisibilityHint()=%q, want %q", got, want)
+		}
+	})
+
+	t.Run("wait fallback possible blocking", func(t *testing.T) {
+		snap := &pipeline.DecisionSnapshot{
+			Path:             pipeline.PathSplice,
+			Reason:           pipeline.ReasonSockmapWaitFallback,
+			SpliceBytes:      512,
+			SpliceDurationNs: int64((3 * time.Second).Nanoseconds()),
+		}
+		if got, want := classifyLatencyVisibilityHint(snap), "possible_blocking_wait_fallback"; got != want {
+			t.Fatalf("classifyLatencyVisibilityHint()=%q, want %q", got, want)
+		}
+	})
+
+	t.Run("early userspace remote reset", func(t *testing.T) {
+		snap := &pipeline.DecisionSnapshot{
+			Path:                pipeline.PathUserspace,
+			Reason:              pipeline.ReasonDefault,
+			UserspaceExit:       pipeline.UserspaceExitRemoteReset,
+			UserspaceDurationNs: int64((100 * time.Millisecond).Nanoseconds()),
+		}
+		if got, want := classifyLatencyVisibilityHint(snap), "early_userspace_remote_reset"; got != want {
+			t.Fatalf("classifyLatencyVisibilityHint()=%q, want %q", got, want)
+		}
+	})
+}
+
+func TestRecordVisionLatencySignalSetsOnce(t *testing.T) {
+	start := time.Unix(0, 1_000_000_000)
+	now := start.Add(250 * time.Millisecond)
+	decision := &pipeline.DecisionSnapshot{}
+
+	recordVisionLatencySignal(decision, start, now, "command_2")
+
+	if decision.VisionSignalSource != "command_2" {
+		t.Fatalf("VisionSignalSource=%q, want command_2", decision.VisionSignalSource)
+	}
+	if decision.VisionSignalWaitNs != (250 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("VisionSignalWaitNs=%d, want %d", decision.VisionSignalWaitNs, (250 * time.Millisecond).Nanoseconds())
+	}
+
+	recordVisionLatencySignal(decision, start, now.Add(time.Second), "command_1")
+
+	if decision.VisionSignalSource != "command_2" {
+		t.Fatalf("VisionSignalSource overwritten to %q, want command_2", decision.VisionSignalSource)
+	}
+	if decision.VisionSignalWaitNs != (250 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("VisionSignalWaitNs overwritten to %d, want %d", decision.VisionSignalWaitNs, (250 * time.Millisecond).Nanoseconds())
+	}
+}
+
+func TestRecordVisionLocalNoDetachWaitSetsOnce(t *testing.T) {
+	noDetachAt := time.Unix(0, 4_000_000_000)
+	now := noDetachAt.Add(320 * time.Millisecond)
+	decision := &pipeline.DecisionSnapshot{}
+
+	recordVisionLocalNoDetachWait(decision, now, noDetachAt.UnixNano())
+
+	if decision.VisionLocalNoDetachWaitNs != (320 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("VisionLocalNoDetachWaitNs=%d, want %d", decision.VisionLocalNoDetachWaitNs, (320 * time.Millisecond).Nanoseconds())
+	}
+
+	recordVisionLocalNoDetachWait(decision, now.Add(time.Second), noDetachAt.UnixNano())
+
+	if decision.VisionLocalNoDetachWaitNs != (320 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("VisionLocalNoDetachWaitNs overwritten to %d, want %d", decision.VisionLocalNoDetachWaitNs, (320 * time.Millisecond).Nanoseconds())
+	}
+}
+
+func TestRecordVisionPreDetachUsesRequestStart(t *testing.T) {
+	requestStart := time.Unix(0, 1_000_000_000)
+	detachAt := requestStart.Add(220 * time.Millisecond)
+	decision := &pipeline.DecisionSnapshot{}
+	timings := &session.FlowTimings{}
+	timings.StoreRequestStart(requestStart.UnixNano())
+
+	recordVisionPreDetach(decision, timings, detachAt.UnixNano())
+
+	if decision.VisionPreDetachNs != (220 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("VisionPreDetachNs=%d, want %d", decision.VisionPreDetachNs, (220 * time.Millisecond).Nanoseconds())
+	}
+}
+
+func TestRecordPostDetachHandoffPrefersDetachTimestamp(t *testing.T) {
+	signalAt := time.Unix(0, 2_000_000_000)
+	detachAt := signalAt.Add(120 * time.Millisecond)
+	now := signalAt.Add(400 * time.Millisecond)
+	decision := &pipeline.DecisionSnapshot{}
+
+	recordPostDetachHandoff(decision, now, "splice", detachAt.UnixNano(), signalAt)
+
+	if decision.PostDetachHandoffPath != "splice" {
+		t.Fatalf("PostDetachHandoffPath=%q, want splice", decision.PostDetachHandoffPath)
+	}
+	want := now.Sub(detachAt).Nanoseconds()
+	if decision.PostDetachHandoffNs != want {
+		t.Fatalf("PostDetachHandoffNs=%d, want %d", decision.PostDetachHandoffNs, want)
+	}
+
+	recordPostDetachHandoff(decision, now.Add(time.Second), "sockmap", 0, signalAt)
+
+	if decision.PostDetachHandoffPath != "splice" {
+		t.Fatalf("PostDetachHandoffPath overwritten to %q, want splice", decision.PostDetachHandoffPath)
+	}
+	if decision.PostDetachHandoffNs != want {
+		t.Fatalf("PostDetachHandoffNs overwritten to %d, want %d", decision.PostDetachHandoffNs, want)
+	}
+}
+
+func TestRecordSockmapFallbackProbeSetsOnce(t *testing.T) {
+	fallbackAt := time.Unix(0, 3_000_000_000)
+	now := fallbackAt.Add(750 * time.Millisecond)
+	decision := &pipeline.DecisionSnapshot{}
+
+	recordSockmapFallbackProbe(decision, fallbackAt, now)
+
+	if decision.SockmapFallbackProbeNs != (750 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("SockmapFallbackProbeNs=%d, want %d", decision.SockmapFallbackProbeNs, (750 * time.Millisecond).Nanoseconds())
+	}
+
+	recordSockmapFallbackProbe(decision, fallbackAt, now.Add(time.Second))
+
+	if decision.SockmapFallbackProbeNs != (750 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("SockmapFallbackProbeNs overwritten to %d, want %d", decision.SockmapFallbackProbeNs, (750 * time.Millisecond).Nanoseconds())
+	}
+}
+
+func TestPopulateDecisionLatencyFromFlowTimings(t *testing.T) {
+	acceptStart := time.Unix(0, 750_000_000)
+	requestParsed := acceptStart.Add(90 * time.Millisecond)
+	firstVisionCommand := acceptStart.Add(180 * time.Millisecond)
+	requestStart := time.Unix(0, 1_000_000_000)
+	dnsResolved := requestStart.Add(35 * time.Millisecond)
+	connectStart := requestStart.Add(40 * time.Millisecond)
+	connectOpen := connectStart.Add(70 * time.Millisecond)
+	uplinkStart := connectOpen.Add(5 * time.Millisecond)
+	uplinkFirstWrite := uplinkStart.Add(3 * time.Millisecond)
+	uplinkLastWrite := uplinkStart.Add(45 * time.Millisecond)
+	uplinkComplete := uplinkStart.Add(7 * time.Second)
+	firstResponse := requestStart.Add(420 * time.Millisecond)
+	timings := &session.FlowTimings{}
+	decision := &pipeline.DecisionSnapshot{}
+
+	timings.StoreAcceptStart(acceptStart.UnixNano())
+	timings.StoreRequestParsed(requestParsed.UnixNano())
+	timings.StoreFirstVisionCommand(firstVisionCommand.UnixNano())
+	timings.StoreRequestStart(requestStart.UnixNano())
+	timings.StoreDNSResolved(dnsResolved.UnixNano())
+	timings.StoreConnectStart(connectStart.UnixNano())
+	timings.StoreConnectOpen(connectOpen.UnixNano())
+	timings.StoreUplinkStart(uplinkStart.UnixNano())
+	timings.ObserveUplinkWrite(uplinkFirstWrite.UnixNano(), 64)
+	timings.ObserveUplinkWrite(uplinkLastWrite.UnixNano(), 128)
+	timings.StoreUplinkComplete(uplinkComplete.UnixNano())
+	timings.StoreFirstResponse(firstResponse.UnixNano())
+
+	populateDecisionLatencyFromFlowTimings(decision, timings)
+
+	if decision.AcceptToRequestParseNs != (90 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("AcceptToRequestParseNs=%d, want %d", decision.AcceptToRequestParseNs, (90 * time.Millisecond).Nanoseconds())
+	}
+	if decision.AcceptToVisionCommandNs != (180 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("AcceptToVisionCommandNs=%d, want %d", decision.AcceptToVisionCommandNs, (180 * time.Millisecond).Nanoseconds())
+	}
+	if decision.DNSResolutionNs != (35 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("DNSResolutionNs=%d, want %d", decision.DNSResolutionNs, (35 * time.Millisecond).Nanoseconds())
+	}
+	if decision.TargetConnectNs != (70 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("TargetConnectNs=%d, want %d", decision.TargetConnectNs, (70 * time.Millisecond).Nanoseconds())
+	}
+	if decision.UplinkUsefulDurationNs != (45 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("UplinkUsefulDurationNs=%d, want %d", decision.UplinkUsefulDurationNs, (45 * time.Millisecond).Nanoseconds())
+	}
+	if decision.UplinkTotalDurationNs != (7 * time.Second).Nanoseconds() {
+		t.Fatalf("UplinkTotalDurationNs=%d, want %d", decision.UplinkTotalDurationNs, (7 * time.Second).Nanoseconds())
+	}
+	if decision.FlowTTFBNs != (420 * time.Millisecond).Nanoseconds() {
+		t.Fatalf("FlowTTFBNs=%d, want %d", decision.FlowTTFBNs, (420 * time.Millisecond).Nanoseconds())
+	}
+	wantTargetFirstByte := firstResponse.Sub(uplinkFirstWrite).Nanoseconds()
+	if decision.TargetFirstByteNs != wantTargetFirstByte {
+		t.Fatalf("TargetFirstByteNs=%d, want %d", decision.TargetFirstByteNs, wantTargetFirstByte)
 	}
 }
 
