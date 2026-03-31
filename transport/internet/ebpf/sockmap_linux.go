@@ -39,6 +39,20 @@ type ebpfState struct {
 
 var currentState atomic.Pointer[ebpfState]
 
+var probeKTLSSetsockoptFn = func(fd int, opt int, val unsafe.Pointer, vallen uintptr) syscall.Errno {
+	const solTLS = 282
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_SETSOCKOPT,
+		uintptr(fd),
+		uintptr(solTLS),
+		uintptr(opt),
+		uintptr(val),
+		vallen,
+		0,
+	)
+	return errno
+}
+
 func init() {
 	currentState.Store(&ebpfState{
 		sockhashFD:      -1,
@@ -47,6 +61,36 @@ func init() {
 		skSkbVerdictFD:  -1,
 		sockmapAttachFD: -1,
 	})
+}
+
+func installProbeBidirectionalKTLS(fd int) bool {
+	// Install minimal TLS 1.3 AES-128-GCM-SHA256 crypto info in both TX and RX
+	// directions so the compatibility probe matches real fallback sockets, which
+	// carry bidirectional kTLS when the fallback path promotes both sides.
+	const (
+		tlsTX = 1
+		tlsRX = 2
+	)
+	// struct tls12_crypto_info_aes_gcm_128:
+	//   tls_crypto_info (4 bytes: version u16, cipher_type u16)
+	//   iv       [8]byte
+	//   key      [16]byte
+	//   salt     [4]byte
+	//   rec_seq  [8]byte
+	var info [40]byte
+	// version = TLS 1.3 (0x0304), little-endian u16
+	info[0] = 0x04
+	info[1] = 0x03
+	// cipher_type = TLS_CIPHER_AES_GCM_128 (51), little-endian u16
+	info[2] = 51
+	info[3] = 0
+
+	for _, opt := range []int{tlsTX, tlsRX} {
+		if errno := probeKTLSSetsockoptFn(fd, opt, unsafe.Pointer(&info), unsafe.Sizeof(info)); errno != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Slot management globals have their own mutex and don't need atomic state.
@@ -1057,37 +1101,7 @@ func probeKTLSSockhashCompat() bool {
 		if err := syscall.SetsockoptString(intFD, syscall.SOL_TCP, unix.TCP_ULP, "tls"); err != nil {
 			return
 		}
-		// Install minimal TLS 1.3 AES-128-GCM-SHA256 TX crypto info.
-		// We don't need real keys — just enough for the kernel to accept the ULP setup.
-		const (
-			solTLS = 282
-			tlsTX  = 1
-		)
-		// struct tls12_crypto_info_aes_gcm_128:
-		//   tls_crypto_info (4 bytes: version u16, cipher_type u16)
-		//   iv       [8]byte
-		//   key      [16]byte
-		//   salt     [4]byte
-		//   rec_seq  [8]byte
-		var info [40]byte
-		// version = TLS 1.3 (0x0304), little-endian u16
-		info[0] = 0x04
-		info[1] = 0x03
-		// cipher_type = TLS_CIPHER_AES_GCM_128 (51), little-endian u16
-		info[2] = 51
-		info[3] = 0
-		// rest is zeroed (dummy keys — this is a probe socket, never used for data)
-
-		_, _, errno := syscall.Syscall6(
-			syscall.SYS_SETSOCKOPT,
-			fd,
-			uintptr(solTLS),
-			uintptr(tlsTX),
-			uintptr(unsafe.Pointer(&info)),
-			uintptr(unsafe.Sizeof(info)),
-			0,
-		)
-		if errno != 0 {
+		if !installProbeBidirectionalKTLS(intFD) {
 			return
 		}
 

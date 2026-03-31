@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -1075,9 +1076,9 @@ func TestComputeRedirectPolicy(t *testing.T) {
 		wantKTLS  bool
 	}{
 		{"both raw TCP", CryptoNone, CryptoNone, true, false},
-		{"both kTLS full", CryptoKTLSBoth, CryptoKTLSBoth, true, true},
-		{"raw + kTLS", CryptoNone, CryptoKTLSBoth, true, true},
-		{"kTLS + raw", CryptoKTLSBoth, CryptoNone, true, true},
+		{"both kTLS full", CryptoKTLSBoth, CryptoKTLSBoth, false, false},
+		{"raw + kTLS", CryptoNone, CryptoKTLSBoth, false, false},
+		{"kTLS + raw", CryptoKTLSBoth, CryptoNone, false, false},
 		{"kTLS TX only + kTLS", CryptoKTLSTxOnly, CryptoKTLSBoth, false, false},
 		{"kTLS RX only + kTLS", CryptoKTLSRxOnly, CryptoKTLSBoth, false, false},
 		{"userspace + raw", CryptoUserspaceTLS, CryptoNone, false, false},
@@ -1193,15 +1194,25 @@ func TestCanUseZeroCopyWithCrypto(t *testing.T) {
 		t.Error("expected true for CryptoNone+CryptoNone")
 	}
 
-	// kTLS pairs: allowed only when the kernel supports kTLS+SOCKHASH.
-	ktlsOK := KTLSSockhashCompatible()
-	if got := CanUseZeroCopyWithCrypto(client, server, CryptoKTLSBoth, CryptoKTLSBoth); got != ktlsOK {
-		t.Errorf("CryptoKTLSBoth+CryptoKTLSBoth: got %v, want %v (KTLSSockhashCompatible=%v)", got, ktlsOK, ktlsOK)
+	// kTLS is denied before compatibility probing; only raw TCP stays eligible.
+	saved := ktlsSockhashCompatFn
+	defer func() { ktlsSockhashCompatFn = saved }()
+	calls := 0
+	ktlsSockhashCompatFn = func() bool {
+		calls++
+		return true
 	}
-
-	// Asymmetric kTLS ↔ plain TCP: allowed only when kernel supports kTLS+SOCKHASH.
-	if got := CanUseZeroCopyWithCrypto(client, server, CryptoNone, CryptoKTLSBoth); got != ktlsOK {
-		t.Errorf("CryptoNone+CryptoKTLSBoth: got %v, want %v (KTLSSockhashCompatible=%v)", got, ktlsOK, ktlsOK)
+	if CanUseZeroCopyWithCrypto(client, server, CryptoKTLSBoth, CryptoKTLSBoth) {
+		t.Error("expected false for CryptoKTLSBoth+CryptoKTLSBoth")
+	}
+	if CanUseZeroCopyWithCrypto(client, server, CryptoNone, CryptoKTLSBoth) {
+		t.Error("expected false for CryptoNone+CryptoKTLSBoth")
+	}
+	if CanUseZeroCopyWithCrypto(client, server, CryptoKTLSBoth, CryptoNone) {
+		t.Error("expected false for CryptoKTLSBoth+CryptoNone")
+	}
+	if calls != 0 {
+		t.Errorf("ktls compatibility probe should not run for kTLS candidates, got %d calls", calls)
 	}
 
 	// Userspace: denied
@@ -1456,13 +1467,49 @@ func TestKTLSSockhashProbe(t *testing.T) {
 	t.Logf("kTLS+SOCKHASH probe result: %v", result)
 }
 
-// TestAsymmetricCryptoPolicyRegistration verifies that RegisterPairWithCrypto
-// with asymmetric crypto hints (kTLS ↔ plain TCP) correctly writes the
-// expected policy flags (PolicyAllowRedirect | PolicyKTLSActive) into the
-// BPF policy map. This validates the core asymmetric redirect policy that
-// allows mixed kTLS/plain pairs in sockmap — the common proxy scenario
-// where one side is encrypted (client) and the other is plain (upstream).
-func TestAsymmetricCryptoPolicyRegistration(t *testing.T) {
+func TestInstallProbeBidirectionalKTLS(t *testing.T) {
+	saved := probeKTLSSetsockoptFn
+	defer func() { probeKTLSSetsockoptFn = saved }()
+
+	var opts []int
+	probeKTLSSetsockoptFn = func(fd int, opt int, val unsafe.Pointer, vallen uintptr) syscall.Errno {
+		opts = append(opts, opt)
+		return 0
+	}
+
+	if !installProbeBidirectionalKTLS(42) {
+		t.Fatal("installProbeBidirectionalKTLS() = false, want true when TX/RX setup succeeds")
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(opts, want) {
+		t.Fatalf("installProbeBidirectionalKTLS() options=%v, want %v", opts, want)
+	}
+}
+
+func TestInstallProbeBidirectionalKTLSFailsOnRXSetup(t *testing.T) {
+	saved := probeKTLSSetsockoptFn
+	defer func() { probeKTLSSetsockoptFn = saved }()
+
+	var opts []int
+	probeKTLSSetsockoptFn = func(fd int, opt int, val unsafe.Pointer, vallen uintptr) syscall.Errno {
+		opts = append(opts, opt)
+		if opt == 2 {
+			return syscall.EINVAL
+		}
+		return 0
+	}
+
+	if installProbeBidirectionalKTLS(42) {
+		t.Fatal("installProbeBidirectionalKTLS() = true, want false when RX setup fails")
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(opts, want) {
+		t.Fatalf("installProbeBidirectionalKTLS() options=%v, want %v", opts, want)
+	}
+}
+
+// TestRegisterPairWithCrypto_KTLSPolicyZero verifies that direct registration
+// with kTLS hints writes a zero redirect policy, so low-level callers cannot
+// accidentally enable redirect on crypto-bearing sockets.
+func TestRegisterPairWithCrypto_KTLSPolicyZero(t *testing.T) {
 	caps := GetCapabilities()
 	if !caps.SockmapSupported {
 		t.Skip("sockmap not supported on this system")
@@ -1496,7 +1543,7 @@ func TestAsymmetricCryptoPolicyRegistration(t *testing.T) {
 		t.Fatalf("RegisterPairWithCrypto(None, KTLSBoth) failed: %v", err)
 	}
 
-	// Verify the policy map entries have the correct flags.
+	// Verify the policy map entries remain non-redirecting.
 	clientFD := getFDOrSkip(t, client)
 	serverFD := getFDOrSkip(t, server)
 
@@ -1522,12 +1569,11 @@ func TestAsymmetricCryptoPolicyRegistration(t *testing.T) {
 		t.Fatalf("policy lookup for outbound socket: %v", err)
 	}
 
-	wantPolicy := PolicyAllowRedirect | PolicyKTLSActive
-	if clientPolicy != wantPolicy {
-		t.Errorf("inbound policy: got 0x%x, want 0x%x (PolicyAllowRedirect|PolicyKTLSActive)", clientPolicy, wantPolicy)
+	if clientPolicy != 0 {
+		t.Errorf("inbound policy: got 0x%x, want 0", clientPolicy)
 	}
-	if serverPolicy != wantPolicy {
-		t.Errorf("outbound policy: got 0x%x, want 0x%x (PolicyAllowRedirect|PolicyKTLSActive)", serverPolicy, wantPolicy)
+	if serverPolicy != 0 {
+		t.Errorf("outbound policy: got 0x%x, want 0", serverPolicy)
 	}
 
 	if err := mgr.UnregisterPair(client, server); err != nil {
@@ -1541,86 +1587,6 @@ func TestAsymmetricCryptoPolicyRegistration(t *testing.T) {
 	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&serverCookie), unsafe.Pointer(&serverPolicy)); err == nil {
 		t.Error("outbound policy entry should be deleted after unregister")
 	}
-}
-
-// TestAsymmetricSockmapDataTransfer validates that the sockmap data path works
-// correctly when a pair is registered with asymmetric crypto hints. The verdict
-// program consults the policy map and sees PolicyKTLSActive — this test ensures
-// that flag does not impede the redirect when both sockets are actually plain
-// TCP (the kernel-side kTLS layer would handle encryption transparently if
-// present, but sockmap redirect operates at the socket/plaintext layer regardless).
-func TestAsymmetricSockmapDataTransfer(t *testing.T) {
-	caps := GetCapabilities()
-	if !caps.SockmapSupported {
-		t.Skip("sockmap not supported on this system")
-	}
-
-	mgr := NewSockmapManager(DefaultSockmapConfig())
-	if err := mgr.Enable(); err != nil {
-		t.Fatal(err)
-	}
-	defer mgr.Disable()
-
-	// Create two TCP pairs: client <-> proxyIn, proxyOut <-> server
-	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer proxyListener.Close()
-
-	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer serverListener.Close()
-
-	proxyInCh := make(chan net.Conn, 1)
-	go func() { c, _ := proxyListener.Accept(); proxyInCh <- c }()
-
-	serverCh := make(chan net.Conn, 1)
-	go func() { c, _ := serverListener.Accept(); serverCh <- c }()
-
-	client, err := net.Dial("tcp", proxyListener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	proxyOut, err := net.Dial("tcp", serverListener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer proxyOut.Close()
-
-	proxyIn := <-proxyInCh
-	defer proxyIn.Close()
-	server := <-serverCh
-	defer server.Close()
-
-	// Register with asymmetric hints: proxyIn = kTLS, proxyOut = plain TCP.
-	// This exercises the code path where computeRedirectPolicy sets
-	// PolicyAllowRedirect | PolicyKTLSActive for asymmetric pairs.
-	if err := mgr.RegisterPairWithCrypto(proxyIn, proxyOut, CryptoKTLSBoth, CryptoNone); err != nil {
-		t.Fatalf("RegisterPairWithCrypto(KTLSBoth, None): %v", err)
-	}
-
-	testData := []byte("asymmetric kTLS<->plain sockmap redirect test")
-	if _, err := client.Write(testData); err != nil {
-		t.Fatal(err)
-	}
-
-	server.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, len(testData)*2)
-	n, err := server.Read(buf)
-	if err != nil {
-		t.Logf("asymmetric sockmap redirect may not be active (kernel-dependent): %v", err)
-	} else if string(buf[:n]) != string(testData) {
-		t.Fatalf("data mismatch: got %q, want %q", buf[:n], testData)
-	} else {
-		t.Log("asymmetric sockmap data transfer successful")
-	}
-
-	mgr.UnregisterPair(proxyIn, proxyOut)
 }
 
 // getFDOrSkip extracts the fd from a net.Conn, skipping the test on error.

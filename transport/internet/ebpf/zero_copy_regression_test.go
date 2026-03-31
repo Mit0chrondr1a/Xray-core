@@ -82,7 +82,7 @@ func TestCanUseZeroCopyWithCrypto_IneligibleCandidatesSkipKTLSProbe(t *testing.T
 	}
 }
 
-func TestCanUseZeroCopyWithCrypto_KTLSCandidatesRespectCompatibilityProbe(t *testing.T) {
+func TestCanUseZeroCopyWithCrypto_KTLSCandidatesAreRejectedWithoutProbe(t *testing.T) {
 	inbound, outbound := newTCPPair(t)
 
 	saved := ktlsSockhashCompatFn
@@ -91,22 +91,20 @@ func TestCanUseZeroCopyWithCrypto_KTLSCandidatesRespectCompatibilityProbe(t *tes
 	var probeCalls atomic.Int32
 	ktlsSockhashCompatFn = func() bool {
 		probeCalls.Add(1)
-		return false
+		return true
 	}
 
 	if CanUseZeroCopyWithCrypto(inbound, outbound, CryptoKTLSBoth, CryptoNone) {
-		t.Fatal("expected false when kTLS+SOCKHASH is incompatible")
+		t.Fatal("expected false for plain/kTLS candidate")
 	}
-	if got := probeCalls.Load(); got != 1 {
-		t.Fatalf("expected exactly one compatibility probe call, got %d", got)
+	if CanUseZeroCopyWithCrypto(inbound, outbound, CryptoNone, CryptoKTLSBoth) {
+		t.Fatal("expected false for kTLS/plain candidate")
 	}
-
-	ktlsSockhashCompatFn = func() bool { return true }
-	if !CanUseZeroCopyWithCrypto(inbound, outbound, CryptoKTLSBoth, CryptoNone) {
-		t.Fatal("expected true when kTLS+SOCKHASH is compatible")
+	if CanUseZeroCopyWithCrypto(inbound, outbound, CryptoKTLSBoth, CryptoKTLSBoth) {
+		t.Fatal("expected false for kTLS/kTLS candidate")
 	}
-	if !CanUseZeroCopyWithCrypto(inbound, outbound, CryptoNone, CryptoKTLSBoth) {
-		t.Fatal("expected true for asymmetric kTLS/plain when compatible")
+	if got := probeCalls.Load(); got != 0 {
+		t.Fatalf("kTLS candidates should be rejected before probing compatibility, got %d probe calls", got)
 	}
 }
 

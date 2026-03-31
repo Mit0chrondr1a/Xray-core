@@ -133,25 +133,19 @@ func TestComputeRedirectPolicy_BothPlain(t *testing.T) {
 	}
 }
 
-// TestComputeRedirectPolicy_BothKTLS verifies kTLS pairs are allowed with flag.
-func TestComputeRedirectPolicy_BothKTLS(t *testing.T) {
+// TestComputeRedirectPolicy_BothKTLS_Denied verifies kTLS pairs are not eligible.
+func TestComputeRedirectPolicy_BothKTLS_Denied(t *testing.T) {
 	policy := computeRedirectPolicy(CryptoKTLSBoth, CryptoKTLSBoth)
-	if policy&PolicyAllowRedirect == 0 {
-		t.Fatal("CryptoKTLSBoth <-> CryptoKTLSBoth should allow redirect")
-	}
-	if policy&PolicyKTLSActive == 0 {
-		t.Fatal("CryptoKTLSBoth <-> CryptoKTLSBoth should set PolicyKTLSActive")
+	if policy != 0 {
+		t.Fatalf("policy=%d, want 0 (kTLS pairs must not be redirected)", policy)
 	}
 }
 
-// TestComputeRedirectPolicy_AsymmetricKTLS verifies mixed kTLS + plain is allowed.
-func TestComputeRedirectPolicy_AsymmetricKTLS(t *testing.T) {
+// TestComputeRedirectPolicy_AsymmetricKTLS_Denied verifies mixed kTLS + plain is rejected.
+func TestComputeRedirectPolicy_AsymmetricKTLS_Denied(t *testing.T) {
 	policy := computeRedirectPolicy(CryptoKTLSBoth, CryptoNone)
-	if policy&PolicyAllowRedirect == 0 {
-		t.Fatal("CryptoKTLSBoth <-> CryptoNone should allow redirect (normal proxy scenario)")
-	}
-	if policy&PolicyKTLSActive == 0 {
-		t.Fatal("should set PolicyKTLSActive when one side is kTLS")
+	if policy != 0 {
+		t.Fatalf("policy=%d, want 0 (mixed kTLS/plain pairs must not be redirected)", policy)
 	}
 }
 
@@ -166,6 +160,8 @@ func TestComputeRedirectPolicy_UserspaceTLS_Denied(t *testing.T) {
 		{"userspace outbound", CryptoNone, CryptoUserspaceTLS},
 		{"both userspace", CryptoUserspaceTLS, CryptoUserspaceTLS},
 		{"userspace + kTLS", CryptoUserspaceTLS, CryptoKTLSBoth},
+		{"kTLS inbound", CryptoKTLSBoth, CryptoNone},
+		{"kTLS outbound", CryptoNone, CryptoKTLSBoth},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

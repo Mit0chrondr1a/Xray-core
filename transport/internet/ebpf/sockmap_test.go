@@ -137,3 +137,29 @@ func TestFullRejectDoesNotAffectGenericFallbackWindow(t *testing.T) {
 		t.Fatal("generic failures should still trigger fallback")
 	}
 }
+
+func TestCapabilityRejectDoesNotAffectGenericFallbackWindow(t *testing.T) {
+	mgr := NewSockmapManager(DefaultSockmapConfig())
+	mgr.enabled.Store(true)
+	mgr.regWindowStartNs.Store(time.Now().UnixNano())
+
+	for i := 0; i < 32; i++ {
+		mgr.recordSockmapRegistrationFailure(fmt.Errorf("wrap: %w", syscall.EOPNOTSUPP))
+	}
+
+	if got := mgr.fullRejects.Load(); got != 0 {
+		t.Fatalf("full rejects should stay untouched for capability rejects, got %d", got)
+	}
+	if got := mgr.regFailures.Load(); got != 0 {
+		t.Fatalf("generic registration failures should stay untouched, got %d", got)
+	}
+	if got := mgr.regWindowTotal.Load(); got != 0 {
+		t.Fatalf("generic registration total should stay untouched, got %d", got)
+	}
+	if got := mgr.regWindowFailures.Load(); got != 0 {
+		t.Fatalf("generic registration failures should stay untouched, got %d", got)
+	}
+	if mgr.ShouldFallbackToSplice() {
+		t.Fatal("capability rejects should not trigger global generic sockmap fallback")
+	}
+}

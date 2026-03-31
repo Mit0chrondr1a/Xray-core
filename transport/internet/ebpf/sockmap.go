@@ -669,23 +669,16 @@ func forceProbeKTLSSockhashCompat(reason string) bool {
 // computeRedirectPolicy determines the redirect policy flags for a pair of
 // sockets based on their crypto states.
 //
-// kTLS sockets are eligible for sockmap redirect because the kernel's kTLS
-// layer sits below the socket layer — it transparently encrypts on TX and
-// decrypts on RX. Sockmap operates at the socket layer (plaintext), so
-// asymmetric pairs (kTLS ↔ plain TCP) work correctly: this is the normal
-// proxy scenario where one side is encrypted (client) and the other is
-// plain (upstream target).
+// Only raw TCP pairs are eligible for sockmap redirect. Vision post-detach
+// flows satisfy that requirement after the outer TLS layer is removed, while
+// fallback kTLS flows already stay kernel-accelerated through splice + TLS ULP
+// without risking SOCKHASH registration failures that can poison contention
+// fallback for unrelated flows.
 func computeRedirectPolicy(inbound, outbound CryptoHint) uint32 {
-	inOK := inbound == CryptoNone || inbound == CryptoKTLSBoth
-	outOK := outbound == CryptoNone || outbound == CryptoKTLSBoth
-	if !inOK || !outOK {
-		return 0 // userspace TLS or partial kTLS — not eligible
+	if inbound != CryptoNone || outbound != CryptoNone {
+		return 0 // only raw TCP is eligible for sockmap redirect
 	}
-	policy := PolicyAllowRedirect
-	if inbound == CryptoKTLSBoth || outbound == CryptoKTLSBoth {
-		policy |= PolicyKTLSActive
-	}
-	return policy
+	return PolicyAllowRedirect
 }
 
 // getConnFD extracts the file descriptor from a net.Conn.
@@ -754,6 +747,11 @@ func (m *SockmapManager) recordRegistrationAttempt(failed bool) {
 func (m *SockmapManager) recordSockmapRegistrationFailure(err error) {
 	if isSockmapFull(err) {
 		m.fullRejects.Add(1)
+		return
+	}
+	if isSockmapCapabilityReject(err) {
+		// Pair-local capability rejects should not poison the shared contention
+		// detector. They already fall back to splice on that flow.
 		return
 	}
 	m.regFailures.Add(1)
@@ -939,6 +937,16 @@ func (m *SockmapManager) doSweep() (int, int) {
 // isSockmapFull returns true if the error indicates the SOCKHASH is at capacity.
 func isSockmapFull(err error) bool {
 	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.E2BIG)
+}
+
+// isSockmapCapabilityReject returns true for pair-local/kernel capability
+// rejects that should fall back on the current flow without poisoning the
+// global contention window for unrelated raw TCP pairs.
+func isSockmapCapabilityReject(err error) bool {
+	return errors.Is(err, syscall.EOPNOTSUPP) ||
+		errors.Is(err, syscall.ENOTSUP) ||
+		errors.Is(err, syscall.ENOSYS) ||
+		errors.Is(err, syscall.EPROTONOSUPPORT)
 }
 
 // Platform-specific implementations with Rust/Aya ↔ Go-native dispatch.
