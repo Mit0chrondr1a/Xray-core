@@ -583,6 +583,75 @@ func TestShouldAttemptNativeRealityDisabledByDebugEnv(t *testing.T) {
 	}
 }
 
+func TestShouldAttemptNativeRealitySkipsVisionTaggedInbound(t *testing.T) {
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+	}()
+
+	v := &Listener{
+		inboundTag: "reality-vision-main",
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeReality(v)
+	if decision.Attempt {
+		t.Fatal("expected Vision-tagged inbound to stay on Go REALITY fallback")
+	}
+	if !decision.SkipByPolicy {
+		t.Fatal("expected Vision-tagged inbound to skip native path by policy")
+	}
+	if decision.SkipReason != nativeSkipReasonVisionInboundGuard {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonVisionInboundGuard)
+	}
+	if decision.PolicyMode != "PREFER_NATIVE" {
+		t.Fatalf("policy mode = %s, want PREFER_NATIVE", decision.PolicyMode)
+	}
+}
+
+func TestShouldAttemptNativeRealityForceNativeOverridesVisionGuard(t *testing.T) {
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+	}()
+
+	v := &Listener{
+		inboundTag: "reality-vision-main",
+		realityXrayConfig: &xrayreality.Config{
+			NativePathPolicy: &xrayreality.NativePathPolicy{
+				Mode:             xrayreality.NativePathMode_FORCE_NATIVE,
+				AllowFallback:    true,
+				TelemetryEnforce: true,
+				Breaker:          defaultNativePathPolicy().Breaker,
+			},
+		},
+	}
+	decision := shouldAttemptNativeReality(v)
+	if !decision.Attempt {
+		t.Fatal("expected FORCE_NATIVE to override Vision inbound guard")
+	}
+	if decision.SkipByPolicy {
+		t.Fatalf("unexpected policy skip: %s", decision.SkipReason)
+	}
+	if !decision.ForceNative {
+		t.Fatal("expected ForceNative=true")
+	}
+}
+
 func TestShouldAttemptNativeRealityModeOverridePrefersNative(t *testing.T) {
 	oldAvail := nativeEligibilityAvailableFn
 	oldKTLS := nativeEligibilityFullKTLSSupportedFn

@@ -30,6 +30,7 @@ const (
 	nativeSkipReasonMissingRealityConfig    = "missing_reality_config"
 	nativeSkipReasonProxyProtocolEnabled    = "accept_proxy_protocol_enabled"
 	nativeSkipReasonLoopbackAutoGuard       = "loopback_listener_auto_guard"
+	nativeSkipReasonVisionInboundGuard      = "vision_inbound_go_fallback_guard"
 	nativeSkipReasonDeferredPromotionPaused = "deferred_ktls_promotion_cooldown"
 	nativeSkipReasonMldsaConfigured         = "mldsa65_seed_configured"
 	nativeSkipReasonUnknown                 = "unknown"
@@ -268,6 +269,20 @@ func nativePathEligibilityWith(v *Listener, nativeAvailable, fullKTLS bool) (boo
 		return false, nativeSkipReasonMldsaConfigured
 	}
 	return true, ""
+}
+
+func inboundTagCarriesVisionSemantics(tag string) bool {
+	tag = strings.TrimSpace(strings.ToLower(tag))
+	if tag == "" {
+		return false
+	}
+	normalized := strings.NewReplacer("_", "-", "/", "-", "|", "-", ":", "-", ".", "-").Replace(tag)
+	for _, part := range strings.Split(normalized, "-") {
+		if part == "vision" {
+			return true
+		}
+	}
+	return false
 }
 
 func nativeBreakerFromPolicy(policy *reality.NativePathPolicy) nativeBreakerConfig {
@@ -636,6 +651,14 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		if decision.ForceNative {
 			decision.FailStop = true
 		}
+		return decision
+	}
+	if !decision.ForceNative && inboundTagCarriesVisionSemantics(v.inboundTag) {
+		// Vision inbounds are still sensitive to branch-local deferred rustls
+		// behavior. Prefer the upstream Go REALITY listener on these semantic
+		// inbounds unless the operator explicitly force-enables native.
+		decision.SkipByPolicy = true
+		decision.SkipReason = nativeSkipReasonVisionInboundGuard
 		return decision
 	}
 	if ok, reason := nativePathEligibility(v); !ok {
