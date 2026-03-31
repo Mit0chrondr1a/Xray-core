@@ -2,6 +2,7 @@ package tls
 
 import (
 	"errors"
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -93,6 +94,90 @@ func TestDeferredRustConnReadWithoutDeadlineUsesLegacyPath(t *testing.T) {
 	}
 }
 
+func TestDeferredRustConnReadWithoutDeadlineRetriesWouldBlock(t *testing.T) {
+	oldReadWithDeadline := deferredReadWithDeadlineFn
+	oldWaitReadable := deferredWaitReadableFn
+	t.Cleanup(func() {
+		deferredReadWithDeadlineFn = oldReadWithDeadline
+		deferredWaitReadableFn = oldWaitReadable
+	})
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	calls := 0
+	waitCalls := 0
+	deferredReadWithDeadlineFn = func(_ *native.DeferredSessionHandle, b []byte, deadline time.Time) (int, error) {
+		calls++
+		if !deadline.IsZero() {
+			t.Fatal("unexpected non-zero deadline")
+		}
+		if calls == 1 {
+			return 0, native.ErrDeferredWouldBlock
+		}
+		copy(b, []byte("OK"))
+		return 2, nil
+	}
+	deferredWaitReadableFn = func(_ *DeferredRustConn) error {
+		waitCalls++
+		return nil
+	}
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+	buf := make([]byte, 2)
+	n, err := dc.Read(buf)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("Read() calls = %d, want retry after would-block", calls)
+	}
+	if waitCalls != 1 {
+		t.Fatalf("waitReadable calls = %d, want 1", waitCalls)
+	}
+	if got := string(buf[:n]); got != "OK" {
+		t.Fatalf("Read() = %q, want %q", got, "OK")
+	}
+}
+
+func TestDeferredRustConnReadWithoutDeadlinePropagatesNetpollerWaitError(t *testing.T) {
+	oldReadWithDeadline := deferredReadWithDeadlineFn
+	oldWaitReadable := deferredWaitReadableFn
+	t.Cleanup(func() {
+		deferredReadWithDeadlineFn = oldReadWithDeadline
+		deferredWaitReadableFn = oldWaitReadable
+	})
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	deferredReadWithDeadlineFn = func(_ *native.DeferredSessionHandle, _ []byte, deadline time.Time) (int, error) {
+		if !deadline.IsZero() {
+			t.Fatal("unexpected non-zero deadline")
+		}
+		return 0, native.ErrDeferredWouldBlock
+	}
+
+	want := io.EOF
+	deferredWaitReadableFn = func(_ *DeferredRustConn) error {
+		return want
+	}
+
+	dc := &DeferredRustConn{
+		rawConn: client,
+		handle:  &native.DeferredSessionHandle{},
+	}
+	_, err := dc.Read(make([]byte, 1))
+	if !errors.Is(err, want) {
+		t.Fatalf("Read() error = %v, want %v", err, want)
+	}
+}
+
 func TestDeferredRustConnReadCacheBeatsExpiredDeadline(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close()
@@ -115,5 +200,59 @@ func TestDeferredRustConnReadCacheBeatsExpiredDeadline(t *testing.T) {
 	}
 	if got := string(buf[:n]); got != "cached" {
 		t.Fatalf("Read() = %q, want %q", got, "cached")
+	}
+}
+
+func TestDeferredDeadlineOverrunRequiresMaterialMiss(t *testing.T) {
+	start := time.Now()
+	deadline := start.Add(50 * time.Millisecond)
+
+	if overrun, ok := deferredDeadlineOverrun(start, deadline, deadline.Add(100*time.Millisecond)); ok {
+		t.Fatalf("deferredDeadlineOverrun() unexpectedly reported short miss: %v", overrun)
+	}
+
+	overrun, ok := deferredDeadlineOverrun(start, deadline, deadline.Add(deferredDeadlineOverrunLogGap+25*time.Millisecond))
+	if !ok {
+		t.Fatal("deferredDeadlineOverrun() did not report material miss")
+	}
+	want := deferredDeadlineOverrunLogGap + 25*time.Millisecond
+	if overrun != want {
+		t.Fatalf("deferredDeadlineOverrun() = %v, want %v", overrun, want)
+	}
+}
+
+func TestDeferredDeadlineOverrunSkipsExpiredOrUnsetDeadlines(t *testing.T) {
+	start := time.Now()
+	if _, ok := deferredDeadlineOverrun(start, time.Time{}, start.Add(time.Second)); ok {
+		t.Fatal("zero deadline should not report overrun")
+	}
+	expired := start.Add(-time.Millisecond)
+	if _, ok := deferredDeadlineOverrun(start, expired, start.Add(time.Second)); ok {
+		t.Fatal("deadline already expired at call start should not report overrun")
+	}
+}
+
+func TestDeferredReadParkedRequiresZeroDeadlineAndLongBlock(t *testing.T) {
+	start := time.Now()
+
+	if parked, ok := deferredReadParked(start, time.Time{}, start.Add(2*time.Second)); ok {
+		t.Fatalf("deferredReadParked() unexpectedly reported short parked read: %v", parked)
+	}
+
+	parked, ok := deferredReadParked(start, time.Time{}, start.Add(deferredReadParkedThreshold+250*time.Millisecond))
+	if !ok {
+		t.Fatal("deferredReadParked() did not report long parked zero-deadline read")
+	}
+	want := deferredReadParkedThreshold + 250*time.Millisecond
+	if parked != want {
+		t.Fatalf("deferredReadParked() = %v, want %v", parked, want)
+	}
+}
+
+func TestDeferredReadParkedSkipsDeadlineAwareReads(t *testing.T) {
+	start := time.Now()
+	deadline := start.Add(time.Second)
+	if _, ok := deferredReadParked(start, deadline, start.Add(deferredReadParkedThreshold+time.Second)); ok {
+		t.Fatal("deadline-aware read should not report parked")
 	}
 }

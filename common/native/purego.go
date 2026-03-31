@@ -37,6 +37,16 @@ func (deferredDeadlineError) Timeout() bool   { return true }
 func (deferredDeadlineError) Temporary() bool { return true }
 func (deferredDeadlineError) Unwrap() error   { return os.ErrDeadlineExceeded }
 
+type deferredWouldBlockError struct{}
+
+func (deferredWouldBlockError) Error() string   { return "native: deferred read would block" }
+func (deferredWouldBlockError) Timeout() bool   { return false }
+func (deferredWouldBlockError) Temporary() bool { return true }
+
+// ErrDeferredWouldBlock mirrors the CGO build's retryable zero-deadline
+// deferred-read wake-up signal.
+var ErrDeferredWouldBlock error = deferredWouldBlockError{}
+
 // ErrRealityAuthFailed indicates REALITY auth failed and Go should handle fallback.
 var ErrRealityAuthFailed = errors.New("REALITY auth failed: needs fallback")
 

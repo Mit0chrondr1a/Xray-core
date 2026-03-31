@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/big"
 	gonet "net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -51,6 +52,8 @@ const (
 	deferredReadBatchThreshold    = 2 * 1024  // batch only for small app reads to amortize cgo crossings
 	deferredWriteBatchCap         = 16 * 1024 // 16 KiB write coalescing budget for deferred rustls writes
 	deferredWriteBatchThreshold   = 2 * 1024  // coalesce only small app writes; large payloads flush immediately
+	deferredDeadlineOverrunLogGap = 500 * time.Millisecond
+	deferredReadParkedThreshold   = 5 * time.Second
 )
 
 // deferredKTLSPromotionDisabledUntilUnixNano stores a cooldown deadline.
@@ -817,6 +820,8 @@ type DeferredRustConn struct {
 	deadlineMu       sync.RWMutex
 	readDeadline     time.Time
 	writeDeadline    time.Time
+	readOverrunLog   atomic.Bool
+	readParkedLog    atomic.Bool
 	readRecords      atomic.Uint64 // kTLS RX record counter for EBADMSG diagnostics
 	readBytes        atomic.Int64  // total kTLS RX bytes for EBADMSG diagnostics
 }
@@ -1087,8 +1092,7 @@ func (c *DeferredRustConn) Read(b []byte) (int, error) {
 		if len(b) < deferredReadBatchThreshold {
 			n, err = c.deferredReadBatched(h, b, readDeadline)
 		} else {
-			n, err = deferredReadWithDeadlineFn(h, b, readDeadline)
-			c.logDeferredKTLSError(err)
+			n, err = c.deferredReadNativeWithDeadline(h, b, readDeadline)
 		}
 		if err == nil && n > 0 {
 			c.readRecords.Add(1)
@@ -1134,8 +1138,7 @@ func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, 
 		c.deferredReadBuf = make([]byte, deferredReadBatchCap)
 	}
 	buf := c.deferredReadBuf[:deferredReadBatchCap]
-	n, err := deferredReadWithDeadlineFn(h, buf, deadline)
-	c.logDeferredKTLSError(err)
+	n, err := c.deferredReadNativeWithDeadline(h, buf, deadline)
 	if n <= 0 {
 		return n, err
 	}
@@ -1151,6 +1154,152 @@ func (c *DeferredRustConn) deferredReadBatched(h *native.DeferredSessionHandle, 
 		}
 	}
 	return outN, err
+}
+
+func deferredDeadlineOverrun(start, deadline, finish time.Time) (time.Duration, bool) {
+	if deadline.IsZero() || !deadline.After(start) || !finish.After(deadline) {
+		return 0, false
+	}
+	overrun := finish.Sub(deadline)
+	if overrun < deferredDeadlineOverrunLogGap {
+		return 0, false
+	}
+	return overrun, true
+}
+
+func deferredReadParked(start, deadline, finish time.Time) (time.Duration, bool) {
+	if !deadline.IsZero() || !finish.After(start) {
+		return 0, false
+	}
+	parked := finish.Sub(start)
+	if parked < deferredReadParkedThreshold {
+		return 0, false
+	}
+	return parked, true
+}
+
+func (c *DeferredRustConn) deferredReadNativeWithDeadline(h *native.DeferredSessionHandle, b []byte, deadline time.Time) (int, error) {
+	for {
+		start := time.Now()
+		n, err := deferredReadWithDeadlineFn(h, b, deadline)
+		c.maybeLogDeferredReadParked(start, deadline, n, err)
+		if deadline.IsZero() && err == native.ErrDeferredWouldBlock {
+			if waitErr := deferredWaitReadableFn(c); waitErr != nil {
+				return 0, waitErr
+			}
+			runtime.Gosched()
+			continue
+		}
+		c.maybeLogDeferredReadDeadlineOverrun(start, deadline, n, err)
+		c.logDeferredKTLSError(err)
+		return n, err
+	}
+}
+
+func (c *DeferredRustConn) waitReadableViaNetpoller() error {
+	if c == nil || c.rawConn == nil {
+		return errors.New("tls: DeferredRustConn: nil raw connection")
+	}
+	type syscallConner interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	sc, ok := c.rawConn.(syscallConner)
+	if !ok {
+		return errors.New("tls: DeferredRustConn: raw connection does not support SyscallConn")
+	}
+	rawConn, err := sc.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var readErr error
+	err = rawConn.Read(func(fd uintptr) bool {
+		var peek [1]byte
+		for {
+			n, _, recvErr := syscall.Recvfrom(int(fd), peek[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
+			switch {
+			case recvErr == nil && n > 0:
+				return true
+			case recvErr == nil && n == 0:
+				readErr = io.EOF
+				return true
+			case recvErr == syscall.EINTR:
+				continue
+			case recvErr == syscall.EAGAIN || recvErr == syscall.EWOULDBLOCK:
+				return false
+			default:
+				readErr = recvErr
+				return true
+			}
+		}
+	})
+	if readErr != nil {
+		return readErr
+	}
+	return err
+}
+
+func (c *DeferredRustConn) maybeLogDeferredReadDeadlineOverrun(start, deadline time.Time, n int, err error) {
+	finish := time.Now()
+	overrun, ok := deferredDeadlineOverrun(start, deadline, finish)
+	if !ok || !c.readOverrunLog.CompareAndSwap(false, true) {
+		return
+	}
+
+	local := "<nil>"
+	remote := "<nil>"
+	c.deferredMu.RLock()
+	rawConn := c.rawConn
+	c.deferredMu.RUnlock()
+	if rawConn != nil {
+		if a := rawConn.LocalAddr(); a != nil {
+			local = a.String()
+		}
+		if a := rawConn.RemoteAddr(); a != nil {
+			remote = a.String()
+		}
+	}
+
+	errors.LogWarning(context.Background(),
+		"[kind=tls.deferred_read_deadline_overrun] deferred Rust read returned after Go deadline budget",
+		" overrun_ns=", overrun.Nanoseconds(),
+		" elapsed_ns=", finish.Sub(start).Nanoseconds(),
+		" bytes=", n,
+		" err=", err,
+		" local=", local,
+		" remote=", remote,
+	)
+}
+
+func (c *DeferredRustConn) maybeLogDeferredReadParked(start, deadline time.Time, n int, err error) {
+	finish := time.Now()
+	parked, ok := deferredReadParked(start, deadline, finish)
+	if !ok || !c.readParkedLog.CompareAndSwap(false, true) {
+		return
+	}
+
+	local := "<nil>"
+	remote := "<nil>"
+	c.deferredMu.RLock()
+	rawConn := c.rawConn
+	c.deferredMu.RUnlock()
+	if rawConn != nil {
+		if a := rawConn.LocalAddr(); a != nil {
+			local = a.String()
+		}
+		if a := rawConn.RemoteAddr(); a != nil {
+			remote = a.String()
+		}
+	}
+
+	errors.LogWarning(context.Background(),
+		"[kind=tls.deferred_read_parked] zero-deadline deferred read blocked in native path",
+		" parked_ns=", parked.Nanoseconds(),
+		" bytes=", n,
+		" err=", err,
+		" local=", local,
+		" remote=", remote,
+	)
 }
 
 func (c *DeferredRustConn) Write(b []byte) (int, error) {
@@ -1421,6 +1570,9 @@ var deferredReadWithDeadlineFn = func(h *native.DeferredSessionHandle, b []byte,
 		return deferredReadFn(h, b)
 	}
 	return native.DeferredReadWithDeadline(h, b, deadline)
+}
+var deferredWaitReadableFn = func(c *DeferredRustConn) error {
+	return c.waitReadableViaNetpoller()
 }
 var deferredWriteFn = native.DeferredWrite
 var deferredWriteWithDeadlineFn = func(h *native.DeferredSessionHandle, b []byte, deadline time.Time) (int, error) {
@@ -1722,10 +1874,9 @@ func (c *DeferredRustConn) IsDetached() bool {
 	return c.detached.Load()
 }
 
-// RestoreNonBlock restores O_NONBLOCK on the underlying fd without detaching.
-// After this call, Go can safely write to the raw socket (via UnwrapRawConn)
-// without blocking the OS thread, while Rust's reader/writer handle EAGAIN
-// via poll(2).
+// RestoreNonBlock is a compatibility shim for older deferred-session call
+// sites. Deferred sessions now start with O_NONBLOCK already restored after
+// the handshake pipeline, so a successful call is currently a no-op.
 func (c *DeferredRustConn) RestoreNonBlock() error {
 	if c.detached.Load() {
 		return nil // already detached, O_NONBLOCK already restored
