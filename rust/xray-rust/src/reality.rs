@@ -1152,6 +1152,19 @@ fn timeout_deadline(timeout_ms: i64) -> Option<Instant> {
     Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
 }
 
+// After the Go-side netpoll bridge was added for zero-deadline deferred reads,
+// this ceiling no longer serves as the primary idle wait. It only needs to be
+// long enough for the initial rustls-buffer check plus a brief fd probe before
+// Go takes over the idle wait on epoll.
+const DEFERRED_READ_WAKEUP_CEILING: Duration = Duration::from_millis(50);
+
+fn deferred_read_deadline(timeout_ms: i64) -> (Option<Instant>, bool) {
+    if timeout_ms < 0 {
+        return (Some(Instant::now() + DEFERRED_READ_WAKEUP_CEILING), true);
+    }
+    (timeout_deadline(timeout_ms), false)
+}
+
 fn remaining_poll_timeout(deadline: Option<Instant>) -> io::Result<i32> {
     let Some(deadline) = deadline else {
         return Ok(-1);
@@ -1265,7 +1278,6 @@ pub(crate) struct DeferredSession {
     detached: AtomicBool,
     capture: Mutex<Option<Arc<tls::SecretCapture>>>,
     pub original_fd: i32,
-    blocking_guard: Mutex<crate::fdutil::BlockingGuard>,
     _timeout_guard: crate::fdutil::SocketTimeoutGuard,
     // Immutable metadata (set at construction, no lock needed)
     pub cipher_suite: u16,
@@ -1287,7 +1299,7 @@ impl DeferredSession {
         alpn: Vec<u8>,
         sni: String,
     ) -> Result<Self, std::io::Error> {
-        let (reader, write_stream, guard, timeout, original_fd) = pipeline.into_parts()?;
+        let (reader, write_stream, timeout, original_fd) = pipeline.into_parts()?;
         Ok(Self {
             tls: Mutex::new(Some(conn)),
             reader: Mutex::new(Some(reader)),
@@ -1295,7 +1307,6 @@ impl DeferredSession {
             detached: AtomicBool::new(false),
             capture: Mutex::new(Some(capture)),
             original_fd,
-            blocking_guard: Mutex::new(guard),
             _timeout_guard: timeout,
             cipher_suite,
             tls_version,
@@ -1320,7 +1331,7 @@ impl DeferredSession {
                 "deferred session detached",
             ));
         }
-        let deadline = timeout_deadline(timeout_ms);
+        let (deadline, wakeup_ceiling_armed) = deferred_read_deadline(timeout_ms);
         loop {
             // Step 1: Check if rustls already has plaintext buffered
             {
@@ -1342,7 +1353,16 @@ impl DeferredSession {
                 let reader = reader_guard.as_mut().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "deferred session reader closed")
                 })?;
-                reader.read_one_record_deadline(deadline)?
+                match reader.read_one_record_deadline(deadline) {
+                    Ok(record) => record,
+                    Err(err) if wakeup_ceiling_armed && err.kind() == io::ErrorKind::TimedOut => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "deferred read wakeup ceiling reached",
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
             }; // reader lock released
 
             // Check detached between socket I/O and tls lock
@@ -1466,20 +1486,9 @@ impl DeferredSession {
             }
         }; // reader lock released
 
-        // Step 3: Restore O_NONBLOCK on the original fd BEFORE marking
-        // detached. The writer goroutine may race to use rawConn.Write()
-        // once it sees detached=true — the fd must be non-blocking by then
-        // or Go's runtime will block the OS thread.
-        {
-            let mut guard = self
-                .blocking_guard
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            guard.restore_nonblock_early();
-        }
         self.detached.store(true, Ordering::Release);
 
-        // Step 4: Take all Options to None (drops rustls + dup'd fds)
+        // Step 3: Take all Options to None (drops rustls + dup'd fds)
         {
             let mut tls_guard = self.tls.lock().unwrap_or_else(|e| e.into_inner());
             tls_guard.take();
@@ -1500,21 +1509,12 @@ impl DeferredSession {
         Ok((plaintext, raw_ahead))
     }
 
-    /// Restore O_NONBLOCK on the underlying fd without detaching.
-    /// After this call, Rust's reader/writer use poll()-based I/O to handle
-    /// EAGAIN. This allows Go's VisionWriter to safely write to the raw socket
-    /// without blocking the OS thread during the window before DrainAndDetach.
+    /// Compatibility no-op.
     ///
-    /// Idempotent — safe to call multiple times or after detach.
+    /// BlockingGuard is now handshake-scoped, so DeferredSession starts with
+    /// O_NONBLOCK already restored. Keep the method to avoid a cross-language
+    /// flag day while Go call sites are still wired through this API.
     pub fn restore_nonblock(&self) -> io::Result<()> {
-        if self.detached.load(Ordering::Acquire) {
-            return Ok(()); // already detached, O_NONBLOCK already restored
-        }
-        let mut guard = self
-            .blocking_guard
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.restore_nonblock_early();
         Ok(())
     }
 
@@ -2003,6 +2003,10 @@ pub extern "C" fn xray_deferred_read_timeout(
                         unsafe { *out_n = 0 };
                         3 // deadline exceeded
                     }
+                    io::ErrorKind::WouldBlock => {
+                        unsafe { *out_n = 0 };
+                        4 // retryable wake-up for zero-deadline deferred reads
+                    }
                     _ => -1,
                 }
             }
@@ -2246,22 +2250,16 @@ pub extern "C" fn xray_deferred_drain_and_detach_into(
     })
 }
 
-/// Restore O_NONBLOCK on the deferred session's fd without detaching.
-/// Returns 0 on success, -1 on error. Idempotent.
+/// Compatibility no-op retained for Go-side API stability.
+/// Returns 0 on success, -1 on error for invalid input.
 #[unsafe(no_mangle)]
 pub extern "C" fn xray_deferred_restore_nonblock(handle: *mut c_void) -> i32 {
     ffi_catch_i32!({
         if handle.is_null() {
             return -1;
         }
-        let session = unsafe { &*(handle as *const DeferredSession) };
-        match session.restore_nonblock() {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("xray_deferred_restore_nonblock: {}", e);
-                -1
-            }
-        }
+        let _session = unsafe { &*(handle as *const DeferredSession) };
+        0
     })
 }
 
@@ -3255,5 +3253,44 @@ mod tests {
         let mut r = reader;
         r.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, data);
+    }
+
+    #[test]
+    fn test_deferred_read_deadline_uses_wakeup_ceiling_for_unbounded_reads() {
+        let (deadline, armed) = deferred_read_deadline(-1);
+        assert!(armed);
+        let remaining = deadline
+            .expect("missing wake-up deadline")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= DEFERRED_READ_WAKEUP_CEILING,
+            "remaining {:?} exceeded ceiling {:?}",
+            remaining,
+            DEFERRED_READ_WAKEUP_CEILING
+        );
+        assert!(
+            remaining >= Duration::from_millis(25),
+            "remaining {:?} was unexpectedly short",
+            remaining
+        );
+    }
+
+    #[test]
+    fn test_deferred_read_deadline_preserves_explicit_deadlines() {
+        let (deadline, armed) = deferred_read_deadline(250);
+        assert!(!armed);
+        let remaining = deadline
+            .expect("missing explicit deadline")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_millis(250),
+            "remaining {:?} exceeded explicit timeout",
+            remaining
+        );
+        assert!(
+            remaining >= Duration::from_millis(200),
+            "remaining {:?} was unexpectedly short",
+            remaining
+        );
     }
 }

@@ -73,8 +73,27 @@ func resolveVisionInternalReaders(t reflect.Type, base uintptr) (*bytes.Reader, 
 	return input, rawInput, nil
 }
 
-func applyVisionExecutionGate(inbound *session.Inbound, deferredVisionPath bool) {
+func isSharedParentRequest(request *protocol.RequestHeader) bool {
+	if request == nil {
+		return false
+	}
+	switch request.Command {
+	case protocol.RequestCommandMux, protocol.RequestCommandRvs:
+		return true
+	default:
+		return false
+	}
+}
+
+func applyVisionExecutionGate(inbound *session.Inbound, request *protocol.RequestHeader, deferredVisionPath bool) {
 	if inbound == nil {
+		return
+	}
+	if isSharedParentRequest(request) {
+		// Shared parent connections are control-plane spine links with outsized
+		// blast radius. Keep them on the userspace copy path even under Vision;
+		// they do not follow the ordinary command=2 detach model.
+		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 		return
 	}
 	if deferredVisionPath {
@@ -228,6 +247,53 @@ func isMuxAndNotXUDP(request *protocol.RequestHeader, first *buf.Buffer) bool {
 	return !(firstBytes[2] == 0 && // ID high
 		firstBytes[3] == 0 && // ID low
 		firstBytes[6] == 2) // Network type: UDP
+}
+
+func shouldSkipKTLSPromotionForParentRequest(request *protocol.RequestHeader) bool {
+	if !isSharedParentRequest(request) {
+		return false
+	}
+	// Non-Vision parent links stay on the existing userspace-TLS path. Vision
+	// parent links are handled separately so they can escape DeferredRustConn
+	// residency without becoming fast-path copy candidates.
+	return true
+}
+
+type visionParentKTLSPromoter interface {
+	EnableKTLSOutcome() (tls.KTLSPromotionOutcome, error)
+}
+
+func maybeEnableVisionParentKTLS(ctx context.Context, request *protocol.RequestHeader, conn any) (bool, error) {
+	if !isSharedParentRequest(request) {
+		return false, nil
+	}
+	if request.Command == protocol.RequestCommandMux {
+		// Keep Vision mux parents on the same userspace transport shape as main.
+		// XUDP/DoQ control traffic is especially sensitive to branch-local kTLS
+		// behavior here, while this parent link never participates in the
+		// ordinary Vision detach/direct-copy path anyway.
+		errors.LogDebug(ctx, "Vision parent: mux control connection stays on main-compatible userspace path")
+		return false, nil
+	}
+	promoter, ok := conn.(visionParentKTLSPromoter)
+	if !ok {
+		return false, nil
+	}
+	outcome, err := promoter.EnableKTLSOutcome()
+	if err != nil {
+		return false, err
+	}
+	switch outcome.Status {
+	case tls.KTLSPromotionEnabled:
+		errors.LogDebug(ctx, "Vision parent: kTLS enabled on DeferredRustConn; escaping deferred rustls path")
+		return true, nil
+	case tls.KTLSPromotionCooldown, tls.KTLSPromotionUnsupported:
+		errors.LogWarning(ctx, "Vision parent: kTLS not enabled (", outcome.Status, "); continuing with deferred rustls path")
+		return false, nil
+	default:
+		errors.LogWarning(ctx, "Vision parent: kTLS promotion outcome=", outcome.Status, "; continuing with deferred rustls path")
+		return false, nil
+	}
 }
 
 func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
@@ -622,6 +688,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if err := proxy.ClearHandshakeReadDeadline(connection); err != nil {
 		errors.LogWarningInner(ctx, err, "unable to set back read deadline")
 	}
+	if flowTimings := session.FlowTimingsFromContext(ctx); flowTimings != nil {
+		nowUnix := time.Now().UnixNano()
+		flowTimings.StoreRequestParsed(nowUnix)
+		flowTimings.StoreRequestStart(nowUnix)
+	}
 	errors.LogInfo(ctx, "received request for ", request.Destination())
 
 	inbound := session.InboundFromContext(ctx)
@@ -678,10 +749,16 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					}
 					// kTLS + Vision is unsupported; refuse early to avoid corrupting streams.
 					return errors.New("Vision is incompatible with kTLS-native RustConn; use non-Vision or disable kTLS for this flow").AtWarning()
-				} else if _, ok := iConn.(*tls.DeferredRustConn); ok {
-					// Deferred kTLS: rustls handles TLS. Vision will strip at command=2.
-					// VisionReader will call DeferredRustConn.DrainAndDetach().
-					deferredVisionPath = true
+				} else if dc, ok := iConn.(*tls.DeferredRustConn); ok {
+					// Direct Vision flows stay on the deferred path until command=2.
+					// Shared parent connections are different: they do not follow the
+					// detach model, so opportunistically promote them to kTLS to escape
+					// the deferred Rust I/O boundary while keeping them on userspace copy.
+					if promoted, promoteErr := maybeEnableVisionParentKTLS(ctx, request, dc); promoteErr != nil {
+						return errors.New("deferred kTLS enable failed for Vision parent").Base(promoteErr).AtWarning()
+					} else if !promoted && !isSharedParentRequest(request) {
+						deferredVisionPath = true
+					}
 					input = nil
 					rawInput = nil
 				} else {
@@ -694,7 +771,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 						return layoutErr
 					}
 				}
-				applyVisionExecutionGate(inbound, deferredVisionPath)
+				applyVisionExecutionGate(inbound, request, deferredVisionPath)
 			}
 		} else {
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
@@ -703,14 +780,15 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		gateState, gateReason := flowEmptyGate(iConn)
 		allowRawAccel := os.Getenv("XRAY_FEATURE_FLOW_EMPTY_RAW_ACCEL") == "1"
 		ktlsReady := false
-		allowFlowDowngrade := allowVisionFlowDowngrade(inbound, account.Flow, request.Destination())
 		if strings.HasPrefix(account.Flow, vless.XRV) &&
-			(request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) &&
-			!allowFlowDowngrade {
+			(request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) {
 			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
 		}
+		skipKTLSPromotion := shouldSkipKTLSPromotionForParentRequest(request)
 		if dc, ok := iConn.(*tls.DeferredRustConn); ok {
-			if outcome, err := dc.EnableKTLSOutcome(); err != nil {
+			if skipKTLSPromotion {
+				errors.LogDebug(ctx, "non-Vision VLESS: skipping deferred kTLS on mux parent connection")
+			} else if outcome, err := dc.EnableKTLSOutcome(); err != nil {
 				return errors.New("deferred kTLS enable failed for non-Vision VLESS").Base(err).AtWarning()
 			} else if outcome.Status == tls.KTLSPromotionEnabled {
 				errors.LogDebug(ctx, "non-Vision VLESS: kTLS enabled on DeferredRustConn")
@@ -719,20 +797,19 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				errors.LogWarning(ctx, "non-Vision VLESS: kTLS not enabled (", outcome.Status, "); continuing with rustls path")
 			}
 		} else if tlsConn, ok := iConn.(*tls.Conn); ok {
-			if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
+			if skipKTLSPromotion {
+				errors.LogDebug(ctx, "non-Vision VLESS: skipping kTLS on mux parent connection")
+			} else if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
 				return errors.New("kTLS enable failed for non-Vision VLESS TLS connection").Base(err).AtWarning()
+			} else {
+				ktlsReady = true
 			}
-			ktlsReady = true
 		}
 		// Optional ROI path: allow raw TCP + kTLS-ready empty-flow to be copy-eligible.
 		if allowRawAccel && ktlsReady && gateState != session.CopyGateNotApplicable && proxy.IsRAWTransportWithoutSecurity(iConn) {
 			inbound.SetCopyGate(session.CopyGateEligible, session.CopyGateReasonUnspecified)
 		} else {
 			inbound.SetCopyGate(gateState, gateReason)
-		}
-		if allowFlowDowngrade {
-			ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneOther)
-			errors.LogDebug(ctx, "loopback TCP DNS flow: accepting plain VLESS downgrade on Vision account")
 		}
 	default:
 		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
@@ -750,8 +827,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		ctx = session.ContextWithAllowedNetwork(ctx, net.Network_UDP)
 	}
 
+	visionSharedParent := requestAddons.Flow == vless.XRV && isSharedParentRequest(request)
 	trafficState := proxy.NewTrafficState(userSentID)
-	if deferredVisionPath {
+	if visionSharedParent {
+		ctx = proxy.ApplyVisionSharedParentCompat(ctx, trafficState)
+	} else if deferredVisionPath {
 		trafficState.NumberOfPacketToFilter = 32
 	}
 	visionReaderCtx := ctx
@@ -760,9 +840,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	// Vision uplink/downlink processing can run concurrently, so each direction
 	// needs its own arena because buf.Arena is not thread-safe.
 	if requestAddons.Flow == vless.XRV {
-		visionSignalCh = make(chan session.VisionSignal, 1)
-		ctx = session.ContextWithVisionSignal(ctx, visionSignalCh)
-		ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+		if !visionSharedParent {
+			visionSignalCh = make(chan session.VisionSignal, 1)
+			ctx = session.ContextWithVisionSignal(ctx, visionSignalCh)
+			ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+		}
 		readerArena := buf.NewArena(8 * buf.Size)
 		writerArena := buf.NewArena(8 * buf.Size)
 		visionReaderCtx = buf.ContextWithArena(ctx, readerArena)
@@ -770,18 +852,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer readerArena.Close()
 		defer writerArena.Close()
 	}
-	bypassVision := requestAddons.Flow == vless.XRV &&
-		encoding.ShouldHonorInboundVisionPayloadBypass(requestAddons, ctx, request.Destination())
-	if bypassVision {
-		responseAddons.BypassVisionPayload = true
-		trafficState.VisionPayloadBypassObserved = true
-		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonVisionBypass)
-		ctx = session.ContextWithDNSPlane(ctx, session.DNSPlaneVisionGuard)
-		visionReaderCtx = ctx
-		visionWriterCtx = ctx
-	}
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
-	if requestAddons.Flow == vless.XRV && !bypassVision {
+	if requestAddons.Flow == vless.XRV {
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, visionReaderCtx, connection, visionSignalCh, input, rawInput, nil)
 	}
 
@@ -789,12 +861,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if err := encoding.EncodeResponseHeader(bufferWriter, request, responseAddons); err != nil {
 		return errors.New("failed to encode response header").Base(err).AtWarning()
 	}
-	var clientWriter buf.Writer
-	if bypassVision {
-		clientWriter = bufferWriter
-	} else {
-		clientWriter = encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, visionWriterCtx, connection, nil)
-	}
+	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, visionWriterCtx, connection, nil)
 	bufferWriter.SetFlushNext()
 
 	if request.Command == protocol.RequestCommandRvs {
@@ -823,16 +890,6 @@ func flowEmptyGate(iConn net.Conn) (session.CopyGateState, session.CopyGateReaso
 		reason = session.CopyGateReasonTransportNonRawSplitConn
 	}
 	return state, reason
-}
-
-func allowVisionFlowDowngrade(inbound *session.Inbound, accountFlow string, dest net.Destination) bool {
-	if !strings.HasPrefix(accountFlow, vless.XRV) {
-		return false
-	}
-	if !session.IsControlPlaneLoopbackIngress(inbound) {
-		return false
-	}
-	return session.ClassifyDNSFlow(dest) == session.DNSFlowClassTCPControl
 }
 
 type Reverse struct {

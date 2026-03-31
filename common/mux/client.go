@@ -275,8 +275,6 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 		transferType,
 		xudp.GetGlobalID(ctx),
 		inbound,
-		session.ResolveDNSFlowClass(ctx),
-		session.DNSPlaneFromContext(ctx),
 	)
 	defer s.Close(false)
 	defer writer.Close()

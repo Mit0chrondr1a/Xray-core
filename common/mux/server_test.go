@@ -3,7 +3,6 @@ package mux_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -122,66 +121,4 @@ func TestRegressionOutboundLeak(t *testing.T) {
 	if outbounds[0].Target.Address != nil {
 		t.Error("outbound target got leaked: ", outbounds[0].Target.String())
 	}
-}
-
-func TestServerWorkerPropagatesDNSMetadata(t *testing.T) {
-	serverCtx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{}})
-
-	websiteUplink, websiteDownlink := newLinkPair()
-	dispatchCalled := make(chan struct{}, 1)
-	var gotClass session.DNSFlowClass
-	var gotPlane session.DNSPlane
-
-	dispatcher := TestDispatcher{
-		OnDispatch: func(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-			gotClass = session.DNSFlowClassFromContext(ctx)
-			gotPlane = session.DNSPlaneFromContext(ctx)
-			dispatchCalled <- struct{}{}
-			return websiteDownlink, nil
-		},
-	}
-
-	muxServerUplink, muxServerDownlink := newLinkPair()
-	_, err := mux.NewServerWorker(serverCtx, &dispatcher, muxServerUplink)
-	common.Must(err)
-
-	client, err := mux.NewClientWorker(*muxServerDownlink, mux.ClientStrategy{})
-	common.Must(err)
-
-	clientCtx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
-		Target: net.UDPDestination(net.IPAddress([]byte{1, 1, 1, 1}), net.Port(853)),
-	}})
-	clientCtx = session.ContextWithDNSFlowClass(clientCtx, session.DNSFlowClassUDPControl)
-	clientCtx = session.ContextWithDNSPlane(clientCtx, session.DNSPlaneMuxXUDP)
-
-	muxClientUplink, muxClientDownlink := newLinkPair()
-	ok := client.Dispatch(clientCtx, muxClientUplink)
-	if !ok {
-		t.Fatal("failed to dispatch")
-	}
-
-	b := buf.FromBytes([]byte("dns"))
-	common.Must(muxClientDownlink.Writer.WriteMultiBuffer(buf.MultiBuffer{b}))
-
-	select {
-	case <-dispatchCalled:
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for dispatch")
-	}
-
-	resMb, err := websiteUplink.Reader.ReadMultiBuffer()
-	common.Must(err)
-	if got := resMb.String(); got != "dns" {
-		t.Fatalf("upload=%q, want %q", got, "dns")
-	}
-
-	if gotClass != session.DNSFlowClassUDPControl {
-		t.Fatalf("dnsFlowClass=%v, want %v", gotClass, session.DNSFlowClassUDPControl)
-	}
-	if gotPlane != session.DNSPlaneMuxXUDP {
-		t.Fatalf("dnsPlane=%v, want %v", gotPlane, session.DNSPlaneMuxXUDP)
-	}
-
-	common.Close(muxClientDownlink.Writer)
-	common.Close(websiteUplink.Writer)
 }

@@ -19,30 +19,30 @@ const sockmapPollTimeoutMs = 5_000 // 5 seconds
 
 const (
 	sockmapIdleTimeout   = time.Duration(sockmapPollTimeoutMs) * time.Millisecond
-	sockmapMaxIdleRounds = 3 // tolerate quiet periods before declaring no-progress
+	sockmapMaxIdleRounds = 1 // any 5s no-progress window is enough to fall back
 	writerProbeInterval  = 500 * time.Millisecond
 )
 
 // waitForSockmapForwarding waits for sockmap forwarding completion without
 // consuming userspace payload. It returns fallback=true if data remains pending
 // on the reader socket and caller should fall back to splice/readv.
-func waitForSockmapForwarding(readerConn, writerConn net.Conn) (fallback bool, err error) {
+func waitForSockmapForwarding(readerConn, writerConn net.Conn) (fallback bool, obs sockmapForwardObservation, err error) {
 	readerTCPConn, ok := readerConn.(*net.TCPConn)
 	if !ok {
-		return true, fmt.Errorf("reader connection is not TCP")
+		return true, sockmapForwardObservation{}, fmt.Errorf("reader connection is not TCP")
 	}
 	writerTCPConn, ok := writerConn.(*net.TCPConn)
 	if !ok {
-		return true, fmt.Errorf("writer connection is not TCP")
+		return true, sockmapForwardObservation{}, fmt.Errorf("writer connection is not TCP")
 	}
 
 	readerRawConn, err := readerTCPConn.SyscallConn()
 	if err != nil {
-		return true, err
+		return true, sockmapForwardObservation{}, err
 	}
 	writerRawConn, err := writerTCPConn.SyscallConn()
 	if err != nil {
-		return true, err
+		return true, sockmapForwardObservation{}, err
 	}
 
 	// Bound any temporary read deadlines to this function.
@@ -52,34 +52,36 @@ func waitForSockmapForwarding(readerConn, writerConn net.Conn) (fallback bool, e
 
 	progressCursor, progressAvailable, err := readForwardProgressCursor(readerRawConn, writerRawConn)
 	if err != nil {
-		return true, err
+		return true, sockmapForwardObservation{}, err
 	}
-
 	idleDeadline := time.Now().Add(sockmapIdleTimeout)
 	idleRounds := 0
 	for {
 		readerState, err := probeSocketState(readerRawConn)
 		if err != nil {
-			return true, err
+			return true, sockmapForwardObservation{}, err
 		}
 		writerState, err := probeSocketState(writerRawConn)
 		if err != nil {
-			return true, err
+			return true, sockmapForwardObservation{}, err
 		}
 		if readerState.closed || writerState.closed {
-			return false, nil
+			return false, obs, nil
 		}
 		// Any readable payload on reader means sockmap is not forwarding this
 		// direction; caller should return to userspace/splice path.
 		if readerState.hasData {
-			return true, nil
+			return true, obs, nil
 		}
 
 		remaining := time.Until(idleDeadline)
 		if remaining <= 0 {
-			progressed, err := forwardProgressAdvanced(readerRawConn, writerRawConn, &progressCursor, &progressAvailable)
+			progressed, responseProgressed, err := forwardProgressAdvanced(readerRawConn, writerRawConn, &progressCursor, &progressAvailable)
 			if err != nil {
-				return true, err
+				return true, sockmapForwardObservation{}, err
+			}
+			if responseProgressed && obs.FirstResponseAt.IsZero() {
+				obs.FirstResponseAt = time.Now()
 			}
 			if progressed {
 				idleRounds = 0
@@ -88,7 +90,7 @@ func waitForSockmapForwarding(readerConn, writerConn net.Conn) (fallback bool, e
 			}
 			idleRounds++
 			if idleRounds >= sockmapMaxIdleRounds {
-				return true, nil
+				return true, obs, nil
 			}
 			idleDeadline = time.Now().Add(sockmapIdleTimeout)
 			continue
@@ -99,14 +101,17 @@ func waitForSockmapForwarding(readerConn, writerConn net.Conn) (fallback bool, e
 		}
 
 		if err := readerTCPConn.SetReadDeadline(time.Now().Add(waitWindow)); err != nil {
-			return true, err
+			return true, sockmapForwardObservation{}, err
 		}
 
 		event, err := waitForReadableOrClose(readerRawConn)
 		if isTimeoutError(err) {
-			progressed, perr := forwardProgressAdvanced(readerRawConn, writerRawConn, &progressCursor, &progressAvailable)
+			progressed, responseProgressed, perr := forwardProgressAdvanced(readerRawConn, writerRawConn, &progressCursor, &progressAvailable)
 			if perr != nil {
-				return true, perr
+				return true, sockmapForwardObservation{}, perr
+			}
+			if responseProgressed && obs.FirstResponseAt.IsZero() {
+				obs.FirstResponseAt = time.Now()
 			}
 			if progressed {
 				idleRounds = 0
@@ -115,16 +120,16 @@ func waitForSockmapForwarding(readerConn, writerConn net.Conn) (fallback bool, e
 			continue
 		}
 		if err != nil {
-			return true, err
+			return true, sockmapForwardObservation{}, err
 		}
 
 		switch event {
 		case readerEventData:
-			return true, nil
+			return true, obs, nil
 		case readerEventClosed:
-			return false, nil
+			return false, obs, nil
 		default:
-			return true, fmt.Errorf("unexpected reader event")
+			return true, sockmapForwardObservation{}, fmt.Errorf("unexpected reader event")
 		}
 	}
 }
@@ -239,23 +244,24 @@ func probeSocketState(rawConn syscall.RawConn) (socketProbe, error) {
 	return out, nil
 }
 
-func forwardProgressAdvanced(readerRawConn, writerRawConn syscall.RawConn, cursor *forwardProgressCursor, available *bool) (bool, error) {
+func forwardProgressAdvanced(readerRawConn, writerRawConn syscall.RawConn, cursor *forwardProgressCursor, available *bool) (bool, bool, error) {
 	current, currentAvailable, err := readForwardProgressCursor(readerRawConn, writerRawConn)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if !currentAvailable {
 		*available = false
-		return false, nil
+		return false, false, nil
 	}
 	if !*available {
 		*cursor = current
 		*available = true
-		return true, nil
+		return true, false, nil
 	}
+	responseProgressed := current.readerBytesReceived > cursor.readerBytesReceived
 	progressed := current.advancedFrom(*cursor)
 	*cursor = current
-	return progressed, nil
+	return progressed, responseProgressed, nil
 }
 
 func readForwardProgressCursor(readerRawConn, writerRawConn syscall.RawConn) (forwardProgressCursor, bool, error) {

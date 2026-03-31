@@ -50,5 +50,56 @@ func logPipelineSummary(ctx context.Context, snap pipeline.DecisionSnapshot) {
 		" sockmap_supported=", snap.Caps.SockmapSupported,
 		" splice_supported=", snap.Caps.SpliceSupported,
 	)
+	if snap.Target != "" {
+		args = append(args, " target=", snap.Target)
+	}
+	if snap.LatencyVisibilityHint != "" {
+		args = append(args, " latency_visibility_hint=", snap.LatencyVisibilityHint)
+	}
+	if snap.VisionSignalSource != "" {
+		args = append(args,
+			" vision_signal_source=", snap.VisionSignalSource,
+			" vision_signal_wait_ns=", snap.VisionSignalWaitNs,
+		)
+		if snap.VisionLocalNoDetachWaitNs > 0 {
+			args = append(args, " vision_local_no_detach_wait_ns=", snap.VisionLocalNoDetachWaitNs)
+		}
+	}
+	if snap.AcceptToRequestParseNs > 0 {
+		args = append(args, " accept_to_request_parse_ns=", snap.AcceptToRequestParseNs)
+	}
+	if snap.AcceptToVisionCommandNs > 0 {
+		args = append(args, " accept_to_vision_command_ns=", snap.AcceptToVisionCommandNs)
+	}
+	if snap.PostDetachHandoffPath != "" || snap.PostDetachHandoffNs > 0 {
+		args = append(args,
+			" post_detach_handoff_path=", snap.PostDetachHandoffPath,
+			" post_detach_handoff_ns=", snap.PostDetachHandoffNs,
+		)
+	}
+	if snap.FlowTTFBNs > 0 {
+		args = append(args, " flow_ttfb_ns=", snap.FlowTTFBNs)
+	}
+	if snap.TargetConnectNs > 0 {
+		args = append(args, " target_connect_ns=", snap.TargetConnectNs)
+	}
+	if snap.VisionPreDetachNs > 0 {
+		args = append(args, " vision_predetach_ns=", snap.VisionPreDetachNs)
+	}
+	if snap.TargetFirstByteNs > 0 {
+		args = append(args, " target_first_byte_ns=", snap.TargetFirstByteNs)
+	}
+	if snap.DNSResolutionNs > 0 {
+		args = append(args, " dns_resolution_ns=", snap.DNSResolutionNs)
+	}
+	if snap.UplinkUsefulDurationNs > 0 {
+		args = append(args, " uplink_useful_duration_ns=", snap.UplinkUsefulDurationNs)
+	}
+	if snap.UplinkTotalDurationNs > 0 {
+		args = append(args, " uplink_total_duration_ns=", snap.UplinkTotalDurationNs)
+	}
+	if snap.SockmapFallbackProbeNs > 0 {
+		args = append(args, " sockmap_fallback_probe_ns=", snap.SockmapFallbackProbeNs)
+	}
 	errors.LogInfo(ctx, args...)
 }

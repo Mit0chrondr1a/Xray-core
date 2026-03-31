@@ -358,18 +358,22 @@ fn register_pair_impl(
 
     // Write policy entries.
     bpf_map_update_u64_u32(state.policy_fd.as_raw_fd(), inbound_cookie, policy_flags)?;
-    if let Err(e) = bpf_map_update_u64_u32(state.policy_fd.as_raw_fd(), outbound_cookie, policy_flags) {
+    if let Err(e) =
+        bpf_map_update_u64_u32(state.policy_fd.as_raw_fd(), outbound_cookie, policy_flags)
+    {
         let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), inbound_cookie);
         return Err(e);
     }
 
     // Insert into SOCKHASH: inbound_cookie -> outbound_fd, outbound_cookie -> inbound_fd.
-    if let Err(e) = bpf_sockhash_update(state.sockhash_fd.as_raw_fd(), inbound_cookie, outbound_fd) {
+    if let Err(e) = bpf_sockhash_update(state.sockhash_fd.as_raw_fd(), inbound_cookie, outbound_fd)
+    {
         let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), inbound_cookie);
         let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), outbound_cookie);
         return Err(e);
     }
-    if let Err(e) = bpf_sockhash_update(state.sockhash_fd.as_raw_fd(), outbound_cookie, inbound_fd) {
+    if let Err(e) = bpf_sockhash_update(state.sockhash_fd.as_raw_fd(), outbound_cookie, inbound_fd)
+    {
         let _ = bpf_sockhash_delete(state.sockhash_fd.as_raw_fd(), inbound_cookie);
         let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), inbound_cookie);
         let _ = bpf_map_delete_u64(state.policy_fd.as_raw_fd(), outbound_cookie);

@@ -288,29 +288,24 @@ impl HandshakePipeline {
 
     /// Destructure the pipeline into its components for separate ownership.
     /// The write half gets a dup'd TcpStream so reader and writer can be
-    /// locked independently. Returns (reader, write_stream, blocking_guard,
-    /// timeout_guard, original_fd).
+    /// locked independently.
+    ///
+    /// The blocking-mode override is handshake-scoped: restore O_NONBLOCK
+    /// before returning so DeferredSession starts life on the same
+    /// non-blocking file description that Go expects.
     pub fn into_parts(
         self,
-    ) -> Result<
-        (
-            tls::RecordReader,
-            TcpStream,
-            BlockingGuard,
-            SocketTimeoutGuard,
-            i32,
-        ),
-        std::io::Error,
-    > {
+    ) -> Result<(tls::RecordReader, TcpStream, SocketTimeoutGuard, i32), std::io::Error> {
         let write_stream = self.reader.tcp.try_clone()?; // dup() for write half
         let original_fd = self.original_fd;
         let HandshakePipeline {
             reader,
             timeout_guard,
-            _guard,
+            mut _guard,
             ..
         } = self;
-        Ok((reader, write_stream, _guard, timeout_guard, original_fd))
+        _guard.restore_nonblock_early();
+        Ok((reader, write_stream, timeout_guard, original_fd))
     }
 
     /// Install kTLS on the original fd, then consume self.
@@ -371,7 +366,10 @@ impl HandshakePipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::SocketTimeoutGuard;
+    use super::{HandshakePipeline, SocketTimeoutGuard};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::io::AsRawFd;
+    use std::thread;
     use std::time::Duration;
 
     fn get_timeout(fd: i32, optname: i32) -> std::io::Result<libc::timeval> {
@@ -394,6 +392,16 @@ mod tests {
 
     fn micros(tv: libc::timeval) -> i64 {
         (tv.tv_sec as i64) * 1_000_000 + (tv.tv_usec as i64)
+    }
+
+    fn get_flags(fd: i32) -> i32 {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "fcntl(F_GETFL) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        flags
     }
 
     #[test]
@@ -444,5 +452,41 @@ mod tests {
 
         let _ = unsafe { libc::close(original_fd) };
         let _ = unsafe { libc::close(peer_fd) };
+    }
+
+    #[test]
+    fn into_parts_restores_nonblock_before_deferred_session_handoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = thread::spawn(move || TcpStream::connect(addr).expect("connect client"));
+
+        let (server, _) = listener.accept().expect("accept server");
+        let client = client.join().expect("join client");
+
+        let server_fd = server.as_raw_fd();
+        let old_flags = get_flags(server_fd);
+        let set_rc = unsafe { libc::fcntl(server_fd, libc::F_SETFL, old_flags | libc::O_NONBLOCK) };
+        assert_eq!(
+            set_rc,
+            0,
+            "fcntl(F_SETFL) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(get_flags(server_fd) & libc::O_NONBLOCK, 0);
+
+        let pipeline =
+            HandshakePipeline::new(server_fd, Duration::from_millis(25)).expect("create pipeline");
+        assert_eq!(get_flags(server_fd) & libc::O_NONBLOCK, 0);
+
+        let (reader, writer, timeout_guard, original_fd) =
+            pipeline.into_parts().expect("into_parts");
+        assert_eq!(original_fd, server_fd);
+        assert_ne!(get_flags(server_fd) & libc::O_NONBLOCK, 0);
+
+        drop(timeout_guard);
+        drop(writer);
+        drop(reader);
+        drop(server);
+        drop(client);
     }
 }

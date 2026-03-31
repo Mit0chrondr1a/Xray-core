@@ -27,10 +27,10 @@ const (
 	mitmAlpn11Key             ctx.SessionKey = 11 // used by TLS dialer
 	mitmServerNameKey         ctx.SessionKey = 12 // used by TLS dialer
 	visionFlowKey             ctx.SessionKey = 13 // VLESS Vision flow active — skip kTLS-producing Rust paths
-	dnsFlowClassKey           ctx.SessionKey = 14 // DNS flow class resolved once near dispatch
-	dnsPlaneKey               ctx.SessionKey = 15 // DNS handling plane marker for telemetry
+	visionSharedParentKey     ctx.SessionKey = 14 // main-compatible Vision lane for shared mux/rvs parents
 	visionSignalKey           ctx.SessionKey = 16 // per-flow Vision command signal channel
 	visionTimestampsKey       ctx.SessionKey = 17 // per-flow Vision timestamp storage
+	flowTimingsKey            ctx.SessionKey = 18 // per-flow latency timing storage
 )
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -212,30 +212,19 @@ func VisionFlowFromContext(ctx context.Context) bool {
 	return false
 }
 
-// ContextWithDNSFlowClass stores the resolved DNS flow class in context.
-func ContextWithDNSFlowClass(ctx context.Context, class DNSFlowClass) context.Context {
-	return context.WithValue(ctx, dnsFlowClassKey, class)
+// ContextWithVisionSharedParent marks the context as using main-compatible
+// Vision behavior for shared mux/rvs parents.
+func ContextWithVisionSharedParent(ctx context.Context, shared bool) context.Context {
+	return context.WithValue(ctx, visionSharedParentKey, shared)
 }
 
-// DNSFlowClassFromContext returns the DNS flow class if present.
-func DNSFlowClassFromContext(ctx context.Context) DNSFlowClass {
-	if val, ok := ctx.Value(dnsFlowClassKey).(DNSFlowClass); ok {
+// VisionSharedParentFromContext reports whether the context should keep Vision
+// handling on the main-compatible shared-parent lane.
+func VisionSharedParentFromContext(ctx context.Context) bool {
+	if val, ok := ctx.Value(visionSharedParentKey).(bool); ok {
 		return val
 	}
-	return DNSFlowClassUnset
-}
-
-// ContextWithDNSPlane stores DNS handling plane marker for telemetry.
-func ContextWithDNSPlane(ctx context.Context, plane DNSPlane) context.Context {
-	return context.WithValue(ctx, dnsPlaneKey, plane)
-}
-
-// DNSPlaneFromContext returns DNS handling plane marker if present.
-func DNSPlaneFromContext(ctx context.Context) DNSPlane {
-	if val, ok := ctx.Value(dnsPlaneKey).(DNSPlane); ok {
-		return val
-	}
-	return DNSPlaneUnknown
+	return false
 }
 
 // ContextWithVisionSignal stores the per-flow Vision command channel.
@@ -257,6 +246,17 @@ func ContextWithVisionTimestamps(ctx context.Context, timestamps *VisionTimestam
 
 func VisionTimestampsFromContext(ctx context.Context) *VisionTimestamps {
 	if val, ok := ctx.Value(visionTimestampsKey).(*VisionTimestamps); ok {
+		return val
+	}
+	return nil
+}
+
+func ContextWithFlowTimings(ctx context.Context, timings *FlowTimings) context.Context {
+	return context.WithValue(ctx, flowTimingsKey, timings)
+}
+
+func FlowTimingsFromContext(ctx context.Context) *FlowTimings {
+	if val, ok := ctx.Value(flowTimingsKey).(*FlowTimings); ok {
 		return val
 	}
 	return nil

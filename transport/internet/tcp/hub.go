@@ -311,6 +311,7 @@ func (v *Listener) keepAccepting() {
 			}
 			continue
 		}
+		acceptStartUnixNano := time.Now().UnixNano()
 		select {
 		case v.connSemaphore <- struct{}{}:
 		default:
@@ -318,7 +319,7 @@ func (v *Listener) keepAccepting() {
 			_ = conn.Close()
 			continue
 		}
-		go func(rawConn net.Conn) {
+		go func(rawConn net.Conn, acceptStartUnixNano int64) {
 			var handshakeReleased atomic.Bool
 			var realityFailureRecorded atomic.Bool
 			releaseHandshake := func() {
@@ -593,8 +594,9 @@ func (v *Listener) keepAccepting() {
 			if v.authConfig != nil {
 				conn = v.authConfig.Server(conn)
 			}
+			recordAcceptStartUnixNano(conn, acceptStartUnixNano)
 			v.addConn(stat.Connection(conn))
-		}(conn)
+		}(conn, acceptStartUnixNano)
 	}
 }
 

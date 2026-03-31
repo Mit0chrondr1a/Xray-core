@@ -2,7 +2,11 @@ package mux
 
 import (
 	"context"
+	stderrors "errors"
+	"fmt"
 	"io"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -85,20 +89,30 @@ func (s *Server) Close() error {
 }
 
 type ServerWorker struct {
-	dispatcher     routing.Dispatcher
-	link           *transport.Link
-	sessionManager *SessionManager
-	done           *done.Instance
-	timer          *time.Ticker
+	dispatcher      routing.Dispatcher
+	link            *transport.Link
+	sessionManager  *SessionManager
+	done            *done.Instance
+	timer           *time.Ticker
+	createdAt       time.Time
+	lastActivity    time.Time
+	firstFrameAt    time.Time
+	frameCount      int64
+	sessionsCreated int64
 }
 
+var activeMuxParents int64
+
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
+	now := time.Now()
 	worker := &ServerWorker{
 		dispatcher:     d,
 		link:           link,
 		sessionManager: NewSessionManager(),
 		done:           done.New(),
 		timer:          time.NewTicker(60 * time.Second),
+		createdAt:      now,
+		lastActivity:   now,
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
@@ -110,7 +124,13 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
-	if err := buf.Copy(s.input, writer); err != nil {
+	var err error
+	if s.idleTimeout > 0 {
+		err = copyPacketWithIdleClose(ctx, s, writer)
+	} else {
+		err = buf.Copy(s.input, writer)
+	}
+	if err != nil {
 		recordMuxSessionEnd(err)
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
@@ -118,6 +138,48 @@ func handle(ctx context.Context, s *Session, output buf.Writer) {
 
 	writer.Close()
 	s.Close(false)
+}
+
+const (
+	packetControlIdleCloseTimeout = 10 * time.Second
+)
+
+func packetSessionIdleCloseTimeout(dest net.Destination) time.Duration {
+	if dest.Network != net.Network_UDP {
+		return 0
+	}
+	if dest.Port == net.Port(123) {
+		return packetControlIdleCloseTimeout
+	}
+	return 0
+}
+
+func copyPacketWithIdleClose(ctx context.Context, s *Session, writer *Writer) error {
+	if s.idleTimeout <= 0 {
+		return buf.Copy(s.input, writer)
+	}
+
+	for {
+		err := buf.CopyOnceTimeout(s.input, writer, s.idleTimeout)
+		switch err {
+		case nil:
+			continue
+		case buf.ErrReadTimeout:
+			args := []any{
+				"[kind=mux.packet_idle_close] ",
+				"session_id=", s.ID, " ",
+				"target=", s.target, " ",
+				"xudp=", s.XUDP != nil, " ",
+				"idle_timeout_seconds=", int(s.idleTimeout.Seconds()),
+			}
+			errors.LogDebug(ctx, args...)
+			return nil
+		case buf.ErrNotTimeoutReader:
+			return buf.Copy(s.input, writer)
+		default:
+			return err
+		}
+	}
 }
 
 func (w *ServerWorker) monitor() {
@@ -165,20 +227,6 @@ func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.Bu
 
 func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata, reader *buf.BufferedReader) error {
 	ctx = session.SubContextFromMuxInbound(ctx)
-	dnsFlowClass := meta.DNSFlowClass
-	if dnsFlowClass == session.DNSFlowClassUnset {
-		dnsFlowClass = session.ClassifyDNSFlow(meta.Target)
-	}
-	if dnsFlowClass != session.DNSFlowClassUnset {
-		ctx = session.ContextWithDNSFlowClass(ctx, dnsFlowClass)
-	}
-	dnsPlane := meta.DNSPlane
-	if dnsPlane == session.DNSPlaneUnknown && dnsFlowClass == session.DNSFlowClassUDPControl {
-		dnsPlane = session.DNSPlaneMuxXUDP
-	}
-	if dnsPlane != session.DNSPlaneUnknown && dnsPlane != "" {
-		ctx = session.ContextWithDNSPlane(ctx, dnsPlane)
-	}
 	if meta.Inbound != nil && meta.Inbound.Source.IsValid() && meta.Inbound.Local.IsValid() {
 		if inbound := session.InboundFromContext(ctx); inbound != nil {
 			newInbound := *inbound
@@ -276,7 +324,9 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			output:       x.Mux.output,
 			parent:       w.sessionManager,
 			ID:           meta.SessionID,
+			target:       meta.Target,
 			transferType: protocol.TransferTypePacket,
+			idleTimeout:  packetSessionIdleCloseTimeout(meta.Target),
 			XUDP:         x,
 		}
 		x.Status = Active
@@ -284,6 +334,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			x.Mux.Close(false)
 			return errors.New("failed to add new session")
 		}
+		w.sessionsCreated++
 		go handle(ctx, x.Mux, w.link.Writer)
 		return nil
 	}
@@ -300,15 +351,18 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		output:       link.Writer,
 		parent:       w.sessionManager,
 		ID:           meta.SessionID,
+		target:       meta.Target,
 		transferType: protocol.TransferTypeStream,
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
+		s.idleTimeout = packetSessionIdleCloseTimeout(meta.Target)
 	}
 	if !w.sessionManager.Add(s) {
 		s.Close(false)
 		return errors.New("failed to add new session")
 	}
+	w.sessionsCreated++
 	go handle(ctx, s, w.link.Writer)
 	if !meta.Option.Has(OptionData) {
 		return nil
@@ -387,24 +441,121 @@ func (w *ServerWorker) handleFrame(ctx context.Context, reader *buf.BufferedRead
 	return nil
 }
 
+func classifyMuxParentDeath(err error) string {
+	cause := errors.Cause(err)
+	switch {
+	case cause == io.EOF:
+		return "eof"
+	case stderrors.Is(cause, io.ErrClosedPipe), stderrors.Is(cause, syscall.EPIPE):
+		return "closed_pipe"
+	case stderrors.Is(cause, syscall.ECONNRESET):
+		return "connection_reset"
+	default:
+		return "other"
+	}
+}
+
+func muxParentDeathDurations(now, createdAt, lastActivity time.Time) (idleSeconds, lifetimeSeconds int) {
+	if now.Before(createdAt) {
+		now = createdAt
+	}
+	if lastActivity.Before(createdAt) {
+		lastActivity = createdAt
+	}
+	if now.Before(lastActivity) {
+		lastActivity = now
+	}
+	return int(now.Sub(lastActivity).Seconds()), int(now.Sub(createdAt).Seconds())
+}
+
+func muxFirstFrameLatencyNs(createdAt, firstFrameAt time.Time) int64 {
+	if firstFrameAt.IsZero() || firstFrameAt.Before(createdAt) {
+		return 0
+	}
+	return firstFrameAt.Sub(createdAt).Nanoseconds()
+}
+
+type muxParentLifecycle struct {
+	idleSeconds          int
+	lifetimeSeconds      int
+	activeSeconds        int
+	totalFrames          int64
+	totalSessionsCreated int64
+	firstFrameLatencyNs  int64
+}
+
+func (w *ServerWorker) parentLifecycle(now time.Time) muxParentLifecycle {
+	idleSeconds, lifetimeSeconds := muxParentDeathDurations(now, w.createdAt, w.lastActivity)
+	activeSeconds := lifetimeSeconds - idleSeconds
+	if activeSeconds < 0 {
+		activeSeconds = 0
+	}
+	return muxParentLifecycle{
+		idleSeconds:          idleSeconds,
+		lifetimeSeconds:      lifetimeSeconds,
+		activeSeconds:        activeSeconds,
+		totalFrames:          w.frameCount,
+		totalSessionsCreated: w.sessionsCreated,
+		firstFrameLatencyNs:  muxFirstFrameLatencyNs(w.createdAt, w.firstFrameAt),
+	}
+}
+
+func (w *ServerWorker) logParentBirth(ctx context.Context, concurrentParents int64) {
+	errors.LogDebug(ctx,
+		"[kind=mux.parent_birth] ",
+		"concurrent_parents=", concurrentParents,
+	)
+}
+
+func (w *ServerWorker) logParentDeath(ctx context.Context, errClass string) {
+	lifecycle := w.parentLifecycle(time.Now())
+	errors.LogDebug(ctx,
+		"[kind=mux.parent_lifecycle] ",
+		"error_class=", errClass, " ",
+		"idle_seconds=", lifecycle.idleSeconds, " ",
+		"lifetime_seconds=", lifecycle.lifetimeSeconds, " ",
+		"active_seconds=", lifecycle.activeSeconds, " ",
+		"active_sessions=", w.sessionManager.Size(), " ",
+		"total_frames=", lifecycle.totalFrames, " ",
+		"total_sessions_created=", lifecycle.totalSessionsCreated, " ",
+		"first_frame_ns=", lifecycle.firstFrameLatencyNs, " ",
+		"concurrent_parents=", atomic.LoadInt64(&activeMuxParents),
+	)
+}
+
 func (w *ServerWorker) run(ctx context.Context) {
+	concurrentParents := atomic.AddInt64(&activeMuxParents, 1)
 	defer func() {
+		atomic.AddInt64(&activeMuxParents, -1)
 		common.Must(w.done.Close())
 	}()
+	w.logParentBirth(ctx, concurrentParents)
 
 	reader := &buf.BufferedReader{Reader: w.link.Reader}
 
 	for {
 		select {
 		case <-ctx.Done():
+			w.logParentDeath(ctx, "context_cancelled")
 			return
 		default:
 			err := w.handleFrame(ctx, reader)
 			if err != nil {
-				if errors.Cause(err) != io.EOF {
+				w.logParentDeath(ctx, classifyMuxParentDeath(err))
+				if cause := errors.Cause(err); cause != io.EOF {
 					errors.LogInfoInner(ctx, err, "unexpected EOF")
+					errors.LogDebug(ctx,
+						"[kind=mux.parent_stream_error_origin] ",
+						"cause_type=", fmt.Sprintf("%T", cause), " ",
+						"cause_msg=", cause.Error(),
+					)
 				}
 				return
+			}
+			w.lastActivity = time.Now()
+			w.frameCount++
+			if w.firstFrameAt.IsZero() {
+				w.firstFrameAt = w.lastActivity
 			}
 		}
 	}

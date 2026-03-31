@@ -358,6 +358,17 @@ func (deferredDeadlineError) Unwrap() error   { return os.ErrDeadlineExceeded }
 
 var errDeferredDeadlineExceeded error = deferredDeadlineError{}
 
+type deferredWouldBlockError struct{}
+
+func (deferredWouldBlockError) Error() string   { return "native: deferred read would block" }
+func (deferredWouldBlockError) Timeout() bool   { return false }
+func (deferredWouldBlockError) Temporary() bool { return true }
+
+// ErrDeferredWouldBlock reports that a zero-deadline deferred read hit the
+// native wake-up ceiling and should be retried by the caller without treating
+// it as a connection failure.
+var ErrDeferredWouldBlock error = deferredWouldBlockError{}
+
 func deadlineMillis(deadline time.Time) C.int64_t {
 	if deadline.IsZero() {
 		return C.int64_t(-1)
@@ -1029,6 +1040,8 @@ func DeferredRead(handle *DeferredSessionHandle, buf []byte) (int, error) {
 			return int(outN), io.EOF
 		case 2:
 			return int(outN), io.ErrClosedPipe
+		case 4:
+			return int(outN), ErrDeferredWouldBlock
 		default:
 			return 0, errors.New("native: deferred read failed")
 		}
@@ -1063,6 +1076,8 @@ func DeferredReadWithDeadline(handle *DeferredSessionHandle, buf []byte, deadlin
 			return int(outN), io.ErrClosedPipe
 		case 3:
 			return int(outN), errDeferredDeadlineExceeded
+		case 4:
+			return int(outN), ErrDeferredWouldBlock
 		default:
 			return 0, errors.New("native: deferred read failed")
 		}
@@ -1233,9 +1248,9 @@ func DeferredHandleAlive(handle *DeferredSessionHandle) bool {
 	return handle != nil && handle.ptr != nil
 }
 
-// DeferredRestoreNonBlock restores O_NONBLOCK on the deferred session's fd
-// without detaching. After this call, Rust's reader/writer handle EAGAIN via
-// poll(2), and Go can safely write to the raw socket without blocking.
+// DeferredRestoreNonBlock is a compatibility shim for the deferred-session
+// API. Deferred sessions now start with O_NONBLOCK already restored after the
+// handshake pipeline, so a successful call is currently a no-op.
 func DeferredRestoreNonBlock(handle *DeferredSessionHandle) error {
 	if handle == nil || handle.ptr == nil {
 		return errors.New("native: nil deferred session handle")

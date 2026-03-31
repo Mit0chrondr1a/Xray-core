@@ -78,7 +78,7 @@ func TestTcpWorkerCallback_ConnectionClosedAfterReturn(t *testing.T) {
 		port:    xnet.Port(1234),
 	}
 
-	w.callback(stat.Connection(conn))
+	w.callback(stat.Connection(conn), 0)
 
 	if !p.processed.Load() {
 		t.Fatal("proxy.Process was not called")
@@ -109,7 +109,7 @@ func TestTcpWorkerCallback_ConnectionClosedOnPanic(t *testing.T) {
 		defer func() {
 			recover() // absorb the panic so the test continues
 		}()
-		w.callback(stat.Connection(conn))
+		w.callback(stat.Connection(conn), 0)
 	}()
 
 	if !conn.closed.Load() {
@@ -132,7 +132,7 @@ func TestTcpWorkerCallback_ContextCancelledAfterReturn(t *testing.T) {
 		port:    xnet.Port(1234),
 	}
 
-	w.callback(stat.Connection(conn))
+	w.callback(stat.Connection(conn), 0)
 
 	// The child context (created inside callback) should have been cancelled
 	// by the deferred cancel(). The parent context should still be active.
@@ -182,7 +182,7 @@ func TestTcpWorkerStart_PanicRecovery(t *testing.T) {
 				// This is the panic recovery from Start()'s goroutine
 			}
 		}()
-		w.callback(stat.Connection(conn))
+		w.callback(stat.Connection(conn), 0)
 	}()
 
 	select {

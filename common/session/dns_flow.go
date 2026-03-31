@@ -7,7 +7,8 @@ import (
 	"github.com/xtls/xray-core/common/net"
 )
 
-// DNSFlowClass describes DNS/control-plane classification for a request.
+// DNSFlowClass is lightweight DNS classification used for diagnostics.
+// It does not imply any special mux or Vision policy.
 type DNSFlowClass uint8
 
 const (
@@ -30,13 +31,15 @@ func (c DNSFlowClass) String() string {
 	}
 }
 
-// DNSPlane marks which DNS handling plane processed this request.
+// DNSPlane is a telemetry label for DNS handling paths.
 type DNSPlane string
 
 const (
 	DNSPlaneUnknown     DNSPlane = "unknown"
 	DNSPlaneVisionGuard DNSPlane = "vision_dns_guard"
+	DNSPlaneTCPGuard    DNSPlane = "tcp_control_guard"
 	DNSPlaneXHTTPSplit  DNSPlane = "xhttp_splitconn"
+	DNSPlaneMuxUDP      DNSPlane = "mux_udp"
 	DNSPlaneMuxXUDP     DNSPlane = "mux_xudp"
 	DNSPlaneOther       DNSPlane = "other"
 )
@@ -56,12 +59,8 @@ func ClassifyDNSFlow(dest net.Destination) DNSFlowClass {
 	}
 }
 
-// ResolveDNSFlowClass resolves DNS flow class from context, falling back to
-// outbound metadata when no explicit class was propagated.
+// ResolveDNSFlowClass resolves DNS flow class from outbound metadata.
 func ResolveDNSFlowClass(ctx context.Context) DNSFlowClass {
-	if class := DNSFlowClassFromContext(ctx); class != DNSFlowClassUnset {
-		return class
-	}
 	outbounds := OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		return DNSFlowClassUnset
@@ -109,25 +108,4 @@ func IsLoopbackIngress(inbound *Inbound) bool {
 // ingress and should use deterministic control-plane handling.
 func IsControlPlaneLoopbackIngress(inbound *Inbound) bool {
 	return IsLoopbackIngress(inbound)
-}
-
-// ShouldBypassVisionDetach reports whether Vision should keep userspace TLS
-// instead of detach/zero-copy for deterministic control-plane behavior.
-func ShouldBypassVisionDetach(ctx context.Context) bool {
-	class := ResolveDNSFlowClass(ctx)
-	if class != DNSFlowClassTCPControl && class != DNSFlowClassUDPControl {
-		return false
-	}
-	inbound := InboundFromContext(ctx)
-	// DNS control-plane bypass is restricted to control-plane loopback ingress.
-	return IsControlPlaneLoopbackIngress(inbound)
-}
-
-// ShouldDowngradeVisionFlow reports whether loopback TCP DNS control traffic
-// should avoid the Vision flow entirely and use plain VLESS semantics instead.
-func ShouldDowngradeVisionFlow(ctx context.Context, dest net.Destination) bool {
-	if ClassifyDNSFlow(dest) != DNSFlowClassTCPControl {
-		return false
-	}
-	return IsControlPlaneLoopbackIngress(InboundFromContext(ctx))
 }
