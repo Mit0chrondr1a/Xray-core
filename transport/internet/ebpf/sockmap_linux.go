@@ -39,20 +39,6 @@ type ebpfState struct {
 
 var currentState atomic.Pointer[ebpfState]
 
-var probeKTLSSetsockoptFn = func(fd int, opt int, val unsafe.Pointer, vallen uintptr) syscall.Errno {
-	const solTLS = 282
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_SETSOCKOPT,
-		uintptr(fd),
-		uintptr(solTLS),
-		uintptr(opt),
-		uintptr(val),
-		vallen,
-		0,
-	)
-	return errno
-}
-
 func init() {
 	currentState.Store(&ebpfState{
 		sockhashFD:      -1,
@@ -61,36 +47,6 @@ func init() {
 		skSkbVerdictFD:  -1,
 		sockmapAttachFD: -1,
 	})
-}
-
-func installProbeBidirectionalKTLS(fd int) bool {
-	// Install minimal TLS 1.3 AES-128-GCM-SHA256 crypto info in both TX and RX
-	// directions so the compatibility probe matches real fallback sockets, which
-	// carry bidirectional kTLS when the fallback path promotes both sides.
-	const (
-		tlsTX = 1
-		tlsRX = 2
-	)
-	// struct tls12_crypto_info_aes_gcm_128:
-	//   tls_crypto_info (4 bytes: version u16, cipher_type u16)
-	//   iv       [8]byte
-	//   key      [16]byte
-	//   salt     [4]byte
-	//   rec_seq  [8]byte
-	var info [40]byte
-	// version = TLS 1.3 (0x0304), little-endian u16
-	info[0] = 0x04
-	info[1] = 0x03
-	// cipher_type = TLS_CIPHER_AES_GCM_128 (51), little-endian u16
-	info[2] = 51
-	info[3] = 0
-
-	for _, opt := range []int{tlsTX, tlsRX} {
-		if errno := probeKTLSSetsockoptFn(fd, opt, unsafe.Pointer(&info), unsafe.Sizeof(info)); errno != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 // Slot management globals have their own mutex and don't need atomic state.
@@ -119,14 +75,13 @@ func buildSKSkbParserProgram() []bpfInsn {
 //  1. Gets the receiving socket's cookie via bpf_get_socket_cookie
 //  2. Looks up the cookie in the policy map to check redirect permission
 //  3. If denied (flags & 1 == 0), returns SK_PASS (data to userspace)
-//  4. If allowed (or no policy entry), redirects via SOCKHASH (egress by default)
+//  4. If allowed, redirects raw TCP via SOCKHASH (egress by default)
 //  5. If policy sets PolicyUseIngress, redirect into target ingress queue
 //
 // This achieves true zero-copy TCP proxying — data arriving from the
 // network on one socket is forwarded directly to the paired socket
-// without ever entering userspace. The policy lookup enables kTLS-aware
-// sockmap: when both sockets have kTLS, the kernel handles encrypt/decrypt
-// transparently.
+// without ever entering userspace. Admission is restricted to raw TCP before
+// sockets reach this program; kTLS remains on its connection wrappers.
 //
 // Context: struct __sk_buff * (R1)
 // Return:  SK_PASS (1) always — on redirect failure, data proceeds normally
@@ -158,8 +113,8 @@ func buildSKSkbVerdictProgram() []bpfInsn {
 		// Store cookie as key on stack
 		bpfStoreMem(bpfDW, bpfRegR10, bpfRegR7, int16(stackKey)), // 5
 
-		// Default policy for missing entries: allow redirect, egress direction.
-		bpfMovImm32(bpfRegR8, int32(PolicyAllowRedirect)), // 6
+		// Missing policy is fail-closed: pass to userspace without redirect.
+		bpfMovImm32(bpfRegR8, 0), // 6
 	}
 
 	// --- Policy map lookup ---
@@ -223,10 +178,12 @@ func buildSKSkbVerdictProgram() []bpfInsn {
 }
 
 // skSkbMapFDPlaceholder is the sockhash map fd placeholder in the verdict bytecode.
-const skSkbMapFDPlaceholder = 0
+// Negative sentinels cannot collide with a real file descriptor during the
+// sequential relocation passes.
+const skSkbMapFDPlaceholder = -1
 
 // skSkbPolicyFDPlaceholder is the policy map fd placeholder in the verdict bytecode.
-const skSkbPolicyFDPlaceholder = 1
+const skSkbPolicyFDPlaceholder = -2
 
 const (
 	pinVersion     = "2"
@@ -269,7 +226,8 @@ func checkBPFSysctls() {
 // Dual-path lifecycle: When CGO is enabled and the Rust staticlib includes eBPF
 // bytecode (native.EbpfAvailable() == true), the Rust/Aya loader in
 // common/native/cgo.go → rust/xray-rust/src/ebpf.rs is the primary path. It
-// handles program loading, Aya-managed map pinning, and SK_MSG attachment.
+// handles program loading and Aya-managed map pinning. It deliberately leaves
+// SK_MSG unattached; both loaders install the same receive-path SK_SKB pair.
 // This Go-native path serves as the fallback for non-CGO builds or when the
 // Rust crate is compiled without the ebpf-bytecode feature. Both paths share
 // the same pin directory layout (/sys/fs/bpf/xray/) and policy map schema,
@@ -352,7 +310,7 @@ func setupSockmapImpl(config SockmapConfig) error {
 			syscall.Close(policyFD)
 			return fmt.Errorf("failed to attach sk_skb programs to sockhash: %w", err)
 		}
-		xerrors.LogInfo(context.Background(), "sockmap: SOCKHASH sk_skb attach failed (", err, "), falling back to SOCKMAP attach (kTLS+sockmap may not work)")
+		xerrors.LogInfo(context.Background(), "sockmap: SOCKHASH sk_skb attach failed (", err, "), falling back to compatibility SOCKMAP attach")
 
 		// Compatibility fallback for older kernels:
 		// attach sk_skb to SOCKMAP, but keep redirect lookups in SOCKHASH.
@@ -1036,91 +994,18 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 	return fd, nil
 }
 
-// probeKTLSSockhashCompat tests whether a kTLS socket can be inserted into a
-// SOCKHASH map on this kernel. Returns true if compatible. This runs once at
-// startup when both kTLS and sockmap are available, and gates whether kTLS
-// sockets are eligible for sockmap redirect.
-func probeKTLSSockhashCompat() bool {
-	st := currentState.Load()
-	sockhashFD := st.sockhashFD
-
-	// When the Rust/Aya loader is active, sockhashFD is -1 (Rust-managed).
-	// Open the pinned SOCKHASH map for this probe, then close it after.
-	var pinnedFD int
-	if sockhashFD < 0 && st.sockmapPinPath != "" {
-		var err error
-		pinnedFD, err = openPinnedBPFMap(sockhashPinPath(st.sockmapPinPath))
-		if err != nil {
-			return false
-		}
-		defer syscall.Close(pinnedFD)
-		sockhashFD = pinnedFD
-	} else if sockhashFD < 0 {
-		return false
-	}
-
-	// Create a loopback TCP pair in ESTABLISHED state.
-	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+// attestSocketULPEmpty verifies the kernel-side TCP ULP rather than trusting
+// caller metadata. Current Linux makes TLS ULP and sockmap mutually exclusive;
+// any non-empty ULP is therefore a hard, fail-closed registration boundary.
+func attestSocketULPEmpty(fd int) error {
+	ulp, err := unix.GetsockoptString(fd, unix.IPPROTO_TCP, unix.TCP_ULP)
 	if err != nil {
-		return false
+		return fmt.Errorf("get TCP_ULP: %w", err)
 	}
-	defer ln.Close()
-
-	serverCh := make(chan *net.TCPConn, 1)
-	go func() {
-		c, err := ln.AcceptTCP()
-		if err != nil {
-			serverCh <- nil
-			return
-		}
-		serverCh <- c
-	}()
-
-	client, err := net.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
-	if err != nil {
-		return false
+	if ulp != "" {
+		return fmt.Errorf("%w: %s", ErrSockmapSocketULPActive, ulp)
 	}
-	defer client.Close()
-
-	server := <-serverCh
-	if server == nil {
-		return false
-	}
-	defer server.Close()
-
-	// Set up kTLS ULP + TX on the client socket.
-	rawConn, err := client.SyscallConn()
-	if err != nil {
-		return false
-	}
-
-	var ktlsOK bool
-	rawConn.Control(func(fd uintptr) {
-		intFD := int(fd)
-		// TCP_ULP = "tls"
-		if err := syscall.SetsockoptString(intFD, syscall.SOL_TCP, unix.TCP_ULP, "tls"); err != nil {
-			return
-		}
-		if !installProbeBidirectionalKTLS(intFD) {
-			return
-		}
-
-		// Try inserting this kTLS socket into the SOCKHASH.
-		cookie, err := getSocketCookie(intFD)
-		if err != nil {
-			return
-		}
-		key := cookie
-		value := uint32(intFD)
-		if err := bpfMapUpdate(sockhashFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
-			return
-		}
-		// Clean up — remove probe entry.
-		_ = bpfMapDelete(sockhashFD, unsafe.Pointer(&key))
-		ktlsOK = true
-	})
-
-	return ktlsOK
+	return nil
 }
 
 // setPolicyEntry writes a redirect policy entry for the given socket cookie.
@@ -1191,8 +1076,10 @@ func nativeEbpfAvailable() bool {
 	return native.EbpfAvailable()
 }
 
-// setupSockmapNative initializes eBPF via the Rust/Aya loader. This loads all
-// three programs (SK_SKB parser + verdict + SK_MSG cork) and pins maps to bpffs.
+// setupSockmapNative initializes eBPF via the Rust/Aya loader. It attaches the
+// SK_SKB parser and verdict and pins maps to bpffs. SK_MSG programs may remain
+// compiled into the artifact for future experiments, but are not loaded or
+// attached by the production path.
 func setupSockmapNative(config SockmapConfig) error {
 	// Validate PinPath before passing to Rust/Aya loader (same check as Go-native path).
 	if config.PinPath != "" {
@@ -1217,7 +1104,6 @@ func setupSockmapNative(config SockmapConfig) error {
 
 	// The Rust loader manages its own FDs and map pinning. Set currentState
 	// to sentinel values so the Go-native path knows not to use its FDs.
-	// sockhashFD = -1 signals "Rust-managed" to probeKTLSSockhashCompat.
 	currentState.Store(&ebpfState{
 		sockhashFD:      -1,
 		policyMapFD:     -1,

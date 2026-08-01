@@ -223,9 +223,9 @@ type SockmapConfig struct {
 	// dropped after BPF setup. Defense-in-depth measure.
 	DropCapabilities bool
 
-	// CorkThreshold is the SK_MSG cork batching threshold in bytes.
-	// Small sendmsg() calls are coalesced until this many bytes are buffered.
-	// Only used by the Rust/Aya loader (SK_MSG program). Default is 1400.
+	// CorkThreshold is retained for configuration and native-ABI compatibility.
+	// Production loaders do not attach SK_MSG; non-default values are rejected
+	// instead of silently implying that send-path corking is active.
 	CorkThreshold uint32
 }
 

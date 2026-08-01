@@ -36,6 +36,10 @@ func getConnFDImpl(conn net.Conn) (int, error) {
 	return -1, ErrSockmapNotSupported
 }
 
+func attestSocketULPEmpty(fd int) error {
+	return ErrSockmapNotSupported
+}
+
 // setPolicyEntry is a no-op on non-Linux systems.
 func setPolicyEntry(cookie uint64, flags uint32) error {
 	return nil
@@ -48,11 +52,6 @@ func deletePolicyEntry(cookie uint64) error {
 
 // isSocketAlive always returns false on non-Linux systems.
 func isSocketAlive(fd int) bool {
-	return false
-}
-
-// probeKTLSSockhashCompat always returns false on non-Linux systems.
-func probeKTLSSockhashCompat() bool {
 	return false
 }
 

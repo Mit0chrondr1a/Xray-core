@@ -31,7 +31,7 @@ fn try_skb_verdict(ctx: &SkBuffContext) -> Result<u32, ()> {
     // Look up policy for this socket.
     let policy = match unsafe { POLICY_MAP.get(&cookie) } {
         Some(flags) => *flags,
-        None => POLICY_ALLOW_REDIRECT, // match Go loader default (allow redirect if missing)
+        None => 0, // fail closed: an absent policy must pass to userspace
     };
 
     // Check allow bit.

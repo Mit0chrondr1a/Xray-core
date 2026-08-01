@@ -42,9 +42,8 @@ type SockmapManager struct {
 	regWindowFailures atomic.Int64 // generic sockmap registration failures in current window
 	sweepStaleRatio   atomic.Int64 // last sweep: stale-found * 1000 / total-checked (permille)
 	spliceFallbacks   atomic.Int64 // times sockmap was skipped due to contention
-
-	// kTLS splice fallback tracking
-	ktlsSpliceFallbacks atomic.Int64 // times kTLS pairs routed to splice due to kernel incompatibility
+	// Deprecated compatibility counter retained for telemetry ABI stability.
+	ktlsSpliceFallbacks atomic.Int64
 
 	// Userspace LRU eviction for SOCKHASH
 	lruList  *list.List                    // front=MRU, back=LRU
@@ -58,13 +57,14 @@ type SockmapManager struct {
 
 // SockmapStats provides a snapshot of sockmap manager statistics.
 type SockmapStats struct {
-	ActivePairs         int64
-	TotalPairs          int64
-	FullRejects         int64
-	PeakPairs           int64
-	StaleCleanups       int64
-	RegFailures         int64
-	SpliceFallbacks     int64
+	ActivePairs     int64
+	TotalPairs      int64
+	FullRejects     int64
+	PeakPairs       int64
+	StaleCleanups   int64
+	RegFailures     int64
+	SpliceFallbacks int64
+	// Deprecated compatibility field retained for telemetry ABI stability.
 	KTLSSpliceFallbacks int64
 	Enabled             bool
 	MaxEntries          uint32 // effective runtime capacity
@@ -87,6 +87,7 @@ const (
 	CryptoKTLSTxOnly   CryptoHint = 2
 	CryptoKTLSRxOnly   CryptoHint = 3
 	CryptoUserspaceTLS CryptoHint = 4 // Go/uTLS — not eligible
+	CryptoUnknown      CryptoHint = 255
 )
 
 func (h CryptoHint) String() string {
@@ -101,6 +102,8 @@ func (h CryptoHint) String() string {
 		return "kTLS-RX"
 	case CryptoUserspaceTLS:
 		return "userspace"
+	case CryptoUnknown:
+		return "unknown"
 	default:
 		return "unknown"
 	}
@@ -109,7 +112,10 @@ func (h CryptoHint) String() string {
 const (
 	PolicyAllowRedirect uint32 = 1 << 0
 	PolicyUseIngress    uint32 = 1 << 1
-	PolicyKTLSActive    uint32 = 1 << 2
+	// PolicyKTLSActive is a reserved legacy Go/Rust policy-ABI bit. New Go
+	// registrations never set it; remove it only with the corresponding Rust
+	// verdict programs and embedded-object rebuild.
+	PolicyKTLSActive uint32 = 1 << 2
 )
 
 // SockPair represents a pair of sockets being proxied.
@@ -167,8 +173,10 @@ func NewSockmapManager(config SockmapConfig) *SockmapManager {
 
 // Enable activates sockmap-based proxying.
 // If the Rust/Aya eBPF loader is available (native.EbpfAvailable()), it is
-// tried first — providing SK_SKB parser + verdict + SK_MSG cork (3 programs).
-// On failure, falls back transparently to the Go-native loader (SK_SKB only, 2 programs).
+// tried first. Both loaders attach only the SK_SKB parser and verdict. SK_MSG
+// remains deliberately unattached because this pair map is receive-oriented:
+// applying it to ordinary userspace writes would reverse their destination.
+// On failure, Enable falls back transparently to the Go-native loader.
 func (m *SockmapManager) Enable() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -213,9 +221,6 @@ func (m *SockmapManager) Enable() error {
 
 	m.enabled.Store(true)
 
-	// Re-probe kTLS+SOCKHASH after maps are ready to avoid latched-false from early probes.
-	_ = forceProbeKTLSSockhashCompat("post-enable")
-
 	return nil
 }
 
@@ -252,15 +257,24 @@ func (m *SockmapManager) Disable() error {
 	return nil
 }
 
-// RegisterPair registers a socket pair for zero-copy proxying.
-// Both connections must be TCP connections without TLS encryption.
+// RegisterPair registers a socket pair whose caller asserts both sockets are
+// raw TCP without TLS encryption.
+// Deprecated: use RegisterPairWithCrypto so the declared crypto state is explicit.
 func (m *SockmapManager) RegisterPair(inbound, outbound net.Conn) error {
 	return m.RegisterPairWithCrypto(inbound, outbound, CryptoNone, CryptoNone)
 }
 
-// RegisterPairWithCrypto registers a socket pair for zero-copy proxying with crypto awareness.
-// The crypto hints are used to compute a redirect policy that the verdict program consults.
+// RegisterPairWithCrypto registers a raw TCP pair for zero-copy proxying.
+//
+// Xray treats TLS ULP sockets and sockmap/sockhash as separate lanes. Current
+// Linux kernels enforce the same exclusion. Reject non-raw declarations before
+// manager or FD work, then attest the kernel's TCP_ULP state before cookie or
+// map operations so a stale/incorrect hint cannot attach a sk_psock to TLS.
 func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inboundCrypto, outboundCrypto CryptoHint) error {
+	if !sockmapCryptoEligible(inboundCrypto, outboundCrypto) {
+		return fmt.Errorf("%w: inbound=%s outbound=%s", ErrSockmapCryptoUnsupported, inboundCrypto, outboundCrypto)
+	}
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -277,6 +291,12 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 	if err != nil {
 		return err
 	}
+	if err := attestSocketULPEmpty(inboundFD); err != nil {
+		return fmt.Errorf("inbound socket: %w", err)
+	}
+	if err := attestSocketULPEmpty(outboundFD); err != nil {
+		return fmt.Errorf("outbound socket: %w", err)
+	}
 
 	key := SockPairKey{
 		InboundFD:  inboundFD,
@@ -292,29 +312,14 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 		return err
 	}
 
-	// Compute redirect policy from crypto hints.
+	// The precondition above guarantees this is the raw redirect policy.
 	policy := computeRedirectPolicy(inboundCrypto, outboundCrypto)
-	if policy&PolicyAllowRedirect != 0 && inboundCrypto != outboundCrypto {
-		xerrors.LogDebug(context.Background(),
-			"sockmap: asymmetric crypto redirect (",
-			inboundCrypto.String(), " <-> ", outboundCrypto.String(), ")")
-	}
-	if policy&PolicyKTLSActive != 0 {
-		// Ensure probe is fresh for kTLS flows.
-		if !refreshKTLSSockhashCompat(false, "register-ktls") {
-			m.IncrementKTLSSpliceFallback()
-			return xerrors.New("sockmap: kTLS+sockhash not compatible on this kernel")
-		}
-	}
 
 	if m.useNativeLoader {
 		// Rust/Aya path: register_pair_impl handles policy map writes internally,
 		// so skip Go-side setPolicyEntry() calls.
 		if err := m.setupForwardingWithEviction(inboundFD, outboundFD, inboundCookie, outboundCookie, policy); err != nil {
 			m.recordSockmapRegistrationFailure(err)
-			if policy&PolicyKTLSActive != 0 {
-				_ = forceProbeKTLSSockhashCompat("register-ktls-fail")
-			}
 			return err
 		}
 	} else {
@@ -332,9 +337,6 @@ func (m *SockmapManager) RegisterPairWithCrypto(inbound, outbound net.Conn, inbo
 			m.recordSockmapRegistrationFailure(err)
 			_ = deletePolicyEntry(inboundCookie)  // best-effort cleanup
 			_ = deletePolicyEntry(outboundCookie) // best-effort cleanup
-			if policy&PolicyKTLSActive != 0 {
-				_ = forceProbeKTLSSockhashCompat("register-ktls-fail")
-			}
 			return err
 		}
 	}
@@ -573,109 +575,38 @@ func CanUseZeroCopy(inbound, outbound net.Conn) bool {
 	return ok1 && ok2
 }
 
-var (
-	ktlsSockhashCompatFn = KTLSSockhashCompatible
-)
-
-const ktlsSockhashProbeTTL = 5 * time.Minute
-
-var (
-	ktlsProbeMu     sync.Mutex
-	ktlsProbeResult atomic.Bool
-	ktlsProbeLastNs atomic.Int64
-	ktlsProbeForced atomic.Bool
-)
-
-// KTLSSockhashCompatible reports whether the running kernel supports inserting
-// kTLS sockets into SOCKHASH maps. This is probed once at startup by creating
-// a real kTLS socket and attempting SOCKHASH insertion.
-//
-// Kernel 6.18 removed psock_update_sk_prot from TLS proto structs, breaking
-// this path. When/if a future kernel restores the callback, this probe will
-// automatically detect it — no code changes or version gates needed.
-func KTLSSockhashCompatible() bool {
-	return refreshKTLSSockhashCompat(false, "compat-check")
+// CanUseZeroCopyWithCrypto returns true if the connection pair can use
+// zero-copy given their crypto states. Both connections and both hints must
+// describe raw TCP. kTLS remains on its control-record-aware wrappers.
+func CanUseZeroCopyWithCrypto(inbound, outbound net.Conn, inCrypto, outCrypto CryptoHint) bool {
+	return sockmapCryptoEligible(inCrypto, outCrypto) && CanUseZeroCopy(inbound, outbound)
 }
 
-// IncrementKTLSSpliceFallback records that a kTLS-eligible connection pair was
-// routed to splice(2) instead of sockmap due to kernel incompatibility.
+// KTLSSockhashCompatible is retained for source compatibility.
+// Deprecated: kTLS sockets are never sockhash-compatible.
+func KTLSSockhashCompatible() bool {
+	return false
+}
+
+// IncrementKTLSSpliceFallback is retained for source compatibility.
+// Deprecated compatibility counter.
 func (m *SockmapManager) IncrementKTLSSpliceFallback() {
 	m.ktlsSpliceFallbacks.Add(1)
 }
 
-// CanUseZeroCopyWithCrypto returns true if the connection pair can use
-// zero-copy given their crypto states. Both must be raw TCP connections
-// and the redirect policy must allow it.
-//
-// Security invariant: when this returns false for kTLS connections (e.g.
-// KTLSSockhashCompatible() == false on kernel 6.18+), the caller falls
-// through to splice(2). kTLS connections still get kernel-level encryption
-// via the TLS ULP — only the forwarding mechanism changes from BPF redirect
-// to splice pipe buffers. Data remains encrypted in transit and never passes
-// through userspace in cleartext.
-func CanUseZeroCopyWithCrypto(inbound, outbound net.Conn, inCrypto, outCrypto CryptoHint) bool {
-	_, ok1 := inbound.(*net.TCPConn)
-	_, ok2 := outbound.(*net.TCPConn)
-	if !ok1 || !ok2 {
-		return false
-	}
-	policy := computeRedirectPolicy(inCrypto, outCrypto)
-	if policy&PolicyAllowRedirect == 0 {
-		return false
-	}
-	// If either side is kTLS, verify this kernel supports kTLS+SOCKHASH.
-	if policy&PolicyKTLSActive != 0 && !ktlsSockhashCompatFn() {
-		return false
-	}
-	return true
-}
-
-// refreshKTLSSockhashCompat refreshes the probe result. When force is true, TTL is ignored.
-func refreshKTLSSockhashCompat(force bool, reason string) bool {
-	now := time.Now().UnixNano()
-	last := ktlsProbeLastNs.Load()
-	if !force && last != 0 && now-last < int64(ktlsSockhashProbeTTL) {
-		return ktlsProbeResult.Load()
-	}
-
-	ktlsProbeMu.Lock()
-	defer ktlsProbeMu.Unlock()
-
-	// Re-check after acquiring lock.
-	last = ktlsProbeLastNs.Load()
-	if !force && last != 0 && time.Duration(now-last) < ktlsSockhashProbeTTL {
-		return ktlsProbeResult.Load()
-	}
-
-	result := probeKTLSSockhashCompat()
-	ktlsProbeResult.Store(result)
-	ktlsProbeLastNs.Store(time.Now().UnixNano())
-
-	if result {
-		xerrors.LogDebug(context.Background(), "sockmap: kTLS+SOCKHASH probe passed (reason=", reason, ")")
-	} else {
-		xerrors.LogInfo(context.Background(), "sockmap: kTLS+SOCKHASH probe failed (kernel ", unameRelease(), ", reason=", reason, ") — kTLS sockets will use splice instead of sockmap")
-	}
-
-	return result
-}
-
-// forceProbeKTLSSockhashCompat ignores TTL and reprobes immediately.
-func forceProbeKTLSSockhashCompat(reason string) bool {
-	ktlsProbeForced.Store(true)
-	return refreshKTLSSockhashCompat(true, reason)
+func sockmapCryptoEligible(inbound, outbound CryptoHint) bool {
+	return inbound == CryptoNone && outbound == CryptoNone
 }
 
 // computeRedirectPolicy determines the redirect policy flags for a pair of
 // sockets based on their crypto states.
 //
 // Only raw TCP pairs are eligible for sockmap redirect. Vision post-detach
-// flows satisfy that requirement after the outer TLS layer is removed, while
-// fallback kTLS flows already stay kernel-accelerated through splice + TLS ULP
-// without risking SOCKHASH registration failures that can poison contention
-// fallback for unrelated flows.
+// flows satisfy that requirement after the outer TLS layer is removed. kTLS
+// flows stay on their wrappers and never risk SOCKHASH registration failures
+// that can poison contention fallback for unrelated flows.
 func computeRedirectPolicy(inbound, outbound CryptoHint) uint32 {
-	if inbound != CryptoNone || outbound != CryptoNone {
+	if !sockmapCryptoEligible(inbound, outbound) {
 		return 0 // only raw TCP is eligible for sockmap redirect
 	}
 	return PolicyAllowRedirect

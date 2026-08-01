@@ -80,6 +80,7 @@ const (
 	ReasonDeferredTLSGuard                  = "deferred_tls_guard"
 	ReasonUserspaceTLSGuard                 = "userspace_tls_guard"
 	ReasonLoopbackUserspaceTLSGuard         = "loopback_userspace_tls_guard"
+	ReasonIncompleteCryptoGuard             = "incomplete_crypto_guard"
 	ReasonSplicePrimary                     = "splice_primary"
 	ReasonMissingInboundMetadata            = "missing_inbound_metadata"
 	ReasonInboundForcedUserspace            = "inbound_forced_userspace"
@@ -90,12 +91,11 @@ const (
 	ReasonLoopbackPairGuard                 = "loopback_pair_guard"
 	ReasonEnsureRawFailed                   = "ensure_raw_failed"
 	ReasonLoopbackTLSGuard                  = "loopback_tls_guard"
+	ReasonSpliceDirectionalNotReady         = "splice_directional_not_ready"
 	ReasonSockmapCapabilityUnsupported      = "sockmap_capability_unsupported"
+	ReasonSockmapOwnershipUnproven          = "sockmap_ownership_unproven"
 	ReasonSockmapManagerUnavailable         = "sockmap_mgr_unavailable"
 	ReasonSockmapContention                 = "sockmap_contention"
-	ReasonSockmapKTLSSockhashIncompatible   = "sockmap_ktls_sockhash_incompatible"
-	ReasonSockmapUserspaceTLS               = "sockmap_userspace_tls"
-	ReasonSockmapAsymmetricKTLS             = "sockmap_asymmetric_ktls"
 	ReasonSockmapOtherPolicy                = "sockmap_other_policy"
 	ReasonSockmapActive                     = "sockmap_active"
 	ReasonSockmapWaitError                  = "sockmap_wait_error"
@@ -125,6 +125,13 @@ const (
 	ReasonFallbackSuccess                   = "fallback_success"
 	ReasonUnexpectedDrop                    = "unexpected_drop"
 	ReasonCopyNotApplicable                 = "copy_not_applicable"
+)
+
+// Deprecated compatibility reasons retained for downstream telemetry users.
+const (
+	ReasonSockmapKTLSSockhashIncompatible = "sockmap_ktls_sockhash_incompatible"
+	ReasonSockmapUserspaceTLS             = "sockmap_userspace_tls"
+	ReasonSockmapAsymmetricKTLS           = "sockmap_asymmetric_ktls"
 )
 
 // DecisionSnapshot carries per-connection pipeline outcomes for logging/telemetry.

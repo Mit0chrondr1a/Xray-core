@@ -132,7 +132,7 @@ func BenchmarkCopyRawConn_ReadVWriteV(b *testing.B) {
 	b.SetBytes(int64(len(payload)))
 }
 
-func BenchmarkCopyRawConn_KTLSSplice(b *testing.B) {
+func BenchmarkCopyRawConn_KTLSGuardedUserspace(b *testing.B) {
 	cert := benchCert(b)
 	payload := make([]byte, 64*1024)
 	rand.Read(payload)
@@ -178,7 +178,8 @@ func BenchmarkCopyRawConn_KTLSSplice(b *testing.B) {
 			writerPeer.Close()
 		}()
 
-		// UnwrapRawConn will peel the TLS to get the raw TCP conn
+		// kTLS remains on its control-record-aware wrapper; this benchmark
+		// measures the guarded userspace lane rather than raw splice.
 		b.StartTimer()
 		err := CopyRawConnIfExist(ctx, tlsClient, writer, buf.Discard, timer, nil)
 		b.StopTimer()

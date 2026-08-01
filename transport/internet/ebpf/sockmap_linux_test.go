@@ -3,16 +3,17 @@
 package ebpf
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestSockmapManagerEnable(t *testing.T) {
@@ -47,6 +48,25 @@ func TestSetupSockmapImplRejectsInvalidPinPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "pin path must be under /sys/fs/bpf/") {
 		t.Fatalf("unexpected error for invalid pin path: %v", err)
+	}
+}
+
+func TestAttestSocketULPEmptyAcceptsRawTCP(t *testing.T) {
+	client, _ := newTCPPair(t)
+	fd := getFDOrSkip(t, client)
+	if err := attestSocketULPEmpty(fd); err != nil {
+		t.Skipf("kernel cannot attest an empty TCP_ULP: %v", err)
+	}
+}
+
+func TestAttestSocketULPEmptyRejectsTLS(t *testing.T) {
+	client, _ := newTCPPair(t)
+	fd := getFDOrSkip(t, client)
+	if err := unix.SetsockoptString(fd, unix.IPPROTO_TCP, unix.TCP_ULP, "tls"); err != nil {
+		t.Skipf("kernel cannot attach TLS ULP for attestation test: %v", err)
+	}
+	if err := attestSocketULPEmpty(fd); !errors.Is(err, ErrSockmapSocketULPActive) {
+		t.Fatalf("attestation error=%v, want ErrSockmapSocketULPActive", err)
 	}
 }
 
@@ -91,6 +111,43 @@ func TestBuildSKSkbVerdictProgramDenyPolicyJumpsToSKPass(t *testing.T) {
 	target := denyJumpIdx + 1 + int(insns[denyJumpIdx].off)
 	if target == redirectCallIdx {
 		t.Fatalf("deny-policy jump incorrectly targets redirect helper at %d", redirectCallIdx)
+	}
+}
+
+func TestBuildSKSkbVerdictProgramMissingPolicyDefaultsToDeny(t *testing.T) {
+	insns := buildSKSkbVerdictProgram()
+	for _, insn := range insns {
+		if insn.code == (bpfClassALU|bpfMov|bpfK) && insn.dst == bpfRegR8 {
+			if insn.imm != 0 {
+				t.Fatalf("missing-policy default flags=%d, want 0 (SK_PASS)", insn.imm)
+			}
+			return
+		}
+	}
+	t.Fatal("missing-policy default initialization not found")
+}
+
+func TestSKSkbMapRelocationsCannotRepatchRealFD(t *testing.T) {
+	insns := encodeBPFInsns(buildSKSkbVerdictProgram())
+	patchMapFD(insns, skSkbMapFDPlaceholder, 1)
+	patchMapFD(insns, skSkbPolicyFDPlaceholder, 99)
+
+	var sockhashFound, policyFound bool
+	for _, insn := range insns {
+		code := uint8(insn)
+		srcReg := uint8((insn >> 12) & 0xf)
+		if code != (bpfClassLD|bpfDW|bpfIMM) || srcReg != bpfPseudoMapFD {
+			continue
+		}
+		switch int32(insn >> 32) {
+		case 1:
+			sockhashFound = true
+		case 99:
+			policyFound = true
+		}
+	}
+	if !sockhashFound || !policyFound {
+		t.Fatalf("relocations found sockhash=%v policy=%v, want both", sockhashFound, policyFound)
 	}
 }
 
@@ -1194,14 +1251,7 @@ func TestCanUseZeroCopyWithCrypto(t *testing.T) {
 		t.Error("expected true for CryptoNone+CryptoNone")
 	}
 
-	// kTLS is denied before compatibility probing; only raw TCP stays eligible.
-	saved := ktlsSockhashCompatFn
-	defer func() { ktlsSockhashCompatFn = saved }()
-	calls := 0
-	ktlsSockhashCompatFn = func() bool {
-		calls++
-		return true
-	}
+	// kTLS is categorically denied; only raw TCP stays eligible.
 	if CanUseZeroCopyWithCrypto(client, server, CryptoKTLSBoth, CryptoKTLSBoth) {
 		t.Error("expected false for CryptoKTLSBoth+CryptoKTLSBoth")
 	}
@@ -1211,10 +1261,6 @@ func TestCanUseZeroCopyWithCrypto(t *testing.T) {
 	if CanUseZeroCopyWithCrypto(client, server, CryptoKTLSBoth, CryptoNone) {
 		t.Error("expected false for CryptoKTLSBoth+CryptoNone")
 	}
-	if calls != 0 {
-		t.Errorf("ktls compatibility probe should not run for kTLS candidates, got %d calls", calls)
-	}
-
 	// Userspace: denied
 	if CanUseZeroCopyWithCrypto(client, server, CryptoUserspaceTLS, CryptoUserspaceTLS) {
 		t.Error("expected false for CryptoUserspaceTLS+CryptoUserspaceTLS")
@@ -1446,146 +1492,6 @@ func TestAdaptSweepInterval(t *testing.T) {
 					tt.current, tt.stale, tt.total, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestKTLSSockhashProbe(t *testing.T) {
-	caps := GetCapabilities()
-	if !caps.SockmapSupported {
-		t.Skip("sockmap not supported on this system")
-	}
-
-	mgr := NewSockmapManager(DefaultSockmapConfig())
-	if err := mgr.Enable(); err != nil {
-		t.Fatal(err)
-	}
-	defer mgr.Disable()
-
-	result := probeKTLSSockhashCompat()
-	// We don't know if kTLS+SOCKHASH works on this kernel, so just verify
-	// the probe doesn't panic and returns a valid boolean.
-	t.Logf("kTLS+SOCKHASH probe result: %v", result)
-}
-
-func TestInstallProbeBidirectionalKTLS(t *testing.T) {
-	saved := probeKTLSSetsockoptFn
-	defer func() { probeKTLSSetsockoptFn = saved }()
-
-	var opts []int
-	probeKTLSSetsockoptFn = func(fd int, opt int, val unsafe.Pointer, vallen uintptr) syscall.Errno {
-		opts = append(opts, opt)
-		return 0
-	}
-
-	if !installProbeBidirectionalKTLS(42) {
-		t.Fatal("installProbeBidirectionalKTLS() = false, want true when TX/RX setup succeeds")
-	}
-	if want := []int{1, 2}; !reflect.DeepEqual(opts, want) {
-		t.Fatalf("installProbeBidirectionalKTLS() options=%v, want %v", opts, want)
-	}
-}
-
-func TestInstallProbeBidirectionalKTLSFailsOnRXSetup(t *testing.T) {
-	saved := probeKTLSSetsockoptFn
-	defer func() { probeKTLSSetsockoptFn = saved }()
-
-	var opts []int
-	probeKTLSSetsockoptFn = func(fd int, opt int, val unsafe.Pointer, vallen uintptr) syscall.Errno {
-		opts = append(opts, opt)
-		if opt == 2 {
-			return syscall.EINVAL
-		}
-		return 0
-	}
-
-	if installProbeBidirectionalKTLS(42) {
-		t.Fatal("installProbeBidirectionalKTLS() = true, want false when RX setup fails")
-	}
-	if want := []int{1, 2}; !reflect.DeepEqual(opts, want) {
-		t.Fatalf("installProbeBidirectionalKTLS() options=%v, want %v", opts, want)
-	}
-}
-
-// TestRegisterPairWithCrypto_KTLSPolicyZero verifies that direct registration
-// with kTLS hints writes a zero redirect policy, so low-level callers cannot
-// accidentally enable redirect on crypto-bearing sockets.
-func TestRegisterPairWithCrypto_KTLSPolicyZero(t *testing.T) {
-	caps := GetCapabilities()
-	if !caps.SockmapSupported {
-		t.Skip("sockmap not supported on this system")
-	}
-
-	mgr := NewSockmapManager(DefaultSockmapConfig())
-	if err := mgr.Enable(); err != nil {
-		t.Fatal(err)
-	}
-	defer mgr.Disable()
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	serverCh := make(chan net.Conn, 1)
-	go func() { c, _ := listener.Accept(); serverCh <- c }()
-
-	client, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	server := <-serverCh
-	defer server.Close()
-
-	// Register with asymmetric hints: plain TCP inbound, kTLS outbound.
-	if err := mgr.RegisterPairWithCrypto(client, server, CryptoNone, CryptoKTLSBoth); err != nil {
-		t.Fatalf("RegisterPairWithCrypto(None, KTLSBoth) failed: %v", err)
-	}
-
-	// Verify the policy map entries remain non-redirecting.
-	clientFD := getFDOrSkip(t, client)
-	serverFD := getFDOrSkip(t, server)
-
-	clientCookie, err := getSocketCookie(clientFD)
-	if err != nil {
-		t.Fatalf("getSocketCookie(client): %v", err)
-	}
-	serverCookie, err := getSocketCookie(serverFD)
-	if err != nil {
-		t.Fatalf("getSocketCookie(server): %v", err)
-	}
-
-	st := currentState.Load()
-	if st.policyMapFD < 0 {
-		t.Fatal("policy map not initialized")
-	}
-
-	var clientPolicy, serverPolicy uint32
-	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&clientCookie), unsafe.Pointer(&clientPolicy)); err != nil {
-		t.Fatalf("policy lookup for inbound socket: %v", err)
-	}
-	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&serverCookie), unsafe.Pointer(&serverPolicy)); err != nil {
-		t.Fatalf("policy lookup for outbound socket: %v", err)
-	}
-
-	if clientPolicy != 0 {
-		t.Errorf("inbound policy: got 0x%x, want 0", clientPolicy)
-	}
-	if serverPolicy != 0 {
-		t.Errorf("outbound policy: got 0x%x, want 0", serverPolicy)
-	}
-
-	if err := mgr.UnregisterPair(client, server); err != nil {
-		t.Fatalf("UnregisterPair: %v", err)
-	}
-
-	// After unregister, policy entries should be cleaned up.
-	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&clientCookie), unsafe.Pointer(&clientPolicy)); err == nil {
-		t.Error("inbound policy entry should be deleted after unregister")
-	}
-	if err := bpfMapLookup(st.policyMapFD, unsafe.Pointer(&serverCookie), unsafe.Pointer(&serverPolicy)); err == nil {
-		t.Error("outbound policy entry should be deleted after unregister")
 	}
 }
 

@@ -480,6 +480,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			visionSignalCh = make(chan session.VisionSignal, 1)
 			ctx = session.ContextWithVisionSignal(ctx, visionSignalCh)
 			ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+			ctx = session.ContextWithVisionRawWriterProof(ctx, &session.VisionRawWriterProof{})
 		}
 	}
 

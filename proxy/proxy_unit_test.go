@@ -8,6 +8,7 @@ import (
 	gonet "net"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,6 +22,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/proxy/vless/encryption"
+	"github.com/xtls/xray-core/transport/internet/ebpf"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -516,6 +518,8 @@ func TestVisionWriterCanSpliceCopyTransitions(t *testing.T) {
 
 	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
 	ctx := session.ContextWithInbound(context.Background(), inbound)
+	proof := &session.VisionRawWriterProof{}
+	ctx = session.ContextWithVisionRawWriterProof(ctx, proof)
 
 	w := NewVisionWriter(
 		buf.Discard,
@@ -548,6 +552,8 @@ func TestVisionWriterCanSpliceCopyTransitionsNoDeferredConn(t *testing.T) {
 
 	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
 	ctx := session.ContextWithInbound(context.Background(), inbound)
+	proof := &session.VisionRawWriterProof{}
+	ctx = session.ContextWithVisionRawWriterProof(ctx, proof)
 
 	w := NewVisionWriter(
 		buf.Discard,
@@ -565,6 +571,38 @@ func TestVisionWriterCanSpliceCopyTransitionsNoDeferredConn(t *testing.T) {
 
 	if inbound.GetCanSpliceCopy() != session.CopyGateEligible {
 		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateEligible)
+	}
+	if proof.ReadyFor(left) {
+		t.Fatal("empty write must not prove a physical-socket commit")
+	}
+
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("commit"))}); err != nil {
+		t.Fatalf("payload WriteMultiBuffer() error = %v", err)
+	}
+	if !proof.ReadyFor(left) {
+		t.Fatal("first successful physical payload write should commit the raw destination")
+	}
+}
+
+func TestVisionWriterFailedPhysicalWriteDoesNotCommitRawDestination(t *testing.T) {
+	left, right := mustTCPPair(t)
+	right.Close()
+	left.Close()
+
+	ts := NewTrafficState(nil)
+	ts.Inbound.IsPadding = false
+	ts.Inbound.DownlinkWriterDirectCopy = true
+	inbound := &session.Inbound{CanSpliceCopy: int32(session.CopyGatePendingDetach)}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	proof := &session.VisionRawWriterProof{}
+	ctx = session.ContextWithVisionRawWriterProof(ctx, proof)
+	w := NewVisionWriter(buf.Discard, ts, false, ctx, left, nil, nil)
+
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("must fail"))}); err == nil {
+		t.Fatal("WriteMultiBuffer() error = nil, want closed-socket failure")
+	}
+	if proof.ReadyFor(left) {
+		t.Fatal("failed physical write must not commit the raw destination")
 	}
 }
 
@@ -673,7 +711,7 @@ func TestVisionReaderCommandPaddingEndOverridesCommandContinueHandoff(t *testing
 	}
 }
 
-func TestVisionReaderDetectsRawDNSPayloadBypass(t *testing.T) {
+func TestVisionReaderLeavesLoopbackDNSOnNormalPath(t *testing.T) {
 	ts := NewTrafficState([]byte("0123456789abcdef"))
 	rawDNS := []byte{
 		0x00, 0x2c, // tcp length
@@ -706,15 +744,15 @@ func TestVisionReaderDetectsRawDNSPayloadBypass(t *testing.T) {
 	if got := mb.Len(); got != int32(len(rawDNS)) {
 		t.Fatalf("raw payload length = %d, want %d", got, len(rawDNS))
 	}
-	if !ts.VisionPayloadBypassObserved {
-		t.Fatal("VisionPayloadBypassObserved should be latched for raw DNS payload")
+	if ts.VisionPayloadBypassObserved {
+		t.Fatal("VisionPayloadBypassObserved should stay false when DNS follows the normal Vision path")
 	}
-	if inbound.GetCanSpliceCopy() != session.CopyGateForcedUserspace {
-		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateForcedUserspace)
+	if inbound.GetCanSpliceCopy() != session.CopyGateUnset {
+		t.Fatalf("CopyGateState = %v, want %v", inbound.GetCanSpliceCopy(), session.CopyGateUnset)
 	}
 }
 
-func TestVisionWriterBypassesPaddingAfterRawDNSObservation(t *testing.T) {
+func TestVisionWriterHonorsExplicitCompatibilityBypassState(t *testing.T) {
 	var out bytes.Buffer
 	ts := NewTrafficState([]byte("0123456789abcdef"))
 	ts.VisionPayloadBypassObserved = true
@@ -794,6 +832,43 @@ func TestDetermineSocketCryptoHintNil(t *testing.T) {
 	}
 }
 
+func TestDetermineSocketCryptoHintClassifiesCommonConnAsUserspace(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	tests := []struct {
+		name string
+		conn gonet.Conn
+	}{
+		{
+			name: "stats over encryption",
+			conn: &stat.CounterConnection{
+				Connection: encryption.NewCommonConn(left, false),
+			},
+		},
+		{
+			name: "encryption over stats",
+			conn: encryption.NewCommonConn(&stat.CounterConnection{Connection: left}, false),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, hint, source := determineSocketCryptoHintWithSource(tt.conn)
+			if raw != left {
+				t.Fatalf("raw=%T, want original *net.TCPConn", raw)
+			}
+			if hint != ebpf.CryptoUserspaceTLS {
+				t.Fatalf("hint=%v, want CryptoUserspaceTLS (source=%q)", hint, source)
+			}
+			if !strings.Contains(source, "*encryption.CommonConn") || !strings.Contains(source, "*stat.CounterConnection") {
+				t.Fatalf("source=%q, want CommonConn and stats wrapper markers", source)
+			}
+		})
+	}
+}
+
 func TestBuildVisionDecisionInputRefreshesCryptoHint(t *testing.T) {
 	left, right := mustTCPPair(t)
 	defer left.Close()
@@ -808,12 +883,12 @@ func TestBuildVisionDecisionInputRefreshesCryptoHint(t *testing.T) {
 		t.Fatalf("first ReaderCrypto=%q, want userspace-tls", first.ReaderCrypto)
 	}
 
-	// Switch the wrapped connection to raw TCP and verify the next decision
-	// snapshot reflects the new state.
+	// Switching the inner connection does not remove CommonConn's live AEAD
+	// record transform, so the wrapped snapshot must remain userspace.
 	wrappedReader.Conn = left
 	second, _, _, _, _ := buildVisionDecisionInput(wrappedReader, wrappedWriter, caps, false)
-	if second.ReaderCrypto != "none" {
-		t.Fatalf("second ReaderCrypto=%q, want none", second.ReaderCrypto)
+	if second.ReaderCrypto != "userspace-tls" {
+		t.Fatalf("second ReaderCrypto=%q, want userspace-tls", second.ReaderCrypto)
 	}
 }
 
@@ -872,6 +947,68 @@ func TestBuildVisionDecisionInputForCopyGateKeepsWrapperGuardBeforeEligibility(t
 	}
 }
 
+func TestBuildVisionDecisionInputForCopyGateCommonConnMatrix(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+
+	wrappedReader := encryption.NewCommonConn(left, false)
+	caps := pipeline.CapabilitySummary{SpliceSupported: true}
+	tests := []struct {
+		name       string
+		gate       session.CopyGateState
+		preserve   bool
+		rawReader  gonet.Conn
+		rawWriter  gonet.Conn
+		wantReader string
+	}{
+		{name: "pending", gate: session.CopyGatePendingDetach, rawReader: left, rawWriter: right, wantReader: "userspace-tls"},
+		{name: "forced userspace", gate: session.CopyGateForcedUserspace, rawReader: left, rawWriter: right, wantReader: "userspace-tls"},
+		{name: "not applicable", gate: session.CopyGateNotApplicable, rawReader: left, rawWriter: right, wantReader: "userspace-tls"},
+		{name: "eligible direct handoff", gate: session.CopyGateEligible, rawReader: left, rawWriter: right, wantReader: "none"},
+		{name: "eligible but preserved", gate: session.CopyGateEligible, preserve: true, rawReader: left, rawWriter: right, wantReader: "userspace-tls"},
+		{name: "eligible missing raw candidate", gate: session.CopyGateEligible, rawWriter: right, wantReader: "userspace-tls"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _, _, _, _ := buildVisionDecisionInputForCopyGate(
+				wrappedReader,
+				right,
+				tt.rawReader,
+				tt.rawWriter,
+				caps,
+				false,
+				tt.gate,
+				tt.preserve,
+			)
+			if got.ReaderCrypto != tt.wantReader {
+				t.Fatalf("ReaderCrypto=%q, want %q", got.ReaderCrypto, tt.wantReader)
+			}
+		})
+	}
+}
+
+func TestBuildVisionDecisionInputCommonConnVirtualStreamStaysUserspace(t *testing.T) {
+	wrapped := encryption.NewCommonConn(&testXHTTPFlowConn{}, false)
+	got, rawHint, _, _, _ := buildVisionDecisionInputForCopyGate(
+		wrapped,
+		&testXHTTPFlowConn{},
+		nil,
+		nil,
+		pipeline.CapabilitySummary{SpliceSupported: true},
+		false,
+		session.CopyGateEligible,
+		false,
+	)
+	if rawHint != ebpf.CryptoUserspaceTLS || got.ReaderCrypto != "userspace-tls" {
+		t.Fatalf("virtual CommonConn classified as hint=%v input=%q, want userspace", rawHint, got.ReaderCrypto)
+	}
+	if snap := pipeline.DecideVisionPath(got); snap.Path != pipeline.PathUserspace {
+		t.Fatalf("virtual CommonConn path=%q, want userspace", snap.Path)
+	}
+}
+
 func TestBuildVisionDecisionInputForCopyGatePreservesWrappedCryptoForFallbackKTLS(t *testing.T) {
 	left, right := mustTCPPair(t)
 	defer left.Close()
@@ -892,6 +1029,126 @@ func TestBuildVisionDecisionInputForCopyGatePreservesWrappedCryptoForFallbackKTL
 	)
 	if got.ReaderCrypto != "userspace-tls" {
 		t.Fatalf("ReaderCrypto=%q, want userspace-tls when fallback kTLS preserves wrapped hints", got.ReaderCrypto)
+	}
+}
+
+func TestShouldPreserveWrappedCryptoForHints(t *testing.T) {
+	tests := []struct {
+		name     string
+		explicit bool
+		reader   ebpf.CryptoHint
+		writer   ebpf.CryptoHint
+		want     bool
+	}{
+		{name: "explicit", explicit: true, reader: ebpf.CryptoNone, writer: ebpf.CryptoNone, want: true},
+		{name: "raw pair replaceable", reader: ebpf.CryptoNone, writer: ebpf.CryptoNone, want: false},
+		{name: "userspace wrapper replaceable after detach", reader: ebpf.CryptoUserspaceTLS, writer: ebpf.CryptoNone, want: false},
+		{name: "full kTLS reader", reader: ebpf.CryptoKTLSBoth, writer: ebpf.CryptoNone, want: true},
+		{name: "TX-only reader", reader: ebpf.CryptoKTLSTxOnly, writer: ebpf.CryptoNone, want: true},
+		{name: "RX-only writer", reader: ebpf.CryptoNone, writer: ebpf.CryptoKTLSRxOnly, want: true},
+		{name: "unknown reader", reader: ebpf.CryptoUnknown, writer: ebpf.CryptoNone, want: true},
+		{name: "unknown writer", reader: ebpf.CryptoNone, writer: ebpf.CryptoUnknown, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldPreserveWrappedCryptoForHints(tt.explicit, tt.reader, tt.writer); got != tt.want {
+				t.Fatalf("shouldPreserveWrappedCryptoForHints()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClassifyCopyCryptoLaneMatrix(t *testing.T) {
+	hints := []ebpf.CryptoHint{
+		ebpf.CryptoNone,
+		ebpf.CryptoKTLSBoth,
+		ebpf.CryptoKTLSTxOnly,
+		ebpf.CryptoKTLSRxOnly,
+		ebpf.CryptoUserspaceTLS,
+		ebpf.CryptoUnknown,
+	}
+
+	for _, reader := range hints {
+		for _, writer := range hints {
+			want := copyCryptoLaneUserspace
+			if reader == ebpf.CryptoNone && writer == ebpf.CryptoNone {
+				want = copyCryptoLaneRawSockmap
+			}
+			if got := classifyCopyCryptoLane(reader, writer); got != want {
+				t.Fatalf("classifyCopyCryptoLane(%v, %v)=%v, want %v", reader, writer, got, want)
+			}
+		}
+	}
+}
+
+func TestDirectionalRawCopyReadyRequiresDirectSourceAndCommittedSink(t *testing.T) {
+	reader, readerPeer := mustTCPPair(t)
+	defer reader.Close()
+	defer readerPeer.Close()
+	writer, writerPeer := mustTCPPair(t)
+	defer writer.Close()
+	defer writerPeer.Close()
+
+	proof := &session.VisionRawWriterProof{}
+	visionCtx := session.ContextWithVisionRawWriterProof(context.Background(), proof)
+	proof.RequireCommit()
+	wrappedWriter := encryption.NewCommonConn(writer, false)
+	if directionalRawCopyReady(visionCtx, session.CopyGatePendingDetach, reader, wrappedWriter, writer) {
+		t.Fatal("pending protocol gate must not admit a raw handoff")
+	}
+	if directionalRawCopyReady(visionCtx, session.CopyGateEligible, reader, wrappedWriter, writer) {
+		t.Fatal("direct source must not bypass a still-framing destination")
+	}
+	if directionalRawCopyReady(visionCtx, session.CopyGateEligible, reader, writer, writer) {
+		t.Fatal("Vision must require commit even when its destination is direct TCP")
+	}
+	proof.Commit(writer)
+	if !directionalRawCopyReady(visionCtx, session.CopyGateEligible, reader, wrappedWriter, writer) {
+		t.Fatal("physical destination commit should admit one-way splice from a direct source")
+	}
+	otherWriter, otherWriterPeer := mustTCPPair(t)
+	defer otherWriter.Close()
+	defer otherWriterPeer.Close()
+	if directionalRawCopyReady(visionCtx, session.CopyGateEligible, reader, encryption.NewCommonConn(otherWriter, false), otherWriter) {
+		t.Fatal("commit proof must not admit a different physical destination")
+	}
+	if directionalRawCopyReady(visionCtx, session.CopyGateEligible, encryption.NewCommonConn(reader, false), writer, writer) {
+		t.Fatal("a wrapped or queued source must stay on its reader wrapper")
+	}
+	if directionalRawCopyReady(context.Background(), session.CopyGatePendingDetach, reader, writer, writer) {
+		t.Fatal("generic direct raw pair must wait for its protocol gate")
+	}
+	if !directionalRawCopyReady(context.Background(), session.CopyGateEligible, reader, writer, writer) {
+		t.Fatal("a direct raw pair should admit one-way splice")
+	}
+}
+
+func TestApplyCopyPathDecisionPreservesAccumulatedTelemetry(t *testing.T) {
+	decision := pipeline.DecisionSnapshot{
+		Path:                    pipeline.PathUserspace,
+		Reason:                  pipeline.ReasonDefault,
+		Target:                  "example.test:443",
+		Kind:                    "proxy",
+		UserspaceBytes:          4096,
+		UserspaceExit:           pipeline.UserspaceExitComplete,
+		DNSGuardFirstResponseNs: 123,
+	}
+	next := pipeline.DecisionSnapshot{
+		Path:           pipeline.PathSplice,
+		Reason:         pipeline.ReasonSplicePrimary,
+		Caps:           pipeline.CapabilitySummary{SpliceSupported: true},
+		TLSOffloadPath: pipeline.TLSOffloadNotRequired,
+		CopyPath:       pipeline.CopyPathSplice,
+	}
+
+	applyCopyPathDecision(&decision, next)
+
+	if decision.Path != next.Path || decision.Reason != next.Reason || decision.CopyPath != next.CopyPath {
+		t.Fatalf("routing verdict was not applied: %+v", decision)
+	}
+	if decision.UserspaceBytes != 4096 || decision.Target != "example.test:443" || decision.Kind != "proxy" || decision.DNSGuardFirstResponseNs != 123 {
+		t.Fatalf("accumulated telemetry was reset: %+v", decision)
 	}
 }
 
@@ -1676,9 +1933,10 @@ func TestCopyRawConnIfExistDNSGuardRecordsFirstResponseLatency(t *testing.T) {
 	defer timer.SetTimeout(0)
 
 	inbound := &session.Inbound{
-		CanSpliceCopy: int32(session.CopyGateUnset),
+		CanSpliceCopy: int32(session.CopyGateNotApplicable),
 		Local:         xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
 	}
+	inbound.SetCopyGate(session.CopyGateNotApplicable, session.CopyGateReasonTransportNonRawSplitConn)
 	outbound := &session.Outbound{
 		CanSpliceCopy: int32(session.CopyGateUnset),
 		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),
@@ -1718,9 +1976,10 @@ func TestCopyRawConnIfExistDNSGuardReturnsAfterSingleResponseFrame(t *testing.T)
 	defer timer.SetTimeout(0)
 
 	inbound := &session.Inbound{
-		CanSpliceCopy: int32(session.CopyGateUnset),
+		CanSpliceCopy: int32(session.CopyGateNotApplicable),
 		Local:         xnet.TCPDestination(xnet.IPAddress([]byte{127, 0, 0, 1}), xnet.Port(2036)),
 	}
+	inbound.SetCopyGate(session.CopyGateNotApplicable, session.CopyGateReasonTransportNonRawSplitConn)
 	outbound := &session.Outbound{
 		CanSpliceCopy: int32(session.CopyGateUnset),
 		Target:        xnet.TCPDestination(xnet.IPAddress([]byte{1, 1, 1, 1}), xnet.Port(53)),

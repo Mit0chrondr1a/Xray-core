@@ -4,6 +4,7 @@ package session // import "github.com/xtls/xray-core/common/session"
 import (
 	"context"
 	"math/rand"
+	gonet "net"
 	"sync/atomic"
 
 	c "github.com/xtls/xray-core/common/ctx"
@@ -96,6 +97,35 @@ type VisionSignal struct {
 type VisionTimestamps struct {
 	detachUnixNano   atomic.Int64
 	noDetachUnixNano atomic.Int64
+}
+
+// VisionRawWriterProof is flow-local handoff state shared by the Vision writer
+// and copy loop through context. Keeping it outside Inbound is intentional:
+// Inbound metadata is copied for mux children and fallbacks, while a physical
+// socket ownership proof must never be inherited by a logically distinct flow.
+type VisionRawWriterProof struct {
+	required atomic.Bool
+	ready    atomic.Pointer[gonet.TCPConn]
+}
+
+func (p *VisionRawWriterProof) RequireCommit() {
+	if p != nil {
+		p.required.Store(true)
+	}
+}
+
+func (p *VisionRawWriterProof) Commit(conn *gonet.TCPConn) {
+	if p != nil && conn != nil {
+		p.ready.Store(conn)
+	}
+}
+
+func (p *VisionRawWriterProof) CommitRequired() bool {
+	return p != nil && p.required.Load()
+}
+
+func (p *VisionRawWriterProof) ReadyFor(conn *gonet.TCPConn) bool {
+	return p != nil && conn != nil && p.ready.Load() == conn
 }
 
 func (t *VisionTimestamps) StoreDetach(unixNano int64) {

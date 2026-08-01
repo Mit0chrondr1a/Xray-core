@@ -1,8 +1,8 @@
 package ebpf
 
 import (
+	stderrors "errors"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -50,17 +50,8 @@ func newTCPPair(t *testing.T) (net.Conn, net.Conn) {
 	return client, server
 }
 
-func TestCanUseZeroCopyWithCrypto_IneligibleCandidatesSkipKTLSProbe(t *testing.T) {
+func TestCanUseZeroCopyWithCrypto_IneligibleCandidatesAreRejected(t *testing.T) {
 	inbound, outbound := newTCPPair(t)
-
-	saved := ktlsSockhashCompatFn
-	defer func() { ktlsSockhashCompatFn = saved }()
-
-	var probeCalls atomic.Int32
-	ktlsSockhashCompatFn = func() bool {
-		probeCalls.Add(1)
-		return true
-	}
 
 	tests := []struct {
 		name string
@@ -71,28 +62,17 @@ func TestCanUseZeroCopyWithCrypto_IneligibleCandidatesSkipKTLSProbe(t *testing.T
 		{"userspace outbound", CryptoNone, CryptoUserspaceTLS},
 		{"partial tx only", CryptoKTLSTxOnly, CryptoNone},
 		{"partial rx only", CryptoNone, CryptoKTLSRxOnly},
+		{"unknown", CryptoUnknown, CryptoNone},
 	}
 	for _, tt := range tests {
 		if CanUseZeroCopyWithCrypto(inbound, outbound, tt.in, tt.out) {
 			t.Fatalf("%s: expected false for ineligible candidate", tt.name)
 		}
 	}
-	if got := probeCalls.Load(); got != 0 {
-		t.Fatalf("kTLS compatibility probe should not run for ineligible candidates, got %d calls", got)
-	}
 }
 
-func TestCanUseZeroCopyWithCrypto_KTLSCandidatesAreRejectedWithoutProbe(t *testing.T) {
+func TestCanUseZeroCopyWithCrypto_KTLSCandidatesAreRejected(t *testing.T) {
 	inbound, outbound := newTCPPair(t)
-
-	saved := ktlsSockhashCompatFn
-	defer func() { ktlsSockhashCompatFn = saved }()
-
-	var probeCalls atomic.Int32
-	ktlsSockhashCompatFn = func() bool {
-		probeCalls.Add(1)
-		return true
-	}
 
 	if CanUseZeroCopyWithCrypto(inbound, outbound, CryptoKTLSBoth, CryptoNone) {
 		t.Fatal("expected false for plain/kTLS candidate")
@@ -102,9 +82,6 @@ func TestCanUseZeroCopyWithCrypto_KTLSCandidatesAreRejectedWithoutProbe(t *testi
 	}
 	if CanUseZeroCopyWithCrypto(inbound, outbound, CryptoKTLSBoth, CryptoKTLSBoth) {
 		t.Fatal("expected false for kTLS/kTLS candidate")
-	}
-	if got := probeCalls.Load(); got != 0 {
-		t.Fatalf("kTLS candidates should be rejected before probing compatibility, got %d probe calls", got)
 	}
 }
 
@@ -118,13 +95,43 @@ func TestCanUseZeroCopyWithCrypto_NonTCPAlwaysFalse(t *testing.T) {
 	}
 }
 
-func TestIncrementKTLSSpliceFallback_TrackedInStats(t *testing.T) {
+func TestRegisterPairWithCryptoRejectsNonRawBeforeManagerAndFDWork(t *testing.T) {
 	mgr := NewSockmapManager(DefaultSockmapConfig())
-	mgr.IncrementKTLSSpliceFallback()
-	mgr.IncrementKTLSSpliceFallback()
+	before := mgr.GetSockmapStats()
+	tests := []struct {
+		name string
+		in   CryptoHint
+		out  CryptoHint
+	}{
+		{"full kTLS", CryptoKTLSBoth, CryptoKTLSBoth},
+		{"raw to full kTLS", CryptoNone, CryptoKTLSBoth},
+		{"full kTLS to raw", CryptoKTLSBoth, CryptoNone},
+		{"TX-only", CryptoKTLSTxOnly, CryptoNone},
+		{"RX-only", CryptoNone, CryptoKTLSRxOnly},
+		{"userspace", CryptoUserspaceTLS, CryptoNone},
+		{"unknown", CryptoUnknown, CryptoNone},
+	}
 
-	stats := mgr.GetSockmapStats()
-	if stats.KTLSSpliceFallbacks != 2 {
-		t.Fatalf("KTLSSpliceFallbacks=%d, want 2", stats.KTLSSpliceFallbacks)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mgr.RegisterPairWithCrypto(nil, nil, tt.in, tt.out)
+			if !stderrors.Is(err, ErrSockmapCryptoUnsupported) {
+				t.Fatalf("error=%v, want ErrSockmapCryptoUnsupported", err)
+			}
+			if stderrors.Is(err, ErrSockmapNotEnabled) {
+				t.Fatalf("error=%v reached manager state before crypto rejection", err)
+			}
+		})
+	}
+
+	if after := mgr.GetSockmapStats(); after != before {
+		t.Fatalf("stats changed after rejected registrations: before=%+v after=%+v", before, after)
+	}
+	if mgr.lruList.Len() != 0 || len(mgr.lruIndex) != 0 {
+		t.Fatalf("LRU changed after rejected registrations: list=%d index=%d", mgr.lruList.Len(), len(mgr.lruIndex))
+	}
+
+	if err := mgr.RegisterPairWithCrypto(nil, nil, CryptoNone, CryptoNone); !stderrors.Is(err, ErrSockmapNotEnabled) {
+		t.Fatalf("raw registration error=%v, want ErrSockmapNotEnabled", err)
 	}
 }

@@ -15,6 +15,14 @@ var (
 	// ErrSockmapNotEnabled is returned when trying to use sockmap without enabling it.
 	ErrSockmapNotEnabled = errors.New("sockmap is not enabled")
 
+	// ErrSockmapCryptoUnsupported is returned before any socket or BPF work when
+	// a pair is not raw TCP. kTLS and userspace TLS use separate copy lanes.
+	ErrSockmapCryptoUnsupported = errors.New("sockmap only supports raw TCP crypto state")
+
+	// ErrSockmapSocketULPActive is returned when the kernel reports any TCP ULP
+	// on a socket that was declared raw. TLS ULP and sockmap are separate lanes.
+	ErrSockmapSocketULPActive = errors.New("sockmap requires an empty TCP ULP")
+
 	// ErrRoutingCacheNotSupported is returned when BPF routing cache is not available.
 	ErrRoutingCacheNotSupported = errors.New("BPF routing cache is not supported on this system")
 

@@ -1,13 +1,11 @@
-//! SK_MSG verdict with cork — send-path batching for small writes.
+//! Experimental SK_MSG verdict with cork — not attached in production.
 //!
-//! This program attaches to the SOCKHASH alongside SK_SKB programs.
-//! They serve complementary paths:
-//!   - SK_SKB: receive path — redirects incoming data between sockets
-//!   - SK_MSG: send path — batches outgoing writes before they hit the wire
+//! The receive-oriented cookie map is not a valid redirect map for ordinary
+//! userspace writes, which already target their correct egress socket. The Aya
+//! loader therefore leaves this program unloaded and unattached.
 //!
-//! When kTLS is active, SK_MSG fires AFTER kernel encryption. Cork batches
-//! ciphertext TLS records into MTU-sized chunks, reducing TCP segment count
-//! and verdict invocations on the remote peer.
+//! New admission is raw-TCP only. The legacy kTLS policy bit remains in the
+//! map ABI but is never set by current userspace.
 //!
 //! Flow:
 //!   App sendmsg() -> SK_MSG verdict:
@@ -44,7 +42,7 @@ fn try_sk_msg(ctx: &SkMsgContext) -> Result<u32, ()> {
 
     let policy = match unsafe { POLICY_MAP.get(&cookie) } {
         Some(flags) => *flags,
-        None => POLICY_ALLOW_REDIRECT, // match Go loader default (allow redirect if missing)
+        None => 0, // fail closed: an absent policy must pass to userspace
     };
 
     if policy & POLICY_ALLOW_REDIRECT == 0 {

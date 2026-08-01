@@ -57,6 +57,15 @@ func DecideVisionPath(in DecisionInput) DecisionSnapshot {
 		}
 		return snap
 	}
+	if readerCrypto != "none" || writerCrypto != "none" {
+		// kTLS is direction-sensitive: splice-reading a TLS_RX socket cannot
+		// deliver control records, while a TLS_TX destination has different
+		// requirements. Unknown states are equally unprovable. Keep every such
+		// flow on its connection wrappers until a dedicated, control-record-aware
+		// directional lane is selected and tested.
+		snap.Reason = ReasonIncompleteCryptoGuard
+		return snap
+	}
 
 	// Start optimistic with splice; sockmap decided later by caller.
 	snap.Path = PathSplice

@@ -2,7 +2,7 @@
 //!
 //! Replaces Go raw-bytecode BPF infrastructure with Aya-rs for:
 //!   - Deterministic BPF map pinning lifecycle
-//!   - SK_MSG cork program attachment
+//!   - SK_SKB receive-path redirect attachment
 //!   - Type-safe map operations
 //!
 //! Setup flow:
@@ -12,16 +12,17 @@
 //!   4. Attach all programs to the SOCKHASH
 
 use aya::{
-    maps::{sock::SockMapFd, HashMap, SockHash},
-    programs::{SkMsg, SkSkb},
-    Ebpf,
+    maps::{HashMap, SockHash},
+    programs::SkSkb,
+    Ebpf, EbpfLoader,
 };
 use std::ffi::{c_char, CStr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::Path;
-use std::sync::RwLock;
-
-const EBPF_MAX_ENTRIES: u32 = 65_536;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    RwLock,
+};
 
 /// Align macro for include_bytes (ensures eBPF bytecode is properly aligned).
 #[cfg(feature = "ebpf-bytecode")]
@@ -75,10 +76,12 @@ const EBPF_ERR_MISSING_FEATURE: i32 = -3;
 const EBPF_ERR_LOAD_FAILURE: i32 = -4;
 const DEFAULT_MAX_ENTRIES: u32 = 65_536;
 const DEFAULT_CORK_THRESHOLD: u32 = 1_400;
+static EBPF_EFFECTIVE_MAX_ENTRIES: AtomicU32 = AtomicU32::new(DEFAULT_MAX_ENTRIES);
 
-/// SK_MSG capability levels (positive return codes from xray_ebpf_setup).
-const SK_MSG_FULL: i32 = 0;
-const SK_MSG_CORK_ONLY: i32 = 1;
+/// Compatibility capability code returned by xray_ebpf_setup. SK_MSG remains
+/// deliberately unattached: userspace proxy writes already target the correct
+/// egress socket, while the cookie map points at the opposite socket for
+/// receive-path SK_SKB redirect.
 const SK_MSG_NONE: i32 = 2;
 
 /// Classify an error string into an FFI error code.
@@ -107,10 +110,10 @@ fn classify_ebpf_error(err: &str) -> i32 {
 /// # Arguments
 /// * `pin_path` — BPF filesystem path for pinning (e.g., "/sys/fs/bpf/xray/")
 /// * `max_entries` — maximum SOCKHASH entries (default 65536)
-/// * `cork_threshold` — SK_MSG cork threshold in bytes (default 1400)
+/// * `cork_threshold` — compatibility-only SK_MSG threshold; production SK_MSG is unattached
 ///
 /// # Returns
-/// 0 on success, negative error code on failure:
+/// `SK_MSG_NONE` (capability level 2) on success, negative error code on failure:
 /// `-1` generic, `-2` permission, `-3` missing feature, `-4` load failure.
 fn setup_sockmap_impl(
     pin_path: &str,
@@ -125,9 +128,19 @@ fn setup_sockmap_impl(
         return Err("eBPF already initialized".into());
     }
 
+    let target_entries = if max_entries == 0 {
+        DEFAULT_MAX_ENTRIES
+    } else {
+        max_entries
+    };
+
     // Step 1: Load eBPF programs.
     #[cfg(feature = "ebpf-bytecode")]
-    let mut bpf = Ebpf::load(EBPF_BYTECODE).map_err(|e| format!("load: {e}"))?;
+    let mut bpf = EbpfLoader::new()
+        .set_max_entries("SOCKHASH", target_entries)
+        .set_max_entries("POLICY_MAP", target_entries)
+        .load(EBPF_BYTECODE)
+        .map_err(|e| format!("load: {e}"))?;
 
     #[cfg(not(feature = "ebpf-bytecode"))]
     return Err("eBPF bytecode not compiled (build with --features ebpf-bytecode)".into());
@@ -152,12 +165,6 @@ fn setup_sockmap_impl(
         // stay consistent with the attached programs.
         let _ = std::fs::remove_file(pin_dir.join("sockhash"));
         let _ = std::fs::remove_file(pin_dir.join("policy"));
-
-        let target_entries = if max_entries == 0 {
-            DEFAULT_MAX_ENTRIES
-        } else {
-            max_entries
-        };
 
         let (sockhash_fd, sockhash_map_fd) = {
             let sockhash: SockHash<_, u64> = bpf
@@ -202,8 +209,8 @@ fn setup_sockmap_impl(
         // Set 0600 permissions on pinned files.
         set_pin_permissions(pin_dir);
 
-        // Runtime cork threshold is still compiled into the bytecode; reject
-        // mismatches to avoid silent drift.
+        // The threshold remains part of the stable native ABI and experimental
+        // bytecode. Reject mismatches so callers cannot infer active corking.
         if cork_threshold != 0 && cork_threshold != DEFAULT_CORK_THRESHOLD {
             return Err(format!(
                 "runtime cork_threshold {} not supported; compiled threshold {}",
@@ -212,8 +219,8 @@ fn setup_sockmap_impl(
         }
 
         eprintln!(
-            "xray-rust eBPF: sockhash/policy requested_max_entries={} compiled_max_entries={} cork_threshold={} (compiled)",
-            target_entries, EBPF_MAX_ENTRIES, DEFAULT_CORK_THRESHOLD
+            "xray-rust eBPF: sockhash/policy max_entries={} cork_threshold={} (compiled, SK_MSG unattached)",
+            target_entries, DEFAULT_CORK_THRESHOLD
         );
 
         // Step 3: Attach programs.
@@ -240,8 +247,10 @@ fn setup_sockmap_impl(
             .attach(&sockhash_map_fd)
             .map_err(|e| format!("verdict attach: {e}"))?;
 
-        // SK_MSG verdict — try full (cork+redirect), fall back to cork-only, then none.
-        let sk_msg_level = attach_sk_msg_with_fallback(&mut bpf, &sockhash_map_fd);
+        // SK_MSG is intentionally not attached. Pair mapping is defined for
+        // receive-path SK_SKB redirect; applying it to an ordinary userspace
+        // write can reverse the message back to the opposite socket.
+        let sk_msg_level = SK_MSG_NONE;
 
         *guard = Some(EbpfState {
             _bpf: bpf,
@@ -249,61 +258,15 @@ fn setup_sockmap_impl(
             policy_fd,
             pin_path: pin_path.to_string(),
         });
+        EBPF_EFFECTIVE_MAX_ENTRIES.store(target_entries, Ordering::Release);
 
         eprintln!(
-            "xray-rust eBPF: capability snapshot {{sk_msg_level={}, requested_max_entries={}, compiled_max_entries={}, cork_threshold={}}}",
-            sk_msg_level, target_entries, EBPF_MAX_ENTRIES, DEFAULT_CORK_THRESHOLD
+            "xray-rust eBPF: capability snapshot {{sk_msg_level={}, max_entries={}, cork_threshold={}}}",
+            sk_msg_level, target_entries, DEFAULT_CORK_THRESHOLD
         );
 
         Ok(sk_msg_level)
     }
-}
-
-/// Try SK_MSG variants in order: full → cork-only → none.
-/// Never fails the whole setup over SK_MSG — returns the capability level.
-fn attach_sk_msg_with_fallback(bpf: &mut Ebpf, sockhash_map_fd: &SockMapFd) -> i32 {
-    // Tier 1: Full SK_MSG (cork + cookie lookup + redirect).
-    match try_load_attach_sk_msg(bpf, "xray_sk_msg", sockhash_map_fd) {
-        Ok(()) => {
-            eprintln!("xray-rust eBPF: SK_MSG full (cork+redirect) loaded");
-            return SK_MSG_FULL;
-        }
-        Err(e) => {
-            eprintln!("xray-rust eBPF: SK_MSG full failed ({e}), trying cork-only fallback");
-        }
-    }
-
-    // Tier 2: Cork-only SK_MSG (batching, no cookie/redirect).
-    match try_load_attach_sk_msg(bpf, "xray_sk_msg_cork", sockhash_map_fd) {
-        Ok(()) => {
-            eprintln!("xray-rust eBPF: SK_MSG cork-only loaded");
-            return SK_MSG_CORK_ONLY;
-        }
-        Err(e) => {
-            eprintln!("xray-rust eBPF: SK_MSG cork-only failed ({e}), continuing without SK_MSG");
-        }
-    }
-
-    // Tier 3: No SK_MSG — SK_SKB-only, log and continue.
-    eprintln!("xray-rust eBPF: no SK_MSG loaded — SK_SKB-only mode");
-    SK_MSG_NONE
-}
-
-/// Load and attach a single SK_MSG program by name.
-fn try_load_attach_sk_msg(
-    bpf: &mut Ebpf,
-    prog_name: &str,
-    sockhash_map_fd: &SockMapFd,
-) -> Result<(), String> {
-    let prog: &mut SkMsg = bpf
-        .program_mut(prog_name)
-        .ok_or_else(|| format!("missing {prog_name} program"))?
-        .try_into()
-        .map_err(|e| format!("{prog_name} type: {e}"))?;
-    prog.load().map_err(|e| format!("{prog_name} load: {e}"))?;
-    prog.attach(sockhash_map_fd)
-        .map_err(|e| format!("{prog_name} attach: {e}"))?;
-    Ok(())
 }
 
 /// Set 0600 root-only permissions on pinned map files.
@@ -496,10 +459,10 @@ pub extern "C" fn xray_ebpf_available() -> i32 {
     1
 }
 
-/// Reports the effective map capacity compiled into the native Aya loader.
+/// Reports the effective map capacity from the latest successful setup.
 #[no_mangle]
 pub extern "C" fn xray_ebpf_max_entries() -> u32 {
-    EBPF_MAX_ENTRIES
+    EBPF_EFFECTIVE_MAX_ENTRIES.load(Ordering::Acquire)
 }
 
 /// Set up eBPF sockmap with pinned maps.

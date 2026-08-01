@@ -847,6 +847,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			visionSignalCh = make(chan session.VisionSignal, 1)
 			ctx = session.ContextWithVisionSignal(ctx, visionSignalCh)
 			ctx = session.ContextWithVisionTimestamps(ctx, &session.VisionTimestamps{})
+			ctx = session.ContextWithVisionRawWriterProof(ctx, &session.VisionRawWriterProof{})
 		}
 		readerArena := buf.NewArena(8 * buf.Size)
 		writerArena := buf.NewArena(8 * buf.Size)

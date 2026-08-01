@@ -20,14 +20,6 @@ import (
 // logAccelerationSummary emits a single-line startup summary of which
 // acceleration paths are available for each connection type.
 func logAccelerationSummary(ctx context.Context) {
-	ktlsCompat := KTLSSockhashCompatible()
-	ktlsPath := "sockmap"
-	ktlsDetail := "probe-passed"
-	if !ktlsCompat {
-		ktlsPath = "splice"
-		ktlsDetail = "probe-failed"
-	}
-
 	st := currentState.Load()
 	sockhashFD := -1
 	if st != nil {
@@ -61,8 +53,9 @@ func logAccelerationSummary(ctx context.Context) {
 	xerrors.LogInfo(ctx,
 		"sockmap: acceleration summary — loader=", loaderType,
 		" sk_msg=", skMsgMode,
-		" plain-TCP=sockmap kTLS=", ktlsPath,
-		"(", ktlsDetail, ") kernel=", unameRelease(),
+		" plain-TCP=splice sockmap=admission-disabled(ownership-handoff-pending)",
+		" kTLS=userspace-wrapper(policy-separated)",
+		" kernel=", unameRelease(),
 		" sockhash-fd=", sockhashFD,
 		" capacity=", capacity,
 	)
@@ -82,7 +75,8 @@ func logSockmapDeploymentDebug(ctx context.Context, caps Capabilities, initErr e
 		" sk_skb=", caps.SockmapSKSkbSupported,
 		" xdp=", caps.XDPSupported,
 		" btf=", caps.BTFSupported,
-		" kTLS+SOCKHASH=", KTLSSockhashCompatible(),
+		" sockmapCryptoPolicy=raw-only",
+		" sockmapAdmission=ownership-handoff-pending",
 		" sockmapProbe=", caps.sockmapProbeSummary(),
 		" sockmapProbeClass=", caps.sockmapFailureKind().String(),
 	)

@@ -5,13 +5,10 @@ import (
 	gonet "net"
 	"sync/atomic"
 
-	"github.com/pires/go-proxyproto"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/pipeline"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/proxy/vless/encryption"
-	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -33,27 +30,10 @@ type fallbackRuntimeRecoveryState struct {
 }
 
 func fallbackRawHandoffEligible(conn gonet.Conn) bool {
-	conn = stat.TryUnwrapStatsConn(conn)
-	switch c := conn.(type) {
-	case *gonet.TCPConn, *proxyproto.Conn, *internet.UnixConnWrapper:
-		return true
-	case *tls.Conn:
-		state := c.KTLSEnabled()
-		return state.TxReady && state.RxReady
-	case *tls.RustConn:
-		state := c.KTLSEnabled()
-		return state.TxReady && state.RxReady
-	case *tls.DeferredRustConn:
-		if c.IsDetached() {
-			return true
-		}
-		state := c.KTLSEnabled()
-		return state.TxReady && state.RxReady
-	case *encryption.CommonConn, *encryption.XorConn:
-		return false
-	default:
-		return false
-	}
+	// Internal VLESS/Trojan fallbacks may use the raw pipeline only when the
+	// live objects are direct TCP sockets. kTLS must remain on its wrapper until
+	// the RX control-record pump and directional splice lane are implemented.
+	return directRawTCPConn(conn, 0)
 }
 
 func fallbackRuntimeRecoveryTransport(conn gonet.Conn) (string, pipeline.TLSOffloadPath, bool) {
@@ -190,7 +170,6 @@ func CopyFallbackRequest(ctx context.Context, clientConn, backendConn gonet.Conn
 	if err := flushFallbackBufferedPrelude(reader, writer, timer); err != nil {
 		return err
 	}
-	maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff(copyCtx, "request")
 	return copyRawConnIfExistFn(copyCtx, clientConn, backendConn, writer, timer, nil)
 }
 
@@ -201,6 +180,5 @@ func CopyFallbackResponse(ctx context.Context, backendConn, clientConn gonet.Con
 	if !rawEligible {
 		return copyFallbackUserspace(buf.NewReader(backendConn), writer, timer)
 	}
-	maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff(copyCtx, "response")
 	return copyRawConnIfExistFn(copyCtx, backendConn, clientConn, writer, timer, nil)
 }

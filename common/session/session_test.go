@@ -1,6 +1,9 @@
 package session
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestSetCopyGateClearsReasonOnUnset(t *testing.T) {
 	inb := &Inbound{}
@@ -38,5 +41,28 @@ func TestSetCopyGateClearsReasonOutbound(t *testing.T) {
 func TestCopyGateReasonVisionNoDetachString(t *testing.T) {
 	if got := CopyGateReasonVisionNoDetach.String(); got != "vision_no_detach" {
 		t.Fatalf("reason string=%q, want %q", got, "vision_no_detach")
+	}
+}
+
+func TestVisionRawWriterProofIsBoundToPhysicalSocket(t *testing.T) {
+	first := &net.TCPConn{}
+	second := &net.TCPConn{}
+	proof := &VisionRawWriterProof{}
+	if proof.CommitRequired() {
+		t.Fatal("empty proof must not require a commit")
+	}
+	proof.RequireCommit()
+	if !proof.CommitRequired() {
+		t.Fatal("proof should record the Vision writer requirement")
+	}
+	if proof.ReadyFor(first) {
+		t.Fatal("required proof must not be ready before a physical write")
+	}
+	proof.Commit(first)
+	if !proof.ReadyFor(first) {
+		t.Fatal("proof should report the committed physical writer")
+	}
+	if proof.ReadyFor(second) {
+		t.Fatal("commit proof must not authorize a different physical writer")
 	}
 }

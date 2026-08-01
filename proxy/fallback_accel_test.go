@@ -91,6 +91,26 @@ func TestCopyFallbackResponseForcedUserspacePreservesPayload(t *testing.T) {
 	}
 }
 
+func TestFallbackRawHandoffEligibleRequiresDirectTCP(t *testing.T) {
+	left, right := mustTCPPair(t)
+	defer left.Close()
+	defer right.Close()
+	if !fallbackRawHandoffEligible(left) {
+		t.Fatal("direct TCP should be eligible for one-way raw copy")
+	}
+	for name, conn := range map[string]net.Conn{
+		"go kTLS wrapper":       &xtls.Conn{},
+		"rust kTLS wrapper":     &xtls.RustConn{},
+		"deferred rust wrapper": &xtls.DeferredRustConn{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if fallbackRawHandoffEligible(conn) {
+				t.Fatal("TLS wrapper must remain on the control-record-aware userspace lane")
+			}
+		})
+	}
+}
+
 func TestFallbackRawCopyContextAnnotatesRuntimeRecoveryMeta(t *testing.T) {
 	oldEligible := fallbackRawHandoffEligibleFn
 	t.Cleanup(func() {
@@ -200,7 +220,7 @@ func TestWithFallbackRuntimeRecoveryContextPreservesSharedState(t *testing.T) {
 	}
 }
 
-func TestCopyFallbackRawHandoffReportsRuntimeRecoveryOnceAcrossDirections(t *testing.T) {
+func TestCopyFallbackRawHandoffDoesNotReportRecoveryBeforeMeasuredOutcome(t *testing.T) {
 	oldCopyRaw := copyRawConnIfExistFn
 	oldEligible := fallbackRawHandoffEligibleFn
 	oldReport := reportNativeRuntimeRecoveryByTagFn
@@ -235,10 +255,7 @@ func TestCopyFallbackRawHandoffReportsRuntimeRecoveryOnceAcrossDirections(t *tes
 	if err := CopyFallbackResponse(ctx, testEOFConn{}, &xtls.DeferredRustConn{}, buf.Discard, nil); err != nil {
 		t.Fatalf("CopyFallbackResponse() error = %v", err)
 	}
-	if len(reported) != 1 {
-		t.Fatalf("runtime recovery reports = %d, want 1", len(reported))
-	}
-	if reported[0] != inbound.Tag {
-		t.Fatalf("reported tag=%q, want %q", reported[0], inbound.Tag)
+	if len(reported) != 0 {
+		t.Fatalf("runtime recovery reports = %d, want 0 before CopyRaw publishes a measured decision", len(reported))
 	}
 }

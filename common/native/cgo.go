@@ -2216,7 +2216,7 @@ var ebpfSkMsgCapability SkMsgCapability = SkMsgNone
 // EbpfSkMsgCapability returns the SK_MSG capability level from the Rust loader.
 func EbpfSkMsgCapability() SkMsgCapability { return ebpfSkMsgCapability }
 
-// EbpfMaxEntries reports the effective SOCKHASH capacity compiled into the native loader.
+// EbpfMaxEntries reports the effective SOCKHASH capacity from the latest native setup.
 func EbpfMaxEntries() uint32 { return uint32(C.xray_ebpf_max_entries()) }
 
 // EbpfSetup initializes eBPF sockmap with pinned maps for zero-downtime recovery.

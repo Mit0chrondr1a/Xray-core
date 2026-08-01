@@ -31,6 +31,7 @@ const (
 	visionSignalKey           ctx.SessionKey = 16 // per-flow Vision command signal channel
 	visionTimestampsKey       ctx.SessionKey = 17 // per-flow Vision timestamp storage
 	flowTimingsKey            ctx.SessionKey = 18 // per-flow latency timing storage
+	visionRawWriterProofKey   ctx.SessionKey = 19 // per-flow physical writer commit proof
 )
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -246,6 +247,17 @@ func ContextWithVisionTimestamps(ctx context.Context, timestamps *VisionTimestam
 
 func VisionTimestampsFromContext(ctx context.Context) *VisionTimestamps {
 	if val, ok := ctx.Value(visionTimestampsKey).(*VisionTimestamps); ok {
+		return val
+	}
+	return nil
+}
+
+func ContextWithVisionRawWriterProof(ctx context.Context, proof *VisionRawWriterProof) context.Context {
+	return context.WithValue(ctx, visionRawWriterProofKey, proof)
+}
+
+func VisionRawWriterProofFromContext(ctx context.Context) *VisionRawWriterProof {
+	if val, ok := ctx.Value(visionRawWriterProofKey).(*VisionRawWriterProof); ok {
 		return val
 	}
 	return nil

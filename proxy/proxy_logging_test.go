@@ -62,8 +62,8 @@ func TestDetermineSocketCryptoHintWithSourceXHTTPFlow(t *testing.T) {
 	if raw != nil {
 		t.Fatalf("raw conn should be nil for non-TCP XHTTP-like conn, got %T", raw)
 	}
-	if hint != ebpf.CryptoNone {
-		t.Fatalf("expected CryptoNone for XHTTP-like conn, got %d", hint)
+	if hint != ebpf.CryptoUnknown {
+		t.Fatalf("expected CryptoUnknown for XHTTP-like conn, got %d", hint)
 	}
 	if !strings.Contains(source, "*proxy.testXHTTPFlowConn") {
 		t.Fatalf("expected source to include XHTTP-like conn type, got %q", source)
@@ -289,41 +289,6 @@ func TestAnnotateFallbackTLSOffloadOverridesUserspaceSummary(t *testing.T) {
 
 	if decision.TLSOffloadPath != pipeline.TLSOffloadKTLS {
 		t.Fatalf("decision.TLSOffloadPath=%q, want %q", decision.TLSOffloadPath, pipeline.TLSOffloadKTLS)
-	}
-}
-
-func TestMaybeReportFallbackNativeRuntimeRecoveryOnRawHandoffLogsMeasuredTLSOffload(t *testing.T) {
-	t.Cleanup(func() {
-		clog.RegisterHandler(clog.NewLogger(clog.CreateStdoutLogWriter()))
-	})
-
-	oldReport := reportNativeRuntimeRecoveryByTagFn
-	t.Cleanup(func() {
-		reportNativeRuntimeRecoveryByTagFn = oldReport
-	})
-
-	reportNativeRuntimeRecoveryByTagFn = func(string) bool { return true }
-
-	handler := &testSeverityCaptureHandler{level: clog.Severity_Info}
-	clog.RegisterHandler(handler)
-
-	ctx := context.WithValue(context.Background(), fallbackRuntimeRecoveryContextKey{}, fallbackRuntimeRecoveryMeta{
-		Tag:                    "reality-vision-main",
-		FrontendTransport:      "deferred_rust",
-		FrontendTLSOffloadPath: pipeline.TLSOffloadKTLS,
-		State:                  &fallbackRuntimeRecoveryState{},
-	})
-
-	if !maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff(ctx, "response") {
-		t.Fatal("maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff()=false, want true")
-	}
-
-	logs := strings.Join(handler.msgs, "\n")
-	if !strings.Contains(logs, "tls_offload_path=ktls") {
-		t.Fatalf("fallback runtime recovery log missing measured tls_offload_path: %s", logs)
-	}
-	if strings.Contains(logs, "copy_path=splice") {
-		t.Fatalf("fallback runtime recovery log should not hardcode copy_path before execution: %s", logs)
 	}
 }
 

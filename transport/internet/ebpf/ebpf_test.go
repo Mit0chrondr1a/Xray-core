@@ -270,6 +270,8 @@ func TestErrorSentinels(t *testing.T) {
 		ErrXDPNotEnabled,
 		ErrSockmapNotSupported,
 		ErrSockmapNotEnabled,
+		ErrSockmapCryptoUnsupported,
+		ErrSockmapSocketULPActive,
 		ErrRoutingCacheNotSupported,
 		ErrRoutingCacheNotEnabled,
 		ErrKernelTooOld,

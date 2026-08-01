@@ -1,10 +1,14 @@
 //! Xray eBPF programs — compiled for bpfel-unknown-none target.
 //!
-//! Contains four programs attached to a shared SOCKHASH map:
+//! Contains four program entry points backed by a shared SOCKHASH map:
 //!   - xray_skb_parse:    SK_SKB stream parser (accept all data)
 //!   - xray_skb_verdict:  SK_SKB stream verdict (receive-path redirect)
-//!   - xray_sk_msg:       SK_MSG verdict (send-path cork + redirect)
-//!   - xray_sk_msg_cork:  SK_MSG cork-only fallback (batching, no redirect)
+//!   - xray_sk_msg:       experimental SK_MSG verdict (unattached)
+//!   - xray_sk_msg_cork:  experimental SK_MSG cork fallback (unattached)
+//!
+//! The production Aya loader attaches only the two SK_SKB programs. The pair
+//! map points from a receiving socket to its peer; using the same mapping on an
+//! ordinary userspace send would reverse the intended destination.
 
 #![no_std]
 #![no_main]

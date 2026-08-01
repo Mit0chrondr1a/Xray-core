@@ -70,6 +70,40 @@ func TestDecideVisionPathLoopbackUserspaceTLSGuard(t *testing.T) {
 	}
 }
 
+func TestDecideVisionPathIncompleteCryptoGuard(t *testing.T) {
+	tests := []struct {
+		name   string
+		reader string
+		writer string
+	}{
+		{name: "TX-only reader", reader: "ktls-tx-only", writer: "none"},
+		{name: "RX-only writer", reader: "none", writer: "ktls-rx-only"},
+		{name: "partial and full", reader: "ktls-tx-only", writer: "ktls-both"},
+		{name: "full kTLS reader", reader: "ktls-both", writer: "none"},
+		{name: "full kTLS writer", reader: "none", writer: "ktls-both"},
+		{name: "full kTLS pair", reader: "ktls-both", writer: "ktls-both"},
+		{name: "unknown reader", reader: "future-crypto", writer: "none"},
+		{name: "unknown writer", reader: "none", writer: "future-crypto"},
+		{name: "missing hints", reader: "", writer: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DecideVisionPath(DecisionInput{
+				Caps:         CapabilitySummary{SpliceSupported: true},
+				ReaderCrypto: tt.reader,
+				WriterCrypto: tt.writer,
+			})
+			if got.Path != PathUserspace {
+				t.Fatalf("Path=%q, want %q", got.Path, PathUserspace)
+			}
+			if got.Reason != ReasonIncompleteCryptoGuard {
+				t.Fatalf("Reason=%q, want %q", got.Reason, ReasonIncompleteCryptoGuard)
+			}
+		})
+	}
+}
+
 func TestEvaluateCopyGateInboundForced(t *testing.T) {
 	reason, gate, gateReason, copyPath, stop := EvaluateCopyGate(CopyGateInput{
 		InboundGate:   CopyGateForcedUserspace,

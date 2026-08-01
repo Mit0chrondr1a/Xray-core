@@ -962,45 +962,6 @@ func maybeReportFallbackNativeRuntimeRecovery(ctx context.Context, decision *pip
 	return true
 }
 
-func shouldReportFallbackNativeRuntimeRecoveryOnRawHandoff(ctx context.Context) (fallbackRuntimeRecoveryMeta, bool) {
-	meta, ok := fallbackRuntimeRecoveryMetaFromContext(ctx)
-	if !ok || meta.Tag == "" {
-		return fallbackRuntimeRecoveryMeta{}, false
-	}
-	switch meta.FrontendTransport {
-	case "deferred_rust", "rust":
-		return meta, true
-	default:
-		return fallbackRuntimeRecoveryMeta{}, false
-	}
-}
-
-func maybeReportFallbackNativeRuntimeRecoveryOnRawHandoff(ctx context.Context, direction string) bool {
-	meta, ok := shouldReportFallbackNativeRuntimeRecoveryOnRawHandoff(ctx)
-	if !ok {
-		return false
-	}
-	if meta.State != nil && !meta.State.reported.CompareAndSwap(false, true) {
-		return false
-	}
-	if reportNativeRuntimeRecoveryByTagFn == nil || !reportNativeRuntimeRecoveryByTagFn(meta.Tag) {
-		return false
-	}
-	errors.LogInfo(ctx,
-		"[kind=fallback.native_runtime_recovery] reported healthy native fallback raw handoff to shared-listener breaker; tag=",
-		meta.Tag,
-		" transport=",
-		meta.FrontendTransport,
-		" direction=",
-		direction,
-		" tls_offload_path=",
-		meta.FrontendTLSOffloadPath,
-		" raw_handoff=",
-		true,
-	)
-	return true
-}
-
 func annotateFallbackTLSOffload(ctx context.Context, decision *pipeline.DecisionSnapshot) {
 	if decision == nil {
 		return
@@ -1320,8 +1281,9 @@ type VisionWriter struct {
 	ob           *session.Outbound
 
 	// internal
-	writeOnceUserUUID  []byte
-	directWriteCounter stats.Counter
+	writeOnceUserUUID     []byte
+	directWriteCounter    stats.Counter
+	rawWriteCommitPending atomic.Pointer[gonet.TCPConn]
 
 	testseed []uint32
 }
@@ -1332,7 +1294,7 @@ func NewVisionWriter(writer buf.Writer, trafficState *TrafficState, isUplink boo
 	if len(testseed) < 4 {
 		testseed = []uint32{900, 500, 900, 256}
 	}
-	return &VisionWriter{
+	visionWriter := &VisionWriter{
 		Writer:            writer,
 		trafficState:      trafficState,
 		ctx:               ctx,
@@ -1342,6 +1304,12 @@ func NewVisionWriter(writer buf.Writer, trafficState *TrafficState, isUplink boo
 		ob:                ob,
 		testseed:          testseed,
 	}
+	if !isUplink {
+		if proof := session.VisionRawWriterProofFromContext(ctx); proof != nil {
+			proof.RequireCommit()
+		}
+	}
+	return visionWriter
 }
 
 func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -1373,7 +1341,6 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		switchToDirectCopy = &ts.Inbound.DownlinkWriterDirectCopy
 	}
 	sharedParentCompat := session.VisionSharedParentFromContext(w.ctx)
-
 	switchNow := *switchToDirectCopy
 	if sharedParentCompat && switchNow {
 		switchNow = false
@@ -1402,6 +1369,9 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			w.Writer = buf.NewWriter(rawConn)
 			w.directWriteCounter = writerCounter
 			*switchToDirectCopy = false
+			if tcpConn, ok := rawConn.(*gonet.TCPConn); ok && !w.isUplink {
+				w.rawWriteCommitPending.Store(tcpConn)
+			}
 		}
 	}
 
@@ -1458,8 +1428,16 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 	}
 
+	hasPhysicalPayload := !mb.IsEmpty()
+	pendingRawWriter := w.rawWriteCommitPending.Load()
 	unlock()
-	return w.Writer.WriteMultiBuffer(mb)
+	err := w.Writer.WriteMultiBuffer(mb)
+	if err == nil && hasPhysicalPayload && pendingRawWriter != nil && w.rawWriteCommitPending.CompareAndSwap(pendingRawWriter, nil) {
+		if proof := session.VisionRawWriterProofFromContext(w.ctx); proof != nil {
+			proof.Commit(pendingRawWriter)
+		}
+	}
+	return err
 }
 
 // IsCompleteRecord checks if the MultiBuffer contains complete TLS application
@@ -1941,8 +1919,8 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 
 // startKeyUpdateMonitor creates and starts a KeyUpdateMonitor for a raw
 // connection with the given handler. Returns nil (safe to Stop()) on any
-// failure. Used by zero-copy paths (SOCKMAP, splice) that bypass Write()
-// and thus skip the per-record write counter for TX key rotation.
+// failure. Reserved for a future control-record-aware directional kTLS copy
+// lane, which would bypass Write() and its TX key-rotation counter.
 func startKeyUpdateMonitor(rawConn net.Conn, handler *tls.KTLSKeyUpdateHandler) *tls.KeyUpdateMonitor {
 	if handler == nil {
 		return nil
@@ -1981,27 +1959,50 @@ func determineSocketCryptoHintRecurse(conn net.Conn, depth int) (net.Conn, ebpf.
 	}
 	source := connTypeName(conn)
 
-	// Peel encryption wrappers
-	if commonConn, ok := conn.(*encryption.CommonConn); ok {
-		source = appendCryptoHintSource(source, "*encryption.CommonConn")
-		conn = commonConn.Conn
-	}
-	if _, ok := conn.(*encryption.XorConn); ok {
-		return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*encryption.XorConn")
+	// Wrapper order varies by transport and accounting configuration. Peel only
+	// wrappers that do not transform the byte stream. The depth bound keeps
+	// malformed/cyclic wrapper chains fail-closed.
+	for {
+		if depth > maxCryptoHintDepth {
+			return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "depth-exceeded")
+		}
+		switch wrapped := conn.(type) {
+		case *encryption.XorConn:
+			return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "*encryption.XorConn")
+		case *stat.CounterConnection:
+			source = appendCryptoHintSource(source, "*stat.CounterConnection")
+			if wrapped == nil || wrapped.Connection == nil {
+				return nil, ebpf.CryptoUnknown, appendCryptoHintSource(source, "nil-inner")
+			}
+			conn = wrapped.Connection
+			depth++
+			continue
+		case *proxyproto.Conn:
+			source = appendCryptoHintSource(source, "*proxyproto.Conn")
+			if wrapped == nil {
+				return nil, ebpf.CryptoUnknown, appendCryptoHintSource(source, "nil-inner")
+			}
+			raw := wrapped.Raw()
+			if raw == nil {
+				return nil, ebpf.CryptoUnknown, appendCryptoHintSource(source, "nil-inner")
+			}
+			conn = raw
+			depth++
+			continue
+		}
+		break
 	}
 
-	// Peel stats and proxyproto wrappers before TLS inspection.
-	// NOTE: peel order here differs from UnwrapRawConn (which peels proxyproto
-	// after TLS). Both orderings are correct because the type assertions are
-	// independent — if proxyproto wraps TLS, we peel it first and see TLS next;
-	// if TLS wraps proxyproto, the TLS branch fires first.
-	if statConn, ok := conn.(*stat.CounterConnection); ok {
-		source = appendCryptoHintSource(source, "*stat.CounterConnection")
-		conn = statConn.Connection
-	}
-	if pc, ok := conn.(*proxyproto.Conn); ok {
-		source = appendCryptoHintSource(source, "*proxyproto.Conn")
-		conn = pc.Raw()
+	// CommonConn is VLESS Encryption's userspace AEAD record layer. Recurse only
+	// to retain a possible physical-socket candidate for an explicitly proven
+	// Vision direct handoff; the live wrapped stream itself is never raw.
+	if commonConn, ok := conn.(*encryption.CommonConn); ok {
+		source = appendCryptoHintSource(source, "*encryption.CommonConn(userspace-record)")
+		if commonConn == nil || commonConn.Conn == nil {
+			return nil, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "nil-inner")
+		}
+		raw, _, innerSource := determineSocketCryptoHintRecurse(commonConn.Conn, depth+1)
+		return raw, ebpf.CryptoUserspaceTLS, appendCryptoHintSource(source, "inner="+innerSource)
 	}
 
 	// Check TLS type
@@ -2084,7 +2085,7 @@ func determineSocketCryptoHintRecurse(conn net.Conn, depth int) (net.Conn, ebpf.
 		return conn, ebpf.CryptoNone, appendCryptoHintSource(source, "*net.TCPConn(raw)")
 	}
 
-	return nil, ebpf.CryptoNone, appendCryptoHintSource(source, connTypeName(conn))
+	return nil, ebpf.CryptoUnknown, appendCryptoHintSource(source, connTypeName(conn))
 }
 
 func isLoopbackConnPair(a, b gonet.Conn) bool {
@@ -2127,13 +2128,26 @@ func buildVisionDecisionInputForCopyGate(
 	inboundGate session.CopyGateState,
 	preserveWrappedCrypto bool,
 ) (pipeline.DecisionInput, ebpf.CryptoHint, ebpf.CryptoHint, string, string) {
-	if preserveWrappedCrypto {
-		return buildVisionDecisionInput(readerConn, writerConn, caps, deferredTLSActive)
+	wrappedInput, wrappedReaderCrypto, wrappedWriterCrypto, wrappedReaderSource, wrappedWriterSource := buildVisionDecisionInput(
+		readerConn,
+		writerConn,
+		caps,
+		deferredTLSActive,
+	)
+	if shouldPreserveWrappedCryptoForHints(preserveWrappedCrypto, wrappedReaderCrypto, wrappedWriterCrypto) {
+		return wrappedInput, wrappedReaderCrypto, wrappedWriterCrypto, wrappedReaderSource, wrappedWriterSource
 	}
 	if inboundGate == session.CopyGateEligible && !deferredTLSActive && rawReaderConn != nil && rawWriterConn != nil {
 		return buildVisionDecisionInput(rawReaderConn, rawWriterConn, caps, deferredTLSActive)
 	}
-	return buildVisionDecisionInput(readerConn, writerConn, caps, deferredTLSActive)
+	return wrappedInput, wrappedReaderCrypto, wrappedWriterCrypto, wrappedReaderSource, wrappedWriterSource
+}
+
+func shouldPreserveWrappedCryptoForHints(explicit bool, reader, writer ebpf.CryptoHint) bool {
+	replaceableAfterVisionDetach := func(h ebpf.CryptoHint) bool {
+		return h == ebpf.CryptoNone || h == ebpf.CryptoUserspaceTLS
+	}
+	return explicit || !replaceableAfterVisionDetach(reader) || !replaceableAfterVisionDetach(writer)
 }
 
 func shouldPreserveWrappedCryptoHintsForCopyGate(ctx context.Context) bool {
@@ -2193,6 +2207,80 @@ func cryptoHintUsesKTLS(h ebpf.CryptoHint) bool {
 	default:
 		return false
 	}
+}
+
+type copyCryptoLane uint8
+
+const (
+	copyCryptoLaneUserspace copyCryptoLane = iota
+	copyCryptoLaneRawSockmap
+)
+
+// Pair-wide sockmap cannot be enabled until both directional userspace loops
+// can be parked under a single cookie/generation-bound ownership lease. Raw
+// crypto state alone is not that proof (queued buffers and half-closes remain).
+const sockmapOwnershipHandoffImplemented = false
+
+func classifyCopyCryptoLane(reader, writer ebpf.CryptoHint) copyCryptoLane {
+	if reader == ebpf.CryptoNone && writer == ebpf.CryptoNone {
+		return copyCryptoLaneRawSockmap
+	}
+	return copyCryptoLaneUserspace
+}
+
+// applyCopyPathDecision updates only the current routing verdict. Copy loops
+// can re-evaluate the path after already forwarding userspace bytes, so
+// replacing the whole snapshot would erase accumulated telemetry.
+func applyCopyPathDecision(dst *pipeline.DecisionSnapshot, src pipeline.DecisionSnapshot) {
+	if dst == nil {
+		return
+	}
+	dst.Path = src.Path
+	dst.Reason = src.Reason
+	dst.Caps = src.Caps
+	dst.TLSOffloadPath = src.TLSOffloadPath
+	dst.CopyPath = src.CopyPath
+}
+
+func directRawTCPConn(conn net.Conn, depth int) bool {
+	if conn == nil || depth > maxCryptoHintDepth {
+		return false
+	}
+	switch wrapped := conn.(type) {
+	case *gonet.TCPConn:
+		return true
+	case *stat.CounterConnection:
+		return wrapped != nil && directRawTCPConn(wrapped.Connection, depth+1)
+	case *proxyproto.Conn:
+		return wrapped != nil && directRawTCPConn(wrapped.Raw(), depth+1)
+	default:
+		return false
+	}
+}
+
+// directionalRawCopyReady permits only a one-way splice whose protocol gate
+// explicitly committed the raw handoff and whose source was a direct raw TCP
+// socket. Every Vision downlink destination, including a direct TCP object,
+// must additionally commit its transition payload to that exact physical
+// socket. This excludes client pipe/deferred-reader and L7 framing races.
+func directionalRawCopyReady(ctx context.Context, gate session.CopyGateState, readerConn, writerConn, rawWriterConn net.Conn) bool {
+	if gate != session.CopyGateEligible {
+		return false
+	}
+	if !directRawTCPConn(readerConn, 0) {
+		return false
+	}
+	physicalWriter, ok := rawWriterConn.(*gonet.TCPConn)
+	proof := session.VisionRawWriterProofFromContext(ctx)
+	if proof != nil && proof.CommitRequired() {
+		return ok && proof.ReadyFor(physicalWriter)
+	}
+	// Incomplete Vision metadata fails closed. Generic non-Vision raw TCP can
+	// remain immediately eligible because no framing handoff exists.
+	if session.VisionSignalFromContext(ctx) != nil || session.VisionFlowFromContext(ctx) {
+		return false
+	}
+	return directRawTCPConn(writerConn, 0)
 }
 
 func inferTLSOffloadPathFromCrypto(readerCrypto, writerCrypto ebpf.CryptoHint) pipeline.TLSOffloadPath {
@@ -2271,10 +2359,8 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 	postDetachRetrySeen := false
 	var (
-		readerCrypto       ebpf.CryptoHint
-		writerCrypto       ebpf.CryptoHint
-		readerCryptoSource string
-		writerCryptoSource string
+		readerCrypto ebpf.CryptoHint
+		writerCrypto ebpf.CryptoHint
 	)
 	var inbound *session.Inbound
 	var outbounds []*session.Outbound
@@ -2634,6 +2720,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		}
 	}
 	for {
+		cryptoGuardedUserspace := false
 		inboundGate := inbound.GetCanSpliceCopy()
 		var splice = !disableAccel && !forceUserspaceAfterSockmap &&
 			inboundGate != session.CopyGateUnset &&
@@ -2682,7 +2769,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inboundGate == session.CopyGateEligible && !deferredTLSActive {
 				_ = ensureRaw()
 			}
-			input, currentReaderCrypto, currentWriterCrypto, currentReaderCryptoSource, currentWriterCryptoSource := buildVisionDecisionInputForCopyGate(
+			input, currentReaderCrypto, currentWriterCrypto, _, _ := buildVisionDecisionInputForCopyGate(
 				readerConn,
 				writerConn,
 				rawReaderConn,
@@ -2694,9 +2781,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			)
 			readerCrypto = currentReaderCrypto
 			writerCrypto = currentWriterCrypto
-			readerCryptoSource = currentReaderCryptoSource
-			writerCryptoSource = currentWriterCryptoSource
-			decision = pipeline.DecideVisionPath(input)
+			applyCopyPathDecision(&decision, pipeline.DecideVisionPath(input))
 			if decision.Path == pipeline.PathSplice && input.LoopbackPair {
 				if shouldBypassVisionDetachInProxy(ctx, inbound) {
 					decision.Path = pipeline.PathUserspace
@@ -2732,7 +2817,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			// Re-evaluate crypto hints right before gating sockmap/splice so
 			// deferred detach or kTLS promotion transitions are reflected.
 			deferredTLSActive = deferredConnRequiresTLS(readerConn) || deferredConnRequiresTLS(writerConn)
-			_, currentReaderCrypto, currentWriterCrypto, currentReaderCryptoSource, currentWriterCryptoSource := buildVisionDecisionInputForCopyGate(
+			currentInput, currentReaderCrypto, currentWriterCrypto, _, _ := buildVisionDecisionInputForCopyGate(
 				readerConn,
 				writerConn,
 				rawReaderConn,
@@ -2744,13 +2829,41 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			)
 			readerCrypto = currentReaderCrypto
 			writerCrypto = currentWriterCrypto
-			readerCryptoSource = currentReaderCryptoSource
-			writerCryptoSource = currentWriterCryptoSource
+			currentDecision := pipeline.DecideVisionPath(currentInput)
+			cryptoLane := classifyCopyCryptoLane(readerCrypto, writerCrypto)
+			if currentDecision.Path != pipeline.PathSplice || cryptoLane == copyCryptoLaneUserspace {
+				// Crypto state can change while raw connections are being resolved.
+				// Revalidate at the last responsible moment and fall through to the
+				// existing guarded userspace loop for partial or unknown states.
+				applyCopyPathDecision(&decision, currentDecision)
+				splice = false
+				cryptoGuardedUserspace = cryptoLane == copyCryptoLaneUserspace
+				errors.LogDebug(ctx, "CopyRawConn splice skipped after crypto revalidation: reason=", decision.Reason,
+					" reader=", cryptoHintName(readerCrypto), " writer=", cryptoHintName(writerCrypto))
+			} else if !directionalRawCopyReady(ctx, inbound.GetCanSpliceCopy(), readerConn, writerConn, rawWriterConn) {
+				// A one-way splice may bypass only the source reader and destination
+				// writer that have committed their raw transitions. Continue through
+				// the wrappers until that directional proof exists.
+				applyCopyPathDecision(&decision, currentDecision)
+				decision.Path = pipeline.PathUserspace
+				decision.Reason = pipeline.ReasonSpliceDirectionalNotReady
+				decision.CopyPath = pipeline.CopyPathUserspace
+				splice = false
+			}
+			if !splice {
+				goto userspaceCopy
+			}
 
-			// Try eBPF sockmap first — kernel-level forwarding without pipe buffers.
 			if !caps.SockmapSupported {
+				// Raw TCP prefers eBPF sockmap, then falls back to splice.
 				decision.Path = pipeline.PathSplice
 				decision.Reason = pipeline.ReasonSockmapCapabilityUnsupported
+			} else if !sockmapOwnershipHandoffImplemented {
+				// Capability and raw-crypto checks are necessary but not sufficient.
+				// Keep pair-wide redirect disabled until one owner can park both
+				// copy loops and track half-close per direction.
+				decision.Path = pipeline.PathSplice
+				decision.Reason = pipeline.ReasonSockmapOwnershipUnproven
 			} else if mgr := ebpf.GlobalSockmapManager(); mgr == nil {
 				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: manager unavailable")
 				decision.Path = pipeline.PathSplice
@@ -2768,26 +2881,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				decision.Path = pipeline.PathSplice
 				decision.Reason = pipeline.ReasonSockmapContention
 			} else if !ebpf.CanUseZeroCopyWithCrypto(rawReaderConn, rawWriterConn, readerCrypto, writerCrypto) {
-				errors.LogDebug(ctx, "CopyRawConn crypto hint: reader=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] source=", readerCryptoSource, " writer=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] source=", writerCryptoSource)
-				switch {
-				case !ebpf.KTLSSockhashCompatible() && (readerCrypto == ebpf.CryptoKTLSBoth || writerCrypto == ebpf.CryptoKTLSBoth):
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: kTLS+SOCKHASH not supported on this kernel, using splice")
-					mgr.IncrementKTLSSpliceFallback()
-					decision.Path = pipeline.PathSplice
-					decision.Reason = pipeline.ReasonSockmapKTLSSockhashIncompatible
-				case readerCrypto == ebpf.CryptoUserspaceTLS || writerCrypto == ebpf.CryptoUserspaceTLS:
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: userspace TLS not eligible (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
-					decision.Path = pipeline.PathSplice
-					decision.Reason = pipeline.ReasonSockmapUserspaceTLS
-				case (readerCrypto == ebpf.CryptoKTLSBoth) != (writerCrypto == ebpf.CryptoKTLSBoth):
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: asymmetric kTLS state (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
-					decision.Path = pipeline.PathSplice
-					decision.Reason = pipeline.ReasonSockmapAsymmetricKTLS
-				default:
-					errors.LogDebug(ctx, "CopyRawConn sockmap skipped: policy/type mismatch (readerCrypto=", int(readerCrypto), "[", cryptoHintName(readerCrypto), "] writerCrypto=", int(writerCrypto), "[", cryptoHintName(writerCrypto), "] readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
-					decision.Path = pipeline.PathSplice
-					decision.Reason = pipeline.ReasonSockmapOtherPolicy
-				}
+				errors.LogDebug(ctx, "CopyRawConn sockmap skipped: raw policy/type mismatch (readerType=", connTypeName(rawReaderConn), " writerType=", connTypeName(rawWriterConn), ")")
+				decision.Path = pipeline.PathSplice
+				decision.Reason = pipeline.ReasonSockmapOtherPolicy
 			} else {
 				if pair, ok := mgr.GetStats(rawReaderConn, rawWriterConn); ok && (pair.InboundCrypto != readerCrypto || pair.OutboundCrypto != writerCrypto) {
 					if err := mgr.UnregisterPair(rawReaderConn, rawWriterConn); err != nil {
@@ -2805,7 +2901,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 					lr, rr := connAddrs(rawReaderConn)
 					lw, rw := connAddrs(rawWriterConn)
 					errors.LogInfo(ctx, "CopyRawConn sockmap start: crypto reader=", int(readerCrypto), " writer=", int(writerCrypto), " reader_addrs=", lr, "->", rr, " writer_addrs=", lw, "->", rw, " loopback=", isLoopbackConnPair(rawReaderConn, rawWriterConn))
-					writerMonitor := startKeyUpdateMonitor(rawWriterConn, writerHandler)
 					// Splice takes over connection lifecycle. Transfer timer ownership explicitly.
 					if activityTimer, ok := timer.(*signal.ActivityTimer); ok && activityTimer != nil {
 						activityTimer.SetTimeout(24 * time.Hour)
@@ -2814,7 +2909,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 						inTimer.SetTimeout(24 * time.Hour)
 					}
 					fallbackToSplice, sockmapObs, waitErr := waitForSockmapForwarding(rawReaderConn, rawWriterConn)
-					writerMonitor.Stop()
 					if err := mgr.UnregisterPair(rawReaderConn, rawWriterConn); err != nil {
 						errors.LogDebugInner(ctx, err, "CopyRawConn sockmap unregister failed")
 					}
@@ -2849,7 +2943,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 					decision.Reason = pipeline.ReasonSockmapRegisterFail
 				}
 			}
-			// Fall through to splice on sockmap failure
+			// Use splice after raw sockmap is unavailable or declines the flow.
 
 			decision.Path = pipeline.PathSplice
 			if decision.Reason == pipeline.ReasonDefault || decision.Reason == pipeline.ReasonSockmapActive {
@@ -2927,10 +3021,31 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			errors.LogWarning(ctx, "[kind=vision.splice_unexpected_error] splice/readfrom failed: ", err)
 			return err
 		}
+	userspaceCopy:
+		useRawUserspaceReader := false
+		if inbound.GetCanSpliceCopy() == session.CopyGateEligible && !readerStillUsesDeferredTLS && ensureRaw() && rawUserspaceReader != nil {
+			_, guardedReaderCrypto, guardedWriterCrypto, _, _ := buildVisionDecisionInputForCopyGate(
+				readerConn,
+				writerConn,
+				rawReaderConn,
+				rawWriterConn,
+				decisionCaps,
+				deferredTLSActive,
+				inbound.GetCanSpliceCopy(),
+				preserveWrappedCryptoHints,
+			)
+			if classifyCopyCryptoLane(guardedReaderCrypto, guardedWriterCrypto) == copyCryptoLaneUserspace {
+				cryptoGuardedUserspace = true
+			} else if directRawTCPConn(readerConn, 0) {
+				useRawUserspaceReader = true
+			}
+		}
 		if !loggedUserspaceLoop {
 			inboundSplice := inbound.GetCanSpliceCopy()
 			if inboundSplice != session.CopyGateEligible {
 				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: inbound.CopyGate=", inboundSplice.String())
+			} else if cryptoGuardedUserspace {
+				errors.LogDebug(ctx, "CopyRawConn userspace copy loop: partial or unknown crypto state")
 			} else if readerStillUsesDeferredTLS || writerStillUsesDeferredTLS {
 				errors.LogDebug(ctx,
 					"CopyRawConn userspace copy loop: deferred rustls still active",
@@ -2943,7 +3058,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			loggedUserspaceLoop = true
 		}
 		currentReader := userspaceReader
-		if inbound.GetCanSpliceCopy() == session.CopyGateEligible && !readerStillUsesDeferredTLS && ensureRaw() && rawUserspaceReader != nil {
+		if useRawUserspaceReader {
 			currentReader = rawUserspaceReader
 		}
 		if phase == copyLoopPhaseAwaitSignal && inboundGate == session.CopyGatePendingDetach {
@@ -3188,17 +3303,19 @@ func logStartupHealth() {
 		}
 	}
 	sockmapEnabled := false
-	if mgr := ebpf.GlobalSockmapManager(); mgr != nil && mgr.IsEnabled() {
-		sockmapEnabled = true
+	if sockmapOwnershipHandoffImplemented {
+		if mgr := ebpf.GlobalSockmapManager(); mgr != nil && mgr.IsEnabled() {
+			sockmapEnabled = true
+		}
 	}
-	ktlsSockhash := ebpf.KTLSSockhashCompatible()
-
 	errors.LogInfo(ctx,
 		"startup health: bpffs_mounted=", bpffsMounted,
 		" pin_dir=", pinDir,
 		" pins_ready=", pinsReady,
 		" sockmap_enabled=", sockmapEnabled,
-		" ktls_sockhash_compatible=", ktlsSockhash,
+		" sockmap_crypto_policy=raw-only",
+		" sockmap_admission=disabled(ownership-handoff-pending)",
+		" ktls_copy_lane=userspace-wrapper",
 		" vision_detach_mode=async budget=", visionDetachWaitBudget(),
 	)
 }
@@ -3330,6 +3447,8 @@ func cryptoHintName(h ebpf.CryptoHint) string {
 		return "ktls-rx-only"
 	case ebpf.CryptoUserspaceTLS:
 		return "userspace-tls"
+	case ebpf.CryptoUnknown:
+		return "unknown"
 	default:
 		return "unknown"
 	}

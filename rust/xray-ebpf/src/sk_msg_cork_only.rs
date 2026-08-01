@@ -1,11 +1,8 @@
-//! Cork-only SK_MSG fallback — batching without cookie lookup or redirect.
+//! Experimental cork-only SK_MSG fallback — not attached in production.
 //!
-//! This program is loaded when the kernel rejects `bpf_get_socket_cookie`
-//! inside `BPF_PROG_TYPE_SK_MSG` (observed on kernel 6.18.13). It provides
-//! the cork batching benefit (coalescing small writes into MTU-sized chunks)
-//! without the send-path redirect that requires the cookie helper.
-//!
-//! Receive-path redirect via SK_SKB is unaffected — data flows normally.
+//! Retained as a future experiment only. Production does not attach it because
+//! corking a short userspace write without a guaranteed follow-up can retain
+//! that write indefinitely.
 
 use aya_ebpf::{
     bindings::sk_action::SK_PASS, helpers::bpf_msg_cork_bytes, macros::sk_msg,

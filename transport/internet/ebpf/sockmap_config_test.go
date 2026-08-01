@@ -205,6 +205,7 @@ func TestCryptoHint_String(t *testing.T) {
 		{CryptoKTLSTxOnly, "kTLS-TX"},
 		{CryptoKTLSRxOnly, "kTLS-RX"},
 		{CryptoUserspaceTLS, "userspace"},
+		{CryptoUnknown, "unknown"},
 		{CryptoHint(99), "unknown"},
 	}
 	for _, tt := range tests {
