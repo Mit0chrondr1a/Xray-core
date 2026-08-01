@@ -52,7 +52,7 @@ var (
 	visionRawInputFieldType     = reflect.TypeOf(bytes.Buffer{})
 )
 
-func resolveVisionInternalReaders(t reflect.Type, base uintptr) (*bytes.Reader, *bytes.Buffer, error) {
+func resolveVisionInternalReaders(t reflect.Type, base unsafe.Pointer) (*bytes.Reader, *bytes.Buffer, error) {
 	if t == nil {
 		return nil, nil, nil
 	}
@@ -68,8 +68,11 @@ func resolveVisionInternalReaders(t reflect.Type, base uintptr) (*bytes.Reader, 
 			", rawInput=", rawInputField.Type.String(), ")",
 		).AtWarning()
 	}
-	input := (*bytes.Reader)(unsafe.Pointer(base + inputField.Offset))
-	rawInput := (*bytes.Buffer)(unsafe.Pointer(base + rawInputField.Offset))
+	// Preserve pointer provenance for Go's checkptr instrumentation. Converting
+	// the base pointer to uintptr before adding a field offset can make the
+	// derived pointer appear unrelated to its allocation.
+	input := (*bytes.Reader)(unsafe.Add(base, inputField.Offset))
+	rawInput := (*bytes.Buffer)(unsafe.Add(base, rawInputField.Offset))
 	return input, rawInput, nil
 }
 
@@ -727,22 +730,22 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				fallthrough // we will break Mux connections that contain TCP requests
 			case protocol.RequestCommandTCP:
 				var t reflect.Type
-				var p uintptr
+				var p unsafe.Pointer
 				if commonConn, ok := connection.(*encryption.CommonConn); ok {
 					if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
 						inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 					}
 					t = reflect.TypeOf(commonConn).Elem()
-					p = uintptr(unsafe.Pointer(commonConn))
+					p = unsafe.Pointer(commonConn)
 				} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 					if tlsConn.ConnectionState().Version != gotls.VersionTLS13 {
 						return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
 					}
 					t = reflect.TypeOf(tlsConn.Conn).Elem()
-					p = uintptr(unsafe.Pointer(tlsConn.Conn))
+					p = unsafe.Pointer(tlsConn.Conn)
 				} else if realityConn, ok := iConn.(*reality.Conn); ok {
 					t = reflect.TypeOf(realityConn.Conn).Elem()
-					p = uintptr(unsafe.Pointer(realityConn.Conn))
+					p = unsafe.Pointer(realityConn.Conn)
 				} else if rc, ok := iConn.(*tls.RustConn); ok {
 					if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
 						return errors.New("RustConn without full kTLS cannot use " + requestAddons.Flow).AtWarning()

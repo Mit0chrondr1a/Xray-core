@@ -28,7 +28,7 @@ func TestResolveVisionInternalReadersAcceptsExpectedLayout(t *testing.T) {
 	state.rawInput.WriteString("raw")
 	state.input.Reset([]byte("hello"))
 
-	input, rawInput, err := resolveVisionInternalReaders(reflect.TypeOf(*state), uintptr(unsafe.Pointer(state)))
+	input, rawInput, err := resolveVisionInternalReaders(reflect.TypeOf(*state), unsafe.Pointer(state))
 	if err != nil {
 		t.Fatalf("resolveVisionInternalReaders() error = %v", err)
 	}
@@ -47,7 +47,7 @@ func TestResolveVisionInternalReadersAcceptsExpectedLayout(t *testing.T) {
 
 func TestResolveVisionInternalReadersRejectsMissingFields(t *testing.T) {
 	state := &visionLayoutMissing{}
-	_, _, err := resolveVisionInternalReaders(reflect.TypeOf(*state), uintptr(unsafe.Pointer(state)))
+	_, _, err := resolveVisionInternalReaders(reflect.TypeOf(*state), unsafe.Pointer(state))
 	if err == nil {
 		t.Fatal("resolveVisionInternalReaders() error = nil, want missing-field error")
 	}
@@ -58,7 +58,7 @@ func TestResolveVisionInternalReadersRejectsMissingFields(t *testing.T) {
 
 func TestResolveVisionInternalReadersRejectsWrongFieldTypes(t *testing.T) {
 	state := &visionLayoutWrongTypes{}
-	_, _, err := resolveVisionInternalReaders(reflect.TypeOf(*state), uintptr(unsafe.Pointer(state)))
+	_, _, err := resolveVisionInternalReaders(reflect.TypeOf(*state), unsafe.Pointer(state))
 	if err == nil {
 		t.Fatal("resolveVisionInternalReaders() error = nil, want wrong-type error")
 	}

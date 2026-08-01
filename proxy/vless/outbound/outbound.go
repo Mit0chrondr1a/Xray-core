@@ -131,6 +131,26 @@ func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, in
 	return true, nil, nil, errors.New("Vision is incompatible with kTLS-native RustConn; aborting outbound Vision flow").AtWarning()
 }
 
+func resolveVisionInternalReaders(t reflect.Type, base unsafe.Pointer) (*bytes.Reader, *bytes.Buffer, error) {
+	if t == nil {
+		return nil, nil, nil
+	}
+	inputField, inputOK := t.FieldByName("input")
+	rawInputField, rawInputOK := t.FieldByName("rawInput")
+	if !inputOK || !rawInputOK {
+		return nil, nil, errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+	}
+	if inputField.Type != reflect.TypeOf(bytes.Reader{}) || rawInputField.Type != reflect.TypeOf(bytes.Buffer{}) {
+		return nil, nil, errors.New(
+			"XTLS Vision internal layout mismatch for ", t.String(),
+			": unexpected input/rawInput types (input=", inputField.Type.String(),
+			", rawInput=", rawInputField.Type.String(), ")",
+		).AtWarning()
+	}
+	return (*bytes.Reader)(unsafe.Add(base, inputField.Offset)),
+		(*bytes.Buffer)(unsafe.Add(base, rawInputField.Offset)), nil
+}
+
 // New creates a new VLess outbound handler.
 func New(ctx context.Context, config *Config) (*Handler, error) {
 	if config.Vnext == nil {
@@ -382,22 +402,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			fallthrough // let server break Mux connections that contain TCP requests
 		case protocol.RequestCommandTCP, protocol.RequestCommandRvs:
 			var t reflect.Type
-			var p uintptr
+			var p unsafe.Pointer
 			if commonConn, ok := conn.(*encryption.CommonConn); ok {
 				if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
 					ob.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 				}
 				t = reflect.TypeOf(commonConn).Elem()
-				p = uintptr(unsafe.Pointer(commonConn))
+				p = unsafe.Pointer(commonConn)
 			} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 				t = reflect.TypeOf(tlsConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(tlsConn.Conn))
+				p = unsafe.Pointer(tlsConn.Conn)
 			} else if utlsConn, ok := iConn.(*tls.UConn); ok {
 				t = reflect.TypeOf(utlsConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(utlsConn.Conn))
+				p = unsafe.Pointer(utlsConn.Conn)
 			} else if realityConn, ok := iConn.(*reality.UConn); ok {
 				t = reflect.TypeOf(realityConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(realityConn.Conn))
+				p = unsafe.Pointer(realityConn.Conn)
 			} else {
 				handled, rustInput, rustRaw, err := getVisionBuffersForRustConn(iConn, requestAddons.Flow)
 				if err != nil {
@@ -411,13 +431,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 			}
 			if t != nil {
-				i, iOK := t.FieldByName("input")
-				r, rOK := t.FieldByName("rawInput")
-				if !iOK || !rOK {
-					return errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+				var layoutErr error
+				input, rawInput, layoutErr = resolveVisionInternalReaders(t, p)
+				if layoutErr != nil {
+					return layoutErr
 				}
-				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 			}
 		default:
 			return errors.New("unknown VLESS request command: ", request.Command)
