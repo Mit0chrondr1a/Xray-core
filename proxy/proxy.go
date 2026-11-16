@@ -2360,13 +2360,58 @@ func mapCopyGateReason(reason session.CopyGateReason) pipeline.CopyGateReason {
 	}
 }
 
+// countedReader restores the traffic accounting of a stat wrapper that
+// rawCopyReader had to peel together with a security wrapper.
+type countedReader struct {
+	buf.Reader
+	counter stats.Counter
+}
+
+func (r *countedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBuffer()
+	if !mb.IsEmpty() {
+		r.counter.Add(int64(mb.Len()))
+	}
+	return mb, err
+}
+
+// rawCopyReader returns the reader CopyRawConnIfExist must use for readerConn.
+//
+// Both callers hand a connection over only once its byte stream no longer
+// passes through the wrapper's userspace TLS: freedom requires a RAW transport
+// without security, and XtlsRead calls in only after the Vision reader switched
+// to direct copy and drained the wrapper's buffers. From then on the peer sends
+// raw bytes, so reading through a Go TLS / uTLS / REALITY wrapper would parse
+// them as outer TLS records and kill the flow ("bad record MAC"). Peel the
+// wrapper exactly as upstream does.
+//
+// Two wrappers must stay in place and UnwrapRawConn already accounts for both:
+// a deferred rustls conn that still terminates TLS is returned unpeeled, and a
+// kTLS socket is read through the key-update aware reader.
+func rawCopyReader(readerConn net.Conn) buf.Reader {
+	rawConn, readCounter, _, handler := UnwrapRawConn(readerConn)
+	if rawConn == nil || rawConn == readerConn {
+		return buf.NewReader(readerConn)
+	}
+	var reader buf.Reader
+	if handler != nil {
+		reader = buf.NewReader(&ktlsReader{Conn: rawConn, handler: handler})
+	} else {
+		reader = buf.NewReader(rawConn)
+	}
+	if readCounter != nil {
+		return &countedReader{Reader: reader, counter: readCounter}
+	}
+	return reader
+}
+
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
 func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer signal.ActivityUpdater, inTimer *signal.ActivityTimer) error {
 	disableAccel := os.Getenv("XRAY_DEBUG_DISABLE_ACCEL") == "1"
 	disableIdle := os.Getenv("XRAY_DEBUG_IDLE_INFINITE") == "1"
-	userspaceReader := buf.NewReader(readerConn)
+	userspaceReader := rawCopyReader(readerConn)
 	visionCh := session.VisionSignalFromContext(ctx)
 	visionTimestamps := session.VisionTimestampsFromContext(ctx)
 	flowTimings := session.FlowTimingsFromContext(ctx)
