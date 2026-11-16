@@ -77,7 +77,10 @@ func TestXHTTPKTLSListenerEligible(t *testing.T) {
 
 func TestXHTTPKREALITYListenerEligible(t *testing.T) {
 	basePort := net.Port(443)
-	baseReality := &reality.Config{}
+	// Every row except the default-mode one opts in, so each still tests the
+	// condition it names.
+	optIn := &reality.NativePathPolicy{Mode: reality.NativePathMode_PREFER_NATIVE}
+	baseReality := &reality.Config{NativePathPolicy: optIn}
 
 	tests := []struct {
 		name              string
@@ -133,19 +136,40 @@ func TestXHTTPKREALITYListenerEligible(t *testing.T) {
 			name: "mldsa65 seed configured",
 			port: basePort,
 			realityConfig: &reality.Config{
-				Mldsa65Seed: make([]byte, 32),
+				Mldsa65Seed:      make([]byte, 32),
+				NativePathPolicy: optIn,
 			},
 			nativeAvailable:   true,
 			fullKTLSSupported: true,
 			want:              false,
 		},
 		{
-			name:              "eligible",
+			// Default mode keeps the Go REALITY listener: the rustls handshake
+			// is not shaped after the target, so it is never a default.
+			name:              "default mode keeps go reality",
+			port:              basePort,
+			realityConfig:     &reality.Config{},
+			nativeAvailable:   true,
+			fullKTLSSupported: true,
+			want:              false,
+		},
+		{
+			name:              "explicit prefer native opt-in",
 			port:              basePort,
 			realityConfig:     baseReality,
 			nativeAvailable:   true,
 			fullKTLSSupported: true,
 			want:              true,
+		},
+		{
+			name: "explicit disable",
+			port: basePort,
+			realityConfig: &reality.Config{
+				NativePathPolicy: &reality.NativePathPolicy{Mode: reality.NativePathMode_DISABLE_NATIVE},
+			},
+			nativeAvailable:   true,
+			fullKTLSSupported: true,
+			want:              false,
 		},
 	}
 

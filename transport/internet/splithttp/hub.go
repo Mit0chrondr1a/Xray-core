@@ -764,6 +764,11 @@ func xhttpKREALITYListenerEligible(
 	if port == 0 || !nativeAvailable || !fullKTLSSupported || realityConfig == nil {
 		return false
 	}
+	// The rustls REALITY handshake does not shape itself after the target the
+	// way Go REALITY does, so it is opt-in only; the default keeps Go REALITY.
+	if !reality.NativeServerHandshakeOptedIn(realityConfig) {
+		return false
+	}
 	if socketSettings != nil && socketSettings.AcceptProxyProtocol {
 		return false
 	}

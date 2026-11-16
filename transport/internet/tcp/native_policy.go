@@ -29,7 +29,7 @@ const (
 	nativeSkipReasonKTLSSupported           = "ktls_not_supported"
 	nativeSkipReasonMissingRealityConfig    = "missing_reality_config"
 	nativeSkipReasonProxyProtocolEnabled    = "accept_proxy_protocol_enabled"
-	nativeSkipReasonLoopbackAutoGuard       = "loopback_listener_auto_guard"
+	nativeSkipReasonAutoGoHandshake         = "auto_keeps_go_reality_handshake"
 	nativeSkipReasonVisionInboundGuard      = "vision_inbound_go_fallback_guard"
 	nativeSkipReasonDeferredPromotionPaused = "deferred_ktls_promotion_cooldown"
 	nativeSkipReasonMldsaConfigured         = "mldsa65_seed_configured"
@@ -40,7 +40,7 @@ const (
 )
 
 const (
-	nativeRealityModeEnv = "XRAY_DEBUG_NATIVE_REALITY_MODE"
+	nativeRealityModeEnv = reality.NativePathModeEnv
 )
 
 type nativeAttemptOutcome string
@@ -161,23 +161,7 @@ func effectiveNativePathPolicy(cfg *reality.Config) *reality.NativePathPolicy {
 }
 
 func debugNativePathModeOverride() (reality.NativePathMode, bool) {
-	raw := strings.TrimSpace(os.Getenv(nativeRealityModeEnv))
-	if raw == "" {
-		return reality.NativePathMode_AUTO, false
-	}
-	normalized := strings.ToUpper(strings.ReplaceAll(raw, "-", "_"))
-	switch normalized {
-	case "AUTO":
-		return reality.NativePathMode_AUTO, true
-	case "PREFER_NATIVE", "PREFER":
-		return reality.NativePathMode_PREFER_NATIVE, true
-	case "FORCE_NATIVE", "FORCE":
-		return reality.NativePathMode_FORCE_NATIVE, true
-	case "DISABLE_NATIVE", "DISABLE", "OFF":
-		return reality.NativePathMode_DISABLE_NATIVE, true
-	default:
-		return reality.NativePathMode_AUTO, false
-	}
+	return reality.NativePathModeOverride()
 }
 
 func nativePathModeName(mode reality.NativePathMode) string {
@@ -615,17 +599,6 @@ func shouldAttemptNativeReality(v *Listener) nativeAttemptDecision {
 	return shouldAttemptNativeRealityForAddr(v, localAddr)
 }
 
-func isLoopbackAddr(addr stdnet.Addr) bool {
-	switch a := addr.(type) {
-	case *stdnet.TCPAddr:
-		return a != nil && a.IP != nil && a.IP.IsLoopback()
-	case *stdnet.UDPAddr:
-		return a != nil && a.IP != nil && a.IP.IsLoopback()
-	default:
-		return false
-	}
-}
-
 func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativeAttemptDecision {
 	policy := effectiveNativePathPolicy(v.realityXrayConfig)
 	decision := nativeAttemptDecision{
@@ -640,7 +613,7 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		decision.AllowFallback = false
 		decision.FailStop = true
 	}
-	if os.Getenv("XRAY_DEBUG_DISABLE_NATIVE_REALITY") == "1" {
+	if os.Getenv(reality.NativePathDisableEnv) == "1" {
 		decision.SkipByPolicy = true
 		decision.SkipReason = nativeSkipReasonDebugDisabled
 		return decision
@@ -669,9 +642,15 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		}
 		return decision
 	}
-	if policy.GetMode() == reality.NativePathMode_AUTO && isLoopbackAddr(localAddr) {
+	if policy.GetMode() == reality.NativePathMode_AUTO {
+		// AUTO keeps the Go REALITY handshake on every listener. Go REALITY
+		// shapes each authenticated handshake after the real target (ServerHello
+		// template, handshake record lengths, post-handshake records); the rustls
+		// handshake does not, which an on-path observer can see without probing.
+		// The native handshake is therefore opt-in only (PREFER_NATIVE or
+		// FORCE_NATIVE). See reality.NativeServerHandshakeOptedIn.
 		decision.SkipByPolicy = true
-		decision.SkipReason = nativeSkipReasonLoopbackAutoGuard
+		decision.SkipReason = nativeSkipReasonAutoGoHandshake
 		return decision
 	}
 	breaker := getNativePathBreaker(nativePathBreakerScopeKey(v), policy)
@@ -688,7 +667,7 @@ func shouldAttemptNativeRealityForAddr(v *Listener, localAddr stdnet.Addr) nativ
 		return decision
 	}
 	switch policy.GetMode() {
-	case reality.NativePathMode_AUTO, reality.NativePathMode_PREFER_NATIVE, reality.NativePathMode_FORCE_NATIVE:
+	case reality.NativePathMode_PREFER_NATIVE, reality.NativePathMode_FORCE_NATIVE:
 		decision.Attempt = true
 	default:
 		decision.SkipByPolicy = true

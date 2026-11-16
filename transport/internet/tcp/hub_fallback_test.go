@@ -749,8 +749,8 @@ func TestShouldAttemptNativeRealityModeOverrideInvalidIgnored(t *testing.T) {
 	if !decision.SkipByPolicy {
 		t.Fatal("expected invalid env mode override to hit loopback AUTO policy skip")
 	}
-	if decision.SkipReason != nativeSkipReasonLoopbackAutoGuard {
-		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonLoopbackAutoGuard)
+	if decision.SkipReason != nativeSkipReasonAutoGoHandshake {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonAutoGoHandshake)
 	}
 }
 
@@ -770,7 +770,7 @@ func TestShouldAttemptNativeRealitySkipByBreaker(t *testing.T) {
 	v := &Listener{
 		realityXrayConfig: &xrayreality.Config{
 			NativePathPolicy: &xrayreality.NativePathPolicy{
-				Mode:             xrayreality.NativePathMode_AUTO,
+				Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
 				AllowFallback:    true,
 				TelemetryEnforce: true,
 				Breaker: &xrayreality.NativePathBreaker{
@@ -1043,8 +1043,8 @@ func TestLoopbackListenerAutoSkipsNative(t *testing.T) {
 	if !decision.SkipByPolicy {
 		t.Fatal("expected loopback listener in AUTO to skip by policy")
 	}
-	if decision.SkipReason != nativeSkipReasonLoopbackAutoGuard {
-		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonLoopbackAutoGuard)
+	if decision.SkipReason != nativeSkipReasonAutoGoHandshake {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonAutoGoHandshake)
 	}
 }
 
@@ -1112,8 +1112,8 @@ func TestLoopbackConnLocalAddrAutoSkipsNative(t *testing.T) {
 	if !decision.SkipByPolicy {
 		t.Fatal("expected loopback conn local addr in AUTO to skip by policy")
 	}
-	if decision.SkipReason != nativeSkipReasonLoopbackAutoGuard {
-		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonLoopbackAutoGuard)
+	if decision.SkipReason != nativeSkipReasonAutoGoHandshake {
+		t.Fatalf("skip reason = %s, want %s", decision.SkipReason, nativeSkipReasonAutoGoHandshake)
 	}
 }
 
@@ -1376,5 +1376,67 @@ func TestLoopbackIngressPeerAbortDoesNotOpenBreakerWhenPreferNative(t *testing.T
 	}
 	if decision.SkipByBreaker {
 		t.Fatalf("peer-abort should not open breaker, got skip reason %s", decision.SkipReason)
+	}
+}
+
+// AUTO is the default mode. It must keep the Go REALITY handshake on every
+// listener, public ones included: Go REALITY shapes each authenticated
+// handshake after the real target and the rustls handshake does not, so running
+// the latter by default would change what an on-path observer sees.
+func TestShouldAttemptNativeRealityAutoKeepsGoHandshakeOnPublicListener(t *testing.T) {
+	oldAvail := nativeEligibilityAvailableFn
+	oldKTLS := nativeEligibilityFullKTLSSupportedFn
+	nativeEligibilityAvailableFn = func() bool { return true }
+	nativeEligibilityFullKTLSSupportedFn = func() bool { return true }
+	defer func() {
+		nativeEligibilityAvailableFn = oldAvail
+		nativeEligibilityFullKTLSSupportedFn = oldKTLS
+	}()
+	public := &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 443}
+
+	for _, tc := range []struct {
+		name   string
+		policy *xrayreality.NativePathPolicy
+	}{
+		{"no policy configured", nil},
+		{"explicit AUTO", &xrayreality.NativePathPolicy{
+			Mode:             xrayreality.NativePathMode_AUTO,
+			AllowFallback:    true,
+			TelemetryEnforce: true,
+			Breaker:          defaultNativePathPolicy().Breaker,
+		}},
+	} {
+		v := &Listener{
+			inboundTag:        "reality-public-auto",
+			config:            &Config{},
+			realityXrayConfig: &xrayreality.Config{NativePathPolicy: tc.policy},
+		}
+		decision := shouldAttemptNativeRealityForAddr(v, public)
+		if decision.Attempt {
+			t.Fatalf("%s: AUTO must not attempt the rustls REALITY handshake", tc.name)
+		}
+		if !decision.SkipByPolicy || decision.SkipReason != nativeSkipReasonAutoGoHandshake {
+			t.Fatalf("%s: skip=%v reason=%s, want policy skip with %s", tc.name, decision.SkipByPolicy, decision.SkipReason, nativeSkipReasonAutoGoHandshake)
+		}
+		if decision.FailStop {
+			t.Fatalf("%s: AUTO skip must fall through to Go REALITY, not fail-stop", tc.name)
+		}
+	}
+
+	optIn := &Listener{
+		inboundTag: "reality-public-prefer",
+		config:     &Config{},
+		realityXrayConfig: &xrayreality.Config{NativePathPolicy: &xrayreality.NativePathPolicy{
+			Mode:             xrayreality.NativePathMode_PREFER_NATIVE,
+			AllowFallback:    true,
+			TelemetryEnforce: true,
+			Breaker:          defaultNativePathPolicy().Breaker,
+		}},
+	}
+	scope := nativePathBreakerScopeKey(optIn)
+	nativePathBreakerByScope.Delete(scope)
+	t.Cleanup(func() { nativePathBreakerByScope.Delete(scope) })
+	if decision := shouldAttemptNativeRealityForAddr(optIn, public); !decision.Attempt {
+		t.Fatalf("PREFER_NATIVE must stay an explicit opt-in to the native path; skip reason=%s", decision.SkipReason)
 	}
 }

@@ -93,15 +93,23 @@ var (
 	doRustRealityDeferredFn = func(v *Listener, fd int) (*native.DeferredResult, error) {
 		return v.doRustRealityDeferred(fd)
 	}
-	// Rust REALITY server path re-enabled with deferred kTLS:
-	// TLS handshake completes via rustls but kTLS is NOT installed yet.
-	// The VLESS handler decides: Vision flows keep rustls (no kTLS),
-	// non-Vision flows call EnableKTLS() to install kTLS in-place.
-	// Camouflage is preserved: auth uses MSG_PEEK so unauthenticated
-	// probers always fall through to Go goreality which mirrors the
-	// real Dest's ServerHello. Only authenticated clients (our own
-	// Xray clients) see the Rust ServerHello.
-	// See docs/ktls-vision-incompatibility.md.
+	// Rust REALITY server path with deferred kTLS: the TLS handshake completes
+	// via rustls but kTLS is NOT installed yet. The VLESS handler decides:
+	// Vision flows keep rustls (no kTLS), non-Vision flows call EnableKTLS()
+	// to install kTLS in-place.
+	//
+	// Camouflage scope, precisely:
+	//   - Unauthenticated connections are untouched. Auth uses MSG_PEEK, and
+	//     anything that cannot authenticate (wrong key, non-TLS bytes, an
+	//     oversized record, an early close) is handed to Go REALITY with the
+	//     bytes intact, which mirrors it to the real Dest as upstream does.
+	//   - Authenticated connections are NOT equivalent to upstream on the
+	//     wire. Go REALITY shapes its handshake after the Dest (ServerHello
+	//     template, handshake record lengths, post-handshake records); the
+	//     rustls handshake does not, and every on-path observer sees that
+	//     ServerHello, not only our own clients.
+	// That is why the native path is opt-in (PREFER_NATIVE / FORCE_NATIVE) and
+	// AUTO keeps Go REALITY. See reality.NativeServerHandshakeOptedIn.
 	useNativeRealityServerFn = nativeRealityServerEligible
 )
 
