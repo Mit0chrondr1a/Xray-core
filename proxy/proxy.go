@@ -2405,6 +2405,198 @@ func rawCopyReader(readerConn net.Conn) buf.Reader {
 	return reader
 }
 
+// visionUpstreamCopyLane reports whether this leg belongs to a direct Vision
+// flow with no deferred rustls connection on either side: a Go TLS / Go
+// REALITY inbound on the server, or a Vision outbound on a client or relay.
+//
+// Such flows have an exact raw handoff (Vision swaps reader and writer
+// synchronously, and Go TLS keeps no pending output after the handshake), so
+// they follow the upstream copy algorithm (copyVisionUpstreamLane). They never
+// enter the deferred-rustls prediction loop below, whose await-signal phases
+// and 3-60s idle ceilings exist only to bridge the rustls drain/detach
+// boundary and would close healthy keep-alive connections.
+func visionUpstreamCopyLane(ctx context.Context, readerConn, writerConn net.Conn) bool {
+	// The raw-writer proof is created by the VLESS inbound and outbound for
+	// direct Vision flows only (never for mux/reverse parents or fallbacks).
+	if session.VisionRawWriterProofFromContext(ctx) == nil {
+		return false
+	}
+	return unwrapVisionDeferredConn(readerConn) == nil && unwrapVisionDeferredConn(writerConn) == nil
+}
+
+// visionGoTLSLane reports whether a server-side direct Vision flow terminates
+// its outer TLS in a Go TLS / Go REALITY connection and is still a splice
+// candidate, i.e. its response leg is driven by the upstream copy algorithm
+// and may end in splice(2).
+func visionGoTLSLane(ctx context.Context, inbound *session.Inbound, clientConn net.Conn) bool {
+	if inbound == nil || clientConn == nil {
+		return false
+	}
+	if session.VisionRawWriterProofFromContext(ctx) == nil {
+		return false
+	}
+	switch inbound.GetCanSpliceCopy() {
+	case session.CopyGatePendingDetach, session.CopyGateEligible:
+	default:
+		return false
+	}
+	return unwrapVisionDeferredConn(clientConn) == nil
+}
+
+// visionGoTLSLaneSpliceFlows counts response legs the Vision upstream lane
+// handed to splice(2).
+var visionGoTLSLaneSpliceFlows atomic.Uint64
+
+// VisionGoTLSLaneSpliceFlows returns how many Go TLS/REALITY Vision response
+// legs have been handed to splice(2) since process start.
+func VisionGoTLSLaneSpliceFlows() uint64 {
+	return visionGoTLSLaneSpliceFlows.Load()
+}
+
+// IsVisionGoTLSLane reports whether the flow in ctx is a server-side direct
+// Vision flow on a Go TLS / Go REALITY inbound connection, i.e. one whose
+// response leg is driven by the upstream copy algorithm.
+func IsVisionGoTLSLane(ctx context.Context) bool {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil {
+		return false
+	}
+	return visionGoTLSLane(ctx, inbound, inbound.Conn)
+}
+
+// copyVisionUpstreamLane is the upstream CopyRawConnIfExist loop: forward in
+// userspace until the copy gate is eligible on both ends, then hand the rest of
+// the stream to splice(2). It adds one stricter condition than upstream: the
+// splice needs directionalRawCopyReady, i.e. a direct raw source and a Vision
+// writer that committed its first raw write to the exact physical socket
+// (VisionRawWriterProof). That closes the ordering window upstream papers over
+// with a 1ms sleep. Client and relay legs, whose sink is fed through a pipe,
+// therefore stay in userspace.
+//
+// Deliberately absent, to stay behavior-identical with upstream: read
+// deadlines, signal polling and idle ceilings. Session lifetime stays with the
+// caller's activity timer.
+func copyVisionUpstreamLane(
+	ctx context.Context,
+	readerConn, writerConn net.Conn,
+	reader buf.Reader,
+	writer buf.Writer,
+	timer signal.ActivityUpdater,
+	inTimer *signal.ActivityTimer,
+	inbound *session.Inbound,
+	outbounds []*session.Outbound,
+	decision *pipeline.DecisionSnapshot,
+	flowTimings *session.FlowTimings,
+	disableAccel bool,
+) error {
+	errors.LogDebug(ctx, "CopyRawConn: Vision upstream lane")
+	userspaceStart := time.Now()
+	decision.Path = pipeline.PathUserspace
+
+	var (
+		rawResolved               bool
+		rawReader                 net.Conn
+		rawWriter                 *net.TCPConn
+		readCounter, writeCounter stats.Counter
+	)
+	// The wrapper chain of a Go TLS/REALITY conn is static, so one resolution
+	// is enough. A non-TCP client socket simply never splices, as upstream.
+	resolveRaw := func() bool {
+		if rawResolved {
+			return rawWriter != nil
+		}
+		rawResolved = true
+		if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+			return false
+		}
+		candidateReader, candidateReadCounter, _, _ := UnwrapRawConn(readerConn)
+		candidateWriter, _, candidateWriteCounter, _ := UnwrapRawConn(writerConn)
+		tc, ok := candidateWriter.(*net.TCPConn)
+		if !ok || tc == nil || candidateReader == nil {
+			return false
+		}
+		rawReader, rawWriter = candidateReader, tc
+		readCounter, writeCounter = candidateReadCounter, candidateWriteCounter
+		return true
+	}
+
+	for {
+		gate := inbound.GetCanSpliceCopy()
+		splice := !disableAccel && gate == session.CopyGateEligible
+		if splice {
+			for _, ob := range outbounds {
+				if ob.GetCanSpliceCopy() != session.CopyGateEligible {
+					splice = false
+					break
+				}
+			}
+		}
+		if splice && resolveRaw() && directionalRawCopyReady(ctx, gate, readerConn, writerConn, rawWriter) {
+			visionGoTLSLaneSpliceFlows.Add(1)
+			decision.Path = pipeline.PathSplice
+			decision.Reason = pipeline.ReasonSplicePrimary
+			decision.CopyGateState = mapCopyGateState(gate)
+			decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
+			errors.LogDebug(ctx, "CopyRawConn splice")
+			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
+			time.Sleep(time.Millisecond) // kept from upstream: rare ssl error for freedom splice without it
+			// Splice takes over connection lifecycle. Transfer timer ownership explicitly.
+			if activityTimer, ok := timer.(*signal.ActivityTimer); ok && activityTimer != nil {
+				activityTimer.SetTimeout(24 * time.Hour) // prevent leak, just in case
+			}
+			if inTimer != nil {
+				inTimer.SetTimeout(24 * time.Hour)
+			}
+			spliceStart := time.Now()
+			w, err := rawWriter.ReadFrom(rawReader)
+			decision.SpliceBytes = w
+			decision.SpliceDurationNs = time.Since(spliceStart).Nanoseconds()
+			if readCounter != nil {
+				readCounter.Add(w) // outbound stats
+			}
+			if writeCounter != nil {
+				writeCounter.Add(w) // inbound stats
+			}
+			if statWriter != nil {
+				statWriter.Counter.Add(w) // user stats
+			}
+			if err == nil || errors.Cause(err) == io.EOF {
+				return nil
+			}
+			if isExpectedSpliceReadFromError(err) {
+				recordSpliceExpectedTeardownClass(err)
+				errors.LogDebug(ctx, "[kind=vision.splice_expected_teardown] splice/readfrom closed by peer or stream teardown: ", err)
+				return nil
+			}
+			recordSpliceUnexpectedReset(err)
+			errors.LogWarning(ctx, "[kind=vision.splice_unexpected_error] splice/readfrom failed: ", err)
+			return err
+		}
+
+		buffer, err := reader.ReadMultiBuffer()
+		if !buffer.IsEmpty() {
+			recordFirstResponseByte(flowTimings, time.Now())
+			decision.UserspaceBytes += int64(buffer.Len())
+			timer.Update()
+			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
+				decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
+				return werr
+			}
+		}
+		if err != nil {
+			decision.UserspaceDurationNs = time.Since(userspaceStart).Nanoseconds()
+			applyUserspaceExit(decision, err, false)
+			if errors.Cause(err) == io.EOF {
+				if decision.Reason == pipeline.ReasonDefault {
+					decision.Reason = pipeline.ReasonUserspaceComplete
+				}
+				return nil
+			}
+			return err
+		}
+	}
+}
+
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
@@ -2642,6 +2834,10 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				decision.DNSPlane = string(session.DNSPlaneVisionGuard)
 			}
 		}
+	}
+
+	if !dnsGuardFlow && visionUpstreamCopyLane(ctx, readerConn, writerConn) {
+		return copyVisionUpstreamLane(ctx, readerConn, writerConn, userspaceReader, writer, timer, inTimer, inbound, outbounds, &decision, flowTimings, disableAccel)
 	}
 
 	loggedUserspaceLoop := false

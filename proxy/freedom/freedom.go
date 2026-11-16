@@ -830,7 +830,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			proxyOwnsResponseTimeout = true
 		}
 		defer func() {
-			if !proxyOwnsResponseTimeout {
+			// Go TLS/REALITY Vision flows run the upstream response loop, which
+			// has no timeout policy of its own. Keep the upstream rule for them:
+			// once the uplink is done, the downlink-only timeout bounds the flow,
+			// so a spliced response cannot outlive a departed client for 24h.
+			if !proxyOwnsResponseTimeout || proxy.IsVisionGoTLSLane(ctx) {
 				timer.SetTimeout(downlinkTimeout)
 			}
 		}()

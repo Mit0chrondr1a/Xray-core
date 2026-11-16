@@ -114,10 +114,17 @@ func applyVisionExecutionGate(inbound *session.Inbound, request *protocol.Reques
 		inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 		return
 	}
-	// The legacy Go TLS/REALITY path does not have a reliable detach signal
-	// boundary. Keep it on the userspace path from the start instead of sending
-	// the generic copy loop into pending-detach prediction mode.
-	inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonUnspecified)
+	if inbound.CopyGateState() == session.CopyGateForcedUserspace {
+		// A security guard (full-random XorConn, non-RAW transport, nested
+		// security conn) already pinned this flow to userspace. Never widen it.
+		return
+	}
+	// Go TLS / Go REALITY: same contract as upstream. The flow starts in
+	// pending-detach and becomes splice-eligible once Vision switches to direct
+	// copy. The response leg runs the upstream copy algorithm for these flows
+	// (see proxy.copyVisionUpstreamLane), not the deferred-rustls prediction loop,
+	// so no detach signal boundary has to be inferred.
+	inbound.SetCanSpliceCopy(session.CopyGatePendingDetach)
 }
 
 func init() {
