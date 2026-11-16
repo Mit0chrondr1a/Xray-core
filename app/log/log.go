@@ -89,10 +89,10 @@ func (g *Instance) startInternal() error {
 	g.active = true
 
 	if err := g.initAccessLogger(); err != nil {
-		return errors.New("failed to initialize access logger").Base(err).AtWarning()
+		return errors.New("failed to initialize access logger").Base(err)
 	}
 	if err := g.initErrorLogger(); err != nil {
-		return errors.New("failed to initialize error logger").Base(err).AtWarning()
+		return errors.New("failed to initialize error logger").Base(err)
 	}
 
 	return nil
@@ -151,6 +151,10 @@ func (g *Instance) IsSeverityEnabled(severity log.Severity) bool {
 	}
 
 	return severity <= g.config.ErrorLogLevel
+}
+
+func (g *Instance) Severity() log.Severity {
+	return g.config.ErrorLogLevel
 }
 
 // Close implements common.Closable.Close().

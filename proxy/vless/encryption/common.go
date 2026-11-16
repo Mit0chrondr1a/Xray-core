@@ -15,8 +15,8 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
-	"golang.org/x/crypto/chacha20poly1305"
 	"github.com/xtls/xray-core/common/native"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 var OutBytesPool = sync.Pool{
@@ -108,7 +108,7 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 	if _, err := io.ReadFull(c.Conn, peerHeader[:]); err != nil {
 		return 0, err
 	}
-	l, err := DecodeHeader(peerHeader[:]) // l: 17~17000
+	l, err := DecodeHeader(peerHeader[:]) // l: 17~16640
 	if err != nil {
 		if c.Client != nil && strings.Contains(err.Error(), "invalid header: ") { // client's 0-RTT
 			c.Client.RWLock.Lock()
@@ -217,7 +217,7 @@ func DecodeHeader(h []byte) (l int, err error) {
 	if h[0] != 23 || h[1] != 3 || h[2] != 3 {
 		l = 0
 	}
-	if l < 17 || l > 17000 { // TODO: TLSv1.3 max length
+	if l < 17 || l > 16640 { // TLS 1.3 max record: 16384 + 256 (RFC 8446 §5.2)
 		// DO NOT CHANGE format: relied by client's Read()
 		err = errors.New("invalid header: [" +
 			strconv.Itoa(int(h[0])) + " " +

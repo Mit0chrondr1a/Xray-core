@@ -32,6 +32,7 @@ const (
 	visionTimestampsKey       ctx.SessionKey = 17 // per-flow Vision timestamp storage
 	flowTimingsKey            ctx.SessionKey = 18 // per-flow latency timing storage
 	visionRawWriterProofKey   ctx.SessionKey = 19 // per-flow physical writer commit proof
+	streamSettingsKey         ctx.SessionKey = 20 // inbound stream settings (upstream key 13 is taken by visionFlowKey)
 )
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -272,4 +273,12 @@ func FlowTimingsFromContext(ctx context.Context) *FlowTimings {
 		return val
 	}
 	return nil
+}
+
+func ContextWithStreamSettings(ctx context.Context, streamSettings any) context.Context {
+	return context.WithValue(ctx, streamSettingsKey, streamSettings)
+}
+
+func StreamSettingsFromContext(ctx context.Context) any {
+	return ctx.Value(streamSettingsKey)
 }

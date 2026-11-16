@@ -15,9 +15,9 @@ func TestEncodeDecodeHeaderRoundTrip(t *testing.T) {
 	}{
 		{"min valid", 17, true},
 		{"typical", 1024, true},
-		{"max valid", 17000, true},
+		{"max valid", 16640, true},
 		{"too small", 16, false},
-		{"too large", 17001, false},
+		{"too large", 16641, false},
 		{"zero", 0, false},
 	}
 	for _, tt := range tests {

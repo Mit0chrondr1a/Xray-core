@@ -39,6 +39,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/ebpf"
+	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	xtcptunnel "github.com/xtls/xray-core/transport/internet/tcp"
@@ -396,14 +397,14 @@ type VisionReader struct {
 	signalCh     chan session.VisionSignal
 	detachFuture *visionDetachFuture
 	input        *bytes.Reader
-	rawInput     *bytes.Buffer
+	rawInput     **bytes.Buffer
 	ob           *session.Outbound
 
 	// internal
 	directReadCounter stats.Counter
 }
 
-func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, signalCh chan session.VisionSignal, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
+func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, signalCh chan session.VisionSignal, input *bytes.Reader, rawInput **bytes.Buffer, ob *session.Outbound) *VisionReader {
 	return &VisionReader{
 		Reader:       reader,
 		trafficState: trafficState,
@@ -1226,10 +1227,12 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				w.input = nil
 			}
 			if w.rawInput != nil {
-				if rawInputBuffer, err := buf.ReadFrom(w.rawInput); err == nil && !rawInputBuffer.IsEmpty() {
-					buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
+				if raw := *w.rawInput; raw != nil {
+					if rawInputBuffer, err := buf.ReadFrom(raw); err == nil && !rawInputBuffer.IsEmpty() {
+						buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
+					}
+					// *raw = bytes.Buffer{} // may not be suitable for Go 1.27.3+
 				}
-				*w.rawInput = bytes.Buffer{} // release memory
 				w.rawInput = nil
 			}
 		}
@@ -1259,6 +1262,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		if w.isUplink {
 			sendVisionSignal(w.signalCh, session.VisionSignal{Command: 2})
 		}
+		SuppressOuterCloseNotify(w.conn)
 		readerConn, readCounter, _, readerHandler := UnwrapRawConn(w.conn)
 		w.directReadCounter = readCounter
 		if readerHandler != nil {
@@ -1365,6 +1369,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 		if switchNow {
+			SuppressOuterCloseNotify(w.conn)
 			rawConn, _, writerCounter, _ := UnwrapRawConn(w.conn)
 			w.Writer = buf.NewWriter(rawConn)
 			w.directWriteCounter = writerCounter
@@ -1865,6 +1870,19 @@ func (r *ktlsReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
+type CloseNotifySuppressor interface {
+	SuppressCloseNotify()
+}
+
+// Close our local TLS conn instance might send a incorrect close_notify alert
+// if the XTLS direct copy mode is enabled and cause TLS BAD_RECORD_MAC on users' browser
+// Close the underlying connection directly to avoid this issue.
+func SuppressOuterCloseNotify(conn net.Conn) {
+	if suppressor, ok := stat.TryUnwrapStatsConn(conn).(CloseNotifySuppressor); ok {
+		suppressor.SuppressCloseNotify()
+	}
+}
+
 // UnwrapRawConn support unwrap encryption, stats, tls, utls, reality, proxyproto, uds-wrapper conn and get raw tcp/uds conn from it
 func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.KTLSKeyUpdateHandler) {
 	var readCounter, writerCounter stats.Counter
@@ -1906,6 +1924,9 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, *tls.
 				conn = realityUConn.NetConn()
 			}
 		}
+
+		conn = finalmask.UnwrapTcpMask(conn)
+
 		if pc, ok := conn.(*proxyproto.Conn); ok {
 			conn = pc.Raw()
 			// 8192 > 4096, there is no need to process pc's bufReader
@@ -1987,6 +2008,14 @@ func determineSocketCryptoHintRecurse(conn net.Conn, depth int) (net.Conn, ebpf.
 				return nil, ebpf.CryptoUnknown, appendCryptoHintSource(source, "nil-inner")
 			}
 			conn = raw
+			depth++
+			continue
+		case finalmask.TcpMaskConn:
+			if !wrapped.Splice() {
+				return nil, ebpf.CryptoUnknown, appendCryptoHintSource(source, "finalmask(byte-transforming)")
+			}
+			source = appendCryptoHintSource(source, "finalmask(splice-transparent)")
+			conn = wrapped.RawConn()
 			depth++
 			continue
 		}
@@ -3468,6 +3497,7 @@ func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer sign
 
 func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {
 	iConn := stat.TryUnwrapStatsConn(conn)
+	iConn = finalmask.UnwrapTcpMask(iConn)
 	_, ok1 := iConn.(*proxyproto.Conn)
 	_, ok2 := iConn.(*net.TCPConn)
 	_, ok3 := iConn.(*internet.UnixConnWrapper)

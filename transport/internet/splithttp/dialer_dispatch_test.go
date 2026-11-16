@@ -5,6 +5,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 )
 
@@ -14,7 +15,7 @@ func (dispatchStrategyStub) IsClosed() bool { return false }
 func (dispatchStrategyStub) OpenStream(context.Context, string, string, io.Reader, bool) (io.ReadCloser, xnet.Addr, xnet.Addr, error) {
 	return nil, nil, nil, nil
 }
-func (dispatchStrategyStub) PostPacket(context.Context, string, string, string, io.Reader, int64) error {
+func (dispatchStrategyStub) PostPacket(context.Context, string, string, string, buf.MultiBuffer) error {
 	return nil
 }
 

@@ -12,24 +12,24 @@ func TestSessionManagerAllocateMaxConcurrency(t *testing.T) {
 	m := NewSessionManager()
 	strategy := &ClientStrategy{MaxConcurrency: 2}
 
-	s1 := m.Allocate(strategy)
+	s1 := m.Allocate(strategy, nil, nil)
 	if s1 == nil {
 		t.Fatal("first Allocate should succeed")
 	}
-	s2 := m.Allocate(strategy)
+	s2 := m.Allocate(strategy, nil, nil)
 	if s2 == nil {
 		t.Fatal("second Allocate should succeed")
 	}
 
 	// Third allocation should fail: 2 active sessions = MaxConcurrency
-	s3 := m.Allocate(strategy)
+	s3 := m.Allocate(strategy, nil, nil)
 	if s3 != nil {
 		t.Fatal("third Allocate should return nil (MaxConcurrency=2)")
 	}
 
 	// Remove one session, then allocate should succeed again
 	m.Remove(false, s1.ID)
-	s4 := m.Allocate(strategy)
+	s4 := m.Allocate(strategy, nil, nil)
 	if s4 == nil {
 		t.Fatal("Allocate after Remove should succeed")
 	}
@@ -41,14 +41,14 @@ func TestSessionManagerAllocateMaxConnection(t *testing.T) {
 
 	// Allocate 3 sessions
 	for i := 0; i < 3; i++ {
-		s := m.Allocate(strategy)
+		s := m.Allocate(strategy, nil, nil)
 		if s == nil {
 			t.Fatalf("Allocate %d should succeed", i+1)
 		}
 	}
 
 	// Fourth allocation should fail: count=3 >= MaxConnection
-	s := m.Allocate(strategy)
+	s := m.Allocate(strategy, nil, nil)
 	if s != nil {
 		t.Fatal("Allocate should return nil when MaxConnection reached")
 	}
@@ -58,7 +58,7 @@ func TestSessionManagerAllocateOnClosed(t *testing.T) {
 	m := NewSessionManager()
 	m.Close()
 
-	s := m.Allocate(&ClientStrategy{})
+	s := m.Allocate(&ClientStrategy{}, nil, nil)
 	if s != nil {
 		t.Fatal("Allocate on closed manager should return nil")
 	}
@@ -76,7 +76,7 @@ func TestSessionManagerAddOnClosed(t *testing.T) {
 
 func TestSessionManagerGet(t *testing.T) {
 	m := NewSessionManager()
-	s := m.Allocate(&ClientStrategy{})
+	s := m.Allocate(&ClientStrategy{}, nil, nil)
 
 	got, found := m.Get(s.ID)
 	if !found {
@@ -94,7 +94,7 @@ func TestSessionManagerGet(t *testing.T) {
 
 func TestSessionManagerGetOnClosed(t *testing.T) {
 	m := NewSessionManager()
-	s := m.Allocate(&ClientStrategy{})
+	s := m.Allocate(&ClientStrategy{}, nil, nil)
 	m.Close()
 
 	_, found := m.Get(s.ID)
@@ -109,12 +109,12 @@ func TestSessionManagerCount(t *testing.T) {
 		t.Fatalf("initial Count=%d, want 0", m.Count())
 	}
 
-	m.Allocate(&ClientStrategy{})
+	m.Allocate(&ClientStrategy{}, nil, nil)
 	if m.Count() != 1 {
 		t.Fatalf("Count after 1 Allocate=%d, want 1", m.Count())
 	}
 
-	m.Allocate(&ClientStrategy{})
+	m.Allocate(&ClientStrategy{}, nil, nil)
 	if m.Count() != 2 {
 		t.Fatalf("Count after 2 Allocates=%d, want 2", m.Count())
 	}
@@ -126,7 +126,7 @@ func TestSessionManagerSize(t *testing.T) {
 		t.Fatalf("initial Size=%d, want 0", m.Size())
 	}
 
-	s := m.Allocate(&ClientStrategy{})
+	s := m.Allocate(&ClientStrategy{}, nil, nil)
 	if m.Size() != 1 {
 		t.Fatalf("Size after Allocate=%d, want 1", m.Size())
 	}
@@ -161,7 +161,7 @@ func TestSessionManagerCloseIdempotent(t *testing.T) {
 
 func TestSessionManagerRemoveOnClosed(t *testing.T) {
 	m := NewSessionManager()
-	s := m.Allocate(&ClientStrategy{})
+	s := m.Allocate(&ClientStrategy{}, nil, nil)
 	m.Close()
 
 	// Remove on closed manager should be a no-op (not panic).
@@ -182,7 +182,7 @@ func TestSessionManagerCloseIfNoSessionAndIdle(t *testing.T) {
 
 func TestSessionManagerCloseIfNoSessionAndIdleWithActiveSessions(t *testing.T) {
 	m := NewSessionManager()
-	m.Allocate(&ClientStrategy{})
+	m.Allocate(&ClientStrategy{}, nil, nil)
 
 	// Has active sessions, should not close
 	if m.CloseIfNoSessionAndIdle(m.Size(), m.Count()) {
@@ -202,7 +202,7 @@ func TestSessionManagerCloseIfNoSessionAndIdleAlreadyClosed(t *testing.T) {
 
 func TestSessionManagerCloseIfNoSessionAndIdleCountMismatch(t *testing.T) {
 	m := NewSessionManager()
-	s := m.Allocate(&ClientStrategy{})
+	s := m.Allocate(&ClientStrategy{}, nil, nil)
 	m.Remove(false, s.ID)
 
 	// Count=1 but checkCount=0 -> should not close (count mismatch)
@@ -228,9 +228,9 @@ func TestMaxXUDPSessionsConstant(t *testing.T) {
 
 func TestSessionIDMonotonicallyIncreasing(t *testing.T) {
 	m := NewSessionManager()
-	s1 := m.Allocate(&ClientStrategy{})
-	s2 := m.Allocate(&ClientStrategy{})
-	s3 := m.Allocate(&ClientStrategy{})
+	s1 := m.Allocate(&ClientStrategy{}, nil, nil)
+	s2 := m.Allocate(&ClientStrategy{}, nil, nil)
+	s3 := m.Allocate(&ClientStrategy{}, nil, nil)
 
 	if s1.ID >= s2.ID || s2.ID >= s3.ID {
 		t.Fatalf("session IDs should be monotonically increasing: %d, %d, %d", s1.ID, s2.ID, s3.ID)
@@ -241,7 +241,7 @@ func TestSessionIDsAreUnique(t *testing.T) {
 	m := NewSessionManager()
 	ids := make(map[uint16]bool)
 	for i := 0; i < 100; i++ {
-		s := m.Allocate(&ClientStrategy{})
+		s := m.Allocate(&ClientStrategy{}, nil, nil)
 		if s == nil {
 			t.Fatalf("Allocate %d returned nil", i)
 		}

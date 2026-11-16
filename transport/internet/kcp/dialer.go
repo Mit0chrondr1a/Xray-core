@@ -49,25 +49,15 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 	dest.Network = net.Network_UDP
 	errors.LogInfo(ctx, "dialing mKCP to ", dest)
 
-	rawConn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
-	if err != nil {
-		return nil, errors.New("failed to dial to dest: ", err).AtWarning().Base(err)
+	var conn net.Conn
+	var err error
+	if streamSettings.FinalMask != nil {
+		conn, err = streamSettings.FinalMask.DialUDP(ctx, dest)
+	} else {
+		conn, err = internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
 	}
-
-	if streamSettings.UdpmaskManager != nil {
-		wrapper, ok := rawConn.(*internet.PacketConnWrapper)
-		if !ok {
-			rawConn.Close()
-			return nil, errors.New("raw is not PacketConnWrapper")
-		}
-
-		raw := wrapper.Conn
-
-		wrapper.Conn, err = streamSettings.UdpmaskManager.WrapPacketConnClient(raw)
-		if err != nil {
-			raw.Close()
-			return nil, errors.New("mask err").Base(err)
-		}
+	if err != nil {
+		return nil, errors.New("failed to dial to dest: ", err).Base(err)
 	}
 
 	kcpSettings := streamSettings.ProtocolSettings.(*Config)
@@ -76,19 +66,19 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 
 	conv := uint16(atomic.AddUint32(&globalConv, 1))
 	session := NewConnection(ConnMetadata{
-		LocalAddr:    rawConn.LocalAddr(),
-		RemoteAddr:   rawConn.RemoteAddr(),
+		LocalAddr:    conn.LocalAddr(),
+		RemoteAddr:   conn.RemoteAddr(),
 		Conversation: conv,
-	}, rawConn, rawConn, kcpSettings)
+	}, conn, conn, kcpSettings)
 
-	go fetchInput(ctx, rawConn, reader, session)
+	go fetchInput(ctx, conn, reader, session)
 
 	var iConn stat.Connection = session
 
 	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
 		tlsConn := tls.Client(iConn, config.GetTLSConfig(tls.WithDestination(dest)))
 		if err := tlsConn.(*tls.Conn).HandshakeAndEnableKTLS(ctx); err != nil {
-			rawConn.Close()
+			conn.Close()
 			return nil, errors.New("failed to handshake TLS for mKCP").Base(err)
 		}
 		iConn = tlsConn
@@ -98,5 +88,5 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 }
 
 func init() {
-	common.Must(internet.RegisterTransportDialer(protocolName, DialKCP))
+	common.Must(internet.RegisterTransportDialer(ProtocolName, DialKCP))
 }

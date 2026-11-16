@@ -1,28 +1,33 @@
 package conf
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"net"
 	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
-	v2net "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/geodata"
+	"github.com/xtls/xray-core/common/log"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/proxy/freedom"
-	"google.golang.org/protobuf/proto"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
 )
 
 type FreedomConfig struct {
-	TargetStrategy string    `json:"targetStrategy"`
-	DomainStrategy string    `json:"domainStrategy"`
-	Redirect       string    `json:"redirect"`
-	UserLevel      uint32    `json:"userLevel"`
-	Fragment       *Fragment `json:"fragment"`
-	Noise          *Noise    `json:"noise"`
-	Noises         []*Noise  `json:"noises"`
-	ProxyProtocol  uint32    `json:"proxyProtocol"`
+	TargetStrategy string                    `json:"targetStrategy"`
+	DomainStrategy string                    `json:"domainStrategy"`
+	Redirect       string                    `json:"redirect"`
+	UserLevel      uint32                    `json:"userLevel"`
+	Fragment       *Fragment                 `json:"fragment"`
+	Noise          *Noise                    `json:"noise"`
+	Noises         []*Noise                  `json:"noises"`
+	ProxyProtocol  uint32                    `json:"proxyProtocol"`
+	IPsBlocked     *StringList               `json:"ipsBlocked"`
+	FinalRules     []*FreedomFinalRuleConfig `json:"finalRules"`
 }
 
 type Fragment struct {
@@ -39,8 +44,23 @@ type Noise struct {
 	ApplyTo string      `json:"applyTo"`
 }
 
+type FreedomFinalRuleConfig struct {
+	Action     string       `json:"action"`
+	Network    *NetworkList `json:"network"`
+	Port       *PortList    `json:"port"`
+	IP         *StringList  `json:"ip"`
+	Delay      *Int32Range  `json:"delay"`
+	LogLevel   string       `json:"logLevel"`
+	BlockDelay *Int32Range  `json:"blockDelay"`
+}
+
 // Build implements Buildable
 func (c *FreedomConfig) Build() (proto.Message, error) {
+	if c.IPsBlocked != nil {
+		// todo: remove legacy
+		errors.LogWarning(context.Background(), `The feature "ipsBlocked" has been removed and migrated to "finalRules". Please update your config(s) according to release note and documentation.`)
+	}
+
 	config := new(freedom.Config)
 	targetStrategy := c.TargetStrategy
 	if targetStrategy == "" {
@@ -74,6 +94,7 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 	}
 
 	if c.Fragment != nil {
+		errors.PrintDeprecatedFeatureWarning(`"fragment" in Freedom`, `"fragment" in "streamSettings.finalmask.tcp"`)
 		config.Fragment = new(freedom.Fragment)
 
 		switch strings.ToLower(c.Fragment.Packets) {
@@ -130,6 +151,7 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 	}
 
 	if c.Noises != nil {
+		errors.PrintDeprecatedFeatureWarning(`"noises" in Freedom`, `"noise" in "streamSettings.finalmask.udp"`)
 		for _, n := range c.Noises {
 			NConfig, err := ParseNoise(n)
 			if err != nil {
@@ -140,12 +162,13 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 	}
 
 	config.UserLevel = c.UserLevel
+
 	if len(c.Redirect) > 0 {
 		host, portStr, err := net.SplitHostPort(c.Redirect)
 		if err != nil {
 			return nil, errors.New("invalid redirect address: ", c.Redirect, ": ", err).Base(err)
 		}
-		port, err := v2net.PortFromString(portStr)
+		port, err := xnet.PortFromString(portStr)
 		if err != nil {
 			return nil, errors.New("invalid redirect port: ", c.Redirect, ": ", err).Base(err)
 		}
@@ -156,12 +179,22 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 		}
 
 		if len(host) > 0 {
-			config.DestinationOverride.Server.Address = v2net.NewIPOrDomain(v2net.ParseAddress(host))
+			config.DestinationOverride.Server.Address = xnet.NewIPOrDomain(xnet.ParseAddress(host))
 		}
 	}
+
 	if c.ProxyProtocol > 0 && c.ProxyProtocol <= 2 {
 		config.ProxyProtocol = c.ProxyProtocol
 	}
+
+	for _, r := range c.FinalRules {
+		rule, err := r.Build()
+		if err != nil {
+			return nil, err
+		}
+		config.FinalRules = append(config.FinalRules, rule)
+	}
+
 	return config, nil
 }
 
@@ -219,4 +252,69 @@ func ParseNoise(noise *Noise) (*freedom.Noise, error) {
 		return nil, errors.New("Invalid applyTo, only ip/ipv4/ipv6 are supported")
 	}
 	return NConfig, nil
+}
+
+func (c *FreedomFinalRuleConfig) Build() (*freedom.FinalRuleConfig, error) {
+	rule := &freedom.FinalRuleConfig{}
+
+	switch strings.ToLower(c.Action) {
+	case "allow":
+		rule.Action = freedom.RuleAction_Allow
+	case "block":
+		rule.Action = freedom.RuleAction_Block
+	default:
+		return nil, errors.New("unknown action: ", c.Action)
+	}
+
+	if c.Network != nil {
+		rule.Networks = c.Network.Build()
+	}
+
+	if c.Port != nil {
+		rule.PortList = c.Port.Build()
+	}
+
+	if c.IP != nil {
+		rules, err := geodata.ParseIPRules(*c.IP)
+		if err != nil {
+			return nil, err
+		}
+		rule.Ip = rules
+	}
+
+	if c.BlockDelay != nil {
+		errors.PrintDeprecatedFeatureWarning("finalRules.blockDelay", "finalRules.delay")
+		c.Delay = c.BlockDelay
+	}
+
+	if rule.Action != freedom.RuleAction_Block {
+		if c.Delay != nil || c.LogLevel != "" {
+			return nil, errors.New("delay and logLevel are only supported for block finalRules")
+		}
+		return rule, nil
+	}
+
+	if c.Delay != nil {
+		rule.Delay = &freedom.Range{
+			Min: uint64(c.Delay.From),
+			Max: uint64(c.Delay.To),
+		}
+	}
+
+	switch strings.ToLower(c.LogLevel) {
+	case "", "info":
+		rule.LogLevel = log.Severity_Info.Enum()
+	case "none":
+		rule.LogLevel = log.Severity_Unknown.Enum()
+	case "debug":
+		rule.LogLevel = log.Severity_Debug.Enum()
+	case "warning":
+		rule.LogLevel = log.Severity_Warning.Enum()
+	case "error":
+		rule.LogLevel = log.Severity_Error.Enum()
+	default:
+		return nil, errors.New("unknown finalRules.logLevel: ", c.LogLevel)
+	}
+
+	return rule, nil
 }

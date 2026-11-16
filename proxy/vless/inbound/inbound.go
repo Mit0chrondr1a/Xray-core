@@ -28,7 +28,9 @@ import (
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features"
 	"github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/features/extension"
 	feature_inbound "github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/policy"
@@ -50,30 +52,39 @@ var (
 	reverseOutboundPollInterval = 200 * time.Millisecond
 	visionInputFieldType        = reflect.TypeOf(bytes.Reader{})
 	visionRawInputFieldType     = reflect.TypeOf(bytes.Buffer{})
+	visionRawInputPtrFieldType  = reflect.TypeOf((*bytes.Buffer)(nil))
 )
 
-func resolveVisionInternalReaders(t reflect.Type, base unsafe.Pointer) (*bytes.Reader, *bytes.Buffer, error) {
+// resolveVisionInternalReaders locates the TLS library's private input/rawInput
+// buffers. Older TLS libraries hold rawInput as bytes.Buffer, newer ones (Go
+// 1.27.3+ crypto/tls) as *bytes.Buffer; both are returned as **bytes.Buffer so
+// the Vision reader dereferences the live buffer at switch time.
+func resolveVisionInternalReaders(t reflect.Type, base unsafe.Pointer) (*bytes.Reader, **bytes.Buffer, error) {
 	if t == nil {
 		return nil, nil, nil
 	}
 	inputField, inputOK := t.FieldByName("input")
 	rawInputField, rawInputOK := t.FieldByName("rawInput")
 	if !inputOK || !rawInputOK {
-		return nil, nil, errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+		return nil, nil, errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields")
 	}
-	if inputField.Type != visionInputFieldType || rawInputField.Type != visionRawInputFieldType {
+	if inputField.Type != visionInputFieldType ||
+		(rawInputField.Type != visionRawInputFieldType && rawInputField.Type != visionRawInputPtrFieldType) {
 		return nil, nil, errors.New(
 			"XTLS Vision internal layout mismatch for ", t.String(),
 			": unexpected input/rawInput types (input=", inputField.Type.String(),
 			", rawInput=", rawInputField.Type.String(), ")",
-		).AtWarning()
+		)
 	}
 	// Preserve pointer provenance for Go's checkptr instrumentation. Converting
 	// the base pointer to uintptr before adding a field offset can make the
 	// derived pointer appear unrelated to its allocation.
 	input := (*bytes.Reader)(unsafe.Add(base, inputField.Offset))
+	if rawInputField.Type == visionRawInputPtrFieldType {
+		return input, (**bytes.Buffer)(unsafe.Add(base, rawInputField.Offset)), nil
+	}
 	rawInput := (*bytes.Buffer)(unsafe.Add(base, rawInputField.Offset))
-	return input, rawInput, nil
+	return input, &rawInput, nil
 }
 
 func isSharedParentRequest(request *protocol.RequestHeader) bool {
@@ -122,13 +133,13 @@ func init() {
 		c := config.(*Config)
 
 		validator := new(vless.MemoryValidator)
-		for _, user := range c.Clients {
+		for _, user := range c.Users {
 			u, err := user.ToMemoryUser()
 			if err != nil {
-				return nil, errors.New("failed to get VLESS user").Base(err).AtError()
+				return nil, errors.New("failed to get VLESS user").Base(err)
 			}
 			if err := validator.Add(u); err != nil {
-				return nil, errors.New("failed to initiate user").Base(err).AtError()
+				return nil, errors.New("failed to initiate user").Base(err)
 			}
 		}
 
@@ -144,6 +155,7 @@ type Handler struct {
 	validator              vless.Validator
 	decryption             *encryption.ServerInstance
 	outboundHandlerManager outbound.Manager
+	observer               features.Feature
 	defaultDispatcher      routing.Dispatcher
 	ctx                    context.Context
 	fallbacks              map[string]map[string]map[string]*Fallback // or nil
@@ -159,6 +171,7 @@ func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Val
 		stats:                  v.GetFeature(stats.ManagerType()).(stats.Manager),
 		validator:              validator,
 		outboundHandlerManager: v.GetFeature(outbound.ManagerType()).(outbound.Manager),
+		observer:               v.GetFeature(extension.ObservatoryType()),
 		defaultDispatcher:      v.GetFeature(routing.DispatcherType()).(routing.Dispatcher),
 		ctx:                    ctx,
 	}
@@ -172,7 +185,7 @@ func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Val
 		}
 		handler.decryption = &encryption.ServerInstance{}
 		if err := handler.decryption.Init(nfsSKeysBytes, config.XorMode, config.SecondsFrom, config.SecondsTo, config.Padding); err != nil {
-			return nil, errors.New("failed to use decryption").Base(err).AtError()
+			return nil, errors.New("failed to use decryption").Base(err)
 		}
 	}
 
@@ -190,7 +203,7 @@ func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Val
 			/*
 				if fb.Path != "" {
 					if r, err := regexp.Compile(fb.Path); err != nil {
-						return nil, errors.New("invalid path regexp").Base(err).AtError()
+						return nil, errors.New("invalid path regexp").Base(err)
 					} else {
 						handler.regexps[fb.Path] = r
 					}
@@ -397,13 +410,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if h.decryption != nil {
 		var err error
 		if connection, err = h.decryption.Handshake(connection, nil); err != nil {
-			return errors.New("ML-KEM-768 handshake failed").Base(err).AtInfo()
+			return errors.New("ML-KEM-768 handshake failed").Base(err)
 		}
 	}
 
 	sessionPolicy := h.policyManager.ForLevel(0)
 	if err := proxy.SetHandshakeReadDeadline(connection, time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
-		return errors.New("unable to set read deadline").Base(err).AtWarning()
+		return errors.New("unable to set read deadline").Base(err)
 	}
 
 	first := buf.FromBytes(make([]byte, buf.Size))
@@ -465,7 +478,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					tag = inbound.Tag
 				}
 				if outcome, ktlsErr := dc.EnableKTLSOutcome(); ktlsErr != nil {
-					return errors.New("deferred kTLS enable failed in fallback").Base(ktlsErr).AtWarning()
+					return errors.New("deferred kTLS enable failed in fallback").Base(ktlsErr)
 				} else if outcome.Status == tls.KTLSPromotionEnabled {
 					errors.LogInfo(
 						ctx,
@@ -514,7 +527,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			}
 			apfb := napfb[name]
 			if apfb == nil {
-				return errors.New(`failed to find the default "name" config`).AtWarning()
+				return errors.New(`failed to find the default "name" config`)
 			}
 
 			if apfb[alpn] == nil {
@@ -522,7 +535,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			}
 			pfb := apfb[alpn]
 			if pfb == nil {
-				return errors.New(`failed to find the default "alpn" config`).AtWarning()
+				return errors.New(`failed to find the default "alpn" config`)
 			}
 
 			path := ""
@@ -531,7 +544,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					if lines := bytes.Split(firstBytes, []byte{'\r', '\n'}); len(lines) > 1 {
 						if s := bytes.Split(lines[0], []byte{' '}); len(s) == 3 {
 							if len(s[0]) < 8 && len(s[1]) > 0 && len(s[2]) == 8 {
-								errors.New("realPath = " + string(s[1])).AtInfo().WriteToLog(sid)
+								errors.New("realPath = " + string(s[1])).WriteToLog(sid)
 								for _, fb := range pfb {
 									if fb.Path != "" && h.regexps[fb.Path].Match(s[1]) {
 										path = fb.Path
@@ -571,7 +584,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			}
 			fb := pfb[path]
 			if fb == nil {
-				return errors.New(`failed to find the default "path" config`).AtWarning()
+				return errors.New(`failed to find the default "path" config`)
 			}
 
 			ctx, cancel := context.WithCancel(ctx)
@@ -587,7 +600,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				}
 				return nil
 			}); err != nil {
-				return errors.New("failed to dial to " + fb.Dest).Base(err).AtWarning()
+				return errors.New("failed to dial to " + fb.Dest).Base(err)
 			}
 			defer conn.Close()
 
@@ -647,11 +660,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 						pro.Write([]byte{byte(p1 >> 8), byte(p1), byte(p2 >> 8), byte(p2)})
 					}
 					if err := serverWriter.WriteMultiBuffer(buf.MultiBuffer{pro}); err != nil {
-						return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err).AtWarning()
+						return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err)
 					}
 				}
 				if err := proxy.CopyFallbackRequest(ctx, connection, conn, reader, serverWriter, timer); err != nil {
-					return errors.New("failed to fallback request payload").Base(err).AtInfo()
+					return errors.New("failed to fallback request payload").Base(err)
 				}
 				return nil
 			}
@@ -661,7 +674,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			getResponse := func() error {
 				defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 				if err := proxy.CopyFallbackResponse(ctx, conn, connection, writer, timer); err != nil {
-					return errors.New("failed to deliver response payload").Base(err).AtInfo()
+					return errors.New("failed to deliver response payload").Base(err)
 				}
 				return nil
 			}
@@ -671,7 +684,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			if err := task.Run(ctx, task.OnSuccess(postRequest, task.Close(serverWriter)), task.OnSuccess(getResponse, task.Close(writer))); err != nil {
 				common.Interrupt(serverReader)
 				common.Interrupt(serverWriter)
-				return errors.New("fallback ends").Base(err).AtInfo()
+				return errors.New("fallback ends").Base(err)
 			}
 			return nil
 		}
@@ -683,7 +696,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				Status: log.AccessRejected,
 				Reason: err,
 			})
-			err = errors.New("invalid request from ", connection.RemoteAddr()).Base(err).AtInfo()
+			err = errors.New("invalid request from ", connection.RemoteAddr()).Base(err)
 		}
 		return err
 	}
@@ -717,14 +730,14 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 
 	var input *bytes.Reader
-	var rawInput *bytes.Buffer
+	var rawInput **bytes.Buffer
 	deferredVisionPath := false
 	switch requestAddons.Flow {
 	case vless.XRV:
 		if account.Flow == requestAddons.Flow {
 			switch request.Command {
 			case protocol.RequestCommandUDP:
-				return errors.New(requestAddons.Flow + " doesn't support UDP").AtWarning()
+				return errors.New(requestAddons.Flow + " doesn't support UDP")
 			case protocol.RequestCommandMux, protocol.RequestCommandRvs:
 				inbound.SetCopyGate(session.CopyGateForcedUserspace, session.CopyGateReasonSecurityGuard)
 				fallthrough // we will break Mux connections that contain TCP requests
@@ -739,7 +752,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					p = unsafe.Pointer(commonConn)
 				} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 					if tlsConn.ConnectionState().Version != gotls.VersionTLS13 {
-						return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
+						return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version)
 					}
 					t = reflect.TypeOf(tlsConn.Conn).Elem()
 					p = unsafe.Pointer(tlsConn.Conn)
@@ -748,24 +761,24 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					p = unsafe.Pointer(realityConn.Conn)
 				} else if rc, ok := iConn.(*tls.RustConn); ok {
 					if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
-						return errors.New("RustConn without full kTLS cannot use " + requestAddons.Flow).AtWarning()
+						return errors.New("RustConn without full kTLS cannot use " + requestAddons.Flow)
 					}
 					// kTLS + Vision is unsupported; refuse early to avoid corrupting streams.
-					return errors.New("Vision is incompatible with kTLS-native RustConn; use non-Vision or disable kTLS for this flow").AtWarning()
+					return errors.New("Vision is incompatible with kTLS-native RustConn; use non-Vision or disable kTLS for this flow")
 				} else if dc, ok := iConn.(*tls.DeferredRustConn); ok {
 					// Direct Vision flows stay on the deferred path until command=2.
 					// Shared parent connections are different: they do not follow the
 					// detach model, so opportunistically promote them to kTLS to escape
 					// the deferred Rust I/O boundary while keeping them on userspace copy.
 					if promoted, promoteErr := maybeEnableVisionParentKTLS(ctx, request, dc); promoteErr != nil {
-						return errors.New("deferred kTLS enable failed for Vision parent").Base(promoteErr).AtWarning()
+						return errors.New("deferred kTLS enable failed for Vision parent").Base(promoteErr)
 					} else if !promoted && !isSharedParentRequest(request) {
 						deferredVisionPath = true
 					}
 					input = nil
 					rawInput = nil
 				} else {
-					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
+					return errors.New("XTLS only supports TLS and REALITY directly for now.")
 				}
 				if t != nil {
 					var layoutErr error
@@ -777,7 +790,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				applyVisionExecutionGate(inbound, request, deferredVisionPath)
 			}
 		} else {
-			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
+			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow)
 		}
 	case "":
 		gateState, gateReason := flowEmptyGate(iConn)
@@ -785,14 +798,14 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		ktlsReady := false
 		if strings.HasPrefix(account.Flow, vless.XRV) &&
 			(request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) {
-			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
+			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.")
 		}
 		skipKTLSPromotion := shouldSkipKTLSPromotionForParentRequest(request)
 		if dc, ok := iConn.(*tls.DeferredRustConn); ok {
 			if skipKTLSPromotion {
 				errors.LogDebug(ctx, "non-Vision VLESS: skipping deferred kTLS on mux parent connection")
 			} else if outcome, err := dc.EnableKTLSOutcome(); err != nil {
-				return errors.New("deferred kTLS enable failed for non-Vision VLESS").Base(err).AtWarning()
+				return errors.New("deferred kTLS enable failed for non-Vision VLESS").Base(err)
 			} else if outcome.Status == tls.KTLSPromotionEnabled {
 				errors.LogDebug(ctx, "non-Vision VLESS: kTLS enabled on DeferredRustConn")
 				ktlsReady = true
@@ -803,7 +816,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			if skipKTLSPromotion {
 				errors.LogDebug(ctx, "non-Vision VLESS: skipping kTLS on mux parent connection")
 			} else if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
-				return errors.New("kTLS enable failed for non-Vision VLESS TLS connection").Base(err).AtWarning()
+				return errors.New("kTLS enable failed for non-Vision VLESS TLS connection").Base(err)
 			} else {
 				ktlsReady = true
 			}
@@ -815,7 +828,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			inbound.SetCopyGate(gateState, gateReason)
 		}
 	default:
-		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
+		return errors.New("unknown request flow " + requestAddons.Flow)
 	}
 
 	if request.Command != protocol.RequestCommandMux {
@@ -863,7 +876,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))
 	if err := encoding.EncodeResponseHeader(bufferWriter, request, responseAddons); err != nil {
-		return errors.New("failed to encode response header").Base(err).AtWarning()
+		return errors.New("failed to encode response header").Base(err)
 	}
 	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, visionWriterCtx, connection, nil)
 	bufferWriter.SetFlushNext()
@@ -873,12 +886,14 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		if err != nil {
 			return err
 		}
-		return r.NewMux(ctx, dispatcher.WrapLink(ctx, h.policyManager, h.stats, &transport.Link{Reader: clientReader, Writer: clientWriter}))
+		return r.NewMux(ctx, dispatcher.WrapLink(ctx, h.policyManager, h.stats, &transport.Link{Reader: clientReader, Writer: clientWriter}), h.observer)
 	}
 
-	if err := dispatch.DispatchLink(ctx, request.Destination(), &transport.Link{
-		Reader: clientReader,
-		Writer: clientWriter},
+	if err := dispatch.DispatchLink(
+		ctx, request.Destination(), &transport.Link{
+			Reader: clientReader,
+			Writer: clientWriter,
+		},
 	); err != nil {
 		return errors.New("failed to dispatch request").Base(err)
 	}
@@ -906,16 +921,19 @@ func (r *Reverse) Tag() string {
 	return r.tag
 }
 
-func (r *Reverse) NewMux(ctx context.Context, link *transport.Link) error {
+func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer features.Feature) error {
 	muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
 	if err != nil {
-		return errors.New("failed to create mux client worker").Base(err).AtWarning()
+		return errors.New("failed to create mux client worker").Base(err)
 	}
 	worker, err := reverse.NewPortalWorker(muxClient)
 	if err != nil {
-		return errors.New("failed to create portal worker").Base(err).AtWarning()
+		return errors.New("failed to create portal worker").Base(err)
 	}
 	r.picker.AddWorker(worker)
+	if burstObs, ok := observer.(extension.BurstObservatory); ok {
+		go burstObs.Check([]string{r.Tag()})
+	}
 	select {
 	case <-ctx.Done():
 	case <-muxClient.WaitClosed():

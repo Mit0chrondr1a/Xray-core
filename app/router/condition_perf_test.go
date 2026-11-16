@@ -42,13 +42,13 @@ func TestAttributeMatcherMatchCaseInsensitiveFallback(t *testing.T) {
 }
 
 func TestProcessNameMatcherCachesProcessLookup(t *testing.T) {
-	originalFindProcess := findProcess
+	originalProcessLookup := processLookup
 	defer func() {
-		findProcess = originalFindProcess
+		processLookup = originalProcessLookup
 	}()
 
 	var calls int32
-	findProcess = func(dest net.Destination) (int, string, string, error) {
+	processLookup = func(network, srcIP string, srcPort uint16, dstIP string, dstPort uint16) (int, string, string, error) {
 		atomic.AddInt32(&calls, 1)
 		return 100, "curl", "/usr/bin/curl", nil
 	}

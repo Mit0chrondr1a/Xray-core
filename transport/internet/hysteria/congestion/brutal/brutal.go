@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/common"
 
 	"github.com/apernet/quic-go/congestion"
+	"github.com/apernet/quic-go/monotime"
 )
 
 const (
@@ -32,6 +33,8 @@ type BrutalSender struct {
 	pktInfoSlots [pktInfoSlotCount]pktInfo
 	ackRate      float64
 
+	disableLossCompensation bool
+
 	debug                 bool
 	lastAckPrintTimestamp int64
 }
@@ -42,13 +45,14 @@ type pktInfo struct {
 	LossCount uint64
 }
 
-func NewBrutalSender(bps uint64) *BrutalSender {
+func NewBrutalSender(bps uint64, disableLossCompensation bool) *BrutalSender {
 	debug, _ := strconv.ParseBool(os.Getenv(debugEnv))
 	bs := &BrutalSender{
-		bps:             congestion.ByteCount(bps),
-		maxDatagramSize: congestion.InitialPacketSize,
-		ackRate:         1,
-		debug:           debug,
+		bps:                     congestion.ByteCount(bps),
+		maxDatagramSize:         congestion.InitialPacketSize,
+		ackRate:                 1,
+		disableLossCompensation: disableLossCompensation,
+		debug:                   debug,
 	}
 	bs.pacer = common.NewPacer(func() congestion.ByteCount {
 		return congestion.ByteCount(float64(bs.bps) / bs.ackRate)
@@ -60,11 +64,11 @@ func (b *BrutalSender) SetRTTStatsProvider(rttStats congestion.RTTStatsProvider)
 	b.rttStats = rttStats
 }
 
-func (b *BrutalSender) TimeUntilSend(bytesInFlight congestion.ByteCount) congestion.Time {
+func (b *BrutalSender) TimeUntilSend(bytesInFlight congestion.ByteCount) monotime.Time {
 	return b.pacer.TimeUntilSend()
 }
 
-func (b *BrutalSender) HasPacingBudget(now congestion.Time) bool {
+func (b *BrutalSender) HasPacingBudget(now monotime.Time) bool {
 	return b.pacer.Budget(now) >= b.maxDatagramSize
 }
 
@@ -84,14 +88,14 @@ func (b *BrutalSender) GetCongestionWindow() congestion.ByteCount {
 	return cwnd
 }
 
-func (b *BrutalSender) OnPacketSent(sentTime congestion.Time, bytesInFlight congestion.ByteCount,
+func (b *BrutalSender) OnPacketSent(sentTime monotime.Time, bytesInFlight congestion.ByteCount,
 	packetNumber congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool,
 ) {
 	b.pacer.SentPacket(sentTime, bytes)
 }
 
 func (b *BrutalSender) OnPacketAcked(number congestion.PacketNumber, ackedBytes congestion.ByteCount,
-	priorInFlight congestion.ByteCount, eventTime congestion.Time,
+	priorInFlight congestion.ByteCount, eventTime monotime.Time,
 ) {
 	// Stub
 }
@@ -102,7 +106,7 @@ func (b *BrutalSender) OnCongestionEvent(number congestion.PacketNumber, lostByt
 	// Stub
 }
 
-func (b *BrutalSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, eventTime congestion.Time, ackedPackets []congestion.AckedPacketInfo, lostPackets []congestion.LostPacketInfo) {
+func (b *BrutalSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, eventTime monotime.Time, ackedPackets []congestion.AckedPacketInfo, lostPackets []congestion.LostPacketInfo) {
 	currentTimestamp := int64(time.Duration(eventTime) / time.Second)
 	slot := currentTimestamp % pktInfoSlotCount
 	if b.pktInfoSlots[slot].Timestamp == currentTimestamp {
@@ -126,6 +130,10 @@ func (b *BrutalSender) SetMaxDatagramSize(size congestion.ByteCount) {
 }
 
 func (b *BrutalSender) updateAckRate(currentTimestamp int64) {
+	if b.disableLossCompensation {
+		b.ackRate = 1
+		return
+	}
 	minTimestamp := currentTimestamp - pktInfoSlotCount
 	var ackCount, lossCount uint64
 	for _, info := range b.pktInfoSlots {

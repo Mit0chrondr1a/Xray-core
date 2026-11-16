@@ -1,5 +1,4 @@
-//go:build !wasm
-// +build !wasm
+//go:build !openbsd
 
 package buf_test
 

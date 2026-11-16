@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestOnlineMapAddAndCount(t *testing.T) {
@@ -31,6 +30,24 @@ func TestOnlineMapAddDuplicate(t *testing.T) {
 	}
 }
 
+func TestOnlineMapRefCountedRemove(t *testing.T) {
+	om := NewOnlineMap()
+	om.AddIP("10.0.0.1")
+	om.AddIP("10.0.0.1")
+	om.RemoveIP("10.0.0.1")
+	if om.Count() != 1 {
+		t.Fatalf("count=%d after one of two removes, want 1", om.Count())
+	}
+	om.RemoveIP("10.0.0.1")
+	if om.Count() != 0 {
+		t.Fatalf("count=%d after final remove, want 0", om.Count())
+	}
+	om.RemoveIP("10.0.0.1") // removing an absent IP is a no-op
+	if om.Count() != 0 {
+		t.Fatalf("count=%d after extra remove, want 0", om.Count())
+	}
+}
+
 func TestOnlineMapIgnoresLoopback(t *testing.T) {
 	om := NewOnlineMap()
 	om.AddIP("127.0.0.1")
@@ -39,46 +56,30 @@ func TestOnlineMapIgnoresLoopback(t *testing.T) {
 	}
 }
 
-func TestOnlineMapList(t *testing.T) {
+func TestOnlineMapForEach(t *testing.T) {
 	om := NewOnlineMap()
 	om.AddIP("10.0.0.1")
 	om.AddIP("10.0.0.2")
-	list := om.List()
-	if len(list) != 2 {
-		t.Fatalf("List() len=%d, want 2", len(list))
+
+	seen := map[string]bool{}
+	om.ForEach(func(ip string, lastSeen int64) bool {
+		if lastSeen <= 0 {
+			t.Errorf("ip %s has non-positive lastSeen %d", ip, lastSeen)
+		}
+		seen[ip] = true
+		return true
+	})
+	if len(seen) != 2 || !seen["10.0.0.1"] || !seen["10.0.0.2"] {
+		t.Fatalf("ForEach saw %v, want both IPs", seen)
 	}
-}
 
-func TestOnlineMapRemoveExpiredIPs(t *testing.T) {
-	om := NewOnlineMap()
-	om.AddIP("10.0.0.1")
-	// Manually expire by setting timestamp in the past.
-	om.ipList["10.0.0.1"] = time.Now().Add(-30 * time.Second)
-	om.RemoveExpiredIPs()
-	if om.Count() != 0 {
-		t.Fatalf("expired IP should be removed: count=%d", om.Count())
-	}
-}
-
-func TestOnlineMapIpTimeMap(t *testing.T) {
-	om := NewOnlineMap()
-	om.AddIP("192.168.1.1")
-	m := om.IpTimeMap()
-	if _, ok := m["192.168.1.1"]; !ok {
-		t.Fatal("IpTimeMap should contain added IP")
-	}
-}
-
-func TestOnlineMapIpTimeMapTriggerCleanup(t *testing.T) {
-	om := NewOnlineMap()
-	om.cleanupPeriod = 0 // trigger cleanup every time
-
-	om.AddIP("10.0.0.1")
-	om.ipList["10.0.0.1"] = time.Now().Add(-30 * time.Second)
-
-	m := om.IpTimeMap()
-	if _, ok := m["10.0.0.1"]; ok {
-		t.Fatal("expired IP should be cleaned up by IpTimeMap")
+	calls := 0
+	om.ForEach(func(string, int64) bool {
+		calls++
+		return false
+	})
+	if calls != 1 {
+		t.Fatalf("ForEach did not stop early: %d calls", calls)
 	}
 }
 
@@ -93,8 +94,7 @@ func TestOnlineMapConcurrentAccess(t *testing.T) {
 			ip := fmt.Sprintf("10.0.0.%d", idx%10)
 			om.AddIP(ip)
 			_ = om.Count()
-			_ = om.List()
-			_ = om.IpTimeMap()
+			om.ForEach(func(string, int64) bool { return true })
 		}(i)
 	}
 	wg.Wait()
@@ -103,32 +103,5 @@ func TestOnlineMapConcurrentAccess(t *testing.T) {
 	count := om.Count()
 	if count != 10 {
 		t.Fatalf("expected 10 unique IPs, got %d", count)
-	}
-}
-
-func TestOnlineMapCleaningTryLock(t *testing.T) {
-	om := NewOnlineMap()
-	om.cleanupPeriod = 0
-
-	// Simulate concurrent cleanup attempts.
-	// The atomic trylock should prevent both from running RemoveExpiredIPs simultaneously.
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			om.AddIP("10.0.0.1")
-		}()
-	}
-	wg.Wait()
-}
-
-func TestOnlineMapGetKeys(t *testing.T) {
-	om := NewOnlineMap()
-	om.AddIP("a.b.c.d")
-	om.AddIP("e.f.g.h")
-	keys := om.GetKeys()
-	if len(keys) != 2 {
-		t.Fatalf("GetKeys() len=%d, want 2", len(keys))
 	}
 }

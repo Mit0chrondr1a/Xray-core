@@ -2,6 +2,7 @@ package reality
 
 import (
 	"crypto/ecdh"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/subtle"
 	"io"
@@ -9,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/xtls/reality"
 	"github.com/xtls/xray-core/transport/internet"
 	tls "github.com/xtls/xray-core/transport/internet/tls"
@@ -25,7 +25,6 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 		Dest: c.Dest,
 		Xver: byte(c.Xver),
 
-		PrivateKey:   c.PrivateKey,
 		MinClientVer: c.MinClientVer,
 		MaxClientVer: c.MaxClientVer,
 		MaxTimeDiff:  time.Duration(c.MaxTimeDiff) * time.Millisecond,
@@ -35,9 +34,14 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 
 		KeyLogWriter: KeyLogWriterFromConfig(c),
 	}
+	var err error
+	if config.PrivateKey, err = ecdh.X25519().NewPrivateKey(c.PrivateKey); err != nil {
+		panic(err)
+	}
 	if c.Mldsa65Seed != nil {
-		_, key := mldsa65.NewKeyFromSeed((*[32]byte)(c.Mldsa65Seed))
-		config.Mldsa65Key = key.Bytes()
+		if config.Mldsa65Key, err = mldsa.NewPrivateKey(mldsa.MLDSA65(), c.Mldsa65Seed); err != nil {
+			panic(err)
+		}
 	}
 	if c.LimitFallbackUpload != nil {
 		config.LimitFallbackUpload.AfterBytes = c.LimitFallbackUpload.AfterBytes

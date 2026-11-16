@@ -24,7 +24,7 @@ func (s *dialerOpenStreamStub) OpenStream(context.Context, string, string, io.Re
 	return io.NopCloser(strings.NewReader("")), nil, nil, nil
 }
 
-func (s *dialerOpenStreamStub) PostPacket(context.Context, string, string, string, io.Reader, int64) error {
+func (s *dialerOpenStreamStub) PostPacket(context.Context, string, string, string, buf.MultiBuffer) error {
 	return nil
 }
 
@@ -51,7 +51,7 @@ func TestDialPacketUpValidationErrorReleasesXmuxUsage(t *testing.T) {
 		ProtocolSettings: &Config{
 			Mode: "packet-up",
 			ScMaxEachPostBytes: &RangeConfig{
-				From: buf.Size,
+				From: 0, // upstream only rejects non-positive lower bounds
 				To:   buf.Size,
 			},
 		},
@@ -65,8 +65,8 @@ func TestDialPacketUpValidationErrorReleasesXmuxUsage(t *testing.T) {
 	if !strings.Contains(err.Error(), "scMaxEachPostBytes") {
 		t.Fatalf("Dial() error = %q, want scMaxEachPostBytes validation failure", err.Error())
 	}
-	if got := xmuxClient.OpenUsage.Load(); got != 0 {
-		t.Fatalf("xmux OpenUsage = %d, want 0 after Dial() validation failure", got)
+	if got := xmuxClient.Running.Load(); got != 0 {
+		t.Fatalf("xmux Running = %d, want 0 after Dial() validation failure", got)
 	}
 	if stubClient.openStreamCalls != 1 {
 		t.Fatalf("OpenStream calls = %d, want 1", stubClient.openStreamCalls)

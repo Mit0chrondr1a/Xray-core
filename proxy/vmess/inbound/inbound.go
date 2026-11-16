@@ -140,7 +140,8 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 func (h *Handler) Close() error {
 	return errors.Combine(
 		h.sessionHistory.Close(),
-		common.Close(h.usersByEmail))
+		common.Close(h.usersByEmail),
+	)
 }
 
 // Network implements proxy.Inbound.Network().
@@ -228,14 +229,14 @@ func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSess
 func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatcher routing.Dispatcher) error {
 	sessionPolicy := h.policyManager.ForLevel(0)
 	if err := proxy.SetHandshakeReadDeadline(connection, time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
-		return errors.New("unable to set read deadline").Base(err).AtWarning()
+		return errors.New("unable to set read deadline").Base(err)
 	}
 
 	iConn := stat.TryUnwrapStatsConn(connection)
 	// VMess never uses Vision — always wants kTLS if available.
 	if dc, ok := iConn.(*tls.DeferredRustConn); ok {
 		if outcome, err := dc.EnableKTLSOutcome(); err != nil {
-			return errors.New("deferred kTLS enable failed for VMess").Base(err).AtWarning()
+			return errors.New("deferred kTLS enable failed for VMess").Base(err)
 		} else if outcome.Status != tls.KTLSPromotionEnabled {
 			errors.LogWarning(ctx, "VMess: kTLS not enabled (", outcome.Status, "); continuing with rustls path")
 		}
@@ -256,13 +257,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				Status: log.AccessRejected,
 				Reason: err,
 			})
-			err = errors.New("invalid request from ", connection.RemoteAddr()).Base(err).AtInfo()
+			err = errors.New("invalid request from ", connection.RemoteAddr()).Base(err)
 		}
 		return err
 	}
 	if tlsConn, ok := iConn.(*tls.Conn); ok {
 		if err := tlsConn.HandshakeAndEnableKTLS(context.Background()); err != nil {
-			return errors.New("kTLS enable failed for VMess TLS connection").Base(err).AtWarning()
+			return errors.New("kTLS enable failed for VMess TLS connection").Base(err)
 		}
 	}
 

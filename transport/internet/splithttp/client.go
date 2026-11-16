@@ -3,7 +3,6 @@ package splithttp
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/apernet/quic-go/http3"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
@@ -26,7 +27,7 @@ type DialerClient interface {
 	OpenStream(context.Context, string, string, io.Reader, bool) (io.ReadCloser, net.Addr, net.Addr, error)
 
 	// ctx, url, sessionId, seqStr, body, contentLength
-	PostPacket(context.Context, string, string, string, io.Reader, int64) error
+	PostPacket(context.Context, string, string, string, buf.MultiBuffer) error
 }
 
 // implements splithttp.DialerClient in terms of direct network connections
@@ -65,34 +66,12 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 	if body != nil {
 		method = c.transportConfig.GetNormalizedUplinkHTTPMethod() // stream-up/one
 	}
-	req, _ := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
-	req.Header = c.transportConfig.GetRequestHeader()
-	length := int(c.transportConfig.GetNormalizedXPaddingBytes().rand())
-	config := XPaddingConfig{Length: length}
-
-	if c.transportConfig.XPaddingObfsMode {
-		config.Placement = XPaddingPlacement{
-			Placement: c.transportConfig.XPaddingPlacement,
-			Key:       c.transportConfig.XPaddingKey,
-			Header:    c.transportConfig.XPaddingHeader,
-			RawURL:    url,
-		}
-		config.Method = PaddingMethod(c.transportConfig.XPaddingMethod)
-	} else {
-		config.Placement = XPaddingPlacement{
-			Placement: PlacementQueryInHeader,
-			Key:       "x_padding",
-			Header:    "Referer",
-			RawURL:    url,
-		}
+	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+	if err != nil {
+		errors.LogInfoInner(ctx, err, "failed to create HTTP request for "+url)
+		return nil, nil, nil, err
 	}
-
-	c.transportConfig.ApplyXPaddingToRequest(req, config)
-	c.transportConfig.ApplyMetaToRequest(req, sessionId, "")
-
-	if method == c.transportConfig.GetNormalizedUplinkHTTPMethod() && !c.transportConfig.NoGRPCHeader {
-		req.Header.Set("Content-Type", "application/grpc")
-	}
+	c.transportConfig.FillStreamRequest(req, sessionId, "")
 
 	wrc = &WaitReadCloser{Wait: make(chan struct{})}
 	go func() {
@@ -103,6 +82,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
 			}
 			gotConn.Close()
+			common.Close(body)
 			wrc.Close()
 			return
 		}
@@ -112,6 +92,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		if resp.StatusCode != 200 || uploadOnly { // stream-up
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close() // if it is called immediately, the upload will be interrupted also
+			common.Close(body)
 			wrc.Close()
 			return
 		}
@@ -122,93 +103,13 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 	return
 }
 
-func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessionId string, seqStr string, body io.Reader, contentLength int64) error {
-	var encodedData string
-	dataPlacement := c.transportConfig.GetNormalizedUplinkDataPlacement()
-
-	if dataPlacement != PlacementBody {
-		if dataBody, ok := body.(io.ReadCloser); ok {
-			defer dataBody.Close()
-		}
-		maxPost := int64(c.transportConfig.GetNormalizedScMaxEachPostBytes().To)
-		if maxPost <= 0 {
-			maxPost = 1 << 20 // 1 MiB default
-		}
-		data, err := io.ReadAll(io.LimitReader(body, maxPost+1))
-		if err != nil {
-			return err
-		}
-		if int64(len(data)) > maxPost {
-			return errors.New("post packet data exceeds scMaxEachPostBytes limit")
-		}
-		encodedData = base64.RawURLEncoding.EncodeToString(data)
-		body = nil
-		contentLength = 0
-	}
-
+func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessionId string, seqStr string, payload buf.MultiBuffer) error {
 	method := c.transportConfig.GetNormalizedUplinkHTTPMethod()
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, nil)
 	if err != nil {
 		return err
 	}
-	req.ContentLength = contentLength
-	req.Header = c.transportConfig.GetRequestHeader()
-
-	if dataPlacement != PlacementBody {
-		key := c.transportConfig.UplinkDataKey
-		chunkSize := int(c.transportConfig.UplinkChunkSize)
-
-		switch dataPlacement {
-		case PlacementHeader:
-			for i := 0; i < len(encodedData); i += chunkSize {
-				end := i + chunkSize
-				if end > len(encodedData) {
-					end = len(encodedData)
-				}
-				chunk := encodedData[i:end]
-				headerKey := fmt.Sprintf("%s-%d", key, i/chunkSize)
-				req.Header.Set(headerKey, chunk)
-			}
-
-			req.Header.Set(key+"-Length", fmt.Sprintf("%d", len(encodedData)))
-			req.Header.Set(key+"-Upstream", "1")
-		case PlacementCookie:
-			for i := 0; i < len(encodedData); i += chunkSize {
-				end := i + chunkSize
-				if end > len(encodedData) {
-					end = len(encodedData)
-				}
-				chunk := encodedData[i:end]
-				cookieName := fmt.Sprintf("%s_%d", key, i/chunkSize)
-				req.AddCookie(&http.Cookie{Name: cookieName, Value: chunk})
-			}
-
-			req.AddCookie(&http.Cookie{Name: key + "_upstream", Value: "1"})
-		}
-	}
-
-	length := int(c.transportConfig.GetNormalizedXPaddingBytes().rand())
-	config := XPaddingConfig{Length: length}
-
-	if c.transportConfig.XPaddingObfsMode {
-		config.Placement = XPaddingPlacement{
-			Placement: c.transportConfig.XPaddingPlacement,
-			Key:       c.transportConfig.XPaddingKey,
-			Header:    c.transportConfig.XPaddingHeader,
-			RawURL:    url,
-		}
-		config.Method = PaddingMethod(c.transportConfig.XPaddingMethod)
-	} else {
-		config.Placement = XPaddingPlacement{
-			Placement: PlacementQueryInHeader,
-			Key:       "x_padding",
-			Header:    "Referer",
-			RawURL:    url,
-		}
-	}
-
-	c.transportConfig.ApplyXPaddingToRequest(req, config)
-	c.transportConfig.ApplyMetaToRequest(req, sessionId, seqStr)
+	c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
 
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
@@ -229,6 +130,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 		// times, the body is already drained after the first
 		// request
 		requestBuff := new(bytes.Buffer)
+		requestBuff.Grow(512 + int(req.ContentLength))
 		common.Must(req.Write(requestBuff))
 
 		var uploadConn any
@@ -286,6 +188,15 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 		c.uploadRawPool.Put(uploadConn)
 	}
 
+	return nil
+}
+
+// HTTP/1.1 and HTTP/2 will close itself, we only handle HTTP/3 here
+func (c *DefaultDialerClient) Close() error {
+	transport := c.client.Transport
+	if h3Transport, ok := transport.(*http3.Transport); ok {
+		h3Transport.Close()
+	}
 	return nil
 }
 

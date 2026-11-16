@@ -2,19 +2,20 @@ package router
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/strmatcher"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/routing/dns"
 )
 
 type Condition interface {
@@ -47,67 +48,18 @@ func (v *ConditionChan) Len() int {
 	return len(*v)
 }
 
-var matcherTypeMap = map[Domain_Type]strmatcher.Type{
-	Domain_Plain:  strmatcher.Substr,
-	Domain_Regex:  strmatcher.Regex,
-	Domain_Domain: strmatcher.Domain,
-	Domain_Full:   strmatcher.Full,
-}
+type DomainMatcher struct{ geodata.DomainMatcher }
 
-type DomainMatcher struct {
-	Matchers strmatcher.IndexMatcher
-}
-
-func SerializeDomainMatcher(domains []*Domain, w io.Writer) error {
-
-	g := strmatcher.NewMphMatcherGroup()
-	for _, d := range domains {
-		matcherType, f := matcherTypeMap[d.Type]
-		if !f {
-			continue
-		}
-
-		_, err := g.AddPattern(d.Value, matcherType)
-		if err != nil {
-			return err
-		}
-	}
-	g.Build()
-	// serialize
-	return g.Serialize(w)
-}
-
-func NewDomainMatcherFromBuffer(data []byte) (*strmatcher.MphMatcherGroup, error) {
-	matcher, err := strmatcher.NewMphMatcherGroupFromBuffer(data)
+func NewDomainMatcher(rules []*geodata.DomainRule) (*DomainMatcher, error) {
+	m, err := geodata.DomainReg.BuildDomainMatcher(rules)
 	if err != nil {
 		return nil, err
 	}
-	return matcher, nil
-}
-
-func NewMphMatcherGroup(domains []*Domain) (*DomainMatcher, error) {
-	g := strmatcher.NewMphMatcherGroup()
-	for i, d := range domains {
-		domains[i] = nil
-		matcherType, f := matcherTypeMap[d.Type]
-		if !f {
-			errors.LogError(context.Background(), "ignore unsupported domain type ", d.Type, " of rule ", d.Value)
-			continue
-		}
-		_, err := g.AddPattern(d.Value, matcherType)
-		if err != nil {
-			errors.LogErrorInner(context.Background(), err, "ignore domain rule ", d.Type, " ", d.Value)
-			continue
-		}
-	}
-	g.Build()
-	return &DomainMatcher{
-		Matchers: g,
-	}, nil
+	return &DomainMatcher{DomainMatcher: m}, nil
 }
 
 func (m *DomainMatcher) ApplyDomain(domain string) bool {
-	return len(m.Matchers.Match(strings.ToLower(domain))) > 0
+	return m.DomainMatcher.MatchAny(strings.ToLower(domain))
 }
 
 // Apply implements Condition.
@@ -116,7 +68,7 @@ func (m *DomainMatcher) Apply(ctx routing.Context) bool {
 	if len(domain) == 0 {
 		return false
 	}
-	return m.ApplyDomain(domain)
+	return m.DomainMatcher.MatchAny(strings.ToLower(domain))
 }
 
 type MatcherAsType byte
@@ -129,16 +81,16 @@ const (
 )
 
 type IPMatcher struct {
-	matcher GeoIPMatcher
+	matcher geodata.IPMatcher
 	asType  MatcherAsType
 }
 
-func NewIPMatcher(geoips []*GeoIP, asType MatcherAsType) (*IPMatcher, error) {
-	matcher, err := BuildOptimizedGeoIPMatcher(geoips...)
+func NewIPMatcher(rules []*geodata.IPRule, asType MatcherAsType) (*IPMatcher, error) {
+	m, err := geodata.IPReg.BuildIPMatcher(rules)
 	if err != nil {
 		return nil, err
 	}
-	return &IPMatcher{matcher: matcher, asType: asType}, nil
+	return &IPMatcher{matcher: m, asType: asType}, nil
 }
 
 // Apply implements Condition.
@@ -381,7 +333,7 @@ type processLookupEntry struct {
 	valid     bool
 }
 
-var findProcess = net.FindProcess
+var processLookup processFinder = net.FindProcess
 
 func makeProcessLookupKey(network net.Network, ip net.IP, port net.Port) (processLookupKey, bool) {
 	var key processLookupKey
@@ -507,21 +459,19 @@ func (m *ProcessNameMatcher) Apply(ctx routing.Context) bool {
 	sourcePort := ctx.GetSourcePort()
 	network := ctx.GetNetwork()
 
-	address := net.IPAddress(sourceIP)
-	if address == nil {
-		return false
-	}
-
-	var src net.Destination
-	switch ctx.GetNetwork() {
+	var networkName string
+	switch network {
 	case net.Network_TCP:
-		src = net.TCPDestination(address, sourcePort)
+		networkName = "tcp"
 	case net.Network_UDP:
-		src = net.UDPDestination(address, sourcePort)
+		networkName = "udp"
 	default:
 		return false
 	}
 
+	// A local source socket identifies the owning process, so the cache is
+	// keyed by source only; the destination is passed through for platforms
+	// (Android) whose lookup API requires it.
 	key, ok := makeProcessLookupKey(network, sourceIP, sourcePort)
 	if !ok {
 		return false
@@ -532,7 +482,20 @@ func (m *ProcessNameMatcher) Apply(ctx routing.Context) bool {
 		return m.matches(pid, name, absPath)
 	}
 
-	pid, name, absPath, err := findProcess(src)
+	var dstIP string
+	var dstPort uint16 = 0
+
+	// do not use resolved IP because Android process lookup needs original dst ip
+	resolvableContext, ok := ctx.(*dns.ResolvableContext)
+	if ok && len(resolvableContext.Context.GetTargetIPs()) > 0 {
+		dstIP = resolvableContext.Context.GetTargetIPs()[0].String()
+		dstPort = uint16(resolvableContext.Context.GetTargetPort())
+	} else if len(ctx.GetTargetIPs()) > 0 {
+		dstIP = ctx.GetTargetIPs()[0].String()
+		dstPort = uint16(ctx.GetTargetPort())
+	}
+
+	pid, name, absPath, err := processLookup(networkName, sourceIP.String(), uint16(sourcePort), dstIP, dstPort)
 	if err != nil {
 		if err != net.ErrNotLocal {
 			errors.LogError(context.Background(), "Unables to find local process name: ", err)
@@ -542,4 +505,23 @@ func (m *ProcessNameMatcher) Apply(ctx routing.Context) bool {
 
 	m.storeProcessCache(key, pid, name, absPath, now)
 	return m.matches(pid, name, absPath)
+}
+
+// LocalOSMatcher matches the operating system Xray itself is running on. That never
+// changes while Xray is running, so the result is resolved when the rule is built.
+type LocalOSMatcher struct {
+	matched bool
+}
+
+func NewLocalOSMatcher(names []string) *LocalOSMatcher {
+	return &LocalOSMatcher{
+		matched: slices.ContainsFunc(names, func(name string) bool {
+			return strings.EqualFold(name, runtime.GOOS)
+		}),
+	}
+}
+
+// Apply implements Condition.
+func (m *LocalOSMatcher) Apply(_ routing.Context) bool {
+	return m.matched
 }

@@ -9,6 +9,7 @@ import (
 
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/signal"
@@ -236,10 +237,11 @@ type Outbound struct {
 	Tag string
 	// Name of the outbound proxy that handles the connection.
 	Name string
-	// Unused. Conn is actually internet.Connection. May be nil. It is currently nil for outbound with proxySettings
-	Conn net.Conn
 	// CanSpliceCopy is a property for this connection (legacy backing store).
 	// Values are stored using CopyGateState.
+	// Conn is the outbound transport connection when a proxy hands a raw
+	// connection pair to the copy loop (e.g. fallback acceleration). May be nil.
+	Conn           net.Conn
 	CanSpliceCopy  int32
 	copyGateReason int32
 	visionSemantic int32
@@ -385,7 +387,8 @@ func (o *Outbound) PromoteVisionSemanticPhase(phase VisionSemanticPhase) {
 
 // SniffingRequest controls the behavior of content sniffing. They are from inbound config. Read-only
 type SniffingRequest struct {
-	ExcludeForDomain               []string
+	ExcludeForDomain               geodata.DomainMatcher
+	ExcludeForIP                   geodata.IPMatcher
 	OverrideDestinationForProtocol []string
 	Enabled                        bool
 	MetadataOnly                   bool

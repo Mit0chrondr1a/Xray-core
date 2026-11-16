@@ -16,6 +16,7 @@ import (
 	gonet "net"
 
 	utls "github.com/refraction-networking/utls"
+	proxymanConfig "github.com/xtls/xray-core/app/proxyman"
 	proxyman "github.com/xtls/xray-core/app/proxyman/outbound"
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/common"
@@ -112,7 +113,7 @@ func isVisionSharedParentCommand(cmd protocol.RequestCommand) bool {
 	}
 }
 
-func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, input *bytes.Reader, rawInput *bytes.Buffer, err error) {
+func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, input *bytes.Reader, rawInput **bytes.Buffer, err error) {
 	if flow != vless.XRV {
 		return false, nil, nil, nil
 	}
@@ -126,29 +127,38 @@ func getVisionBuffersForRustConn(conn gonet.Conn, flow string) (handled bool, in
 	// bypassed the gate (e.g., pre-connect without VisionFlow propagation).
 	errors.LogWarning(context.Background(), "Vision flow on RustConn — gating bypassed; kTLS+Vision is unsupported and will be rejected")
 	if ktls := rc.KTLSEnabled(); !ktls.TxReady || !ktls.RxReady {
-		return true, nil, nil, errors.New("RustConn without full kTLS cannot use " + flow).AtWarning()
+		return true, nil, nil, errors.New("RustConn without full kTLS cannot use " + flow)
 	}
-	return true, nil, nil, errors.New("Vision is incompatible with kTLS-native RustConn; aborting outbound Vision flow").AtWarning()
+	return true, nil, nil, errors.New("Vision is incompatible with kTLS-native RustConn; aborting outbound Vision flow")
 }
 
-func resolveVisionInternalReaders(t reflect.Type, base unsafe.Pointer) (*bytes.Reader, *bytes.Buffer, error) {
+// resolveVisionInternalReaders locates the TLS library's private input/rawInput
+// buffers. Older TLS libraries hold rawInput as bytes.Buffer, newer ones (Go
+// 1.27.3+ crypto/tls) as *bytes.Buffer; both are returned as **bytes.Buffer so
+// the Vision reader dereferences the live buffer at switch time.
+func resolveVisionInternalReaders(t reflect.Type, base unsafe.Pointer) (*bytes.Reader, **bytes.Buffer, error) {
 	if t == nil {
 		return nil, nil, nil
 	}
 	inputField, inputOK := t.FieldByName("input")
 	rawInputField, rawInputOK := t.FieldByName("rawInput")
 	if !inputOK || !rawInputOK {
-		return nil, nil, errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields").AtWarning()
+		return nil, nil, errors.New("XTLS Vision internal layout mismatch for ", t.String(), ": missing input/rawInput fields")
 	}
-	if inputField.Type != reflect.TypeOf(bytes.Reader{}) || rawInputField.Type != reflect.TypeOf(bytes.Buffer{}) {
+	rawIsPtr := rawInputField.Type == reflect.TypeOf((*bytes.Buffer)(nil))
+	if inputField.Type != reflect.TypeOf(bytes.Reader{}) || (!rawIsPtr && rawInputField.Type != reflect.TypeOf(bytes.Buffer{})) {
 		return nil, nil, errors.New(
 			"XTLS Vision internal layout mismatch for ", t.String(),
 			": unexpected input/rawInput types (input=", inputField.Type.String(),
 			", rawInput=", rawInputField.Type.String(), ")",
-		).AtWarning()
+		)
 	}
-	return (*bytes.Reader)(unsafe.Add(base, inputField.Offset)),
-		(*bytes.Buffer)(unsafe.Add(base, rawInputField.Offset)), nil
+	input := (*bytes.Reader)(unsafe.Add(base, inputField.Offset))
+	if rawIsPtr {
+		return input, (**bytes.Buffer)(unsafe.Add(base, rawInputField.Offset)), nil
+	}
+	rawInput := (*bytes.Buffer)(unsafe.Add(base, rawInputField.Offset))
+	return input, &rawInput, nil
 }
 
 // New creates a new VLess outbound handler.
@@ -158,7 +168,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	}
 	server, err := protocol.NewServerSpecFromPB(config.Vnext)
 	if err != nil {
-		return nil, errors.New("failed to get server spec").Base(err).AtError()
+		return nil, errors.New("failed to get server spec").Base(err)
 	}
 
 	v := core.MustFromContext(ctx)
@@ -178,19 +188,30 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		}
 		handler.encryption = &encryption.ClientInstance{}
 		if err := handler.encryption.Init(nfsPKeysBytes, a.XorMode, a.Seconds, a.Padding); err != nil {
-			return nil, errors.New("failed to use encryption").Base(err).AtError()
+			return nil, errors.New("failed to use encryption").Base(err)
 		}
 	}
 
 	if a.Reverse != nil {
+		rvsCtx := session.ContextWithInbound(ctx, &session.Inbound{
+			Tag:  a.Reverse.Tag,
+			Name: "vless-reverse",
+			User: handler.server.User, // TODO: email
+		})
+		if sc := a.Reverse.Sniffing; sc != nil && sc.Enabled {
+			request, err := proxymanConfig.BuildSniffingRequest(sc)
+			if err != nil {
+				return nil, errors.New("failed to build reverse sniffing request").Base(err)
+			}
+			rvsCtx = session.ContextWithContent(rvsCtx, &session.Content{
+				SniffingRequest: request,
+			})
+		}
 		handler.reverse = &Reverse{
 			tag:        a.Reverse.Tag,
 			dispatcher: v.GetFeature(routing.DispatcherType()).(routing.Dispatcher),
-			ctx: session.ContextWithInbound(ctx, &session.Inbound{
-				Tag:  a.Reverse.Tag,
-				User: handler.server.User, // TODO: email
-			}),
-			handler: handler,
+			ctx:        rvsCtx,
+			handler:    handler,
 		}
 		handler.reverse.monitorTask = &task.Periodic{
 			Execute:  handler.reverse.monitor,
@@ -226,7 +247,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	if !ob.Target.IsValid() && ob.Target.Address.String() != "v1.rvs.cool" {
-		return errors.New("target not specified").AtError()
+		return errors.New("target not specified")
 	}
 	ob.Name = "vless"
 
@@ -309,7 +330,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-h.preCtx.Done():
-				return errors.New("closed handler").AtWarning()
+				return errors.New("closed handler")
 			case connTime = <-prePool:
 			case <-time.After(150 * time.Millisecond):
 				// Preconnect is best-effort. Fall back to direct dial when the
@@ -317,7 +338,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				break preconnectLoop
 			}
 			if connTime == nil {
-				return errors.New("closed handler").AtWarning()
+				return errors.New("closed handler")
 			}
 			if time.Now().Before(connTime.Expire) {
 				conn = connTime.Conn
@@ -336,12 +357,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 			return nil
 		}); err != nil {
-			return errors.New("failed to find an available destination").Base(err).AtWarning()
+			return errors.New("failed to find an available destination").Base(err)
 		}
 	}
 	defer conn.Close()
-
-	ob.Conn = conn // for Vision's pre-connect
 
 	iConn := stat.TryUnwrapStatsConn(conn)
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
@@ -349,7 +368,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	if h.encryption != nil {
 		var err error
 		if conn, err = h.encryption.Handshake(conn); err != nil {
-			return errors.New("ML-KEM-768 handshake failed").Base(err).AtInfo()
+			return errors.New("ML-KEM-768 handshake failed").Base(err)
 		}
 	}
 
@@ -363,7 +382,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			command = protocol.RequestCommandMux
 		case "v1.rvs.cool":
 			if target.Network != net.Network_Unknown {
-				return errors.New("nice try baby").AtError()
+				return errors.New("nice try baby")
 			}
 			command = protocol.RequestCommandRvs
 		}
@@ -384,7 +403,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	var input *bytes.Reader
-	var rawInput *bytes.Buffer
+	var rawInput **bytes.Buffer
 	allowUDP443 := false
 	switch requestAddons.Flow {
 	case vless.XRV + "-udp443":
@@ -396,7 +415,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		switch request.Command {
 		case protocol.RequestCommandUDP:
 			if !allowUDP443 && request.Port == 443 {
-				return errors.New("XTLS rejected UDP/443 traffic").AtInfo()
+				return errors.New("XTLS rejected UDP/443 traffic")
 			}
 		case protocol.RequestCommandMux:
 			fallthrough // let server break Mux connections that contain TCP requests
@@ -427,7 +446,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					input = rustInput
 					rawInput = rustRaw
 				} else {
-					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
+					return errors.New("XTLS only supports TLS and REALITY directly for now.")
 				}
 			}
 			if t != nil {
@@ -489,7 +508,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
 		if err := encoding.EncodeRequestHeader(bufferWriter, request, requestAddons); err != nil {
-			return errors.New("failed to encode request header").Base(err).AtWarning()
+			return errors.New("failed to encode request header").Base(err)
 		}
 
 		// default: serverWriter := bufferWriter
@@ -518,23 +537,23 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 		// Flush; bufferWriter.WriteMultiBuffer now is bufferWriter.writer.WriteMultiBuffer
 		if err := bufferWriter.SetBuffered(false); err != nil {
-			return errors.New("failed to write A request payload").Base(err).AtWarning()
+			return errors.New("failed to write A request payload").Base(err)
 		}
 
 		if requestAddons.Flow == vless.XRV {
 			if tlsConn, ok := iConn.(*tls.Conn); ok {
 				if tlsConn.ConnectionState().Version != gotls.VersionTLS13 {
-					return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
+					return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version)
 				}
 			} else if utlsConn, ok := iConn.(*tls.UConn); ok {
 				if utlsConn.ConnectionState().Version != utls.VersionTLS13 {
-					return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, utlsConn.ConnectionState().Version).AtWarning()
+					return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, utlsConn.ConnectionState().Version)
 				}
 			}
 		}
 		err := buf.Copy(clientReader, serverWriter, buf.UpdateActivity(timer))
 		if err != nil {
-			return errors.New("failed to transfer request payload").Base(err).AtInfo()
+			return errors.New("failed to transfer request payload").Base(err)
 		}
 
 		// Indicates the end of request payload.
@@ -549,7 +568,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		responseAddons, err := encoding.DecodeResponseHeader(conn, request)
 		if err != nil {
-			return errors.New("failed to decode response header").Base(err).AtInfo()
+			return errors.New("failed to decode response header").Base(err)
 		}
 
 		// default: serverReader := buf.NewReader(conn)
@@ -573,7 +592,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		if err != nil {
-			return errors.New("failed to transfer response payload").Base(err).AtInfo()
+			return errors.New("failed to transfer response payload").Base(err)
 		}
 
 		return nil
@@ -584,7 +603,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	if err := task.Run(ctx, postRequest, task.OnSuccess(getResponse, task.Close(clientWriter))); err != nil {
-		return errors.New("connection ends").Base(err).AtInfo()
+		return errors.New("connection ends").Base(err)
 	}
 
 	return nil

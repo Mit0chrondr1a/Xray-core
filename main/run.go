@@ -31,20 +31,23 @@ var cmdRun = &base.Command{
 	Long: `
 Run Xray with config, the default command.
 
-The -config=file, -c=file flags set the config files for 
+The -config=file, -c=file flags set the config files for
 Xray. Multiple assign is accepted.
 
 The -confdir=dir flag sets a dir with multiple json config
 
-The -format=json flag sets the format of config files. 
+The -format=json flag sets the format of config files.
 Default "auto".
 
-The -test flag tells Xray to test config files only, 
+The -test flag tells Xray to test config files only,
 without launching the server.
 
 The -dump flag tells Xray to print the merged config.
 	`,
 }
+
+// The --lua-privileged-pubkey=key flag sets the trusted Ed25519 public key
+// for privileged local Lua scripts, encoded as unpadded Base64URL.
 
 func init() {
 	cmdRun.Run = executeRun // break init loop
@@ -57,6 +60,8 @@ var (
 	dump        = cmdRun.Flag.Bool("dump", false, "Dump merged config only, without launching Xray server.")
 	test        = cmdRun.Flag.Bool("test", false, "Test config file only, without launching Xray server.")
 	format      = cmdRun.Flag.String("format", "auto", "Format of input file.")
+	// TODO: Restore this flag and its help text when Lua privileged signature authorization is re-enabled.
+	// luaPrivilegedPublicKey = cmdRun.Flag.String("lua-privileged-pubkey", "", "Unpadded Base64URL Ed25519 public key for privileged local Lua scripts.")
 
 	/* We have to do this here because Golang's Test will also need to parse flag, before
 	 * main func in this file is run.
@@ -104,12 +109,6 @@ func executeRun(cmd *base.Command, args []string) {
 		fmt.Println("Failed to start:", err)
 		os.Exit(-1)
 	}
-
-	/*
-		conf.FileCache = nil
-		conf.IPCache = nil
-		conf.SiteCache = nil
-	*/
 
 	// Explicitly triggering GC to remove garbage from config loading.
 	runtime.GC()
@@ -319,6 +318,11 @@ func getConfigFormat() string {
 }
 
 func loadXrayConfig() (*core.Config, error) {
+	// TODO: Restore public key initialization when Lua privileged signature authorization is re-enabled.
+	// if err := lua.SetPrivilegedPublicKey(*luaPrivilegedPublicKey); err != nil {
+	// 	return nil, errors.New("failed to configure Lua privileged authorization").Base(err)
+	// }
+
 	configFiles, err := getConfigFilePath(true)
 	if err != nil {
 		return nil, errors.New("failed to resolve config file path").Base(err)

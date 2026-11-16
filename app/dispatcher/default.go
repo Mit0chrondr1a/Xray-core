@@ -2,7 +2,6 @@ package dispatcher
 
 import (
 	"context"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -26,28 +25,6 @@ import (
 )
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
-
-// regexCache caches compiled regexes from sniffing ExcludeForDomain patterns.
-// Patterns from config are static (SniffingRequest is read-only), so compiling
-// once and caching avoids per-connection regex compilation overhead.
-var regexCache sync.Map // string -> *regexp.Regexp
-
-// getOrCompileRegex returns a compiled regex for the given pattern, caching it
-// for subsequent calls. Returns nil if the pattern is invalid.
-func getOrCompileRegex(pattern string) *regexp.Regexp {
-	if v, ok := regexCache.Load(pattern); ok {
-		re, _ := v.(*regexp.Regexp)
-		return re
-	}
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		// Store nil to avoid retrying invalid patterns.
-		regexCache.Store(pattern, (*regexp.Regexp)(nil))
-		return nil
-	}
-	regexCache.Store(pattern, re)
-	return re
-}
 
 type cachedReader struct {
 	sync.Mutex
@@ -185,7 +162,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+			if c, _ := d.stats.GetOrRegisterCounter(name); c != nil {
 				inboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  inboundLink.Writer,
@@ -194,7 +171,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		}
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+			if c, _ := d.stats.GetOrRegisterCounter(name); c != nil {
 				outboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  outboundLink.Writer,
@@ -203,15 +180,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		}
 
 		if p.Stats.UserOnline {
-			name := "user>>>" + user.Email + ">>>online"
-			if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
-				sessionInbounds := session.InboundFromContext(ctx)
-				userIP := sessionInbounds.Source.Address.String()
-				om.AddIP(userIP)
-				// log Online user with ips
-				// errors.LogDebug(ctx, "user>>>" + user.Email + ">>>online", om.Count(), om.List())
-
-			}
+			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
 		}
 	}
 
@@ -231,13 +200,13 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 		p := policyManager.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
+			if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
 				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
 			}
 		}
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
+			if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
 				link.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  link.Writer,
@@ -245,18 +214,19 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 			}
 		}
 		if p.Stats.UserOnline {
-			name := "user>>>" + user.Email + ">>>online"
-			if om, _ := stats.GetOrRegisterOnlineMap(statsManager, name); om != nil {
-				sessionInbounds := session.InboundFromContext(ctx)
-				userIP := sessionInbounds.Source.Address.String()
-				om.AddIP(userIP)
-				// log Online user with ips
-				// errors.LogDebug(ctx, "user>>>" + user.Email + ">>>online", om.Count(), om.List())
-			}
+			trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
 		}
 	}
 
 	return link
+}
+
+func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip string) {
+	name := "user>>>" + email + ">>>online"
+	if om, _ := sm.GetOrRegisterOnlineMap(name); om != nil {
+		om.AddIP(ip)
+		context.AfterFunc(ctx, func() { om.RemoveIP(ip) })
+	}
 }
 
 func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) bool {
@@ -264,21 +234,11 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
 	if domain == "" {
 		return false
 	}
-	for _, d := range request.ExcludeForDomain {
-		if strings.HasPrefix(d, "regexp:") {
-			pattern := d[7:]
-			re := getOrCompileRegex(pattern)
-			if re == nil {
-				continue
-			}
-			if re.MatchString(domain) {
-				return false
-			}
-		} else {
-			if strings.ToLower(domain) == d {
-				return false
-			}
-		}
+	if request.ExcludeForDomain != nil && request.ExcludeForDomain.MatchAny(strings.ToLower(domain)) {
+		return false
+	}
+	if request.ExcludeForIP != nil && destination.Address.Family().IsIP() && request.ExcludeForIP.Match(destination.Address.IP()) {
+		return false
 	}
 	protocolString := result.Protocol()
 	if resComp, ok := result.(SnifferResultComposite); ok {
@@ -526,6 +486,9 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 				return // DO NOT CHANGE: the traffic shouldn't be processed by default outbound if the specified outbound tag doesn't exist (yet), e.g., VLESS Reverse Proxy
 			}
 		} else {
+			if err != common.ErrNoClue {
+				errors.LogErrorInner(ctx, err, "failed to pick route for ", destination)
+			}
 			errors.LogInfo(ctx, "default route for ", destination)
 		}
 	}

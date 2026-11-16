@@ -206,9 +206,9 @@ func TestEncodeDecodeHeaderRoundTripBoundary(t *testing.T) {
 		valid  bool
 	}{
 		{"exactly 17", 17, true},
-		{"exactly 17000", 17000, true},
+		{"exactly 16640", 16640, true},
 		{"16 (below minimum)", 16, false},
-		{"17001 (above maximum)", 17001, false},
+		{"16641 (above maximum)", 16641, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

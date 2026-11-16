@@ -257,6 +257,9 @@ func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
 }
 
 func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+	if err := platform.ReloadEnvSettings(); err != nil {
+		return true, errors.New("failed to reload environment settings").Base(err)
+	}
 	server.ctx = c.ContextWithCone(server.ctx,
 		platform.NewEnvFlag(platform.UseCone).GetValue(func() string { return "" }) != "true")
 	bindOCSPTickerOwners(server, config)

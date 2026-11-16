@@ -3,7 +3,10 @@ package httpupgrade
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/base64"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -32,10 +35,29 @@ func (s *server) Addr() net.Addr {
 	return nil
 }
 
-func (s *server) Handle(conn net.Conn) (stat.Connection, error) {
-	// Set a read deadline to prevent slowloris attacks on the HTTP upgrade handshake
-	conn.SetReadDeadline(time.Now().Add(4 * time.Second))
-	connReader := bufio.NewReader(conn)
+func (s *server) Handle(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			errors.LogError(context.Background(), "panic in httpupgrade handler: ", r)
+			_ = conn.Close()
+		}
+	}()
+	upgradedConn, err := s.upgrade(conn)
+	if err != nil {
+		common.CloseIfExists(conn)
+		errors.LogInfoInner(context.Background(), err, "failed to handle request")
+		return
+	}
+	s.addConn(upgradedConn)
+}
+
+// upgrade execute a fake websocket upgrade process and return the available connection
+func (s *server) upgrade(conn net.Conn) (stat.Connection, error) {
+	// timeout and header limit are the same as websocket
+	conn.SetReadDeadline(time.Now().Add(time.Second * 4))
+	defer conn.SetReadDeadline(time.Time{})
+	connReader := bufio.NewReader(io.LimitReader(conn, 12288))
+
 	req, err := http.ReadRequest(connReader)
 	if err != nil {
 		return nil, err
@@ -55,7 +77,6 @@ func (s *server) Handle(conn net.Conn) (stat.Connection, error) {
 	connection := strings.ToLower(req.Header.Get("Connection"))
 	upgrade := strings.ToLower(req.Header.Get("Upgrade"))
 	if connection != "upgrade" || upgrade != "websocket" {
-		_ = conn.Close()
 		return nil, errors.New("unrecognized request")
 	}
 	resp := &http.Response{
@@ -68,32 +89,22 @@ func (s *server) Handle(conn net.Conn) (stat.Connection, error) {
 	}
 	resp.Header.Set("Connection", "Upgrade")
 	resp.Header.Set("Upgrade", "websocket")
+	// respond a valid Sec-WebSocket-Accept header if received a Sec-WebSocket-Key
+	if wsKey := req.Header.Get("Sec-WebSocket-Key"); wsKey != "" {
+		acceptKey := sha1.Sum([]byte(wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")) // magic number in RFC 6455
+		resp.Header.Set("Sec-WebSocket-Accept", base64.StdEncoding.EncodeToString(acceptKey[:]))
+	}
 	err = resp.Write(conn)
 	if err != nil {
-		_ = conn.Close()
 		return nil, err
 	}
-	// Clear the read deadline after successful upgrade handshake
-	conn.SetReadDeadline(time.Time{})
 
-	var forwardedAddrs []net.Address
-	if s.socketSettings != nil && len(s.socketSettings.TrustedXForwardedFor) > 0 {
-		for _, key := range s.socketSettings.TrustedXForwardedFor {
-			if len(req.Header.Values(key)) > 0 {
-				forwardedAddrs = http_proto.ParseXForwardedFor(req.Header)
-				break
-			}
-		}
-	} else {
-		forwardedAddrs = http_proto.ParseXForwardedFor(req.Header)
-	}
 	remoteAddr := conn.RemoteAddr()
-	if len(forwardedAddrs) > 0 && forwardedAddrs[0].Family().IsIP() {
-		remoteAddr = &net.TCPAddr{
-			IP:   forwardedAddrs[0].IP(),
-			Port: int(0),
-		}
+	var trustedXFF []string
+	if s.socketSettings != nil {
+		trustedXFF = s.socketSettings.TrustedXForwardedFor
 	}
+	remoteAddr = http_proto.ApplyTrustedXForwardedFor(req.Header, trustedXFF, remoteAddr)
 
 	return stat.Connection(newConnection(conn, remoteAddr)), nil
 }
@@ -102,22 +113,17 @@ func (s *server) keepAccepting() {
 	for {
 		conn, err := s.innnerListener.Accept()
 		if err != nil {
-			return
-		}
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					errors.LogError(context.Background(), "panic in httpupgrade handler: ", r)
-					_ = conn.Close()
-				}
-			}()
-			handledConn, err := s.Handle(conn)
-			if err != nil {
-				errors.LogInfoInner(context.Background(), err, "failed to handle request")
-				return
+			errStr := err.Error()
+			if strings.Contains(errStr, "closed") {
+				break
 			}
-			s.addConn(handledConn)
-		}()
+			errors.LogWarningInner(context.Background(), err, "failed to accept raw connections")
+			if strings.Contains(errStr, "too many") {
+				time.Sleep(time.Millisecond * 500)
+			}
+			continue
+		}
+		go s.Handle(conn)
 	}
 }
 
@@ -131,25 +137,21 @@ func ListenHTTPUpgrade(ctx context.Context, address net.Address, port net.Port, 
 	}
 	var listener net.Listener
 	var err error
+	var addr net.Addr
 	if port == net.Port(0) { // unix
-		listener, err = internet.ListenSystem(ctx, &net.UnixAddr{
-			Name: address.Domain(),
-			Net:  "unix",
-		}, streamSettings.SocketSettings)
-		if err != nil {
-			return nil, errors.New("failed to listen unix domain socket(for HttpUpgrade) on ", address).Base(err)
-		}
-		errors.LogInfo(ctx, "listening unix domain socket(for HttpUpgrade) on ", address)
+		addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
 	} else { // tcp
-		listener, err = internet.ListenSystem(ctx, &net.TCPAddr{
-			IP:   address.IP(),
-			Port: int(port),
-		}, streamSettings.SocketSettings)
-		if err != nil {
-			return nil, errors.New("failed to listen TCP(for HttpUpgrade) on ", address, ":", port).Base(err)
-		}
-		errors.LogInfo(ctx, "listening TCP(for HttpUpgrade) on ", address, ":", port)
+		addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
 	}
+	if streamSettings.FinalMask != nil {
+		listener, err = streamSettings.FinalMask.Listen(ctx, addr)
+	} else {
+		listener, err = internet.ListenSystem(ctx, addr, streamSettings.SocketSettings)
+	}
+	if err != nil {
+		return nil, errors.New("failed to listen ", addr.Network(), "(for HttpUpgrade) on ", address, ":", port).Base(err)
+	}
+	errors.LogInfo(ctx, "listening ", addr.Network(), "(for HttpUpgrade) on ", address, ":", port)
 
 	if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol {
 		errors.LogWarning(ctx, "accepting PROXY protocol")

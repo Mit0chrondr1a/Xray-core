@@ -8,17 +8,16 @@ import (
 	"io"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/buf"
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/native"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/native"
 )
 
 var AddrParser = protocol.NewAddressParser(
@@ -29,30 +28,39 @@ var AddrParser = protocol.NewAddressParser(
 )
 
 var (
-	Show      bool
-	baseKeyMu sync.RWMutex
-	baseKey   []byte
+	Show    atomic.Bool
+	baseKey atomic.Value
 )
 
-func init() {
-	if strings.ToLower(platform.NewEnvFlag(platform.XUDPLog).GetValue(func() string { return "" })) == "true" {
-		Show = true
+func reloadEnvSettings() error {
+	Show.Store(strings.ToLower(platform.NewEnvFlag(platform.XUDPLog).GetValue(func() string { return "" })) == "true")
+	raw := platform.NewEnvFlag(platform.XUDPBaseKey).GetValue(func() string { return "" })
+	if raw == "" {
+		ensureBaseKey()
+		return nil
 	}
-	baseKey = make([]byte, 32)
-	rand.Read(baseKey)
-	go func() {
-		time.Sleep(100 * time.Millisecond) // this is not nice, but need to give some time for Android to setup ENV
-		if raw := platform.NewEnvFlag(platform.XUDPBaseKey).GetValue(func() string { return "" }); raw != "" {
-			decoded, _ := base64.RawURLEncoding.DecodeString(raw)
-			if len(decoded) == 32 {
-				baseKeyMu.Lock()
-				baseKey = decoded
-				baseKeyMu.Unlock()
-				return
-			}
-			errors.LogError(context.Background(), platform.XUDPBaseKey+": invalid value (BaseKey must be 32 bytes): "+raw+" len "+strconv.Itoa(len(decoded))+"; keeping random default key")
-		}
-	}()
+	key, _ := base64.RawURLEncoding.DecodeString(raw)
+	if len(key) != 32 {
+		return errors.New(platform.XUDPBaseKey + ": invalid value (BaseKey must be 32 bytes): " + raw + " len " + strconv.Itoa(len(key)))
+	}
+	baseKey.Store(append([]byte(nil), key...))
+	return nil
+}
+
+func ensureBaseKey() []byte {
+	if key := baseKey.Load(); key != nil {
+		return key.([]byte)
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		panic(err)
+	}
+	baseKey.Store(key)
+	return key
+}
+
+func init() {
+	platform.RegisterEnvReload(reloadEnvSettings)
 }
 
 func GetGlobalID(ctx context.Context) (globalID [8]byte) {
@@ -62,15 +70,11 @@ func GetGlobalID(ctx context.Context) (globalID [8]byte) {
 	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.Network == net.Network_UDP &&
 		(inbound.Name == "dokodemo-door" || inbound.Name == "socks" || inbound.Name == "shadowsocks" || inbound.Name == "tun") {
 		var keyArr [32]byte
-		baseKeyMu.RLock()
-		copy(keyArr[:], baseKey)
-		baseKeyMu.RUnlock()
+		copy(keyArr[:], ensureBaseKey())
 		result := native.Blake3KeyedHash(&keyArr, []byte(inbound.Source.String()), 8)
-		for i := range keyArr {
-			keyArr[i] = 0
-		}
+		clear(keyArr[:])
 		copy(globalID[:], result)
-		if Show {
+		if Show.Load() {
 			errors.LogInfo(ctx, fmt.Sprintf("XUDP inbound.Source.String(): %v\tglobalID: %v\n", inbound.Source.String(), globalID))
 		}
 	}

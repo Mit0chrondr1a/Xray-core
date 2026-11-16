@@ -70,7 +70,7 @@ func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (M
 		}
 		return r.mb, r.err
 	case <-timer.C:
-		return nil, nil
+		return nil, ErrReadTimeout
 	}
 }
 
@@ -119,7 +119,7 @@ func NewReader(reader io.Reader) Reader {
 	}
 
 	_, isFile := reader.(*os.File)
-	if !isFile && useReadv {
+	if !isFile && useReadV() {
 		if sc, ok := reader.(syscall.Conn); ok {
 			rawConn, err := sc.SyscallConn()
 			if err != nil {

@@ -3,6 +3,8 @@ package httpupgrade
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"net/http"
 	"net/url"
 	"strings"
@@ -46,7 +48,13 @@ func (c *ConnRF) Read(b []byte) (int, error) {
 func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	transportConfiguration := streamSettings.ProtocolSettings.(*Config)
 
-	pconn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+	var pconn net.Conn
+	var err error
+	if streamSettings.FinalMask != nil {
+		pconn, err = streamSettings.FinalMask.DialTCP(ctx, dest)
+	} else {
+		pconn, err = internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+	}
 	if err != nil {
 		errors.LogErrorInner(ctx, err, "failed to dial to ", dest)
 		return nil, err
@@ -87,11 +95,19 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
 	for key, value := range transportConfiguration.Header {
 		AddHeader(req.Header, key, value)
 	}
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", utils.ChromeUA)
-	}
+	utils.TryDefaultHeadersWith(req.Header, "ws")
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
+
+	// make a valid Sec-WebSocket-Key if not present
+	if len(req.Header.Values("Sec-WebSocket-Key")) == 0 {
+		var buf [16]byte
+		rand.Read(buf[:])
+		req.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(buf[:]))
+	}
+	if len(req.Header.Values("Sec-WebSocket-Version")) == 0 {
+		req.Header.Set("Sec-WebSocket-Version", "13")
+	}
 
 	err = req.Write(conn)
 	if err != nil {

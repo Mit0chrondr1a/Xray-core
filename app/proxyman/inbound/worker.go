@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	c "github.com/xtls/xray-core/common/ctx"
@@ -19,7 +18,9 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/hysteria"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tcp"
 	"github.com/xtls/xray-core/transport/internet/udp"
@@ -41,7 +42,7 @@ type tcpWorker struct {
 	recvOrigDest    bool
 	tag             string
 	dispatcher      routing.Dispatcher
-	sniffingConfig  *proxyman.SniffingConfig
+	sniffingRequest session.SniffingRequest
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
@@ -122,13 +123,7 @@ func (w *tcpWorker) callback(conn stat.Connection, acceptStartUnixNano int64) {
 	})
 
 	content := new(session.Content)
-	if w.sniffingConfig != nil {
-		content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
-		content.SniffingRequest.OverrideDestinationForProtocol = w.sniffingConfig.DestinationOverride
-		content.SniffingRequest.ExcludeForDomain = w.sniffingConfig.DomainsExcluded
-		content.SniffingRequest.MetadataOnly = w.sniffingConfig.MetadataOnly
-		content.SniffingRequest.RouteOnly = w.sniffingConfig.RouteOnly
-	}
+	content.SniffingRequest = w.sniffingRequest
 	ctx = session.ContextWithContent(ctx, content)
 
 	if err := w.proxy.Process(ctx, net.Network_TCP, conn, w.dispatcher); err != nil {
@@ -157,6 +152,11 @@ func (w *tcpWorker) launchHandler(conn stat.Connection, acceptStartUnixNano int6
 func (w *tcpWorker) Start() error {
 	w.connSemaphore = make(chan struct{}, getMaxConnections())
 	ctx := context.Background()
+
+	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
+		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
+	}
+
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
 		acceptStartUnixNano := tcp.TakeAcceptStartUnixNano(conn)
 		// Fast path: try non-blocking acquire first (zero allocation).
@@ -188,7 +188,7 @@ func (w *tcpWorker) Start() error {
 		}
 	})
 	if err != nil {
-		return errors.New("failed to listen TCP on ", w.port).AtWarning().Base(err)
+		return errors.New("failed to listen TCP on ", w.port).Base(err)
 	}
 	w.hub = hub
 	return nil
@@ -312,7 +312,7 @@ type udpWorker struct {
 	tag             string
 	stream          *internet.MemoryStreamConfig
 	dispatcher      routing.Dispatcher
-	sniffingConfig  *proxyman.SniffingConfig
+	sniffingRequest session.SniffingRequest
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
@@ -467,13 +467,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			Tag:     w.tag,
 		})
 		content := new(session.Content)
-		if w.sniffingConfig != nil {
-			content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
-			content.SniffingRequest.OverrideDestinationForProtocol = w.sniffingConfig.DestinationOverride
-			content.SniffingRequest.ExcludeForDomain = w.sniffingConfig.DomainsExcluded
-			content.SniffingRequest.MetadataOnly = w.sniffingConfig.MetadataOnly
-			content.SniffingRequest.RouteOnly = w.sniffingConfig.RouteOnly
-		}
+		content.SniffingRequest = w.sniffingRequest
 		ctx = session.ContextWithContent(ctx, content)
 		if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
 			errors.LogInfoInner(ctx, err, "connection ends")
@@ -589,7 +583,7 @@ type dsWorker struct {
 	stream          *internet.MemoryStreamConfig
 	tag             string
 	dispatcher      routing.Dispatcher
-	sniffingConfig  *proxyman.SniffingConfig
+	sniffingRequest session.SniffingRequest
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
@@ -622,13 +616,7 @@ func (w *dsWorker) callback(conn stat.Connection) {
 	})
 
 	content := new(session.Content)
-	if w.sniffingConfig != nil {
-		content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
-		content.SniffingRequest.OverrideDestinationForProtocol = w.sniffingConfig.DestinationOverride
-		content.SniffingRequest.ExcludeForDomain = w.sniffingConfig.DomainsExcluded
-		content.SniffingRequest.MetadataOnly = w.sniffingConfig.MetadataOnly
-		content.SniffingRequest.RouteOnly = w.sniffingConfig.RouteOnly
-	}
+	content.SniffingRequest = w.sniffingRequest
 	ctx = session.ContextWithContent(ctx, content)
 
 	if err := w.proxy.Process(ctx, net.Network_UNIX, conn, w.dispatcher); err != nil {
@@ -666,7 +654,7 @@ func (w *dsWorker) Start() error {
 		}
 	})
 	if err != nil {
-		return errors.New("failed to listen Unix Domain Socket on ", w.address).AtWarning().Base(err)
+		return errors.New("failed to listen Unix Domain Socket on ", w.address).Base(err)
 	}
 	w.hub = hub
 	return nil

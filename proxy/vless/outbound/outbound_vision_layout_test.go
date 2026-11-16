@@ -36,7 +36,7 @@ func TestResolveVisionInternalReadersAcceptsExpectedLayout(t *testing.T) {
 	if n, readErr := input.Read(buf); readErr != nil || n != 5 || string(buf[:n]) != "hello" {
 		t.Fatalf("input reader = (%d, %v, %q), want (5, nil, %q)", n, readErr, string(buf[:n]), "hello")
 	}
-	if got := rawInput.String(); got != "raw" {
+	if got := (*rawInput).String(); got != "raw" {
 		t.Fatalf("rawInput.String() = %q, want %q", got, "raw")
 	}
 }
@@ -54,5 +54,31 @@ func TestResolveVisionInternalReadersRejectsWrongFieldTypes(t *testing.T) {
 	_, _, err := resolveVisionInternalReaders(reflect.TypeOf(*state), unsafe.Pointer(state))
 	if err == nil || !strings.Contains(err.Error(), "unexpected input/rawInput types") {
 		t.Fatalf("error = %v, want wrong-type error", err)
+	}
+}
+
+// Go 1.27.3+ crypto/tls holds rawInput as *bytes.Buffer.
+type outboundVisionLayoutPtr struct {
+	prefix   byte
+	rawInput *bytes.Buffer
+	input    bytes.Reader
+}
+
+func TestResolveVisionInternalReadersAcceptsPointerRawInput(t *testing.T) {
+	state := &outboundVisionLayoutPtr{prefix: 7, rawInput: bytes.NewBufferString("raw")}
+	state.input.Reset([]byte("hello"))
+
+	input, rawInput, err := resolveVisionInternalReaders(reflect.TypeOf(*state), unsafe.Pointer(state))
+	if err != nil {
+		t.Fatalf("resolveVisionInternalReaders() error = %v", err)
+	}
+	if input == nil || rawInput == nil {
+		t.Fatal("resolveVisionInternalReaders() returned nil pointers for pointer layout")
+	}
+	// The TLS library may swap its buffer after resolution; the reader must
+	// observe the live pointer, not a snapshot.
+	state.rawInput = bytes.NewBufferString("swapped")
+	if got := (*rawInput).String(); got != "swapped" {
+		t.Fatalf("(*rawInput).String() = %q, want %q", got, "swapped")
 	}
 }

@@ -86,9 +86,15 @@ func nativeTLSConfigWithRuntimeOverrides(config *tls.Config, tlsConfig *gotls.Co
 // Dial dials a new TCP connection to the given destination.
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	errors.LogInfo(ctx, "dialing TCP to ", dest)
-	conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+	var conn net.Conn
+	var err error
+	if streamSettings.FinalMask != nil {
+		conn, err = streamSettings.FinalMask.DialTCP(ctx, dest)
+	} else {
+		conn, err = internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+	}
 	if err != nil {
-		return nil, err
+		return nil, errors.New("failed to dial to dest").Base(err)
 	}
 
 	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
@@ -155,14 +161,14 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		if err != nil {
 			if isFromMitmVerify {
-				return nil, errors.New("MITM freedom RAW TLS: failed to verify Domain Fronting certificate from " + mitmServerName).Base(err).AtWarning()
+				return nil, errors.New("MITM freedom RAW TLS: failed to verify Domain Fronting certificate from " + mitmServerName).Base(err)
 			}
 			return nil, err
 		}
 		negotiatedProtocol := conn.(tls.Interface).NegotiatedProtocol()
 		if isFromMitmAlpn && !mitmAlpn11 && negotiatedProtocol != "h2" {
 			conn.Close()
-			return nil, errors.New("MITM freedom RAW TLS: unexpected Negotiated Protocol (" + negotiatedProtocol + ") with " + mitmServerName).AtWarning()
+			return nil, errors.New("MITM freedom RAW TLS: unexpected Negotiated Protocol (" + negotiatedProtocol + ") with " + mitmServerName)
 		}
 	} else if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
 		if conn, err = reality.UClient(conn, config, ctx, dest); err != nil {
@@ -174,11 +180,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if tcpSettings.HeaderSettings != nil {
 		headerConfig, err := tcpSettings.HeaderSettings.GetInstance()
 		if err != nil {
-			return nil, errors.New("failed to get header settings").Base(err).AtError()
+			return nil, errors.New("failed to get header settings").Base(err)
 		}
 		auth, err := internet.CreateConnectionAuthenticator(headerConfig)
 		if err != nil {
-			return nil, errors.New("failed to create header authenticator").Base(err).AtError()
+			return nil, errors.New("failed to create header authenticator").Base(err)
 		}
 		conn = auth.Client(conn)
 	}

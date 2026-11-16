@@ -30,6 +30,7 @@ const (
 
 type SocksServerConfig struct {
 	AuthMethod string          `json:"auth"`
+	Users      []*SocksAccount `json:"users"`
 	StrictAuth bool            `json:"strictAuth"`
 	Accounts   []*SocksAccount `json:"accounts"`
 	UDP        bool            `json:"udp"`
@@ -46,15 +47,19 @@ func (v *SocksServerConfig) Build() (proto.Message, error) {
 		config.AuthType = socks.AuthType_PASSWORD
 	default:
 		if v.StrictAuth {
-			return nil, errors.New("unknown socks auth method: ", v.AuthMethod, ". Allowed values are ", AuthMethodNoAuth, " and ", AuthMethodUserPass).AtError()
+			return nil, errors.New("unknown socks auth method: ", v.AuthMethod, ". Allowed values are ", AuthMethodNoAuth, " and ", AuthMethodUserPass)
 		}
 		errors.LogWarning(context.Background(), "unknown socks auth method: ", v.AuthMethod, ". Default to ", AuthMethodNoAuth)
 		config.AuthType = socks.AuthType_NO_AUTH
 	}
 
-	if len(v.Accounts) > 0 {
-		config.Accounts = make(map[string]string, len(v.Accounts))
-		for _, account := range v.Accounts {
+	if v.Accounts != nil {
+		v.Users = v.Accounts
+	}
+	// TODO: PB
+	if len(v.Users) > 0 {
+		config.Accounts = make(map[string]string, len(v.Users))
+		for _, account := range v.Users {
 			config.Accounts[account.Username] = account.Password
 		}
 	}
@@ -115,7 +120,7 @@ func (v *SocksClientConfig) Build() (proto.Message, error) {
 				user.Email = v.Email
 			} else {
 				if err := json.Unmarshal(rawUser, user); err != nil {
-					return nil, errors.New("failed to parse Socks user").Base(err).AtError()
+					return nil, errors.New("failed to parse Socks user").Base(err)
 				}
 			}
 			account := new(SocksAccount)
@@ -124,7 +129,7 @@ func (v *SocksClientConfig) Build() (proto.Message, error) {
 				account.Password = v.Password
 			} else {
 				if err := json.Unmarshal(rawUser, account); err != nil {
-					return nil, errors.New("failed to parse socks account").Base(err).AtError()
+					return nil, errors.New("failed to parse socks account").Base(err)
 				}
 			}
 			user.Account = serial.ToTypedMessage(account.Build())

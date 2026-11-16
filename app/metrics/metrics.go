@@ -2,17 +2,19 @@ package metrics
 
 import (
 	"context"
+	"encoding/json"
+	stderrors "errors"
 	"expvar"
+	stdnet "net"
 	"net/http"
 	"net/http/pprof"
 	"strings"
 	"time"
 
 	"github.com/xtls/xray-core/app/observatory"
-	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/net"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/extension"
@@ -21,97 +23,27 @@ import (
 )
 
 type MetricsHandler struct {
-	ohm            outbound.Manager
-	statsManager   feature_stats.Manager
-	observatory    extension.Observatory
-	tag            string
-	listen         string
-	tcpListener    net.Listener
-	tcpServer      *http.Server
-	outboundServer *http.Server
-	mux            *http.ServeMux
+	ohm          outbound.Manager
+	statsManager feature_stats.Manager
+	ctx          context.Context
+	tag          string
+	listen       string
+	tcpListener  xnet.Listener
+	listener     *OutboundListener
+	server       *http.Server
 }
 
 // NewMetricsHandler creates a new MetricsHandler based on the given config.
 func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, error) {
-	mux := http.NewServeMux()
-
 	c := &MetricsHandler{
+		ctx:    ctx,
 		tag:    config.Tag,
 		listen: config.Listen,
-		mux:    mux,
 	}
 	common.Must(core.RequireFeatures(ctx, func(om outbound.Manager, sm feature_stats.Manager) {
 		c.statsManager = sm
 		c.ohm = om
 	}))
-
-	expvar.Publish("stats", expvar.Func(func() interface{} {
-		manager, ok := c.statsManager.(*stats.Manager)
-		if !ok {
-			return nil
-		}
-		resp := map[string]map[string]map[string]int64{
-			"inbound":  {},
-			"outbound": {},
-			"user":     {},
-		}
-		manager.VisitCounters(func(name string, counter feature_stats.Counter) bool {
-			nameSplit := strings.Split(name, ">>>")
-			if len(nameSplit) < 4 {
-				errors.LogWarning(context.Background(), "invalid stats counter name: ", name)
-				return true
-			}
-			typeName, tagOrUser, direction := nameSplit[0], nameSplit[1], nameSplit[3]
-			if item, found := resp[typeName][tagOrUser]; found {
-				item[direction] = counter.Value()
-			} else {
-				resp[typeName][tagOrUser] = map[string]int64{
-					direction: counter.Value(),
-				}
-			}
-			return true
-		})
-		return resp
-	}))
-	expvar.Publish("observatory", expvar.Func(func() interface{} {
-		if c.observatory == nil {
-			common.Must(core.RequireFeatures(ctx, func(observatory extension.Observatory) error {
-				c.observatory = observatory
-				return nil
-			}))
-			if c.observatory == nil {
-				return nil
-			}
-		}
-		resp := map[string]*observatory.OutboundStatus{}
-		if o, err := c.observatory.GetObservation(context.Background()); err != nil {
-			return err
-		} else {
-			for _, x := range o.(*observatory.ObservationResult).GetStatus() {
-				resp[x.OutboundTag] = x
-			}
-		}
-		return resp
-	}))
-
-	// Register pprof handlers on dedicated mux
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-
-	// Register expvar handler on dedicated mux
-	mux.Handle("/debug/vars", expvar.Handler())
-
-	// Health check endpoint for container orchestration (Kubernetes, Docker)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok\n"))
-	})
-
 	return c, nil
 }
 
@@ -120,80 +52,203 @@ func (p *MetricsHandler) Type() interface{} {
 }
 
 func (p *MetricsHandler) Start() error {
+	server := &http.Server{
+		Handler:           p.httpHandler(),
+		ReadHeaderTimeout: 4 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      300 * time.Second, // allow long pprof profile/trace captures
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	p.server = server
 
 	// direct listen a port if listen is set
 	if p.listen != "" {
-		if host, _, err := net.SplitHostPort(p.listen); err == nil {
+		if host, _, err := stdnet.SplitHostPort(p.listen); err == nil {
 			if host == "" || host == "0.0.0.0" || host == "::" {
 				errors.LogWarning(context.Background(), "Metrics server listening on all interfaces (", p.listen, ") — consider binding to 127.0.0.1 to prevent remote access to pprof/heap data")
 			}
 		}
-		TCPlistener, err := net.Listen("tcp", p.listen)
+		TCPlistener, err := xnet.Listen("tcp", p.listen)
 		if err != nil {
 			return err
 		}
 		p.tcpListener = TCPlistener
-		p.tcpServer = &http.Server{
-			Handler:           p.mux,
-			ReadHeaderTimeout: 4 * time.Second,
-			ReadTimeout:       15 * time.Second,
-			WriteTimeout:      300 * time.Second,
-			IdleTimeout:       120 * time.Second,
-			MaxHeaderBytes:    1 << 20,
-		}
 		errors.LogInfo(context.Background(), "Metrics server listening on ", p.listen)
 
-		go func() {
-			if err := p.tcpServer.Serve(TCPlistener); err != nil && err != http.ErrServerClosed {
-				errors.LogErrorInner(context.Background(), err, "failed to start metrics server")
-			}
-		}()
+		go p.serve(TCPlistener, server)
+	}
+
+	if p.tag == "" {
+		if p.tcpListener == nil {
+			return errors.New("metrics must have a tag or listen address")
+		}
+		return nil
 	}
 
 	listener := &OutboundListener{
-		buffer: make(chan net.Conn, 4),
+		buffer: make(chan xnet.Conn, 4),
 		done:   done.New(),
 	}
+	p.listener = listener
 
-	p.outboundServer = &http.Server{
-		Handler:           p.mux,
-		ReadHeaderTimeout: 4 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      300 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
-	go func() {
-		if err := p.outboundServer.Serve(listener); err != nil && err != http.ErrServerClosed {
-			errors.LogErrorInner(context.Background(), err, "failed to start metrics server")
-		}
-	}()
+	go p.serve(listener, server)
 
 	if err := p.ohm.RemoveHandler(context.Background(), p.tag); err != nil {
 		errors.LogInfo(context.Background(), "failed to remove existing handler")
 	}
 
-	return p.ohm.AddHandler(context.Background(), &Outbound{
+	if err := p.ohm.AddHandler(context.Background(), &Outbound{
 		tag:      p.tag,
 		listener: listener,
-	})
+	}); err != nil {
+		if closeErr := p.Close(); closeErr != nil {
+			errors.LogErrorInner(context.Background(), closeErr, "failed to close metrics server after start failure")
+		}
+		return err
+	}
+
+	return nil
 }
 
 func (p *MetricsHandler) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var firstErr error
-	if p.tcpServer != nil {
-		if err := p.tcpServer.Shutdown(ctx); err != nil && firstErr == nil {
-			firstErr = err
+	var errs []error
+	if p.tcpListener != nil {
+		errs = append(errs, p.tcpListener.Close())
+		p.tcpListener = nil
+	}
+	if p.listener != nil {
+		errs = append(errs, p.listener.Close())
+		p.listener = nil
+	}
+	if p.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := p.server.Shutdown(ctx)
+		cancel()
+		if err != nil {
+			err = p.server.Close()
+		}
+		if !isClosedListenerError(err) {
+			errs = append(errs, err)
+		}
+		p.server = nil
+	}
+	if p.ohm != nil && p.tag != "" {
+		if err := p.ohm.RemoveHandler(context.Background(), p.tag); err != nil {
+			errors.LogInfo(context.Background(), "failed to remove metrics handler")
 		}
 	}
-	if p.outboundServer != nil {
-		if err := p.outboundServer.Shutdown(ctx); err != nil && firstErr == nil {
-			firstErr = err
+	return errors.Combine(errs...)
+}
+
+func (p *MetricsHandler) serve(listener xnet.Listener, server *http.Server) {
+	if err := server.Serve(listener); err != nil && !isClosedListenerError(err) {
+		errors.LogErrorInner(context.Background(), err, "failed to start metrics server")
+	}
+}
+
+func isClosedListenerError(err error) bool {
+	if err == nil {
+		return true
+	}
+	if stderrors.Is(err, stdnet.ErrClosed) || stderrors.Is(err, http.ErrServerClosed) {
+		return true
+	}
+	errText := err.Error()
+	return strings.Contains(errText, "listen closed") ||
+		strings.Contains(errText, "use of closed network connection")
+}
+
+func (p *MetricsHandler) httpHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/vars", p.handleDebugVars)
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	// Health check endpoint for container orchestration (Kubernetes, Docker)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok\n"))
+	})
+	return mux
+}
+
+func (p *MetricsHandler) handleDebugVars(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	vars := map[string]json.RawMessage{}
+	expvar.Do(func(kv expvar.KeyValue) {
+		value := json.RawMessage(kv.Value.String())
+		if !json.Valid(value) {
+			value = json.RawMessage("null")
+		}
+		vars[kv.Key] = value
+	})
+	vars["stats"] = marshalJSON(p.stats())
+	vars["observatory"] = marshalJSON(p.observatoryStatus())
+
+	payload, err := json.Marshal(vars)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write(payload)
+}
+
+func marshalJSON(value interface{}) json.RawMessage {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return json.RawMessage("null")
+	}
+	return data
+}
+
+func (p *MetricsHandler) stats() map[string]map[string]map[string]int64 {
+	resp := map[string]map[string]map[string]int64{
+		"inbound":  {},
+		"outbound": {},
+		"user":     {},
+	}
+	p.statsManager.VisitCounters(func(name string, counter feature_stats.Counter) bool {
+		nameSplit := strings.Split(name, ">>>")
+		if len(nameSplit) < 4 {
+			return true
+		}
+		typeName, tagOrUser, direction := nameSplit[0], nameSplit[1], nameSplit[3]
+		items, found := resp[typeName]
+		if !found {
+			items = map[string]map[string]int64{}
+			resp[typeName] = items
+		}
+		if item, found := items[tagOrUser]; found {
+			item[direction] = counter.Value()
+		} else {
+			items[tagOrUser] = map[string]int64{
+				direction: counter.Value(),
+			}
+		}
+		return true
+	})
+	return resp
+}
+
+func (p *MetricsHandler) observatoryStatus() interface{} {
+	feature := core.MustFromContext(p.ctx).GetFeature(extension.ObservatoryType())
+	if feature == nil {
+		return nil
+	}
+	observatoryFeature := feature.(extension.Observatory)
+	resp := map[string]*observatory.OutboundStatus{}
+	if o, err := observatoryFeature.GetObservation(context.Background()); err != nil {
+		return err
+	} else {
+		for _, x := range o.(*observatory.ObservationResult).GetStatus() {
+			resp[x.OutboundTag] = x
 		}
 	}
-	return firstErr
+	return resp
 }
 
 func init() {

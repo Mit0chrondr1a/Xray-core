@@ -1,5 +1,4 @@
-//go:build js || netbsd || openbsd || solaris
-// +build js netbsd openbsd solaris
+//go:build !windows && !darwin && !linux && !freebsd && !openbsd
 
 package internet
 
@@ -8,10 +7,6 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 }
 
 func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig) error {
-	return nil
-}
-
-func bindAddr(fd uintptr, ip []byte, port uint32) error {
 	return nil
 }
 

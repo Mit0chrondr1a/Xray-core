@@ -257,6 +257,16 @@ tasks:
                 {{.CARGO}} build ${CARGO_BUILD_STD_FLAGS} --release --locked --target {{.RUST_TARGET}} ${EBPF_FEATURES}
             - mkdir -p target/release
             - install -m 644 target/{{.RUST_TARGET}}/release/libxray_rust.a target/release/libxray_rust.a
+            - |
+                # Go 1.27+ rejects archives reachable via #cgo LDFLAGS -L that embed
+                # LLVM bitcode (.llvmbc/.llvmcmd). Rust's precompiled compiler_builtins
+                # objects carry it even under LTO, so strip it from the shadow copy.
+                OBJCOPY="$(command -v llvm-objcopy || command -v objcopy || true)"
+                if [ -z "$OBJCOPY" ]; then
+                    echo "llvm-objcopy or objcopy is required to strip LLVM bitcode for Go 1.27+ cgo" >&2
+                    exit 1
+                fi
+                "$OBJCOPY" --remove-section=.llvmbc --remove-section=.llvmcmd target/release/libxray_rust.a
 
     build:
         deps:
