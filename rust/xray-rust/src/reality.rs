@@ -798,6 +798,55 @@ impl rustls::server::ResolvesServerCert for RealityCertResolver {
     }
 }
 
+/// Largest TLS record body the native path will try to authenticate.
+const MAX_CLIENT_HELLO_RECORD_LEN: usize = 16384;
+
+/// Whether a 5-byte record header can open a REALITY handshake.
+///
+/// Mirrors the first-record check of Go's TLS stack ("first record does not
+/// look like a TLS handshake"): content type handshake(22) and a record
+/// version below 0x1000.
+fn is_tls_handshake_record_header(header: &[u8; 5]) -> bool {
+    header[0] == 0x16 && header[1] < 0x10
+}
+
+/// Classify the peeked record header before waiting for the record body.
+///
+/// Returns the record length when the native path may go on to authenticate,
+/// or the reason it cannot. Nothing has been consumed from the socket at this
+/// point, so every rejection must be reported with error code 1: the Go
+/// REALITY path then takes the connection over with the bytes intact and
+/// mirrors them to the target exactly as the Go-only build does.
+///
+/// Without this check the body length was taken from bytes 3..4 of whatever
+/// arrived. A plain "GET / HTTP/1.1" claims a 8239-byte record, so the peek
+/// sat out the whole handshake timeout before the target saw anything, and a
+/// record longer than 16384 bytes made the listener close the connection
+/// itself. Both differ visibly from the real target's reaction.
+fn peeked_client_hello_record_len(header: &[u8; 5]) -> Result<usize, &'static str> {
+    if !is_tls_handshake_record_header(header) {
+        return Err("not a TLS handshake record");
+    }
+    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if record_len > MAX_CLIENT_HELLO_RECORD_LEN {
+        return Err("ClientHello record too large");
+    }
+    Ok(record_len)
+}
+
+/// Error code for a failed pre-auth peek. A peer that closes before sending a
+/// complete ClientHello has consumed nothing, so it goes to the Go path (1)
+/// like any other unauthenticated connection instead of counting as a native
+/// handshake failure (2). Timeouts stay 2: the Go side recognises them by
+/// message and applies its own fallback policy.
+fn peek_error_code(err: &io::Error) -> i32 {
+    if err.kind() == io::ErrorKind::UnexpectedEof {
+        1
+    } else {
+        2
+    }
+}
+
 /// Peek at N bytes from a socket using MSG_PEEK (non-consuming).
 /// Blocks until all bytes are available or an error occurs.
 fn peek_exact(fd: i32, buf: &mut [u8], timeout: Duration) -> io::Result<()> {
@@ -909,16 +958,13 @@ fn reality_server_handshake_full(
         .map_err(|e| (2, format!("peek timeout guard: {}", e)))?;
     let mut header = [0u8; 5];
     peek_exact(fd, &mut header, handshake_timeout)
-        .map_err(|e| (2, format!("peek header: {}", e)))?;
+        .map_err(|e| (peek_error_code(&e), format!("peek header: {}", e)))?;
 
-    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-    if record_len > 16384 {
-        return Err((2, "ClientHello record too large".into()));
-    }
+    let record_len = peeked_client_hello_record_len(&header).map_err(|m| (1, m.to_string()))?;
 
     let mut peek_buf = vec![0u8; 5 + record_len];
     peek_exact(fd, &mut peek_buf, handshake_timeout)
-        .map_err(|e| (2, format!("peek record: {}", e)))?;
+        .map_err(|e| (peek_error_code(&e), format!("peek record: {}", e)))?;
 
     let ch_raw = &peek_buf[5..]; // ClientHello body (after TLS record header)
 
@@ -1668,16 +1714,13 @@ fn reality_server_handshake_deferred(
         .map_err(|e| (2, format!("peek timeout guard: {}", e)))?;
     let mut header = [0u8; 5];
     peek_exact(fd, &mut header, handshake_timeout)
-        .map_err(|e| (2, format!("peek header: {}", e)))?;
+        .map_err(|e| (peek_error_code(&e), format!("peek header: {}", e)))?;
 
-    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-    if record_len > 16384 {
-        return Err((2, "ClientHello record too large".into()));
-    }
+    let record_len = peeked_client_hello_record_len(&header).map_err(|m| (1, m.to_string()))?;
 
     let mut peek_buf = vec![0u8; 5 + record_len];
     peek_exact(fd, &mut peek_buf, handshake_timeout)
-        .map_err(|e| (2, format!("peek record: {}", e)))?;
+        .map_err(|e| (peek_error_code(&e), format!("peek record: {}", e)))?;
 
     let ch_raw = &peek_buf[5..];
 
@@ -3195,6 +3238,151 @@ mod tests {
         assert_eq!(copied, 4);
         assert_eq!(&dst, &[9, 8, 7, 6]);
         assert!(secret.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_peeked_record_header_accepts_tls_handshake() {
+        // Chrome-style ClientHello record: handshake, legacy version 3.1.
+        assert_eq!(
+            peeked_client_hello_record_len(&[0x16, 0x03, 0x01, 0x06, 0xb2]),
+            Ok(1714)
+        );
+        assert_eq!(
+            peeked_client_hello_record_len(&[0x16, 0x03, 0x03, 0x40, 0x00]),
+            Ok(16384)
+        );
+        assert_eq!(
+            peeked_client_hello_record_len(&[0x16, 0x03, 0x01, 0x00, 0x00]),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn test_peeked_record_header_rejects_non_tls_without_waiting_for_body() {
+        // "GET /" would otherwise be read as a 0x202f = 8239 byte record and
+        // stall the peek for the full handshake timeout.
+        assert!(peeked_client_hello_record_len(b"GET /").is_err());
+        assert!(peeked_client_hello_record_len(b"SSH-2").is_err());
+        assert!(peeked_client_hello_record_len(&[0u8; 5]).is_err());
+        // Other TLS content types cannot open a handshake either.
+        assert!(peeked_client_hello_record_len(&[0x17, 0x03, 0x03, 0x00, 0x20]).is_err());
+        assert!(peeked_client_hello_record_len(&[0x15, 0x03, 0x03, 0x00, 0x02]).is_err());
+        // Go's first-record check rejects versions >= 0x1000.
+        assert!(peeked_client_hello_record_len(&[0x16, 0x10, 0x00, 0x00, 0x20]).is_err());
+    }
+
+    #[test]
+    fn test_peeked_record_header_rejects_oversized_record() {
+        assert_eq!(
+            peeked_client_hello_record_len(&[0x16, 0x03, 0x01, 0x40, 0x01]),
+            Err("ClientHello record too large")
+        );
+    }
+
+    #[test]
+    fn test_peek_error_code_routes_early_close_to_go_path() {
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed");
+        assert_eq!(peek_error_code(&eof), 1);
+        let timeout = io::Error::new(io::ErrorKind::TimedOut, "peek_exact: receive timeout");
+        assert_eq!(peek_error_code(&timeout), 2);
+        let reset = io::Error::from_raw_os_error(libc::ECONNRESET);
+        assert_eq!(peek_error_code(&reset), 2);
+    }
+
+    fn test_server_config() -> RealityConfig {
+        RealityConfig {
+            is_client: false,
+            server_pubkey: None,
+            private_key: Some([7u8; 32]),
+            short_id: Vec::new(),
+            short_ids: vec![vec![0u8; 8]],
+            server_names: vec!["example.com".to_string()],
+            version: (0, 0, 0),
+            version_range: None,
+            max_time_diff: 0,
+            mldsa65_verify_key: Vec::new(),
+            mldsa65_sign_key: Vec::new(),
+            dest: String::new(),
+            tls_cert_pem: Vec::new(),
+            tls_key_pem: Vec::new(),
+        }
+    }
+
+    /// Runs the deferred server handshake against `first_bytes` and returns
+    /// the error code, how long it took, and what is still unread on the
+    /// socket afterwards.
+    fn deferred_handshake_outcome(
+        first_bytes: &[u8],
+        close_peer: bool,
+    ) -> (i32, Duration, Vec<u8>) {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (server, mut peer) = UnixStream::pair().expect("socketpair");
+        peer.write_all(first_bytes).expect("write probe bytes");
+        if close_peer {
+            drop(peer);
+            peer = UnixStream::pair().expect("socketpair").0;
+        }
+
+        let cfg = test_server_config();
+        let start = Instant::now();
+        let result =
+            reality_server_handshake_deferred(server.as_raw_fd(), &cfg, Duration::from_secs(5));
+        let elapsed = start.elapsed();
+        let code = match result {
+            Ok(_) => 0,
+            Err((code, _)) => code,
+        };
+
+        // MSG_PEEK must have left the probe bytes for the Go path.
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
+        let mut unread = vec![0u8; first_bytes.len() + 16];
+        let n = (&server).read(&mut unread).unwrap_or(0);
+        unread.truncate(n);
+        drop(peer);
+        (code, elapsed, unread)
+    }
+
+    #[test]
+    fn test_deferred_handshake_hands_plain_http_probe_to_go_path_immediately() {
+        let probe = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (code, elapsed, unread) = deferred_handshake_outcome(probe, false);
+        assert_eq!(
+            code, 1,
+            "a non-TLS probe must be reported as needing the Go fallback"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "non-TLS probe stalled the peek for {:?}; the real target answers at once",
+            elapsed
+        );
+        assert_eq!(unread, probe, "the Go path must still see the probe bytes");
+    }
+
+    #[test]
+    fn test_deferred_handshake_hands_oversized_record_to_go_path() {
+        // Handshake record header announcing 16385 bytes, then a little data.
+        let probe = [0x16, 0x03, 0x01, 0x40, 0x01, 0x01, 0x00, 0x00, 0x10];
+        let (code, elapsed, unread) = deferred_handshake_outcome(&probe, false);
+        assert_eq!(
+            code, 1,
+            "an oversized record must go to the Go path, not close the socket"
+        );
+        assert!(elapsed < Duration::from_millis(500), "took {:?}", elapsed);
+        assert_eq!(unread, probe);
+    }
+
+    #[test]
+    fn test_deferred_handshake_hands_early_close_to_go_path() {
+        let (code, elapsed, _) = deferred_handshake_outcome(b"", true);
+        assert_eq!(
+            code, 1,
+            "a peer that closes before a ClientHello is not a native failure"
+        );
+        assert!(elapsed < Duration::from_millis(500), "took {:?}", elapsed);
     }
 
     #[test]
