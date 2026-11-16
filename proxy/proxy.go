@@ -3211,6 +3211,21 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				if phase == copyLoopPhaseAwaitSignal && inboundGate == session.CopyGatePendingDetach {
 					continue
 				}
+				if !dnsGuardFlow && !session.IsDNSControlPlaneClass(dnsFlowClass) {
+					// The read deadline in this loop is a poll tick for Vision
+					// signals and sockmap admission, not a liveness verdict.
+					// Upstream has no idle ceiling in this loop: a connection
+					// that is merely quiet in the response direction (HTTP
+					// keep-alive, long poll, push channel) stays up until the
+					// caller's activity timer, which sees both directions,
+					// decides otherwise. Ending the leg here after 20-60s
+					// closed healthy idle connections and forced clients to
+					// re-handshake on their next request.
+					//
+					// DNS control-plane flows keep their deliberate short
+					// retirement below; DNS behavior is frozen on this branch.
+					continue
+				}
 				return finishUserspaceTimeout()
 			}
 			if phase == copyLoopPhaseAwaitSignal && committedVisionSemanticPhase(inbound, outbounds) == session.VisionSemanticPhaseNoDetach {
